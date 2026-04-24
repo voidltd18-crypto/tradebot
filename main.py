@@ -72,10 +72,10 @@ ALLOW_CUSTOM_BUY = True
 CUSTOM_BUY_REQUIRES_MARKET_OPEN = True
 
 # Money mode risk
-MAX_POSITIONS = 4
+MAX_POSITIONS = 6
 MAX_NEW_BUYS_PER_LOOP = 1
-MAX_POSITION_VALUE_PCT = 0.30
-TARGET_POSITION_VALUE_PCT = 0.22
+MAX_POSITION_VALUE_PCT = 0.20
+TARGET_POSITION_VALUE_PCT = 0.15
 MIN_ORDER_NOTIONAL = 1.00
 CASH_BUFFER = 0.50
 
@@ -697,7 +697,7 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
 
 
 def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 0.0, reason="AUTO SELL"):
-    rounded_qty = round(qty, 6)
+    rounded_qty = max(0, int(qty * 1_000_000) / 1_000_000)
 
     if rounded_qty <= 0:
         return
