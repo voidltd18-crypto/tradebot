@@ -67,9 +67,8 @@ SAFE_UNIVERSE = [
     "META",
     "AVGO",
     "AMD",
-    "OPEN",
-    "BRK.B",
-    "XOM",
+    "BRK",
+    "XOM.B",
 ]
 
 CHECK_INTERVAL = 60
