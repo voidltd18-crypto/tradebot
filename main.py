@@ -59,15 +59,6 @@ SAFE_UNIVERSE = [
     "OPEN",
     "PFE",
     "T",
-    "NVDA",
-    "MSFT",
-    "AAPL",
-    "GOOGL",
-    "AMZN",
-    "META",
-    "AVGO",
-    "AMD",
-    "BRK",
 ]
 
 CHECK_INTERVAL = 60
@@ -76,15 +67,21 @@ UNIVERSE_REFRESH_SECONDS = 60 * 30
 # Strict daily lockout
 STRICT_ONE_CYCLE_PER_STOCK_PER_DAY = True
 
+# PDT notification/protection
+# If a stock was bought today, the bot will not auto-sell it today.
+# It will log a PDT warning and hold until next day reset.
+PDT_PROTECTION_ENABLED = True
+PDT_BLOCK_SAME_DAY_SELLS = True
+
 # Custom buy safety
 ALLOW_CUSTOM_BUY = True
 CUSTOM_BUY_REQUIRES_MARKET_OPEN = True
 
 # Money mode risk
-MAX_POSITIONS = 6
+MAX_POSITIONS = 4
 MAX_NEW_BUYS_PER_LOOP = 1
-MAX_POSITION_VALUE_PCT = 0.20
-TARGET_POSITION_VALUE_PCT = 0.15
+MAX_POSITION_VALUE_PCT = 0.30
+TARGET_POSITION_VALUE_PCT = 0.22
 MIN_ORDER_NOTIONAL = 1.00
 CASH_BUFFER = 0.50
 
@@ -155,6 +152,7 @@ latest_status: Dict[str, Any] = {}
 latest_scans: List[Dict[str, Any]] = []
 
 trade_events: List[Dict[str, Any]] = []
+pdt_events: List[Dict[str, Any]] = []
 equity_curve: List[Dict[str, Any]] = []
 
 bot_enabled = True
@@ -425,6 +423,7 @@ def reset_daily_flags_if_needed():
             starting_equity_today = float(account.equity)
             starting_equity_day = today
             trade_events.clear()
+            pdt_events.clear()
             equity_curve.clear()
         except Exception:
             pass
@@ -559,6 +558,7 @@ def get_all_positions():
                     "inUniverse": symbol in current_universe,
                     "custom": bool(state.get(symbol, {}).get("custom")),
                     "lockedToday": is_locked_today(symbol),
+                    "boughtToday": was_bought_today(symbol),
                 }
             )
 
@@ -631,6 +631,61 @@ def risk_blocked():
         return True, "Max trades per day reached"
 
     return False, ""
+
+
+
+# =========================
+# PDT PROTECTION
+# =========================
+def was_bought_today(symbol: str):
+    today = today_str()
+    for event in reversed(trade_events):
+        if (
+            event.get("symbol") == symbol
+            and event.get("side") == "BUY"
+            and event.get("day") == today
+        ):
+            return True
+    return False
+
+
+def add_pdt_event(symbol: str, reason: str):
+    event = {
+        "day": today_str(),
+        "time": now_time(),
+        "symbol": symbol,
+        "message": f"PDT BLOCK | {symbol} cannot be sold today. Holding until next day reset.",
+        "reason": reason,
+    }
+
+    # Avoid spamming the exact same PDT warning every loop.
+    if pdt_events:
+        last = pdt_events[-1]
+        if (
+            last.get("symbol") == symbol
+            and last.get("reason") == reason
+            and last.get("day") == today_str()
+        ):
+            return
+
+    pdt_events.append(event)
+
+    if len(pdt_events) > 100:
+        pdt_events.pop(0)
+
+    print(event["message"])
+    notify(f"⚠️ {event['message']}")
+
+
+def pdt_blocks_sell(symbol: str, reason: str):
+    if not PDT_PROTECTION_ENABLED or not PDT_BLOCK_SAME_DAY_SELLS:
+        return False
+
+    if was_bought_today(symbol):
+        add_pdt_event(symbol, reason)
+        return True
+
+    return False
 
 
 # =========================
@@ -716,6 +771,14 @@ def close_position(position: Dict[str, Any], reason="MANUAL SELL"):
 
     if has_open_order(symbol):
         return {"ok": False, "message": f"{symbol} already has open order"}
+
+    if pdt_blocks_sell(symbol, reason):
+        return {
+            "ok": False,
+            "message": f"PDT BLOCK | {symbol} cannot be sold today. Holding until next day reset.",
+            "symbol": symbol,
+            "pdtBlocked": True,
+        }
 
     market_sell_qty(symbol, qty, entry=entry, price=price, reason=reason)
 
@@ -992,6 +1055,8 @@ def manage_money_mode_positions():
 
         if price <= stop_price:
             try:
+                if pdt_blocks_sell(symbol, "MONEY MODE STOP LOSS"):
+                    continue
                 market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
                 state[symbol]["highest_since_entry"] = None
                 print(f"MONEY MODE STOP LOSS SELL {qty:.6f} {symbol} | locked until tomorrow")
@@ -1007,6 +1072,8 @@ def manage_money_mode_positions():
 
             if price <= trail_floor:
                 try:
+                    if pdt_blocks_sell(symbol, "MONEY MODE TRAILING PROFIT"):
+                        continue
                     market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
                     state[symbol]["highest_since_entry"] = None
                     print(f"MONEY MODE TRAILING PROFIT SELL {qty:.6f} {symbol} | locked until tomorrow")
@@ -1224,6 +1291,9 @@ def build_status_payload(bot_name, scans):
         "market": market_status,
         "strictOneCyclePerStockPerDay": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
         "allowCustomBuy": ALLOW_CUSTOM_BUY,
+        "pdtProtectionEnabled": PDT_PROTECTION_ENABLED,
+        "pdtBlockSameDaySells": PDT_BLOCK_SAME_DAY_SELLS,
+        "pdtEvents": pdt_events[-50:],
         "lockedSymbolsToday": locked_symbols,
         "customSymbols": sorted(list(custom_symbols.keys())),
         "maxPositions": MAX_POSITIONS,
@@ -1251,6 +1321,8 @@ def build_status_payload(bot_name, scans):
             "trailGiveback": TRAIL_GIVEBACK,
             "maxDailyLoss": MAX_DAILY_LOSS,
             "maxTradesPerDay": MAX_TRADES_PER_DAY,
+            "pdtProtectionEnabled": PDT_PROTECTION_ENABLED,
+            "pdtBlockSameDaySells": PDT_BLOCK_SAME_DAY_SELLS,
         },
         "account": {
             "equity": float(account.equity),
@@ -1285,6 +1357,7 @@ def build_status_payload(bot_name, scans):
                 "readyToBuy": bool(scan["ready_to_buy"]),
                 "lockedToday": bool(scan["locked_today"]),
                 "custom": bool(scan.get("custom", False)),
+                "boughtToday": bool(was_bought_today(scan["symbol"])),
                 "done": bool(scan["locked_today"]),
                 "priceCurve": scan.get("price_curve", []),
             }
@@ -1295,6 +1368,7 @@ def build_status_payload(bot_name, scans):
             f"MARKET | {market_status.get('label', 'UNKNOWN')} | next_open={market_status.get('nextOpen', '')} | next_close={market_status.get('nextClose', '')}",
             f"CUSTOM | enabled={ALLOW_CUSTOM_BUY} | custom_symbols={', '.join(sorted(custom_symbols.keys())) if custom_symbols else 'none'}",
             f"LOCKOUT | strict={STRICT_ONE_CYCLE_PER_STOCK_PER_DAY} | locked_today={', '.join(locked_symbols) if locked_symbols else 'none'}",
+            f"PDT | enabled={PDT_PROTECTION_ENABLED} | same_day_sell_block={PDT_BLOCK_SAME_DAY_SELLS} | events={len(pdt_events)}",
             f"BOT | enabled={bot_enabled} | manual_override={manual_override} | emergency_stop={emergency_stop}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f} | cash={float(account.cash):.2f}",
             f"DAILY PNL | {daily_pnl:.2f}",
