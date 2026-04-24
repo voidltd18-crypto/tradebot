@@ -68,7 +68,6 @@ SAFE_UNIVERSE = [
     "AVGO",
     "AMD",
     "BRK",
-    "XOM.B",
 ]
 
 CHECK_INTERVAL = 60
