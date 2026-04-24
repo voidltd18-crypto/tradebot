@@ -17,15 +17,20 @@ from alpaca.data.requests import StockLatestQuoteRequest
 
 
 # ============================================================
-# MONEY MODE BOT + STRICT LOCKOUT MODE
+# MONEY MODE BOT + STRICT LOCKOUT + CUSTOM BUY
 # ============================================================
 # Rule:
 # BUY stock -> HOLD stock -> SELL stock -> LOCK stock until tomorrow.
 #
+# Custom Buy:
+# - POST /custom-buy/{symbol}
+# - Buys a ticker even if it was not originally hardcoded.
+# - Adds it to the active managed universe.
+# - Then stop loss + trailing profit manage it like any other bot stock.
+#
 # Important:
 # - Lockout blocks RE-BUYS only.
 # - Lockout does NOT block selling a position you already hold.
-# - This prevents getting stuck because a symbol was marked done.
 # ============================================================
 
 
@@ -40,7 +45,7 @@ PAPER = os.getenv("PAPER", "false").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-BOT_NAME = "Money Mode strict-lockout bot"
+BOT_NAME = "Money Mode strict-lockout custom-buy bot"
 
 SAFE_UNIVERSE = [
     "SOFI",
@@ -61,6 +66,10 @@ UNIVERSE_REFRESH_SECONDS = 60 * 30
 
 # Strict daily lockout
 STRICT_ONE_CYCLE_PER_STOCK_PER_DAY = True
+
+# Custom buy safety
+ALLOW_CUSTOM_BUY = True
+CUSTOM_BUY_REQUIRES_MARKET_OPEN = True
 
 # Money mode risk
 MAX_POSITIONS = 4
@@ -125,11 +134,11 @@ for symbol in current_universe:
         "highest_since_entry": None,
         "price_curve": [],
         "last_seen_price": None,
+        "custom": False,
     }
 
-# locked_today means "do not buy this symbol again today".
-# It should NOT block selling.
 locked_today: Dict[str, str] = {}
+custom_symbols: Dict[str, bool] = {}
 
 last_universe_refresh_ts = 0
 
@@ -153,7 +162,7 @@ bot_lock = threading.Lock()
 # =========================
 # FASTAPI
 # =========================
-app = FastAPI(title="Money Mode Strict Lockout Backend")
+app = FastAPI(title="Money Mode Custom Buy Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -167,9 +176,10 @@ app.add_middleware(
 @app.get("/")
 def root():
     return {
-        "message": "Money Mode strict-lockout backend running",
+        "message": "Money Mode custom-buy backend running",
         "status": "/status",
         "manual_buy": "/manual-buy",
+        "custom_buy": "/custom-buy/{symbol}",
         "manual_sell": "/manual-sell",
         "sell_symbol": "/sell/{symbol}",
         "emergency_sell": "/emergency-sell",
@@ -179,6 +189,7 @@ def root():
         "manual_override_off": "/manual-override/off",
         "paperMode": PAPER,
         "strictLockout": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
+        "allowCustomBuy": ALLOW_CUSTOM_BUY,
     }
 
 
@@ -246,6 +257,21 @@ def manual_buy():
             update_status(BOT_NAME, latest_scans)
 
             return {"ok": True, "message": result or "Manual money-mode buy attempted"}
+
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+
+@app.post("/custom-buy/{symbol}")
+def custom_buy(symbol: str):
+    if not ENABLE_MANUAL_BUTTONS or not ALLOW_CUSTOM_BUY:
+        return {"ok": False, "message": "Custom buy disabled"}
+
+    try:
+        with bot_lock:
+            result = buy_custom_symbol(symbol.upper().strip())
+            update_status(BOT_NAME, latest_scans)
+            return result
 
     except Exception as e:
         return {"ok": False, "message": str(e)}
@@ -347,14 +373,32 @@ def notify(message: str):
         pass
 
 
-def ensure_symbol_state(symbol: str):
+def ensure_symbol_state(symbol: str, custom=False):
     if symbol not in state:
         state[symbol] = {
             "ref": None,
             "highest_since_entry": None,
             "price_curve": [],
             "last_seen_price": None,
+            "custom": custom,
         }
+
+    if custom:
+        state[symbol]["custom"] = True
+
+
+def add_symbol_to_universe(symbol: str, custom=False):
+    global current_universe
+
+    symbol = symbol.upper().strip()
+
+    if symbol not in current_universe:
+        current_universe.append(symbol)
+
+    ensure_symbol_state(symbol, custom=custom)
+
+    if custom:
+        custom_symbols[symbol] = True
 
 
 def reset_daily_flags_if_needed():
@@ -384,6 +428,29 @@ def lock_symbol_until_tomorrow(symbol: str):
 
 def is_locked_today(symbol: str):
     return locked_today.get(symbol) == today_str()
+
+
+
+
+def get_market_status_payload():
+    try:
+        clock = trading_client.get_clock()
+        return {
+            "isOpen": bool(clock.is_open),
+            "timestamp": str(clock.timestamp),
+            "nextOpen": str(clock.next_open),
+            "nextClose": str(clock.next_close),
+            "label": "OPEN" if clock.is_open else "CLOSED",
+        }
+    except Exception as e:
+        return {
+            "isOpen": False,
+            "timestamp": "",
+            "nextOpen": "",
+            "nextClose": "",
+            "label": "UNKNOWN",
+            "error": str(e),
+        }
 
 
 # =========================
@@ -481,6 +548,7 @@ def get_all_positions():
                     "trailFloor": trail_floor,
                     "trailingActive": trailing_active,
                     "inUniverse": symbol in current_universe,
+                    "custom": bool(state.get(symbol, {}).get("custom")),
                     "lockedToday": is_locked_today(symbol),
                 }
             )
@@ -622,8 +690,6 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     trade_events.append(event)
     notify(f"🔴 {reason}: {symbol} | est PnL {round(estimated_pnl, 4)} ({round(estimated_pnl_pct, 2)}%)")
 
-    # This is the strict protection.
-    # Once sold, the symbol cannot be bought again until tomorrow.
     lock_symbol_until_tomorrow(symbol)
 
     if len(trade_events) > 200:
@@ -726,13 +792,20 @@ def refresh_universe_if_needed(force=False):
     if not force and (now - last_universe_refresh_ts) < UNIVERSE_REFRESH_SECONDS:
         return
 
-    current_universe = list(SAFE_UNIVERSE)
+    # Keep custom symbols even when base universe refreshes.
+    new_universe = list(SAFE_UNIVERSE)
+
+    for symbol in custom_symbols.keys():
+        if symbol not in new_universe:
+            new_universe.append(symbol)
+
+    current_universe = new_universe
 
     for symbol in current_universe:
-        ensure_symbol_state(symbol)
+        ensure_symbol_state(symbol, custom=symbol in custom_symbols)
 
     last_universe_refresh_ts = now
-    print(f"STRICT LOCKOUT MONEY MODE UNIVERSE REFRESHED: {', '.join(current_universe)}")
+    print(f"CUSTOM BUY STRICT LOCKOUT UNIVERSE REFRESHED: {', '.join(current_universe)}")
 
 
 def compute_short_momentum(symbol: str, current_price: float):
@@ -750,7 +823,7 @@ def compute_short_momentum(symbol: str, current_price: float):
 
 
 def compute_scan(symbol: str):
-    ensure_symbol_state(symbol)
+    ensure_symbol_state(symbol, custom=symbol in custom_symbols)
 
     quote = get_quote(symbol)
     qty, entry = get_position(symbol)
@@ -828,6 +901,7 @@ def compute_scan(symbol: str):
         "buy_trigger": buy_trigger,
         "ready_to_buy": ready_to_buy,
         "locked_today": locked,
+        "custom": symbol in custom_symbols,
         "highest_since_entry": state[symbol].get("highest_since_entry"),
         "price_curve": curve,
     }
@@ -881,9 +955,6 @@ def can_manage_position(position: Dict[str, Any]):
     if not MANAGE_OUTSIDE_UNIVERSE_POSITIONS and symbol not in current_universe:
         return False, f"{symbol} outside universe"
 
-    # Important:
-    # DO NOT check locked_today here.
-    # Lockout is for BUYING only, never selling.
     if has_open_order(symbol):
         return False, f"{symbol} existing open order"
 
@@ -1021,6 +1092,76 @@ def money_mode_buy(scans, manual=False):
     return " | ".join(messages) if messages else "No buy submitted."
 
 
+def buy_custom_symbol(symbol: str):
+    if not symbol or not symbol.replace(".", "").replace("-", "").isalnum():
+        return {"ok": False, "message": "Invalid ticker"}
+
+    if emergency_stop:
+        return {"ok": False, "message": "BUY BLOCKED | emergency stop active"}
+
+    if CUSTOM_BUY_REQUIRES_MARKET_OPEN:
+        clock = trading_client.get_clock()
+        if not clock.is_open:
+            return {"ok": False, "message": "Market closed"}
+
+    blocked, reason = risk_blocked()
+    if blocked:
+        return {"ok": False, "message": f"BUY BLOCKED | {reason}"}
+
+    if allowed_new_position_count() <= 0:
+        return {"ok": False, "message": f"BUY BLOCKED | max positions reached ({MAX_POSITIONS})"}
+
+    can_buy, reason = can_buy_symbol(symbol)
+    if not can_buy:
+        return {"ok": False, "message": f"BUY BLOCKED | {reason}"}
+
+    try:
+        quote = get_quote(symbol)
+    except Exception as e:
+        return {"ok": False, "message": f"Could not get quote for {symbol}: {e}"}
+
+    if quote["spread"] > MAX_SPREAD:
+        return {
+            "ok": False,
+            "message": f"BUY BLOCKED | {symbol} spread too wide: {quote['spread']:.4f}",
+        }
+
+    notional = calculate_new_position_notional()
+
+    if notional < MIN_ORDER_NOTIONAL:
+        return {"ok": False, "message": f"Not enough usable cash to buy. notional={notional:.2f}"}
+
+    add_symbol_to_universe(symbol, custom=True)
+
+    try:
+        market_buy_notional(symbol, notional, reason="CUSTOM MONEY MODE BUY")
+        state[symbol]["ref"] = quote["mid"]
+        state[symbol]["highest_since_entry"] = quote["mid"]
+
+        # Immediately create/refresh a scan so the frontend can show it.
+        scan = compute_scan(symbol)
+        replaced = False
+        for idx, existing in enumerate(latest_scans):
+            if existing["symbol"] == symbol:
+                latest_scans[idx] = scan
+                replaced = True
+                break
+
+        if not replaced:
+            latest_scans.append(scan)
+
+        return {
+            "ok": True,
+            "message": f"CUSTOM BUY ${notional:.2f} of {symbol}. Added to managed universe.",
+            "symbol": symbol,
+            "notional": notional,
+            "price": quote["mid"],
+        }
+
+    except Exception as e:
+        return {"ok": False, "message": f"CUSTOM BUY ERROR {symbol}: {e}"}
+
+
 # =========================
 # STATUS
 # =========================
@@ -1057,11 +1198,12 @@ def build_status_payload(bot_name, scans):
     daily_pnl = get_daily_pnl()
     blocked, risk_reason = risk_blocked()
     notional = calculate_new_position_notional()
+    market_status = get_market_status_payload()
 
     locked_symbols = sorted([s for s, d in locked_today.items() if d == today_str()])
 
     payload = {
-        "id": "strict-lockout-money-mode-live",
+        "id": "custom-buy-strict-lockout-live",
         "name": bot_name,
         "paperMode": PAPER,
         "botEnabled": bot_enabled,
@@ -1069,9 +1211,12 @@ def build_status_payload(bot_name, scans):
         "emergencyStop": emergency_stop,
         "riskBlocked": blocked,
         "riskReason": risk_reason,
-        "mode": "STRICT_LOCKOUT_MONEY_MODE",
+        "mode": "CUSTOM_BUY_STRICT_LOCKOUT_MONEY_MODE",
+        "market": market_status,
         "strictOneCyclePerStockPerDay": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
+        "allowCustomBuy": ALLOW_CUSTOM_BUY,
         "lockedSymbolsToday": locked_symbols,
+        "customSymbols": sorted(list(custom_symbols.keys())),
         "maxPositions": MAX_POSITIONS,
         "newPositionNotional": notional,
         "allowedNewPositions": allowed_new_position_count(),
@@ -1130,13 +1275,16 @@ def build_status_payload(bot_name, scans):
                 "qualityScore": float(scan["quality_score"]),
                 "readyToBuy": bool(scan["ready_to_buy"]),
                 "lockedToday": bool(scan["locked_today"]),
+                "custom": bool(scan.get("custom", False)),
                 "done": bool(scan["locked_today"]),
                 "priceCurve": scan.get("price_curve", []),
             }
             for scan in scans
         ],
         "logs": [
-            f"MODE | STRICT_LOCKOUT_MONEY_MODE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()} | next_notional={notional:.2f}",
+            f"MODE | CUSTOM_BUY_STRICT_LOCKOUT_MONEY_MODE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()} | next_notional={notional:.2f}",
+            f"MARKET | {market_status.get('label', 'UNKNOWN')} | next_open={market_status.get('nextOpen', '')} | next_close={market_status.get('nextClose', '')}",
+            f"CUSTOM | enabled={ALLOW_CUSTOM_BUY} | custom_symbols={', '.join(sorted(custom_symbols.keys())) if custom_symbols else 'none'}",
             f"LOCKOUT | strict={STRICT_ONE_CYCLE_PER_STOCK_PER_DAY} | locked_today={', '.join(locked_symbols) if locked_symbols else 'none'}",
             f"BOT | enabled={bot_enabled} | manual_override={manual_override} | emergency_stop={emergency_stop}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f} | cash={float(account.cash):.2f}",
@@ -1164,7 +1312,7 @@ def update_status(bot_name, scans):
 # BOT LOOP
 # =========================
 def run_bot_loop():
-    print("Strict Lockout Money Mode trading bot started...")
+    print("Custom Buy Strict Lockout Money Mode trading bot started...")
 
     refresh_universe_if_needed(force=True)
     reset_daily_flags_if_needed()
@@ -1196,7 +1344,7 @@ def run_bot_loop():
                             f"| trigger={scan['buy_trigger']:.2f} | spread={scan['spread']:.4f} "
                             f"| pullback={scan['pullback']:.4f} | momentum={scan['short_momentum']:.4f} "
                             f"| quality={scan['quality_score']:.4f} | ready={scan['ready_to_buy']} "
-                            f"| locked={scan['locked_today']} | qty={scan['qty']:.6f}"
+                            f"| locked={scan['locked_today']} | custom={scan['custom']} | qty={scan['qty']:.6f}"
                         )
 
                     except Exception as e:
