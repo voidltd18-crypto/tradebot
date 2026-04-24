@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: money-mode-trading-bot
+    name: strict-lockout-money-mode-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
