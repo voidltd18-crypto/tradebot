@@ -16,8 +16,24 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
 
+# ============================================================
+# MONEY MODE BOT
+# ============================================================
+# Goal:
+# - Sync all Alpaca positions
+# - Hold multiple positions
+# - Buy only liquid/tight-spread pullbacks
+# - Allocate cash carefully
+# - Let winners trail
+# - Block trading after max loss / max trades
+#
+# Important:
+# No bot can guarantee profit. Test in PAPER=True first.
+# ============================================================
+
+
 # =========================
-# CONFIG
+# ENV / CONFIG
 # =========================
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
@@ -27,47 +43,64 @@ PAPER = os.getenv("PAPER", "false").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-BOT_NAME = "Synced portfolio trailing-profit bot"
+BOT_NAME = "Money Mode multi-position momentum bot"
 
+# More liquid universe than only tiny names.
 SAFE_UNIVERSE = [
-    "PLUG",
-    "OPEN",
-    "LCID",
-    "F",
     "SOFI",
+    "PLTR",
+    "F",
     "RIVN",
+    "LCID",
     "AAL",
     "NIO",
+    "PLUG",
+    "OPEN",
+    "PFE",
+    "T",
 ]
 
 CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
+# Money mode risk
+MAX_POSITIONS = 4
+MAX_NEW_BUYS_PER_LOOP = 1
+MAX_POSITION_VALUE_PCT = 0.30      # no single position should exceed ~30% of equity
+TARGET_POSITION_VALUE_PCT = 0.22   # new buys target ~22% of equity
 MIN_ORDER_NOTIONAL = 1.00
 CASH_BUFFER = 0.50
-MAX_SPREAD = 0.02
+
+# Liquidity/spread protection
+MAX_SPREAD = 0.015                 # 1.5% max spread
+PREFER_SPREAD_UNDER = 0.006        # tighter spreads rank better
+
+# Entry logic
+BUY_DIP = 0.9985                   # buy pullback from recent/ref high
+MIN_PULLBACK = 0.0010              # require at least 0.10% pullback
+MAX_PULLBACK = 0.0450              # avoid catching falling knife >4.5% pullback
+MIN_TICKS_BEFORE_BUY = 3           # need a tiny bit of observed data
+
+# Momentum behaviour
+MOMENTUM_LOOKBACK_POINTS = 5       # based on in-memory quote snapshots
+MIN_SHORT_MOMENTUM = -0.015        # avoid severe short-term dumps
+MAX_SHORT_MOMENTUM = 0.045         # avoid chasing massive spikes
+
+# Exits
+STOP_LOSS = 0.982                  # -1.8%
+TRAIL_START = 1.012                # trailing activates after +1.2%
+TRAIL_GIVEBACK = 0.993             # sell if drops 0.7% from highest after trail active
+
+# Daily safety
+MAX_DAILY_LOSS = -8.00
+MAX_TRADES_PER_DAY = 12
 
 DUST_THRESHOLD = 0.1
-TOP_PICKS = 5
 
-BUY_DIP = 0.9995
-
-STOP_LOSS = 0.985
-TRAIL_START = 1.005
-TRAIL_GIVEBACK = 0.995
-
-MAX_DAILY_LOSS = -10.00
-MAX_TRADES_PER_DAY = 10
+SYNC_ALL_ALPACA_POSITIONS = True
+MANAGE_OUTSIDE_UNIVERSE_POSITIONS = False
 
 ENABLE_MANUAL_BUTTONS = True
-
-# This is the key upgrade:
-# True = bot manages every Alpaca position it can see, not just one symbol.
-SYNC_ALL_ALPACA_POSITIONS = True
-
-# True = bot can auto-sell positions even if they are outside SAFE_UNIVERSE.
-# Safer default is False.
-MANAGE_OUTSIDE_UNIVERSE_POSITIONS = False
 
 
 # =========================
@@ -85,14 +118,15 @@ data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
 # =========================
 current_universe = list(SAFE_UNIVERSE)
 
-state: Dict[str, Dict[str, Any]] = {
-    symbol: {
+state: Dict[str, Dict[str, Any]] = {}
+
+for symbol in current_universe:
+    state[symbol] = {
         "ref": None,
         "highest_since_entry": None,
         "price_curve": [],
+        "last_seen_price": None,
     }
-    for symbol in current_universe
-}
 
 done_today: Dict[str, str] = {}
 last_universe_refresh_ts = 0
@@ -117,7 +151,7 @@ bot_lock = threading.Lock()
 # =========================
 # FASTAPI
 # =========================
-app = FastAPI(title="Synced Trading Bot Backend")
+app = FastAPI(title="Money Mode Trading Bot Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -131,7 +165,7 @@ app.add_middleware(
 @app.get("/")
 def root():
     return {
-        "message": "Synced trading bot backend running",
+        "message": "Money Mode trading bot backend running",
         "status": "/status",
         "manual_buy": "/manual-buy",
         "manual_sell": "/manual-sell",
@@ -142,7 +176,7 @@ def root():
         "manual_override_on": "/manual-override/on",
         "manual_override_off": "/manual-override/off",
         "paperMode": PAPER,
-        "syncAllAlpacaPositions": SYNC_ALL_ALPACA_POSITIONS,
+        "maxPositions": MAX_POSITIONS,
     }
 
 
@@ -155,7 +189,7 @@ def get_status():
 def pause_bot():
     global bot_enabled
     bot_enabled = False
-    notify("⏸️ Bot paused")
+    notify("⏸️ Money Mode paused")
     update_status(BOT_NAME, latest_scans)
     return {"ok": True, "message": "Bot paused"}
 
@@ -165,7 +199,7 @@ def resume_bot():
     global bot_enabled, emergency_stop
     bot_enabled = True
     emergency_stop = False
-    notify("▶️ Bot resumed")
+    notify("▶️ Money Mode resumed")
     update_status(BOT_NAME, latest_scans)
     return {"ok": True, "message": "Bot resumed"}
 
@@ -206,10 +240,10 @@ def manual_buy():
             if not latest_scans:
                 return {"ok": False, "message": "No scan data yet"}
 
-            result = buy_best_stock(latest_scans, manual=True)
+            result = money_mode_buy(latest_scans, manual=True)
             update_status(BOT_NAME, latest_scans)
 
-            return {"ok": True, "message": result or "Manual buy attempted"}
+            return {"ok": True, "message": result or "Manual money-mode buy attempted"}
 
     except Exception as e:
         return {"ok": False, "message": str(e)}
@@ -222,7 +256,7 @@ def manual_sell():
 
     try:
         with bot_lock:
-            result = close_largest_position(reason="MANUAL SELL")
+            result = close_worst_or_largest_position(reason="MANUAL SELL")
             update_status(BOT_NAME, latest_scans)
             return result
 
@@ -254,7 +288,7 @@ def emergency_sell():
             emergency_stop = True
             bot_enabled = False
             result = close_all_positions(reason="EMERGENCY SELL")
-            notify("🚨 Emergency stop activated")
+            notify("🚨 Emergency sell all activated")
             update_status(BOT_NAME, latest_scans)
             return {
                 **result,
@@ -279,7 +313,7 @@ def startup_event():
 
 
 # =========================
-# HELPERS
+# TIME / NOTIFY
 # =========================
 def today_str():
     return datetime.now(UTC).strftime("%Y-%m-%d")
@@ -317,6 +351,7 @@ def ensure_symbol_state(symbol: str):
             "ref": None,
             "highest_since_entry": None,
             "price_curve": [],
+            "last_seen_price": None,
         }
 
 
@@ -348,6 +383,9 @@ def is_done_today(symbol: str):
     return done_today.get(symbol) == today_str()
 
 
+# =========================
+# MARKET / ACCOUNT
+# =========================
 def get_quote(symbol: str):
     req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
     quote = data_client.get_stock_latest_quote(req)[symbol]
@@ -395,6 +433,8 @@ def get_all_positions():
             if qty <= DUST_THRESHOLD:
                 continue
 
+            ensure_symbol_state(symbol)
+
             quote_price = 0.0
             spread = 0.0
 
@@ -415,14 +455,12 @@ def get_all_positions():
                 pnl = (quote_price - entry) * qty
                 pnl_pct = ((quote_price / entry) - 1.0) * 100.0
 
-            ensure_symbol_state(symbol)
-
             highest = state[symbol].get("highest_since_entry")
-            if highest is None or quote_price > highest:
+            if quote_price > 0 and (highest is None or quote_price > highest):
                 state[symbol]["highest_since_entry"] = quote_price
 
             trail_start_price = entry * TRAIL_START if entry > 0 else 0.0
-            trail_floor = (state[symbol]["highest_since_entry"] or 0.0) * TRAIL_GIVEBACK
+            trail_floor = (state[symbol].get("highest_since_entry") or 0.0) * TRAIL_GIVEBACK
             trailing_active = quote_price >= trail_start_price if quote_price > 0 and trail_start_price > 0 else False
 
             positions.append(
@@ -435,7 +473,7 @@ def get_all_positions():
                     "pnl": pnl,
                     "pnlPct": pnl_pct,
                     "spread": spread,
-                    "highest": state[symbol]["highest_since_entry"] or 0.0,
+                    "highest": state[symbol].get("highest_since_entry") or 0.0,
                     "trailStartPrice": trail_start_price,
                     "trailFloor": trail_floor,
                     "trailingActive": trailing_active,
@@ -448,22 +486,6 @@ def get_all_positions():
 
     positions.sort(key=lambda p: abs(p.get("marketValue", 0.0)), reverse=True)
     return positions
-
-
-def get_largest_position():
-    positions = get_all_positions()
-    if not positions:
-        return None
-    return positions[0]
-
-
-def get_any_open_position():
-    position = get_largest_position()
-
-    if not position:
-        return None, 0.0, 0.0
-
-    return position["symbol"], position["qty"], position["entry"]
 
 
 def get_open_orders(symbol=None):
@@ -484,17 +506,25 @@ def has_open_order(symbol: str):
     return len(get_open_orders(symbol)) > 0
 
 
+def get_account():
+    return trading_client.get_account()
+
+
 def get_buying_power():
-    account = trading_client.get_account()
+    account = get_account()
     return float(account.buying_power)
+
+
+def get_equity():
+    account = get_account()
+    return float(account.equity)
 
 
 def get_daily_pnl():
     global starting_equity_today
 
     try:
-        account = trading_client.get_account()
-        equity = float(account.equity)
+        equity = get_equity()
 
         if starting_equity_today is None:
             starting_equity_today = equity
@@ -544,6 +574,7 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
         "reason": reason,
         "pnl": 0.0,
     }
+
     trade_events.append(event)
     notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
 
@@ -583,6 +614,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
         "pnl": round(estimated_pnl, 4),
         "pnlPct": round(estimated_pnl_pct, 4),
     }
+
     trade_events.append(event)
     notify(f"🔴 {reason}: {symbol} | est PnL {round(estimated_pnl, 4)} ({round(estimated_pnl_pct, 2)}%)")
 
@@ -618,15 +650,6 @@ def close_position(position: Dict[str, Any], reason="MANUAL SELL"):
     }
 
 
-def close_largest_position(reason="MANUAL SELL"):
-    position = get_largest_position()
-
-    if not position:
-        return {"ok": False, "message": "No open position to sell"}
-
-    return close_position(position, reason=reason)
-
-
 def close_position_by_symbol(symbol: str, reason="MANUAL SYMBOL SELL"):
     positions = get_all_positions()
 
@@ -635,6 +658,16 @@ def close_position_by_symbol(symbol: str, reason="MANUAL SYMBOL SELL"):
             return close_position(position, reason=reason)
 
     return {"ok": False, "message": f"No open position found for {symbol}"}
+
+
+def close_worst_or_largest_position(reason="MANUAL SELL"):
+    positions = get_all_positions()
+
+    if not positions:
+        return {"ok": False, "message": "No open position to sell"}
+
+    positions.sort(key=lambda p: (p["pnlPct"], -abs(p["marketValue"])))
+    return close_position(positions[0], reason=reason)
 
 
 def close_all_positions(reason="EMERGENCY SELL"):
@@ -675,76 +708,38 @@ def close_all_positions(reason="EMERGENCY SELL"):
     }
 
 
-def clean_dust_positions():
-    for position in get_all_positions():
-        symbol = position["symbol"]
-        qty = position["qty"]
-        entry = position["entry"]
-        price = position["price"]
-        rounded_qty = round(qty, 6)
-
-        if 0 < qty < DUST_THRESHOLD and rounded_qty > 0 and not has_open_order(symbol):
-            try:
-                market_sell_qty(symbol, qty, entry=entry, price=price, reason="DUST CLEAN")
-                print(f"CLEANED DUST {symbol} | qty={qty:.6f}")
-            except Exception as e:
-                print(f"DUST CLEAN ERROR {symbol}: {e}")
-
-
 # =========================
-# RULES + SCORING
+# UNIVERSE / SCAN
 # =========================
-def can_buy(symbol: str):
-    if is_done_today(symbol):
-        print(f"SKIP {symbol} | already used today")
-        return False
-
-    if has_open_order(symbol):
-        print(f"SKIP {symbol} | existing open order")
-        return False
-
-    qty, _ = get_position(symbol)
-
-    if qty > DUST_THRESHOLD:
-        print(f"SKIP {symbol} | already holding position")
-        return False
-
-    # Even in synced mode, keep one new auto-entry at a time unless existing holdings came from previous sessions.
-    return True
-
-
-def can_sell_position(position: Dict[str, Any]):
-    symbol = position["symbol"]
-
-    if not MANAGE_OUTSIDE_UNIVERSE_POSITIONS and symbol not in current_universe:
-        return False, f"{symbol} outside universe"
-
-    if is_done_today(symbol):
-        return False, f"{symbol} already done today"
-
-    if has_open_order(symbol):
-        return False, f"{symbol} existing open order"
-
-    return True, ""
-
-
 def refresh_universe_if_needed(force=False):
-    global current_universe, state, last_universe_refresh_ts
+    global current_universe, last_universe_refresh_ts
 
     now = time.time()
 
     if not force and (now - last_universe_refresh_ts) < UNIVERSE_REFRESH_SECONDS:
         return
 
-    new_universe = list(SAFE_UNIVERSE)
+    current_universe = list(SAFE_UNIVERSE)
 
-    for symbol in new_universe:
+    for symbol in current_universe:
         ensure_symbol_state(symbol)
 
-    current_universe = new_universe
     last_universe_refresh_ts = now
+    print(f"MONEY MODE UNIVERSE REFRESHED: {', '.join(current_universe)}")
 
-    print(f"UNIVERSE REFRESHED: {', '.join(current_universe)}")
+
+def compute_short_momentum(symbol: str, current_price: float):
+    curve = state[symbol].get("price_curve", [])
+
+    if len(curve) < MOMENTUM_LOOKBACK_POINTS:
+        return 0.0
+
+    old = curve[-MOMENTUM_LOOKBACK_POINTS]["value"]
+
+    if old <= 0:
+        return 0.0
+
+    return (current_price / old) - 1.0
 
 
 def compute_scan(symbol: str):
@@ -766,23 +761,51 @@ def compute_scan(symbol: str):
         ref = price
 
     if qty > DUST_THRESHOLD:
-        highest = state[symbol]["highest_since_entry"]
+        highest = state[symbol].get("highest_since_entry")
 
         if highest is None or price > highest:
             state[symbol]["highest_since_entry"] = price
     else:
         state[symbol]["highest_since_entry"] = None
 
-    state[symbol]["price_curve"].append({"t": now_chart_time(), "value": price})
-    if len(state[symbol]["price_curve"]) > 120:
-        state[symbol]["price_curve"].pop(0)
+    curve = state[symbol]["price_curve"]
+    curve.append({"t": now_chart_time(), "value": price})
+    if len(curve) > 180:
+        curve.pop(0)
 
-    score = (price / ref) - 1.0 if ref > 0 else 0.0
-    dip_strength = max(0.0, (ref - price) / ref) if ref > 0 else 0.0
-    tightness_score = max(0.0, MAX_SPREAD - spread)
-    momentum_rank = (dip_strength * 2.0) + tightness_score
+    short_momentum = compute_short_momentum(symbol, price)
+
+    pullback = max(0.0, (ref - price) / ref) if ref > 0 else 0.0
+    tightness_score = max(0.0, PREFER_SPREAD_UNDER - spread)
+    quality_score = 0.0
+
+    # Money mode rank:
+    # - wants some pullback
+    # - rejects huge dumps
+    # - likes tight spreads
+    # - avoids chasing spikes
+    if MIN_PULLBACK <= pullback <= MAX_PULLBACK:
+        quality_score += pullback * 3.0
+
+    if spread <= MAX_SPREAD:
+        quality_score += tightness_score * 2.0
+
+    if MIN_SHORT_MOMENTUM <= short_momentum <= MAX_SHORT_MOMENTUM:
+        quality_score += max(0.0, short_momentum) * 0.7
+    else:
+        quality_score -= 0.02
 
     buy_trigger = ref * BUY_DIP
+
+    ready_to_buy = (
+        price <= buy_trigger
+        and spread <= MAX_SPREAD
+        and MIN_PULLBACK <= pullback <= MAX_PULLBACK
+        and short_momentum >= MIN_SHORT_MOMENTUM
+        and len(curve) >= MIN_TICKS_BEFORE_BUY
+    )
+
+    score = (price / ref) - 1.0 if ref > 0 else 0.0
 
     return {
         "symbol": symbol,
@@ -794,14 +817,17 @@ def compute_scan(symbol: str):
         "entry": entry,
         "ref": ref,
         "score": score,
-        "momentum_rank": momentum_rank,
+        "pullback": pullback,
+        "short_momentum": short_momentum,
+        "quality_score": quality_score,
         "buy_trigger": buy_trigger,
-        "highest_since_entry": state[symbol]["highest_since_entry"],
-        "price_curve": state[symbol]["price_curve"],
+        "ready_to_buy": ready_to_buy,
+        "highest_since_entry": state[symbol].get("highest_since_entry"),
+        "price_curve": curve,
     }
 
 
-def pick_best_stocks(scans):
+def pick_money_mode_stocks(scans):
     candidates = []
 
     for scan in scans:
@@ -815,10 +841,162 @@ def pick_best_stocks(scans):
             print(f"SKIP {symbol} | spread too wide: {scan['spread']:.4f}")
             continue
 
+        if not scan["ready_to_buy"]:
+            continue
+
         candidates.append(scan)
 
-    candidates.sort(key=lambda x: (-x["momentum_rank"], x["spread"]))
-    return candidates[:TOP_PICKS]
+    candidates.sort(key=lambda x: (-x["quality_score"], x["spread"]))
+    return candidates
+
+
+# =========================
+# POSITION MANAGEMENT
+# =========================
+def can_manage_position(position: Dict[str, Any]):
+    symbol = position["symbol"]
+
+    if not MANAGE_OUTSIDE_UNIVERSE_POSITIONS and symbol not in current_universe:
+        return False, f"{symbol} outside universe"
+
+    if is_done_today(symbol):
+        return False, f"{symbol} already done today"
+
+    if has_open_order(symbol):
+        return False, f"{symbol} existing open order"
+
+    return True, ""
+
+
+def manage_money_mode_positions():
+    positions = get_all_positions()
+
+    for position in positions:
+        symbol = position["symbol"]
+        qty = position["qty"]
+        entry = position["entry"]
+        price = position["price"]
+        highest = position["highest"]
+
+        allowed, reason = can_manage_position(position)
+        if not allowed:
+            print(f"SKIP SELL {symbol} | {reason}")
+            continue
+
+        if price <= 0 or entry <= 0:
+            continue
+
+        stop_price = entry * STOP_LOSS
+
+        if price <= stop_price:
+            try:
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
+                mark_done(symbol)
+                state[symbol]["highest_since_entry"] = None
+                print(f"MONEY MODE STOP LOSS SELL {qty:.6f} {symbol}")
+            except Exception as e:
+                print(f"SELL ERROR {symbol}: {e}")
+
+            continue
+
+        trail_start_price = entry * TRAIL_START
+
+        if price >= trail_start_price and highest is not None:
+            trail_floor = highest * TRAIL_GIVEBACK
+
+            if price <= trail_floor:
+                try:
+                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
+                    mark_done(symbol)
+                    state[symbol]["highest_since_entry"] = None
+                    print(f"MONEY MODE TRAILING PROFIT SELL {qty:.6f} {symbol}")
+                except Exception as e:
+                    print(f"SELL ERROR {symbol}: {e}")
+
+                continue
+
+
+def allowed_new_position_count():
+    positions = get_all_positions()
+    return max(0, MAX_POSITIONS - len(positions))
+
+
+def calculate_new_position_notional():
+    account = get_account()
+    equity = float(account.equity)
+    buying_power = float(account.buying_power)
+
+    target_value = equity * TARGET_POSITION_VALUE_PCT
+    max_value = equity * MAX_POSITION_VALUE_PCT
+
+    usable_cash = max(0.0, buying_power - CASH_BUFFER)
+
+    notional = min(target_value, max_value, usable_cash)
+
+    return round(max(0.0, notional), 2)
+
+
+def money_mode_buy(scans, manual=False):
+    if emergency_stop:
+        return "BUY BLOCKED | emergency stop active"
+
+    blocked, reason = risk_blocked()
+    if blocked:
+        return f"BUY BLOCKED | {reason}"
+
+    if allowed_new_position_count() <= 0:
+        return f"BUY BLOCKED | max positions reached ({MAX_POSITIONS})"
+
+    picks = pick_money_mode_stocks(scans)
+
+    if manual and not picks:
+        # Manual buy can use best liquid candidate even if not trigger-ready.
+        liquid = [s for s in scans if s["spread"] <= MAX_SPREAD and not is_done_today(s["symbol"])]
+        liquid.sort(key=lambda x: (-x["quality_score"], x["spread"]))
+        picks = liquid
+
+    if not picks:
+        return "No money-mode candidates ready."
+
+    notional = calculate_new_position_notional()
+
+    if notional < MIN_ORDER_NOTIONAL:
+        return f"Not enough usable cash to buy. notional={notional:.2f}"
+
+    bought = 0
+    messages = []
+
+    for candidate in picks:
+        if bought >= MAX_NEW_BUYS_PER_LOOP:
+            break
+
+        symbol = candidate["symbol"]
+
+        if has_open_order(symbol):
+            messages.append(f"SKIP {symbol} | open order")
+            continue
+
+        qty, _ = get_position(symbol)
+
+        if qty > DUST_THRESHOLD:
+            messages.append(f"SKIP {symbol} | already holding")
+            continue
+
+        if not manual and not candidate["ready_to_buy"]:
+            messages.append(f"SKIP {symbol} | not ready")
+            continue
+
+        try:
+            reason = "MANUAL MONEY MODE BUY" if manual else "AUTO MONEY MODE BUY"
+            market_buy_notional(symbol, notional, reason=reason)
+            state[symbol]["ref"] = candidate["price"]
+            state[symbol]["highest_since_entry"] = candidate["price"]
+            bought += 1
+            messages.append(f"{reason} ${notional:.2f} of {symbol}")
+        except Exception as e:
+            messages.append(f"BUY ERROR {symbol}: {e}")
+
+    return " | ".join(messages) if messages else "No buy submitted."
 
 
 # =========================
@@ -838,7 +1016,7 @@ def update_equity_curve(account):
 
 
 def build_status_payload(bot_name, scans):
-    account = trading_client.get_account()
+    account = get_account()
     update_equity_curve(account)
 
     positions = get_all_positions()
@@ -856,9 +1034,10 @@ def build_status_payload(bot_name, scans):
 
     daily_pnl = get_daily_pnl()
     blocked, risk_reason = risk_blocked()
+    notional = calculate_new_position_notional()
 
     payload = {
-        "id": "synced-live",
+        "id": "money-mode-live",
         "name": bot_name,
         "paperMode": PAPER,
         "botEnabled": bot_enabled,
@@ -866,6 +1045,10 @@ def build_status_payload(bot_name, scans):
         "emergencyStop": emergency_stop,
         "riskBlocked": blocked,
         "riskReason": risk_reason,
+        "mode": "MONEY_MODE",
+        "maxPositions": MAX_POSITIONS,
+        "newPositionNotional": notional,
+        "allowedNewPositions": allowed_new_position_count(),
         "syncAllAlpacaPositions": SYNC_ALL_ALPACA_POSITIONS,
         "manageOutsideUniversePositions": MANAGE_OUTSIDE_UNIVERSE_POSITIONS,
         "universe": list(current_universe),
@@ -875,9 +1058,14 @@ def build_status_payload(bot_name, scans):
             "minOrderNotional": MIN_ORDER_NOTIONAL,
             "cashBuffer": CASH_BUFFER,
             "maxSpread": MAX_SPREAD,
+            "preferSpreadUnder": PREFER_SPREAD_UNDER,
             "dustThreshold": DUST_THRESHOLD,
-            "topPicks": TOP_PICKS,
+            "maxPositions": MAX_POSITIONS,
+            "targetPositionValuePct": TARGET_POSITION_VALUE_PCT,
+            "maxPositionValuePct": MAX_POSITION_VALUE_PCT,
             "buyDip": BUY_DIP,
+            "minPullback": MIN_PULLBACK,
+            "maxPullback": MAX_PULLBACK,
             "stopLoss": STOP_LOSS,
             "trailStart": TRAIL_START,
             "trailGiveback": TRAIL_GIVEBACK,
@@ -911,20 +1099,23 @@ def build_status_payload(bot_name, scans):
                 "spread": float(scan["spread"]),
                 "qty": float(scan["qty"]),
                 "score": float(scan["score"]),
-                "momentumRank": float(scan["momentum_rank"]),
+                "pullback": float(scan["pullback"]),
+                "shortMomentum": float(scan["short_momentum"]),
+                "qualityScore": float(scan["quality_score"]),
+                "readyToBuy": bool(scan["ready_to_buy"]),
                 "done": bool(is_done_today(scan["symbol"])),
                 "priceCurve": scan.get("price_curve", []),
             }
             for scan in scans
         ],
         "logs": [
+            f"MODE | MONEY_MODE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()} | next_notional={notional:.2f}",
             f"BOT | enabled={bot_enabled} | manual_override={manual_override} | emergency_stop={emergency_stop}",
-            f"SYNC | all_positions={SYNC_ALL_ALPACA_POSITIONS} | positions={len(positions)}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f} | cash={float(account.cash):.2f}",
             f"DAILY PNL | {daily_pnl:.2f}",
+            f"POSITIONS | {len(positions)}",
             f"ACTIVE | symbol={active_symbol} | qty={float(active_qty):.6f} | entry={float(active_entry):.2f}",
             f"TRADES | count={len(trade_events)}",
-            f"EQUITY_CURVE | points={len(equity_curve)}",
             f"RISK | blocked={blocked} | reason={risk_reason or 'none'}",
         ],
         "trades": trade_events[-50:],
@@ -942,113 +1133,10 @@ def update_status(bot_name, scans):
 
 
 # =========================
-# LOGIC
-# =========================
-def manage_synced_positions():
-    positions = get_all_positions()
-
-    for position in positions:
-        symbol = position["symbol"]
-        qty = position["qty"]
-        entry = position["entry"]
-        price = position["price"]
-        highest = position["highest"]
-
-        allowed, reason = can_sell_position(position)
-        if not allowed:
-            print(f"SKIP SELL {symbol} | {reason}")
-            continue
-
-        stop_price = entry * STOP_LOSS
-
-        if price > 0 and price <= stop_price:
-            try:
-                market_sell_qty(symbol, qty, entry=entry, price=price, reason="SYNCED STOP LOSS")
-                mark_done(symbol)
-                state[symbol]["highest_since_entry"] = None
-                print(f"SYNCED STOP LOSS SELL {qty:.6f} {symbol}")
-            except Exception as e:
-                print(f"SELL ERROR {symbol}: {e}")
-
-            continue
-
-        trail_start_price = entry * TRAIL_START
-
-        if price >= trail_start_price and highest is not None:
-            trail_floor = highest * TRAIL_GIVEBACK
-
-            if price <= trail_floor:
-                try:
-                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="SYNCED TRAILING PROFIT")
-                    mark_done(symbol)
-                    state[symbol]["highest_since_entry"] = None
-                    print(f"SYNCED TRAILING PROFIT SELL {qty:.6f} {symbol}")
-                except Exception as e:
-                    print(f"SELL ERROR {symbol}: {e}")
-
-                continue
-
-
-def buy_best_stock(scans, manual=False):
-    if emergency_stop:
-        return "BUY BLOCKED | emergency stop active"
-
-    blocked, reason = risk_blocked()
-    if blocked:
-        return f"BUY BLOCKED | {reason}"
-
-    positions = get_all_positions()
-    if positions:
-        return f"BUY BLOCKED | already holding {len(positions)} position(s)"
-
-    picks = pick_best_stocks(scans)
-
-    if not picks:
-        return "No eligible stocks right now."
-
-    usable_cash = max(0.0, get_buying_power() - CASH_BUFFER)
-
-    if usable_cash < MIN_ORDER_NOTIONAL:
-        return f"Not enough usable cash to buy. usable_cash={usable_cash:.2f}"
-
-    for candidate in picks:
-        symbol = candidate["symbol"]
-        price = candidate["price"]
-        ref = candidate["ref"]
-
-        if not can_buy(symbol):
-            continue
-
-        if not manual and price > ref * BUY_DIP:
-            continue
-
-        notional = round(usable_cash, 2)
-
-        if notional < MIN_ORDER_NOTIONAL:
-            return f"SKIP {symbol} | notional too small"
-
-        try:
-            reason = "MANUAL BUY" if manual else "AUTO BUY"
-            market_buy_notional(symbol, notional, reason=reason)
-            state[symbol]["ref"] = price
-            state[symbol]["highest_since_entry"] = price
-
-            message = f"{reason} ${notional:.2f} of {symbol}"
-            print(message)
-            return message
-
-        except Exception as e:
-            print(f"BUY ERROR {symbol}: {e}")
-            continue
-
-    return "No ranked stocks are at buy trigger right now."
-
-
-# =========================
 # BOT LOOP
 # =========================
 def run_bot_loop():
-    print("Synced trading bot started...")
+    print("Money Mode trading bot started...")
 
     refresh_universe_if_needed(force=True)
     reset_daily_flags_if_needed()
@@ -1059,8 +1147,6 @@ def run_bot_loop():
             with bot_lock:
                 reset_daily_flags_if_needed()
                 refresh_universe_if_needed()
-
-                clean_dust_positions()
 
                 clock = trading_client.get_clock()
 
@@ -1079,8 +1165,9 @@ def run_bot_loop():
 
                         print(
                             f"{symbol} | price={scan['price']:.2f} | ref={scan['ref']:.2f} "
-                            f"| buy< {scan['buy_trigger']:.2f} | spread={scan['spread']:.4f} "
-                            f"| qty={scan['qty']:.6f} | rank={scan['momentum_rank']:.4f}"
+                            f"| trigger={scan['buy_trigger']:.2f} | spread={scan['spread']:.4f} "
+                            f"| pullback={scan['pullback']:.4f} | momentum={scan['short_momentum']:.4f} "
+                            f"| quality={scan['quality_score']:.4f} | ready={scan['ready_to_buy']} | qty={scan['qty']:.6f}"
                         )
 
                     except Exception as e:
@@ -1090,10 +1177,10 @@ def run_bot_loop():
                 latest_scans.extend(scans)
 
                 if bot_enabled and not emergency_stop:
-                    manage_synced_positions()
+                    manage_money_mode_positions()
 
                     if not manual_override:
-                        result = buy_best_stock(scans, manual=False)
+                        result = money_mode_buy(scans, manual=False)
                         if result:
                             print(result)
                     else:
