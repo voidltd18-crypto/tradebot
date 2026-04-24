@@ -59,6 +59,17 @@ SAFE_UNIVERSE = [
     "OPEN",
     "PFE",
     "T",
+    "NVDA",
+    "MSFT",
+    "AAPL",
+    "GOOGL",
+    "AMZN",
+    "META",
+    "AVGO",
+    "AMD",
+    "OPEN",
+    "BRK.B",
+    "XOM",
 ]
 
 CHECK_INTERVAL = 60
