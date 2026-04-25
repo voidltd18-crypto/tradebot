@@ -1,4 +1,11 @@
+from fastapi import Request, HTTPException
 
+DASHBOARD_API_KEY = os.getenv("DASHBOARD_API_KEY")
+
+def verify_api_key(request: Request):
+    key = request.headers.get("x-api-key")
+    if key != DASHBOARD_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 import os
 import time
 import threading
