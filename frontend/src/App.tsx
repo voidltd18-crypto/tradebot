@@ -126,6 +126,12 @@ export default function App() {
     setMessage("Dashboard key saved on this device");
   };
 
+  const clearApiKey = () => {
+    localStorage.removeItem("dashboard_api_key");
+    setApiKey("");
+    setMessage("Dashboard key cleared");
+  };
+
   const action = async (endpoint: string) => {
     if (!apiKey.trim()) {
       setMessage("Enter your dashboard password first");
@@ -168,11 +174,7 @@ export default function App() {
     const start = timelineFilterMs(timelineRange);
     return (data?.tradeTimeline || [])
       .filter((e: any) => !start || new Date(e.timestamp).getTime() >= start)
-      .map((e: any, i: number) => ({
-        ...e,
-        idx: i,
-        label: `${e.time || ""} ${e.symbol || ""}`,
-      }));
+      .map((e: any, i: number) => ({ ...e, idx: i }));
   }, [data, timelineRange]);
 
   const timelineChart = useMemo(() => {
@@ -192,7 +194,7 @@ export default function App() {
     <div style={{ minHeight: "100vh", background: "#020617", color: "white", padding: 14, fontFamily: "Arial" }}>
       <div style={{ maxWidth: 1350, margin: "0 auto" }}>
         <h1 style={{ textAlign: "center", fontSize: "clamp(28px, 6vw, 48px)" }}>
-          🎯 Sniper Profit Bot
+          🎯 Rebuilt Sniper Profit Bot
         </h1>
 
         <div style={{ textAlign: "center", color: status === "Connected" ? "#22c55e" : "#f87171", fontWeight: 700 }}>
@@ -216,6 +218,7 @@ export default function App() {
             style={{ padding: 11, borderRadius: 12, background: "#020617", color: "white", border: "1px solid rgba(255,255,255,0.18)", minWidth: 220 }}
           />
           <button style={btn("#2563eb")} onClick={saveApiKey}>Save Key</button>
+          <button style={btn("#4b5563")} onClick={clearApiKey}>Clear</button>
           {message && <span style={{ color: "#facc15", marginLeft: 8 }}>{message}</span>}
         </div>
 
@@ -322,7 +325,7 @@ export default function App() {
             </div>
 
             <div style={{ ...panel, marginBottom: 12 }}>
-              <h3>Money Mode Scanner</h3>
+              <h3>Scanner</h3>
               <select value={selectedSymbol} onChange={(e) => setSelectedSymbol(e.target.value)} style={{ padding: 10, borderRadius: 10, marginBottom: 10 }}>
                 {(data.scans || []).map((s: Scan) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
               </select>
@@ -355,6 +358,17 @@ export default function App() {
                 <div key={m.symbol} style={{ background: "#020617", borderRadius: 12, padding: 10, marginBottom: 6 }}>
                   <b>{m.symbol}</b> · Trust {m.trust} · Trades {m.trades} · Win rate {pct((m.winRate || 0) * 100)} · Avg PnL {money(m.avgPnl || 0)}
                 </div>
+              ))}
+            </div>
+
+            <div style={{ ...panel, marginBottom: 12 }}>
+              <h3>Alpaca Rejections / PDT Warnings</h3>
+              {(data.alpacaRejectionEvents || []).length === 0 && (data.pdtWarningEvents || []).length === 0 && <p style={{ color: "#94a3b8" }}>No warnings yet.</p>}
+              {(data.alpacaRejectionEvents || []).map((e: any, i: number) => (
+                <div key={`a-${i}`} style={{ color: "#f87171", marginBottom: 6 }}>{e.time} | {e.message} | {e.error}</div>
+              ))}
+              {(data.pdtWarningEvents || []).map((e: any, i: number) => (
+                <div key={`p-${i}`} style={{ color: "#facc15", marginBottom: 6 }}>{e.time} | {e.message}</div>
               ))}
             </div>
 
