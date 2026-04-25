@@ -2045,7 +2045,12 @@ def order_is_filled(order):
 
 
 def get_order_side(order):
-    return str(getattr(order, "side", "")).upper()
+    side = str(getattr(order, "side", "")).upper()
+    if "BUY" in side:
+        return "BUY"
+    if "SELL" in side:
+        return "SELL"
+    return side
 
 
 def get_order_symbol(order):
