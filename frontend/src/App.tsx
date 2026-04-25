@@ -13,9 +13,9 @@ import {
 const API_URL = "https://tradebot-0myo.onrender.com";
 
 type Trade = {
-  time: string;
-  side: "BUY" | "SELL";
-  symbol: string;
+  time?: string;
+  side?: "BUY" | "SELL";
+  symbol?: string;
   amount?: number;
   amountGbp?: number;
   qty?: number;
@@ -81,19 +81,19 @@ const btn = (color: string): React.CSSProperties => ({
   margin: 4,
 });
 
-function usd(n: number) {
+function usd(n: number | undefined | null) {
   return `$${Number(n || 0).toFixed(2)}`;
 }
 
-function gbpFromUsd(n: number, rate: number) {
+function gbpFromUsd(n: number | undefined | null, rate: number) {
   return `£${(Number(n || 0) * Number(rate || 0.78)).toFixed(2)}`;
 }
 
-function gbpValue(n: number) {
+function gbpValue(n: number | undefined | null) {
   return `£${Number(n || 0).toFixed(2)}`;
 }
 
-function pct(n: number) {
+function pct(n: number | undefined | null) {
   return `${Number(n || 0).toFixed(2)}%`;
 }
 
@@ -108,7 +108,15 @@ function timelineFilterMs(filter: string) {
   return 0;
 }
 
-function DualMoney({ usdValue, gbpValue: gbpDirect, rate }: { usdValue: number; gbpValue?: number; rate: number }) {
+function DualMoney({
+  usdValue,
+  gbpValue: gbpDirect,
+  rate,
+}: {
+  usdValue: number;
+  gbpValue?: number;
+  rate: number;
+}) {
   return (
     <>
       <b>{usd(usdValue)}</b>
@@ -130,7 +138,15 @@ export default function App() {
   const [timelineRange, setTimelineRange] = useState("day");
   const [chartCurrency, setChartCurrency] = useState<"USD" | "GBP">("GBP");
 
-  const rate = data?.fx?.usdToGbp || 0.78;
+  const scans: Scan[] = Array.isArray(data?.scans) ? data.scans : [];
+  const positions: Position[] = Array.isArray(data?.positions) ? data.positions : [];
+  const trades: Trade[] = Array.isArray(data?.trades) ? data.trades : [];
+  const tradeTimeline: any[] = Array.isArray(data?.tradeTimeline) ? data.tradeTimeline : [];
+  const stockMemory: any[] = Array.isArray(data?.stockMemory) ? data.stockMemory : [];
+  const logs: string[] = Array.isArray(data?.logs) ? data.logs : [];
+  const alpacaRejectionEvents: any[] = Array.isArray(data?.alpacaRejectionEvents) ? data.alpacaRejectionEvents : [];
+  const pdtWarningEvents: any[] = Array.isArray(data?.pdtWarningEvents) ? data.pdtWarningEvents : [];
+  const rate = Number(data?.fx?.usdToGbp || 0.78);
 
   const fetchData = async () => {
     try {
@@ -138,8 +154,13 @@ export default function App() {
       const json = await res.json();
       setData(json);
       setStatus("Connected");
-      if (!selectedSymbol && json.scans?.length) setSelectedSymbol(json.scans[0].symbol);
-    } catch {
+
+      const nextScans = Array.isArray(json?.scans) ? json.scans : [];
+      if (!selectedSymbol && nextScans.length) {
+        setSelectedSymbol(nextScans[0].symbol);
+      }
+    } catch (err) {
+      console.error("Fetch failed:", err);
       setStatus("Connection failed");
     }
   };
@@ -181,7 +202,8 @@ export default function App() {
 
       setMessage(json.message || "Action sent");
       fetchData();
-    } catch {
+    } catch (err) {
+      console.error("Action failed:", err);
       setMessage("Action failed");
     }
   };
@@ -194,30 +216,36 @@ export default function App() {
     setCustomTicker("");
   };
 
-  const selectedScan: Scan | undefined = useMemo(
-    () => data?.scans?.find((s: Scan) => s.symbol === selectedSymbol),
-    [data, selectedSymbol]
-  );
+  const selectedScan: Scan | undefined = useMemo(() => {
+    if (!scans.length) return undefined;
+    return scans.find((s) => s.symbol === selectedSymbol) || scans[0];
+  }, [scans, selectedSymbol]);
 
   const timeline = useMemo(() => {
     const start = timelineFilterMs(timelineRange);
-    return (data?.tradeTimeline || [])
-      .filter((e: any) => !start || new Date(e.timestamp).getTime() >= start)
+    return tradeTimeline
+      .filter((e: any) => {
+        if (!start) return true;
+        const t = new Date(e?.timestamp || 0).getTime();
+        return Number.isFinite(t) && t >= start;
+      })
       .map((e: any, i: number) => ({ ...e, idx: i }));
-  }, [data, timelineRange]);
+  }, [tradeTimeline, timelineRange]);
 
   const timelineChart = useMemo(() => {
     return timeline.map((e: any, i: number) => ({
       idx: i,
-      equity: chartCurrency === "GBP" ? (e.equityGbp ?? (e.equity || 0) * rate) : e.equity || 0,
-      symbol: e.symbol,
-      side: e.side,
-      time: e.time,
-      reason: e.reason,
-      pnl: chartCurrency === "GBP" ? (e.pnlGbp ?? (e.pnl || 0) * rate) : e.pnl,
-      pnlPct: e.pnlPct,
+      equity: chartCurrency === "GBP" ? (e.equityGbp ?? Number(e.equity || 0) * rate) : Number(e.equity || 0),
+      symbol: e.symbol || "",
+      side: e.side || "",
+      time: e.time || "",
+      reason: e.reason || "",
+      pnl: chartCurrency === "GBP" ? (e.pnlGbp ?? Number(e.pnl || 0) * rate) : Number(e.pnl || 0),
+      pnlPct: e.pnlPct || 0,
     }));
   }, [timeline, chartCurrency, rate]);
+
+  const scannerChartData = selectedScan?.priceCurve || [];
 
   return (
     <div style={{ minHeight: "100vh", background: "#020617", color: "white", padding: 14, fontFamily: "Arial" }}>
@@ -232,7 +260,7 @@ export default function App() {
 
         {data && (
           <div style={{ textAlign: "center", color: "#94a3b8", marginBottom: 12 }}>
-            {data.name} · {data.paperMode ? "PAPER" : "LIVE"} · Bot {data.botEnabled ? "ON" : "OFF"} · Market{" "}
+            {data.name || "Trading Bot"} · {data.paperMode ? "PAPER" : "LIVE"} · Bot {data.botEnabled ? "ON" : "OFF"} · Market{" "}
             {data.market?.label || "UNKNOWN"} · USD/GBP {Number(rate).toFixed(4)}
           </div>
         )}
@@ -252,24 +280,24 @@ export default function App() {
         </div>
 
         {data && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.45)" }}>
-            <h3>GBP Conversion</h3>
-            <p style={{ color: "#22c55e", fontWeight: 700 }}>
-              1 USD = £{Number(rate).toFixed(4)} GBP
-            </p>
-            <p style={{ color: "#94a3b8" }}>
-              Equity, PnL, position value and trade history now show both USD and GBP.
-            </p>
-          </div>
-        )}
+          <>
+            <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.45)" }}>
+              <h3>GBP Conversion</h3>
+              <p style={{ color: "#22c55e", fontWeight: 700 }}>
+                1 USD = £{Number(rate).toFixed(4)} GBP
+              </p>
+              <p style={{ color: "#94a3b8" }}>
+                Equity, PnL, position value and trade history show both USD and GBP.
+              </p>
+            </div>
 
-        {data && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(250,204,21,0.45)" }}>
-            <h3>Strategy Modes</h3>
-            <p style={{ color: "#facc15", fontWeight: 700 }}>
-              Sniper {data.sniperModeEnabled ? "ON" : "OFF"} · A+ Gate {data.aPlusGateEnabled ? "ON" : "OFF"} · Confidence Sizing {data.confidenceSizingEnabled ? "ON" : "OFF"} · Stock Memory {data.stockMemoryEnabled ? "ON" : "OFF"} · PDT-Aware {data.pdtAwareModeEnabled ? "ON" : "OFF"}
-            </p>
-          </div>
+            <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(250,204,21,0.45)" }}>
+              <h3>Strategy Modes</h3>
+              <p style={{ color: "#facc15", fontWeight: 700 }}>
+                Sniper {data.sniperModeEnabled ? "ON" : "OFF"} · A+ Gate {data.aPlusGateEnabled ? "ON" : "OFF"} · Confidence Sizing {data.confidenceSizingEnabled ? "ON" : "OFF"} · Stock Memory {data.stockMemoryEnabled ? "ON" : "OFF"} · PDT-Aware {data.pdtAwareModeEnabled ? "ON" : "OFF"}
+              </p>
+            </div>
+          </>
         )}
 
         <div style={{ ...panel, marginBottom: 12 }}>
@@ -299,11 +327,11 @@ export default function App() {
         {data && (
           <>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12, marginBottom: 12 }}>
-              <div style={panel}>Equity<br /><DualMoney usdValue={data.account.equity} gbpValue={data.account.equityGbp} rate={rate} /></div>
-              <div style={panel}>Buying Power<br /><DualMoney usdValue={data.account.buyingPower} gbpValue={data.account.buyingPowerGbp} rate={rate} /></div>
-              <div style={panel}>Cash<br /><DualMoney usdValue={data.account.cash} gbpValue={data.account.cashGbp} rate={rate} /></div>
-              <div style={panel}>Day PnL<br /><b style={{ color: data.account.pnlDay >= 0 ? "#22c55e" : "#f87171" }}>{usd(data.account.pnlDay)}</b><br /><span style={{ color: data.account.pnlDay >= 0 ? "#22c55e" : "#f87171" }}>{gbpValue(data.account.pnlDayGbp ?? data.account.pnlDay * rate)}</span></div>
-              <div style={panel}>Positions<br /><b>{(data.positions || []).length}/{data.maxPositions}</b></div>
+              <div style={panel}>Equity<br /><DualMoney usdValue={data.account?.equity || 0} gbpValue={data.account?.equityGbp} rate={rate} /></div>
+              <div style={panel}>Buying Power<br /><DualMoney usdValue={data.account?.buyingPower || 0} gbpValue={data.account?.buyingPowerGbp} rate={rate} /></div>
+              <div style={panel}>Cash<br /><DualMoney usdValue={data.account?.cash || 0} gbpValue={data.account?.cashGbp} rate={rate} /></div>
+              <div style={panel}>Day PnL<br /><b style={{ color: Number(data.account?.pnlDay || 0) >= 0 ? "#22c55e" : "#f87171" }}>{usd(data.account?.pnlDay)}</b><br /><span style={{ color: Number(data.account?.pnlDay || 0) >= 0 ? "#22c55e" : "#f87171" }}>{gbpValue(data.account?.pnlDayGbp ?? Number(data.account?.pnlDay || 0) * rate)}</span></div>
+              <div style={panel}>Positions<br /><b>{positions.length}/{data.maxPositions || 0}</b></div>
               <div style={panel}>Next Buy Size<br /><DualMoney usdValue={data.newPositionNotional || 0} rate={rate} /></div>
             </div>
 
@@ -318,35 +346,41 @@ export default function App() {
                 <button style={btn(chartCurrency === "USD" ? "#16a34a" : "#334155")} onClick={() => setChartCurrency("USD")}>USD Chart</button>
                 <button style={btn(chartCurrency === "GBP" ? "#16a34a" : "#334155")} onClick={() => setChartCurrency("GBP")}>GBP Chart</button>
               </div>
-              <div style={{ height: 320 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={timelineChart}>
-                    <CartesianGrid stroke="rgba(255,255,255,0.1)" />
-                    <XAxis dataKey="idx" />
-                    <YAxis />
-                    <Tooltip formatter={(value: any) => chartCurrency === "GBP" ? gbpValue(value) : usd(value)} />
-                    <Line type="monotone" dataKey="equity" stroke="#22c55e" strokeWidth={2} dot={false} />
-                    {timelineChart.map((e: any) => (
-                      <ReferenceDot
-                        key={`${e.idx}-${e.symbol}-${e.side}`}
-                        x={e.idx}
-                        y={e.equity}
-                        r={5}
-                        fill={e.side === "BUY" ? "#22c55e" : "#ef4444"}
-                        stroke="white"
-                        label={{ value: e.symbol, position: "top", fill: "white", fontSize: 11 }}
-                      />
-                    ))}
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-              {timeline.length === 0 && <p style={{ color: "#94a3b8" }}>No timeline trades yet.</p>}
+
+              {timelineChart.length > 0 ? (
+                <div style={{ height: 320 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={timelineChart}>
+                      <CartesianGrid stroke="rgba(255,255,255,0.1)" />
+                      <XAxis dataKey="idx" />
+                      <YAxis />
+                      <Tooltip formatter={(value: any) => chartCurrency === "GBP" ? gbpValue(Number(value)) : usd(Number(value))} />
+                      <Line type="monotone" dataKey="equity" stroke="#22c55e" strokeWidth={2} dot={false} />
+                      {timelineChart.map((e: any) => (
+                        <ReferenceDot
+                          key={`${e.idx}-${e.symbol}-${e.side}`}
+                          x={e.idx}
+                          y={e.equity}
+                          r={5}
+                          fill={e.side === "BUY" ? "#22c55e" : "#ef4444"}
+                          stroke="white"
+                          label={{ value: e.symbol, position: "top", fill: "white", fontSize: 11 }}
+                        />
+                      ))}
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              ) : (
+                <div style={{ height: 180, display: "flex", alignItems: "center", justifyContent: "center", color: "#94a3b8", border: "1px dashed rgba(255,255,255,0.15)", borderRadius: 14, marginTop: 12 }}>
+                  No trades yet — timeline will appear after first buy/sell.
+                </div>
+              )}
             </div>
 
             <div style={{ ...panel, marginBottom: 12 }}>
               <h3>All Positions</h3>
-              {(data.positions || []).length === 0 && <p>No open positions.</p>}
-              {(data.positions || []).map((p: Position) => (
+              {positions.length === 0 && <p>No open positions.</p>}
+              {positions.map((p: Position) => (
                 <div key={p.symbol} style={{ background: "#020617", borderRadius: 14, padding: 12, marginBottom: 8 }}>
                   <b>{p.symbol}</b>
                   {p.boughtToday ? <span style={{ color: "#facc15" }}> · BOUGHT TODAY · {p.minutesSinceBuy}m held</span> : null}
@@ -368,37 +402,50 @@ export default function App() {
 
             <div style={{ ...panel, marginBottom: 12 }}>
               <h3>Scanner</h3>
-              <select value={selectedSymbol} onChange={(e) => setSelectedSymbol(e.target.value)} style={{ padding: 10, borderRadius: 10, marginBottom: 10 }}>
-                {(data.scans || []).map((s: Scan) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
-              </select>
 
-              <div style={{ height: 220, marginBottom: 12 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={selectedScan?.priceCurve || []}>
-                    <CartesianGrid stroke="rgba(255,255,255,0.1)" />
-                    <XAxis dataKey="t" />
-                    <YAxis />
-                    <Tooltip />
-                    <Line type="monotone" dataKey="value" stroke="#38bdf8" strokeWidth={2} dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
+              {scans.length > 0 ? (
+                <>
+                  <select value={selectedScan?.symbol || ""} onChange={(e) => setSelectedSymbol(e.target.value)} style={{ padding: 10, borderRadius: 10, marginBottom: 10 }}>
+                    {scans.map((s: Scan) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
+                  </select>
 
-              {(data.scans || []).map((s: Scan) => (
-                <div key={s.symbol} style={{ background: s.aPlusPass || s.sniperPass ? "rgba(22,163,74,0.18)" : "#020617", borderRadius: 14, padding: 12, marginBottom: 8 }}>
-                  <b>{s.symbol}</b> | {usd(s.price)} / {gbpFromUsd(s.price, rate)} | trigger {usd(s.trigger)} | spread {(s.spread * 100).toFixed(2)}%
-                  <br />
-                  quality {(s.qualityScore || 0).toFixed(4)} | confidence {(s.confidence || 0).toFixed(2)} {s.confidenceLabel} | {(s.aPlusPass || s.sniperPass) ? "PASS" : `WAIT: ${s.aPlusReason || s.sniperReason}`}
+                  {scannerChartData.length > 0 ? (
+                    <div style={{ height: 220, marginBottom: 12 }}>
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart data={scannerChartData}>
+                          <CartesianGrid stroke="rgba(255,255,255,0.1)" />
+                          <XAxis dataKey="t" />
+                          <YAxis />
+                          <Tooltip />
+                          <Line type="monotone" dataKey="value" stroke="#38bdf8" strokeWidth={2} dot={false} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                  ) : (
+                    <p style={{ color: "#94a3b8" }}>No scanner chart data yet.</p>
+                  )}
+
+                  {scans.map((s: Scan) => (
+                    <div key={s.symbol} style={{ background: s.aPlusPass || s.sniperPass ? "rgba(22,163,74,0.18)" : "#020617", borderRadius: 14, padding: 12, marginBottom: 8 }}>
+                      <b>{s.symbol}</b> | {usd(s.price)} / {gbpFromUsd(s.price, rate)} | trigger {usd(s.trigger)} | spread {(Number(s.spread || 0) * 100).toFixed(2)}%
+                      <br />
+                      quality {(s.qualityScore || 0).toFixed(4)} | confidence {(s.confidence || 0).toFixed(2)} {s.confidenceLabel} | {(s.aPlusPass || s.sniperPass) ? "PASS" : `WAIT: ${s.aPlusReason || s.sniperReason || "not ready"}`}
+                    </div>
+                  ))}
+                </>
+              ) : (
+                <div style={{ color: "#94a3b8", padding: 20, border: "1px dashed rgba(255,255,255,0.15)", borderRadius: 14 }}>
+                  No scan data yet. This is normal while the market is closed.
                 </div>
-              ))}
+              )}
             </div>
 
             <div style={{ ...panel, marginBottom: 12 }}>
               <h3>Trades</h3>
-              {(data.trades || []).length === 0 && <p>No trades yet</p>}
-              {(data.trades || []).map((t: Trade, i: number) => (
+              {trades.length === 0 && <p>No trades yet.</p>}
+              {trades.map((t: Trade, i: number) => (
                 <div key={i} style={{ color: t.side === "BUY" ? "#22c55e" : "#f87171", marginBottom: 6 }}>
-                  {t.time} | {t.side} | {t.symbol}
+                  {t.time || "—"} | {t.side || "—"} | {t.symbol || "—"}
                   {t.amount ? ` | ${usd(t.amount)} / ${gbpValue(t.amountGbp ?? t.amount * rate)}` : ""}
                   {t.qty ? ` | ${t.qty} shares` : ""}
                   {t.reason ? ` | ${t.reason}` : ""}
@@ -409,8 +456,8 @@ export default function App() {
 
             <div style={{ ...panel, marginBottom: 12 }}>
               <h3>Stock Memory</h3>
-              {(data.stockMemory || []).length === 0 && <p style={{ color: "#94a3b8" }}>No completed sell history yet.</p>}
-              {(data.stockMemory || []).slice(0, 20).map((m: any) => (
+              {stockMemory.length === 0 && <p style={{ color: "#94a3b8" }}>No completed sell history yet.</p>}
+              {stockMemory.slice(0, 20).map((m: any) => (
                 <div key={m.symbol} style={{ background: "#020617", borderRadius: 12, padding: 10, marginBottom: 6 }}>
                   <b>{m.symbol}</b> · Trust {m.trust} · Trades {m.trades} · Win rate {pct((m.winRate || 0) * 100)} · Avg PnL {usd(m.avgPnl || 0)} / {gbpFromUsd(m.avgPnl || 0, rate)}
                 </div>
@@ -418,8 +465,19 @@ export default function App() {
             </div>
 
             <div style={{ ...panel, marginBottom: 12 }}>
+              <h3>Alpaca Rejections / PDT Warnings</h3>
+              {alpacaRejectionEvents.length === 0 && pdtWarningEvents.length === 0 && <p style={{ color: "#94a3b8" }}>No warnings yet.</p>}
+              {alpacaRejectionEvents.map((e: any, i: number) => (
+                <div key={`a-${i}`} style={{ color: "#f87171", marginBottom: 6 }}>{e.time} | {e.message} | {e.error}</div>
+              ))}
+              {pdtWarningEvents.map((e: any, i: number) => (
+                <div key={`p-${i}`} style={{ color: "#facc15", marginBottom: 6 }}>{e.time} | {e.message}</div>
+              ))}
+            </div>
+
+            <div style={{ ...panel, marginBottom: 12 }}>
               <h3>Logs</h3>
-              {(data.logs || []).map((l: string, i: number) => (
+              {logs.map((l: string, i: number) => (
                 <div key={i} style={{ color: l.includes("FX") ? "#22c55e" : l.includes("SNIPER") ? "#38bdf8" : l.includes("PDT") ? "#facc15" : l.includes("PROFIT") ? "#22c55e" : "#94a3b8", fontSize: 12 }}>
                   {l}
                 </div>

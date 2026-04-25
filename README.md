@@ -1,17 +1,16 @@
-# GBP Profit Dashboard Package
+# GBP Profit Dashboard Fixed Package
 
-Adds USD → GBP conversion across the trading dashboard.
+This fixes the white-screen crash when:
+- market is closed
+- scans are empty
+- trade timeline is empty
+- selected scan is undefined
 
-## Features
-- Live USD/GBP exchange rate from backend
-- GBP fallback rate if FX API fails
-- Equity shown in USD + GBP
-- Buying power shown in USD + GBP
-- Cash shown in USD + GBP
-- Day PnL shown in USD + GBP
-- Position value shown in USD + GBP
-- Trade PnL shown in USD + GBP
-- Timeline chart can switch between USD and GBP
+It also keeps:
+- USD/GBP conversion
+- GBP values for equity, PnL, positions, trades
+- timeline USD/GBP chart toggle
+- A+ gate / Sniper / Memory / PDT-aware dashboard sections
 
 ## Render settings
 
@@ -21,8 +20,12 @@ pip install -r backend/requirements.txt
 Start:
 uvicorn backend.main:app --host 0.0.0.0 --port $PORT
 
-## Required Render env vars
-APCA_API_KEY_ID
-APCA_API_SECRET_KEY
-DASHBOARD_API_KEY
-PAPER=false
+## Vercel
+Root directory:
+frontend
+
+Build command:
+npm run build
+
+Output:
+dist
