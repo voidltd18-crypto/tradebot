@@ -136,6 +136,36 @@ STALL_EXIT_AFTER_MINUTES = 90
 STALL_EXIT_MIN_PNL_PCT = 0.30
 MIN_SELL_NOTIONAL = 1.00
 
+# Profit Optimiser / Analytics / Auto-Improve
+PROFIT_OPTIMIZER_ENABLED = True
+ANALYTICS_ENABLED = True
+AUTO_IMPROVE_ENABLED = True
+
+DAILY_PROFIT_TARGET = 4.00
+DAILY_LOSS_LIMIT_OPTIMIZER = -4.00
+PAUSE_BUYS_AFTER_DAILY_TARGET = True
+PAUSE_BUYS_AFTER_DAILY_LOSS = True
+
+OPTIMIZED_STOP_LOSS = 0.985
+OPTIMIZED_TRAIL_START = 1.020
+OPTIMIZED_TRAIL_GIVEBACK = 0.995
+OPTIMIZED_FAST_STOP_LOSS_PCT = -1.00
+OPTIMIZED_PARTIAL_PROFIT_TRIGGER_PCT = 1.20
+OPTIMIZED_PARTIAL_PROFIT_SELL_PCT = 0.35
+
+AUTO_BLACKLIST_ENABLED = True
+AUTO_BLACKLIST_MIN_TRADES = 4
+AUTO_BLACKLIST_MAX_WINRATE = 0.38
+AUTO_BLACKLIST_MAX_TOTAL_PNL = -1.50
+AUTO_BOOST_ENABLED = True
+AUTO_BOOST_MIN_TRADES = 4
+AUTO_BOOST_MIN_WINRATE = 0.60
+AUTO_BOOST_MIN_TOTAL_PNL = 1.00
+AUTO_BOOST_MULTIPLIER = 1.20
+AUTO_REDUCE_MULTIPLIER = 0.70
+OPTIMIZER_MIN_CONFIDENCE = 0.68
+
+
 
 SNIPER_MODE_ENABLED = True
 CONFIDENCE_SIZING_ENABLED = True
@@ -186,6 +216,15 @@ BACKFILL_MAX_PAGES = 50
 TRADE_HISTORY_FILE = "trade_history.json"
 STOCK_MEMORY_FILE = "stock_memory.json"
 
+
+
+if PROFIT_OPTIMIZER_ENABLED:
+    STOP_LOSS = OPTIMIZED_STOP_LOSS
+    TRAIL_START = OPTIMIZED_TRAIL_START
+    TRAIL_GIVEBACK = OPTIMIZED_TRAIL_GIVEBACK
+    FAST_STOP_LOSS_PCT = OPTIMIZED_FAST_STOP_LOSS_PCT
+    PARTIAL_PROFIT_TRIGGER_PCT = OPTIMIZED_PARTIAL_PROFIT_TRIGGER_PCT
+    PARTIAL_PROFIT_SELL_PCT = OPTIMIZED_PARTIAL_PROFIT_SELL_PCT
 
 # =========================
 # CLIENTS
@@ -982,6 +1021,11 @@ def daily_trade_count():
 
 
 def risk_blocked():
+    if PROFIT_OPTIMIZER_ENABLED:
+        opt_blocked, opt_reason = profit_guardrail_status()
+        if opt_blocked:
+            return True, opt_reason
+
     pnl = get_daily_pnl()
     if pnl <= MAX_DAILY_LOSS:
         return True, f"Max daily loss hit: {pnl:.2f}"
@@ -2045,12 +2089,7 @@ def order_is_filled(order):
 
 
 def get_order_side(order):
-    side = str(getattr(order, "side", "")).upper()
-    if "BUY" in side:
-        return "BUY"
-    if "SELL" in side:
-        return "SELL"
-    return side
+    return str(getattr(order, "side", "")).upper()
 
 
 def get_order_symbol(order):
@@ -2379,6 +2418,158 @@ def backfill_trades_from_alpaca():
     }
 
 
+
+# =========================
+# PROFIT OPTIMISER / ANALYTICS / AUTO IMPROVE
+# =========================
+def today_realised_pnl():
+    today = today_str()
+    closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
+    return sum(float(t.get("pnl") or 0.0) for t in closed if t.get("day") == today)
+
+
+def today_realised_pnl_gbp():
+    today = today_str()
+    closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
+    return sum(float(t.get("pnlGbp") or 0.0) for t in closed if t.get("day") == today)
+
+
+def profit_guardrail_status():
+    pnl = today_realised_pnl()
+    if PAUSE_BUYS_AFTER_DAILY_TARGET and pnl >= DAILY_PROFIT_TARGET:
+        return True, f"Daily profit target hit: ${pnl:.2f}"
+    if PAUSE_BUYS_AFTER_DAILY_LOSS and pnl <= DAILY_LOSS_LIMIT_OPTIMIZER:
+        return True, f"Daily optimiser loss limit hit: ${pnl:.2f}"
+    return False, ""
+
+
+def analytics_payload():
+    closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
+    wins = [t for t in closed if float(t.get("pnl") or 0.0) >= 0]
+    losses = [t for t in closed if float(t.get("pnl") or 0.0) < 0]
+    total_pnl = sum(float(t.get("pnl") or 0.0) for t in closed)
+    total_pnl_gbp = sum(float(t.get("pnlGbp") or 0.0) for t in closed)
+    gross_win = sum(float(t.get("pnl") or 0.0) for t in wins)
+    gross_loss = abs(sum(float(t.get("pnl") or 0.0) for t in losses))
+    avg_win = gross_win / max(1, len(wins))
+    avg_loss = -gross_loss / max(1, len(losses))
+    avg_win_gbp = sum(float(t.get("pnlGbp") or 0.0) for t in wins) / max(1, len(wins))
+    avg_loss_gbp = sum(float(t.get("pnlGbp") or 0.0) for t in losses) / max(1, len(losses))
+
+    by_symbol = {}
+    for t in closed:
+        symbol = str(t.get("symbol", "")).upper()
+        if not symbol:
+            continue
+        row = by_symbol.setdefault(symbol, {"symbol": symbol, "trades": 0, "wins": 0, "losses": 0, "totalPnl": 0.0, "totalPnlGbp": 0.0, "winRate": 0.0, "avgPnl": 0.0, "trust": "NEW"})
+        pnl = float(t.get("pnl") or 0.0)
+        row["trades"] += 1
+        row["totalPnl"] += pnl
+        row["totalPnlGbp"] += float(t.get("pnlGbp") or 0.0)
+        if pnl >= 0:
+            row["wins"] += 1
+        else:
+            row["losses"] += 1
+
+    rows = []
+    for row in by_symbol.values():
+        row["winRate"] = row["wins"] / max(1, row["trades"])
+        row["avgPnl"] = row["totalPnl"] / max(1, row["trades"])
+        if row["trades"] >= AUTO_BOOST_MIN_TRADES and row["winRate"] >= AUTO_BOOST_MIN_WINRATE and row["totalPnl"] >= AUTO_BOOST_MIN_TOTAL_PNL:
+            row["trust"] = "BOOST"
+        elif row["trades"] >= AUTO_BLACKLIST_MIN_TRADES and row["winRate"] <= AUTO_BLACKLIST_MAX_WINRATE and row["totalPnl"] <= AUTO_BLACKLIST_MAX_TOTAL_PNL:
+            row["trust"] = "BLACKLIST"
+        elif row["trades"] >= 3:
+            row["trust"] = "NEUTRAL"
+        rows.append(row)
+
+    return {
+        "enabled": ANALYTICS_ENABLED,
+        "closedTrades": len(closed),
+        "wins": len(wins),
+        "losses": len(losses),
+        "winRate": len(wins) / max(1, len(closed)),
+        "totalPnl": total_pnl,
+        "totalPnlGbp": total_pnl_gbp,
+        "averageWin": avg_win,
+        "averageLoss": avg_loss,
+        "averageWinGbp": avg_win_gbp,
+        "averageLossGbp": avg_loss_gbp,
+        "profitFactor": gross_win / max(0.01, gross_loss),
+        "bestStocks": sorted(rows, key=lambda x: (x["totalPnl"], x["winRate"]), reverse=True)[:10],
+        "worstStocks": sorted(rows, key=lambda x: (x["totalPnl"], x["winRate"]))[:10],
+        "todayRealisedPnl": today_realised_pnl(),
+        "todayRealisedPnlGbp": today_realised_pnl_gbp(),
+    }
+
+
+def symbol_stats(symbol: str):
+    symbol = symbol.upper()
+    rows = analytics_payload().get("bestStocks", []) + analytics_payload().get("worstStocks", [])
+    for row in rows:
+        if row.get("symbol") == symbol:
+            return row
+    closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
+    trades = [t for t in closed if str(t.get("symbol", "")).upper() == symbol]
+    wins = [t for t in trades if float(t.get("pnl") or 0.0) >= 0]
+    total = sum(float(t.get("pnl") or 0.0) for t in trades)
+    return {"symbol": symbol, "trades": len(trades), "wins": len(wins), "winRate": len(wins) / max(1, len(trades)), "totalPnl": total}
+
+
+def auto_improve_decision(symbol: str):
+    if not AUTO_IMPROVE_ENABLED:
+        return {"action": "NORMAL", "multiplier": 1.0, "reason": "auto improve off"}
+    row = symbol_stats(symbol)
+    trades = int(row.get("trades") or 0)
+    win_rate = float(row.get("winRate") or 0.0)
+    total_pnl = float(row.get("totalPnl") or 0.0)
+    if AUTO_BLACKLIST_ENABLED and trades >= AUTO_BLACKLIST_MIN_TRADES and win_rate <= AUTO_BLACKLIST_MAX_WINRATE and total_pnl <= AUTO_BLACKLIST_MAX_TOTAL_PNL:
+        return {"action": "BLACKLIST", "multiplier": 0.0, "reason": f"weak history: trades={trades}, winRate={win_rate:.2f}, pnl=${total_pnl:.2f}"}
+    if AUTO_BOOST_ENABLED and trades >= AUTO_BOOST_MIN_TRADES and win_rate >= AUTO_BOOST_MIN_WINRATE and total_pnl >= AUTO_BOOST_MIN_TOTAL_PNL:
+        return {"action": "BOOST", "multiplier": AUTO_BOOST_MULTIPLIER, "reason": f"strong history: trades={trades}, winRate={win_rate:.2f}, pnl=${total_pnl:.2f}"}
+    if trades >= AUTO_BLACKLIST_MIN_TRADES and total_pnl < 0:
+        return {"action": "REDUCE", "multiplier": AUTO_REDUCE_MULTIPLIER, "reason": f"negative history: trades={trades}, pnl=${total_pnl:.2f}"}
+    return {"action": "NORMAL", "multiplier": 1.0, "reason": "normal history"}
+
+
+def optimiser_allows_scan(scan):
+    if not PROFIT_OPTIMIZER_ENABLED:
+        return True, "optimiser off"
+    symbol = scan.get("symbol", "")
+    confidence = float(scan.get("confidence", 0.0))
+    if confidence < OPTIMIZER_MIN_CONFIDENCE:
+        return False, f"confidence {confidence:.2f} below optimiser {OPTIMIZER_MIN_CONFIDENCE:.2f}"
+    decision = auto_improve_decision(symbol)
+    if decision["action"] == "BLACKLIST":
+        return False, f"auto-blacklisted: {decision['reason']}"
+    blocked, reason = profit_guardrail_status()
+    if blocked:
+        return False, reason
+    return True, decision["reason"]
+
+
+def optimiser_position_multiplier(symbol):
+    return float(auto_improve_decision(symbol).get("multiplier", 1.0))
+
+
+def optimiser_payload():
+    blocked, reason = profit_guardrail_status()
+    return {
+        "enabled": PROFIT_OPTIMIZER_ENABLED,
+        "autoImproveEnabled": AUTO_IMPROVE_ENABLED,
+        "buyBlocked": blocked,
+        "blockReason": reason,
+        "dailyProfitTarget": DAILY_PROFIT_TARGET,
+        "dailyLossLimit": DAILY_LOSS_LIMIT_OPTIMIZER,
+        "todayRealisedPnl": today_realised_pnl(),
+        "todayRealisedPnlGbp": today_realised_pnl_gbp(),
+        "optimizedStopLoss": OPTIMIZED_STOP_LOSS,
+        "optimizedTrailStart": OPTIMIZED_TRAIL_START,
+        "optimizedTrailGiveback": OPTIMIZED_TRAIL_GIVEBACK,
+        "autoBoostMultiplier": AUTO_BOOST_MULTIPLIER,
+        "autoReduceMultiplier": AUTO_REDUCE_MULTIPLIER,
+    }
+
 # =========================
 # STATUS
 # =========================
@@ -2413,6 +2604,8 @@ def build_status_payload(bot_name, scans):
         "mode": "SNIPER_CONFIDENCE_MEMORY_TIMELINE_GBP",
         "market": market_status,
         "fx": fx_payload(),
+        "analytics": analytics_payload(),
+        "optimiser": optimiser_payload(),
         "strictOneCyclePerStockPerDay": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
         "allowCustomBuy": ALLOW_CUSTOM_BUY,
         "profitModeEnabled": PROFIT_MODE_ENABLED,
@@ -2421,6 +2614,9 @@ def build_status_payload(bot_name, scans):
         "sniperModeEnabled": SNIPER_MODE_ENABLED,
         "confidenceSizingEnabled": CONFIDENCE_SIZING_ENABLED,
         "stockMemoryEnabled": STOCK_MEMORY_ENABLED,
+        "profitOptimizerEnabled": PROFIT_OPTIMIZER_ENABLED,
+        "analyticsEnabled": ANALYTICS_ENABLED,
+        "autoImproveEnabled": AUTO_IMPROVE_ENABLED,
         "fastExitModeEnabled": FAST_EXIT_MODE_ENABLED,
         "partialProfitEnabled": PARTIAL_PROFIT_ENABLED,
         "partialProfitTriggerPct": PARTIAL_PROFIT_TRIGGER_PCT,
@@ -2493,6 +2689,7 @@ def build_status_payload(bot_name, scans):
                 "sniperReason": s.get("sniper_reason", ""),
                 "aPlusPass": bool(s.get("a_plus_pass", False)),
                 "aPlusReason": s.get("a_plus_reason", ""),
+                "optimiserDecision": auto_improve_decision(s["symbol"]),
             } for s in scans
         ],
         "logs": [
@@ -2501,6 +2698,8 @@ def build_status_payload(bot_name, scans):
             f"FX | USDGBP={get_usd_to_gbp_rate():.4f} | source={fx_cache.get('source', 'fallback')}",
             f"DB | sqlite={SQLITE_ENABLED} | raw_trades={db_summary_payload().get('totalTrades', 0)} | closed={closed_trade_summary_payload().get('closedTrades', 0)} | pnl_gbp={closed_trade_summary_payload().get('totalPnlGbp', 0):.2f}",
             f"BACKFILL | chunk={BACKFILL_CHUNK_SIZE} | max_pages={BACKFILL_MAX_PAGES}",
+            f"OPTIMIZER | enabled={PROFIT_OPTIMIZER_ENABLED} | today_realised={today_realised_pnl():.2f} | block={profit_guardrail_status()[1] or 'none'}",
+            f"ANALYTICS | profit_factor={analytics_payload().get('profitFactor', 0):.2f} | avg_win={analytics_payload().get('averageWin', 0):.2f} | avg_loss={analytics_payload().get('averageLoss', 0):.2f}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
