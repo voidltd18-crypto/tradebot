@@ -17,8 +17,10 @@ type Trade = {
   side: "BUY" | "SELL";
   symbol: string;
   amount?: number;
+  amountGbp?: number;
   qty?: number;
   pnl?: number;
+  pnlGbp?: number;
   pnlPct?: number;
   reason?: string;
 };
@@ -29,7 +31,9 @@ type Position = {
   entry: number;
   price: number;
   marketValue: number;
+  marketValueGbp?: number;
   pnl: number;
+  pnlGbp?: number;
   pnlPct: number;
   trailStartPrice: number;
   trailFloor: number;
@@ -77,8 +81,16 @@ const btn = (color: string): React.CSSProperties => ({
   margin: 4,
 });
 
-function money(n: number) {
+function usd(n: number) {
   return `$${Number(n || 0).toFixed(2)}`;
+}
+
+function gbpFromUsd(n: number, rate: number) {
+  return `£${(Number(n || 0) * Number(rate || 0.78)).toFixed(2)}`;
+}
+
+function gbpValue(n: number) {
+  return `£${Number(n || 0).toFixed(2)}`;
 }
 
 function pct(n: number) {
@@ -96,6 +108,18 @@ function timelineFilterMs(filter: string) {
   return 0;
 }
 
+function DualMoney({ usdValue, gbpValue: gbpDirect, rate }: { usdValue: number; gbpValue?: number; rate: number }) {
+  return (
+    <>
+      <b>{usd(usdValue)}</b>
+      <br />
+      <span style={{ color: "#94a3b8" }}>
+        {gbpDirect !== undefined ? gbpValue(gbpDirect) : gbpFromUsd(usdValue, rate)}
+      </span>
+    </>
+  );
+}
+
 export default function App() {
   const [data, setData] = useState<any>(null);
   const [status, setStatus] = useState("Connecting...");
@@ -104,6 +128,9 @@ export default function App() {
   const [customTicker, setCustomTicker] = useState("");
   const [selectedSymbol, setSelectedSymbol] = useState("");
   const [timelineRange, setTimelineRange] = useState("day");
+  const [chartCurrency, setChartCurrency] = useState<"USD" | "GBP">("GBP");
+
+  const rate = data?.fx?.usdToGbp || 0.78;
 
   const fetchData = async () => {
     try {
@@ -182,21 +209,21 @@ export default function App() {
   const timelineChart = useMemo(() => {
     return timeline.map((e: any, i: number) => ({
       idx: i,
-      equity: e.equity || 0,
+      equity: chartCurrency === "GBP" ? (e.equityGbp ?? (e.equity || 0) * rate) : e.equity || 0,
       symbol: e.symbol,
       side: e.side,
       time: e.time,
       reason: e.reason,
-      pnl: e.pnl,
+      pnl: chartCurrency === "GBP" ? (e.pnlGbp ?? (e.pnl || 0) * rate) : e.pnl,
       pnlPct: e.pnlPct,
     }));
-  }, [timeline]);
+  }, [timeline, chartCurrency, rate]);
 
   return (
     <div style={{ minHeight: "100vh", background: "#020617", color: "white", padding: 14, fontFamily: "Arial" }}>
       <div style={{ maxWidth: 1350, margin: "0 auto" }}>
         <h1 style={{ textAlign: "center", fontSize: "clamp(28px, 6vw, 48px)" }}>
-          🎯 Rebuilt Sniper Profit Bot
+          🇬🇧 GBP Profit Trading Bot
         </h1>
 
         <div style={{ textAlign: "center", color: status === "Connected" ? "#22c55e" : "#f87171", fontWeight: 700 }}>
@@ -206,7 +233,7 @@ export default function App() {
         {data && (
           <div style={{ textAlign: "center", color: "#94a3b8", marginBottom: 12 }}>
             {data.name} · {data.paperMode ? "PAPER" : "LIVE"} · Bot {data.botEnabled ? "ON" : "OFF"} · Market{" "}
-            {data.market?.label || "UNKNOWN"} · {data.mode}
+            {data.market?.label || "UNKNOWN"} · USD/GBP {Number(rate).toFixed(4)}
           </div>
         )}
 
@@ -226,24 +253,21 @@ export default function App() {
 
         {data && (
           <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.45)" }}>
-            <h3>Strategy Modes</h3>
+            <h3>GBP Conversion</h3>
             <p style={{ color: "#22c55e", fontWeight: 700 }}>
-              Sniper {data.sniperModeEnabled ? "ON" : "OFF"} · A+ Gate {data.aPlusGateEnabled ? "ON" : "OFF"} · Confidence Sizing {data.confidenceSizingEnabled ? "ON" : "OFF"} · Stock Memory {data.stockMemoryEnabled ? "ON" : "OFF"} · PDT-Aware {data.pdtAwareModeEnabled ? "ON" : "OFF"}
+              1 USD = £{Number(rate).toFixed(4)} GBP
             </p>
             <p style={{ color: "#94a3b8" }}>
-              A+ Gate only allows the highest quality trades. Sniper decides IF to buy. Confidence decides HOW MUCH. Memory learns which stocks work best.
+              Equity, PnL, position value and trade history now show both USD and GBP.
             </p>
           </div>
         )}
 
         {data && (
           <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(250,204,21,0.45)" }}>
-            <h3>A+ Trade Quality Gate</h3>
+            <h3>Strategy Modes</h3>
             <p style={{ color: "#facc15", fontWeight: 700 }}>
-              {data.aPlusGateEnabled ? "ACTIVE" : "OFF"} · Minimum confidence {data.aPlusMinConfidence} · Minimum quality {data.aPlusMinQuality}
-            </p>
-            <p style={{ color: "#94a3b8" }}>
-              Money Buy is blocked unless an A+ candidate is available. Temporary blacklist: {Object.keys(data.tempBlacklist || {}).length} stocks.
+              Sniper {data.sniperModeEnabled ? "ON" : "OFF"} · A+ Gate {data.aPlusGateEnabled ? "ON" : "OFF"} · Confidence Sizing {data.confidenceSizingEnabled ? "ON" : "OFF"} · Stock Memory {data.stockMemoryEnabled ? "ON" : "OFF"} · PDT-Aware {data.pdtAwareModeEnabled ? "ON" : "OFF"}
             </p>
           </div>
         )}
@@ -275,12 +299,12 @@ export default function App() {
         {data && (
           <>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12, marginBottom: 12 }}>
-              <div style={panel}>Equity<br /><b>{money(data.account.equity)}</b></div>
-              <div style={panel}>Buying Power<br /><b>{money(data.account.buyingPower)}</b></div>
-              <div style={panel}>Day PnL<br /><b style={{ color: data.account.pnlDay >= 0 ? "#22c55e" : "#f87171" }}>{money(data.account.pnlDay)}</b></div>
+              <div style={panel}>Equity<br /><DualMoney usdValue={data.account.equity} gbpValue={data.account.equityGbp} rate={rate} /></div>
+              <div style={panel}>Buying Power<br /><DualMoney usdValue={data.account.buyingPower} gbpValue={data.account.buyingPowerGbp} rate={rate} /></div>
+              <div style={panel}>Cash<br /><DualMoney usdValue={data.account.cash} gbpValue={data.account.cashGbp} rate={rate} /></div>
+              <div style={panel}>Day PnL<br /><b style={{ color: data.account.pnlDay >= 0 ? "#22c55e" : "#f87171" }}>{usd(data.account.pnlDay)}</b><br /><span style={{ color: data.account.pnlDay >= 0 ? "#22c55e" : "#f87171" }}>{gbpValue(data.account.pnlDayGbp ?? data.account.pnlDay * rate)}</span></div>
               <div style={panel}>Positions<br /><b>{(data.positions || []).length}/{data.maxPositions}</b></div>
-              <div style={panel}>Next Buy Size<br /><b>{money(data.newPositionNotional || 0)}</b></div>
-              <div style={panel}>Risk<br /><b style={{ color: data.riskBlocked ? "#f87171" : "#22c55e" }}>{data.riskBlocked ? "BLOCKED" : "OK"}</b></div>
+              <div style={panel}>Next Buy Size<br /><DualMoney usdValue={data.newPositionNotional || 0} rate={rate} /></div>
             </div>
 
             <div style={{ ...panel, marginBottom: 12 }}>
@@ -291,6 +315,8 @@ export default function App() {
                     {r.toUpperCase()}
                   </button>
                 ))}
+                <button style={btn(chartCurrency === "USD" ? "#16a34a" : "#334155")} onClick={() => setChartCurrency("USD")}>USD Chart</button>
+                <button style={btn(chartCurrency === "GBP" ? "#16a34a" : "#334155")} onClick={() => setChartCurrency("GBP")}>GBP Chart</button>
               </div>
               <div style={{ height: 320 }}>
                 <ResponsiveContainer width="100%" height="100%">
@@ -298,7 +324,7 @@ export default function App() {
                     <CartesianGrid stroke="rgba(255,255,255,0.1)" />
                     <XAxis dataKey="idx" />
                     <YAxis />
-                    <Tooltip />
+                    <Tooltip formatter={(value: any) => chartCurrency === "GBP" ? gbpValue(value) : usd(value)} />
                     <Line type="monotone" dataKey="equity" stroke="#22c55e" strokeWidth={2} dot={false} />
                     {timelineChart.map((e: any) => (
                       <ReferenceDot
@@ -324,14 +350,16 @@ export default function App() {
                 <div key={p.symbol} style={{ background: "#020617", borderRadius: 14, padding: 12, marginBottom: 8 }}>
                   <b>{p.symbol}</b>
                   {p.boughtToday ? <span style={{ color: "#facc15" }}> · BOUGHT TODAY · {p.minutesSinceBuy}m held</span> : null}
-                  {" · "}Qty {Number(p.qty).toFixed(4)} · Entry {money(p.entry)} · Price {money(p.price)} · Value {money(p.marketValue)}
+                  {" · "}Qty {Number(p.qty).toFixed(4)} · Entry {usd(p.entry)} · Price {usd(p.price)}
+                  <br />
+                  Value: <b>{usd(p.marketValue)}</b> / <span style={{ color: "#94a3b8" }}>{gbpValue(p.marketValueGbp ?? p.marketValue * rate)}</span>
                   <br />
                   <span style={{ color: p.pnlPct >= 0 ? "#22c55e" : "#f87171" }}>
-                    PnL {money(p.pnl)} / {pct(p.pnlPct)}
+                    PnL {usd(p.pnl)} / {gbpValue(p.pnlGbp ?? p.pnl * rate)} / {pct(p.pnlPct)}
                   </span>
                   {" · "}
                   <span style={{ color: p.trailingActive ? "#22c55e" : "#facc15" }}>
-                    {p.trailingActive ? `Trailing floor ${money(p.trailFloor)}` : `Trail starts ${money(p.trailStartPrice)}`}
+                    {p.trailingActive ? `Trailing floor ${usd(p.trailFloor)}` : `Trail starts ${usd(p.trailStartPrice)}`}
                   </span>
                   <button style={btn("#dc2626")} onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button>
                 </div>
@@ -357,10 +385,24 @@ export default function App() {
               </div>
 
               {(data.scans || []).map((s: Scan) => (
-                <div key={s.symbol} style={{ background: s.sniperPass ? "rgba(22,163,74,0.18)" : "#020617", borderRadius: 14, padding: 12, marginBottom: 8 }}>
-                  <b>{s.symbol}</b> | {money(s.price)} | trigger {money(s.trigger)} | spread {(s.spread * 100).toFixed(2)}%
+                <div key={s.symbol} style={{ background: s.aPlusPass || s.sniperPass ? "rgba(22,163,74,0.18)" : "#020617", borderRadius: 14, padding: 12, marginBottom: 8 }}>
+                  <b>{s.symbol}</b> | {usd(s.price)} / {gbpFromUsd(s.price, rate)} | trigger {usd(s.trigger)} | spread {(s.spread * 100).toFixed(2)}%
                   <br />
-                  quality {(s.qualityScore || 0).toFixed(4)} | confidence {(s.confidence || 0).toFixed(2)} {s.confidenceLabel} | {s.aPlusPass ? "A+ PASS" : `A+ WAIT: ${s.aPlusReason || s.sniperReason}`}
+                  quality {(s.qualityScore || 0).toFixed(4)} | confidence {(s.confidence || 0).toFixed(2)} {s.confidenceLabel} | {(s.aPlusPass || s.sniperPass) ? "PASS" : `WAIT: ${s.aPlusReason || s.sniperReason}`}
+                </div>
+              ))}
+            </div>
+
+            <div style={{ ...panel, marginBottom: 12 }}>
+              <h3>Trades</h3>
+              {(data.trades || []).length === 0 && <p>No trades yet</p>}
+              {(data.trades || []).map((t: Trade, i: number) => (
+                <div key={i} style={{ color: t.side === "BUY" ? "#22c55e" : "#f87171", marginBottom: 6 }}>
+                  {t.time} | {t.side} | {t.symbol}
+                  {t.amount ? ` | ${usd(t.amount)} / ${gbpValue(t.amountGbp ?? t.amount * rate)}` : ""}
+                  {t.qty ? ` | ${t.qty} shares` : ""}
+                  {t.reason ? ` | ${t.reason}` : ""}
+                  {t.pnl !== undefined ? ` | PnL ${usd(t.pnl)} / ${gbpValue(t.pnlGbp ?? t.pnl * rate)} (${pct(t.pnlPct || 0)})` : ""}
                 </div>
               ))}
             </div>
@@ -370,28 +412,7 @@ export default function App() {
               {(data.stockMemory || []).length === 0 && <p style={{ color: "#94a3b8" }}>No completed sell history yet.</p>}
               {(data.stockMemory || []).slice(0, 20).map((m: any) => (
                 <div key={m.symbol} style={{ background: "#020617", borderRadius: 12, padding: 10, marginBottom: 6 }}>
-                  <b>{m.symbol}</b> · Trust {m.trust} · Trades {m.trades} · Win rate {pct((m.winRate || 0) * 100)} · Avg PnL {money(m.avgPnl || 0)}
-                </div>
-              ))}
-            </div>
-
-            <div style={{ ...panel, marginBottom: 12 }}>
-              <h3>Alpaca Rejections / PDT Warnings</h3>
-              {(data.alpacaRejectionEvents || []).length === 0 && (data.pdtWarningEvents || []).length === 0 && <p style={{ color: "#94a3b8" }}>No warnings yet.</p>}
-              {(data.alpacaRejectionEvents || []).map((e: any, i: number) => (
-                <div key={`a-${i}`} style={{ color: "#f87171", marginBottom: 6 }}>{e.time} | {e.message} | {e.error}</div>
-              ))}
-              {(data.pdtWarningEvents || []).map((e: any, i: number) => (
-                <div key={`p-${i}`} style={{ color: "#facc15", marginBottom: 6 }}>{e.time} | {e.message}</div>
-              ))}
-            </div>
-
-            <div style={{ ...panel, marginBottom: 12 }}>
-              <h3>Trades</h3>
-              {(data.trades || []).length === 0 && <p>No trades yet</p>}
-              {(data.trades || []).map((t: Trade, i: number) => (
-                <div key={i} style={{ color: t.side === "BUY" ? "#22c55e" : "#f87171", marginBottom: 6 }}>
-                  {t.time} | {t.side} | {t.symbol} {t.amount ? `| ${money(t.amount)}` : ""} {t.qty ? `| ${t.qty} shares` : ""} {t.reason ? `| ${t.reason}` : ""} {t.pnl !== undefined ? `| PnL ${money(t.pnl)} (${pct(t.pnlPct || 0)})` : ""}
+                  <b>{m.symbol}</b> · Trust {m.trust} · Trades {m.trades} · Win rate {pct((m.winRate || 0) * 100)} · Avg PnL {usd(m.avgPnl || 0)} / {gbpFromUsd(m.avgPnl || 0, rate)}
                 </div>
               ))}
             </div>
@@ -399,7 +420,7 @@ export default function App() {
             <div style={{ ...panel, marginBottom: 12 }}>
               <h3>Logs</h3>
               {(data.logs || []).map((l: string, i: number) => (
-                <div key={i} style={{ color: l.includes("SNIPER") ? "#38bdf8" : l.includes("PDT") ? "#facc15" : l.includes("PROFIT") ? "#22c55e" : "#94a3b8", fontSize: 12 }}>
+                <div key={i} style={{ color: l.includes("FX") ? "#22c55e" : l.includes("SNIPER") ? "#38bdf8" : l.includes("PDT") ? "#facc15" : l.includes("PROFIT") ? "#22c55e" : "#94a3b8", fontSize: 12 }}>
                   {l}
                 </div>
               ))}

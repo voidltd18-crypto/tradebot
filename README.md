@@ -1,22 +1,28 @@
-# A+ Trade Quality Gate Package
+# GBP Profit Dashboard Package
 
-This is a focused money-making upgrade.
+Adds USD → GBP conversion across the trading dashboard.
 
-## What it adds
-- A+ Trade Quality Gate
-- Blocks low-confidence manual Money Buy
-- Requires confidence >= 0.70
-- Requires stronger quality score
-- Requires tighter spread
-- Requires non-negative momentum
-- Temporary loser blacklist after repeat losses
+## Features
+- Live USD/GBP exchange rate from backend
+- GBP fallback rate if FX API fails
+- Equity shown in USD + GBP
+- Buying power shown in USD + GBP
+- Cash shown in USD + GBP
+- Day PnL shown in USD + GBP
+- Position value shown in USD + GBP
+- Trade PnL shown in USD + GBP
+- Timeline chart can switch between USD and GBP
 
-## Why
-Trade less, only take better setups, and stop feeding weak tickers.
+## Render settings
 
-## Render
 Build:
 pip install -r backend/requirements.txt
 
 Start:
 uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+
+## Required Render env vars
+APCA_API_KEY_ID
+APCA_API_SECRET_KEY
+DASHBOARD_API_KEY
+PAPER=false

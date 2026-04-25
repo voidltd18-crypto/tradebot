@@ -48,6 +48,14 @@ PAPER = os.getenv("PAPER", "false").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# GBP dashboard conversion
+FX_ENABLED = True
+FX_BASE = "USD"
+FX_QUOTE = "GBP"
+FX_FALLBACK_USD_TO_GBP = 0.78
+FX_REFRESH_SECONDS = 60 * 30
+
+
 if not API_KEY or not API_SECRET:
     raise RuntimeError("Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY")
 
@@ -202,6 +210,7 @@ bot_lock = threading.Lock()
 starting_equity_today: Optional[float] = None
 starting_equity_day: Optional[str] = None
 last_rotation_ts = 0
+fx_cache: Dict[str, Any] = {"rate": FX_FALLBACK_USD_TO_GBP, "updated": 0, "source": "fallback"}
 
 
 # =========================
@@ -473,6 +482,70 @@ def is_likely_pdt_error(error_text: str):
     return any(term in lower for term in ["pattern day", "pdt", "day trade", "day-trade", "day trading"])
 
 
+
+# =========================
+# FX / GBP CONVERSION
+# =========================
+def get_usd_to_gbp_rate():
+    global fx_cache
+
+    if not FX_ENABLED:
+        return FX_FALLBACK_USD_TO_GBP
+
+    now = time.time()
+
+    if fx_cache.get("rate") and (now - float(fx_cache.get("updated", 0))) < FX_REFRESH_SECONDS:
+        return float(fx_cache["rate"])
+
+    urls = [
+        "https://api.frankfurter.app/latest?from=USD&to=GBP",
+        "https://api.exchangerate.host/latest?base=USD&symbols=GBP",
+    ]
+
+    for url in urls:
+        try:
+            response = requests.get(url, timeout=5)
+            data = response.json()
+            rate = float(data["rates"]["GBP"])
+
+            if rate > 0:
+                fx_cache = {
+                    "rate": rate,
+                    "updated": now,
+                    "source": url,
+                }
+                return rate
+        except Exception as e:
+            print(f"FX ERROR {url}: {e}")
+
+    fx_cache = {
+        "rate": FX_FALLBACK_USD_TO_GBP,
+        "updated": now,
+        "source": "fallback",
+    }
+    return FX_FALLBACK_USD_TO_GBP
+
+
+def money_gbp(value_usd: float):
+    try:
+        return float(value_usd) * get_usd_to_gbp_rate()
+    except Exception:
+        return 0.0
+
+
+def fx_payload():
+    rate = get_usd_to_gbp_rate()
+    return {
+        "enabled": FX_ENABLED,
+        "base": FX_BASE,
+        "quote": FX_QUOTE,
+        "usdToGbp": rate,
+        "label": "USD/GBP",
+        "source": fx_cache.get("source", "fallback"),
+        "updated": fx_cache.get("updated", 0),
+    }
+
+
 # =========================
 # ACCOUNT / MARKET
 # =========================
@@ -584,7 +657,9 @@ def get_all_positions():
                 "entry": entry,
                 "price": quote_price,
                 "marketValue": market_value,
+                "marketValueGbp": money_gbp(market_value),
                 "pnl": pnl,
+                "pnlGbp": money_gbp(pnl),
                 "pnlPct": pnl_pct,
                 "spread": spread,
                 "highest": state[symbol].get("highest_since_entry") or 0.0,
@@ -696,7 +771,19 @@ def add_trade_history_event(event: Dict[str, Any]):
         equity = float(get_account().equity)
     except Exception:
         pass
-    item = {**event, "timestamp": datetime.now(UTC).isoformat(), "equity": equity}
+    item = {
+        **event,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "equity": equity,
+        "equityGbp": money_gbp(equity),
+        "fxRate": get_usd_to_gbp_rate(),
+    }
+
+    if "pnl" in item:
+        item["pnlGbp"] = money_gbp(float(item.get("pnl") or 0.0))
+
+    if "amount" in item:
+        item["amountGbp"] = money_gbp(float(item.get("amount") or 0.0))
     trade_history.append(item)
     if len(trade_history) > 2000:
         del trade_history[:-2000]
@@ -952,7 +1039,17 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
     order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
     trading_client.submit_order(order)
-    event = {"day": today_str(), "time": now_time(), "side": "BUY", "symbol": symbol, "amount": round(notional_amount, 2), "reason": reason, "pnl": 0.0}
+    event = {
+        "day": today_str(),
+        "time": now_time(),
+        "side": "BUY",
+        "symbol": symbol,
+        "amount": round(notional_amount, 2),
+        "amountGbp": round(money_gbp(notional_amount), 2),
+        "reason": reason,
+        "pnl": 0.0,
+        "pnlGbp": 0.0,
+    }
     trade_events.append(event)
     add_trade_history_event(event)
     notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
@@ -990,7 +1087,17 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
 
     pnl = (price - entry) * rounded_qty if entry > 0 and price > 0 else 0.0
     pnl_pct = ((price / entry) - 1.0) * 100.0 if entry > 0 and price > 0 else 0.0
-    event = {"day": today_str(), "time": now_time(), "side": "SELL", "symbol": symbol, "qty": rounded_qty, "reason": reason, "pnl": round(pnl, 4), "pnlPct": round(pnl_pct, 4)}
+    event = {
+        "day": today_str(),
+        "time": now_time(),
+        "side": "SELL",
+        "symbol": symbol,
+        "qty": rounded_qty,
+        "reason": reason,
+        "pnl": round(pnl, 4),
+        "pnlGbp": round(money_gbp(pnl), 4),
+        "pnlPct": round(pnl_pct, 4),
+    }
     trade_events.append(event)
     add_trade_history_event(event)
     update_stock_memory_from_sell(symbol, pnl, pnl_pct)
@@ -1234,7 +1341,8 @@ def buy_custom_symbol(symbol: str):
 # STATUS
 # =========================
 def update_equity_curve(account):
-    point = {"t": now_chart_time(), "value": float(account.equity)}
+    equity_usd = float(account.equity)
+    point = {"t": now_chart_time(), "value": equity_usd, "valueGbp": money_gbp(equity_usd)}
     if not equity_curve or equity_curve[-1]["value"] != point["value"]:
         equity_curve.append(point)
     if len(equity_curve) > 240:
@@ -1260,8 +1368,9 @@ def build_status_payload(bot_name, scans):
         "emergencyStop": emergency_stop,
         "riskBlocked": blocked,
         "riskReason": risk_reason,
-        "mode": "SNIPER_CONFIDENCE_MEMORY_TIMELINE",
+        "mode": "SNIPER_CONFIDENCE_MEMORY_TIMELINE_GBP",
         "market": market_status,
+        "fx": fx_payload(),
         "strictOneCyclePerStockPerDay": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
         "allowCustomBuy": ALLOW_CUSTOM_BUY,
         "profitModeEnabled": PROFIT_MODE_ENABLED,
@@ -1295,9 +1404,13 @@ def build_status_payload(bot_name, scans):
         },
         "account": {
             "equity": float(account.equity),
+            "equityGbp": money_gbp(float(account.equity)),
             "buyingPower": float(account.buying_power),
+            "buyingPowerGbp": money_gbp(float(account.buying_power)),
             "cash": float(account.cash),
+            "cashGbp": money_gbp(float(account.cash)),
             "pnlDay": float(daily_pnl),
+            "pnlDayGbp": money_gbp(float(daily_pnl)),
         },
         "activePosition": {
             "symbol": active["symbol"] if active else "—",
@@ -1305,6 +1418,7 @@ def build_status_payload(bot_name, scans):
             "entry": float(active["entry"]) if active else 0.0,
             "price": float(active["price"]) if active else 0.0,
             "pnl": float(active["pnl"]) if active else 0.0,
+            "pnlGbp": money_gbp(float(active["pnl"])) if active else 0.0,
             "pnlPct": float(active["pnlPct"]) if active else 0.0,
             "trailingActive": bool(active["trailingActive"]) if active else False,
             "trailStartPrice": float(active["trailStartPrice"]) if active else 0.0,
@@ -1330,6 +1444,7 @@ def build_status_payload(bot_name, scans):
         "logs": [
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
+            f"FX | USDGBP={get_usd_to_gbp_rate():.4f} | source={fx_cache.get('source', 'fallback')}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
