@@ -1,5 +1,6 @@
 
 import os
+import json
 import time
 import threading
 from datetime import datetime, UTC
@@ -71,6 +72,64 @@ STRICT_ONE_CYCLE_PER_STOCK_PER_DAY = True
 # Custom buy safety
 ALLOW_CUSTOM_BUY = True
 CUSTOM_BUY_REQUIRES_MARKET_OPEN = True
+
+# Profit mode upgrade
+PROFIT_MODE_ENABLED = True
+ROTATION_MODE_ENABLED = True
+ROTATION_MIN_QUALITY_EDGE = 0.018
+ROTATE_ONLY_IF_WEAKEST_PNL_BELOW = 0.35
+ROTATION_COOLDOWN_SECONDS = 60 * 20
+MIN_BUY_QUALITY_SCORE = 0.018
+MIN_BUY_SHORT_MOMENTUM = -0.004
+PREFER_POSITIVE_MOMENTUM = True
+PAUSE_NEW_BUYS_IF_DAILY_PNL_BELOW = -3.00
+
+# PDT-aware safety upgrade
+PDT_AWARE_MODE_ENABLED = True
+
+# If a position was bought today, avoid normal/profit sells that may be rejected by Alpaca PDT.
+# Emergency sell and hard stop-loss can still try to sell.
+AVOID_SAME_DAY_PROFIT_SELLS = True
+AVOID_SAME_DAY_ROTATION_SELLS = True
+
+# Slower/safer mode: avoid flipping quickly.
+MIN_HOLD_MINUTES_BEFORE_PROFIT_SELL = 45
+MIN_HOLD_MINUTES_BEFORE_ROTATION = 60
+
+# Hard stop-loss override. If loss is worse than this, still attempt sell even if bought today.
+HARD_STOP_LOSS_PCT = -3.50
+
+# Buy fewer stocks quickly to avoid creating many same-day exit traps.
+MAX_NEW_BUYS_PER_DAY_PDT_AWARE = 6
+
+# Sniper + confidence + memory upgrade
+SNIPER_MODE_ENABLED = True
+CONFIDENCE_SIZING_ENABLED = True
+STOCK_MEMORY_ENABLED = True
+TRADE_TIMELINE_ENABLED = True
+
+TRADE_HISTORY_FILE = "trade_history.json"
+STOCK_MEMORY_FILE = "stock_memory.json"
+
+SNIPER_MIN_CONFIDENCE = 0.58
+SNIPER_MIN_QUALITY = 0.020
+SNIPER_MAX_SPREAD = 0.012
+SNIPER_MIN_PULLBACK = 0.0015
+SNIPER_MAX_PULLBACK = 0.035
+SNIPER_MIN_MOMENTUM = -0.003
+
+LOW_CONFIDENCE_SIZE_MULTIPLIER = 0.65
+MEDIUM_CONFIDENCE_SIZE_MULTIPLIER = 1.00
+HIGH_CONFIDENCE_SIZE_MULTIPLIER = 1.35
+MAX_CONFIDENCE_POSITION_VALUE_PCT = 0.14
+
+MEMORY_MIN_TRADES_FOR_TRUST = 3
+MEMORY_BAD_WINRATE = 0.35
+MEMORY_GOOD_WINRATE = 0.58
+MEMORY_BAD_MULTIPLIER = 0.70
+MEMORY_GOOD_MULTIPLIER = 1.15
+
+
 
 # Money mode risk
 MAX_POSITIONS = 4
@@ -147,12 +206,16 @@ latest_status: Dict[str, Any] = {}
 latest_scans: List[Dict[str, Any]] = []
 
 trade_events: List[Dict[str, Any]] = []
+trade_history: List[Dict[str, Any]] = []
+stock_memory: Dict[str, Dict[str, Any]] = {}
 alpaca_rejection_events: List[Dict[str, Any]] = []
+pdt_warning_events: List[Dict[str, Any]] = []
 equity_curve: List[Dict[str, Any]] = []
 
 bot_enabled = True
 manual_override = False
 emergency_stop = False
+last_rotation_ts = 0
 
 starting_equity_today: Optional[float] = None
 starting_equity_day: Optional[str] = None
@@ -206,6 +269,15 @@ def root():
         "paperMode": PAPER,
         "strictLockout": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
         "allowCustomBuy": ALLOW_CUSTOM_BUY,
+        "profitModeEnabled": PROFIT_MODE_ENABLED,
+        "rotationModeEnabled": ROTATION_MODE_ENABLED,
+        "rotationCooldownSeconds": ROTATION_COOLDOWN_SECONDS,
+        "minBuyQualityScore": MIN_BUY_QUALITY_SCORE,
+        "rotationMinQualityEdge": ROTATION_MIN_QUALITY_EDGE,
+        "pdtAwareModeEnabled": PDT_AWARE_MODE_ENABLED,
+        "pdtWarningEvents": pdt_warning_events[-50:],
+        "todayBuyCount": today_buy_count(),
+        "maxNewBuysPerDayPdtAware": MAX_NEW_BUYS_PER_DAY_PDT_AWARE,
     }
 
 
@@ -230,6 +302,7 @@ def resume_bot(request: Request):
     global bot_enabled, emergency_stop
     bot_enabled = True
     emergency_stop = False
+last_rotation_ts = 0
     notify("▶️ Strict Lockout Money Mode resumed")
     update_status(BOT_NAME, latest_scans)
     return {"ok": True, "message": "Bot resumed"}
@@ -360,9 +433,236 @@ def startup_event():
     if bot_thread_started:
         return
 
+    load_persistent_state()
     bot_thread_started = True
     thread = threading.Thread(target=run_bot_loop, daemon=True)
     thread.start()
+
+
+
+# =========================
+# TRADE HISTORY / STOCK MEMORY
+# =========================
+def safe_load_json(path: str, fallback):
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return fallback
+
+
+def safe_save_json(path: str, data):
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"SAVE ERROR {path}: {e}")
+
+
+def load_persistent_state():
+    global trade_history, stock_memory
+    trade_history = safe_load_json(TRADE_HISTORY_FILE, [])
+    stock_memory = safe_load_json(STOCK_MEMORY_FILE, {})
+
+
+def save_trade_history():
+    safe_save_json(TRADE_HISTORY_FILE, trade_history[-2000:])
+
+
+def save_stock_memory():
+    safe_save_json(STOCK_MEMORY_FILE, stock_memory)
+
+
+def get_memory(symbol: str):
+    symbol = symbol.upper()
+    if symbol not in stock_memory:
+        stock_memory[symbol] = {
+            "wins": 0,
+            "losses": 0,
+            "trades": 0,
+            "totalPnl": 0.0,
+            "totalPnlPct": 0.0,
+            "avgPnl": 0.0,
+            "avgPnlPct": 0.0,
+            "winRate": 0.0,
+            "trust": "NEW",
+            "lastResult": "—",
+        }
+    return stock_memory[symbol]
+
+
+def update_stock_memory_from_sell(symbol: str, pnl: float, pnl_pct: float):
+    if not STOCK_MEMORY_ENABLED:
+        return
+
+    m = get_memory(symbol)
+    m["trades"] += 1
+    m["totalPnl"] += float(pnl)
+    m["totalPnlPct"] += float(pnl_pct)
+
+    if pnl >= 0:
+        m["wins"] += 1
+        m["lastResult"] = "WIN"
+    else:
+        m["losses"] += 1
+        m["lastResult"] = "LOSS"
+
+    m["winRate"] = m["wins"] / max(1, m["trades"])
+    m["avgPnl"] = m["totalPnl"] / max(1, m["trades"])
+    m["avgPnlPct"] = m["totalPnlPct"] / max(1, m["trades"])
+
+    if m["trades"] < MEMORY_MIN_TRADES_FOR_TRUST:
+        m["trust"] = "NEW"
+    elif m["winRate"] >= MEMORY_GOOD_WINRATE:
+        m["trust"] = "GOOD"
+    elif m["winRate"] <= MEMORY_BAD_WINRATE:
+        m["trust"] = "BAD"
+    else:
+        m["trust"] = "NEUTRAL"
+
+    save_stock_memory()
+
+
+def memory_multiplier(symbol: str):
+    if not STOCK_MEMORY_ENABLED:
+        return 1.0
+
+    m = get_memory(symbol)
+
+    if m["trades"] < MEMORY_MIN_TRADES_FOR_TRUST:
+        return 1.0
+
+    if m["winRate"] >= MEMORY_GOOD_WINRATE:
+        return MEMORY_GOOD_MULTIPLIER
+
+    if m["winRate"] <= MEMORY_BAD_WINRATE:
+        return MEMORY_BAD_MULTIPLIER
+
+    return 1.0
+
+
+def add_trade_history_event(event: Dict[str, Any]):
+    if not TRADE_TIMELINE_ENABLED:
+        return
+
+    account_equity = 0.0
+    try:
+        account_equity = float(get_account().equity)
+    except Exception:
+        pass
+
+    timeline_event = {
+        **event,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "equity": account_equity,
+    }
+
+    trade_history.append(timeline_event)
+
+    if len(trade_history) > 2000:
+        del trade_history[:-2000]
+
+    save_trade_history()
+
+
+def calculate_confidence(scan: Dict[str, Any]):
+    quality = float(scan.get("quality_score", 0.0))
+    spread = float(scan.get("spread", 1.0))
+    momentum = float(scan.get("short_momentum", 0.0))
+    pullback = float(scan.get("pullback", 0.0))
+    symbol = scan.get("symbol", "")
+
+    confidence = 0.0
+
+    confidence += min(0.35, quality * 8.0)
+
+    if spread <= PREFER_SPREAD_UNDER:
+        confidence += 0.20
+    elif spread <= MAX_SPREAD:
+        confidence += 0.10
+
+    if momentum >= 0:
+        confidence += 0.20
+    elif momentum >= SNIPER_MIN_MOMENTUM:
+        confidence += 0.10
+
+    if SNIPER_MIN_PULLBACK <= pullback <= SNIPER_MAX_PULLBACK:
+        confidence += 0.15
+
+    confidence *= memory_multiplier(symbol)
+    confidence = max(0.0, min(1.0, confidence))
+
+    if confidence >= 0.75:
+        label = "HIGH"
+    elif confidence >= 0.58:
+        label = "MEDIUM"
+    else:
+        label = "LOW"
+
+    return confidence, label
+
+
+def sniper_passes(scan: Dict[str, Any]):
+    if not SNIPER_MODE_ENABLED:
+        return True, "SNIPER OFF"
+
+    confidence, label = calculate_confidence(scan)
+
+    if confidence < SNIPER_MIN_CONFIDENCE:
+        return False, f"confidence too low {confidence:.2f}"
+
+    if scan["quality_score"] < SNIPER_MIN_QUALITY:
+        return False, f"quality too low {scan['quality_score']:.4f}"
+
+    if scan["spread"] > SNIPER_MAX_SPREAD:
+        return False, f"spread too wide {scan['spread']:.4f}"
+
+    if scan["pullback"] < SNIPER_MIN_PULLBACK or scan["pullback"] > SNIPER_MAX_PULLBACK:
+        return False, f"pullback outside sniper range {scan['pullback']:.4f}"
+
+    if scan["short_momentum"] < SNIPER_MIN_MOMENTUM:
+        return False, f"momentum too weak {scan['short_momentum']:.4f}"
+
+    return True, f"{label} confidence {confidence:.2f}"
+
+
+def confidence_notional(scan: Dict[str, Any]):
+    base = calculate_new_position_notional()
+    if not CONFIDENCE_SIZING_ENABLED:
+        return base
+
+    confidence, label = calculate_confidence(scan)
+
+    if label == "HIGH":
+        mult = HIGH_CONFIDENCE_SIZE_MULTIPLIER
+    elif label == "MEDIUM":
+        mult = MEDIUM_CONFIDENCE_SIZE_MULTIPLIER
+    else:
+        mult = LOW_CONFIDENCE_SIZE_MULTIPLIER
+
+    try:
+        equity = float(get_account().equity)
+    except Exception:
+        equity = 0.0
+
+    max_conf_value = equity * MAX_CONFIDENCE_POSITION_VALUE_PCT if equity > 0 else base
+    adjusted = min(base * mult, max_conf_value)
+
+    return round(max(0.0, adjusted), 2)
+
+
+def trade_timeline_payload():
+    return trade_history[-1000:]
+
+
+def stock_memory_payload():
+    items = []
+    for symbol, m in stock_memory.items():
+        items.append({"symbol": symbol, **m})
+    items.sort(key=lambda x: (x.get("trust") != "GOOD", -x.get("winRate", 0), -x.get("trades", 0)))
+    return items
 
 
 # =========================
@@ -442,6 +742,7 @@ def reset_daily_flags_if_needed():
             starting_equity_day = today
             trade_events.clear()
             alpaca_rejection_events.clear()
+            pdt_warning_events.clear()
             equity_curve.clear()
         except Exception:
             pass
@@ -576,6 +877,8 @@ def get_all_positions():
                     "inUniverse": symbol in current_universe,
                     "custom": bool(state.get(symbol, {}).get("custom")),
                     "lockedToday": is_locked_today(symbol),
+                    "boughtToday": was_bought_today(symbol),
+                    "minutesSinceBuy": minutes_since_today_buy(symbol),
                 }
             )
 
@@ -738,6 +1041,7 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
     }
 
     trade_events.append(event)
+    add_trade_history_event(event)
     notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
 
     if len(trade_events) > 200:
@@ -814,6 +1118,8 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     }
 
     trade_events.append(event)
+    add_trade_history_event(event)
+    update_stock_memory_from_sell(symbol, estimated_pnl, estimated_pnl_pct)
     notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(estimated_pnl, 4)} ({round(estimated_pnl_pct, 2)}%)")
 
     lock_symbol_until_tomorrow(symbol)
@@ -1030,6 +1336,10 @@ def compute_scan(symbol: str):
         "custom": symbol in custom_symbols,
         "highest_since_entry": state[symbol].get("highest_since_entry"),
         "price_curve": curve,
+        "confidence": calculate_confidence({"symbol": symbol, "quality_score": quality_score, "spread": spread, "short_momentum": short_momentum, "pullback": pullback})[0],
+        "confidence_label": calculate_confidence({"symbol": symbol, "quality_score": quality_score, "spread": spread, "short_momentum": short_momentum, "pullback": pullback})[1],
+        "sniper_pass": sniper_passes({"symbol": symbol, "quality_score": quality_score, "spread": spread, "short_momentum": short_momentum, "pullback": pullback})[0],
+        "sniper_reason": sniper_passes({"symbol": symbol, "quality_score": quality_score, "spread": spread, "short_momentum": short_momentum, "pullback": pullback})[1],
     }
 
 
@@ -1048,6 +1358,148 @@ def can_buy_symbol(symbol: str):
     return True, ""
 
 
+
+def get_best_profit_candidate(scans):
+    candidates = []
+
+    for scan in scans:
+        symbol = scan["symbol"]
+
+        can_buy, reason = can_buy_symbol(symbol)
+        if not can_buy:
+            continue
+
+        if scan["spread"] > MAX_SPREAD:
+            continue
+
+        if scan["quality_score"] < MIN_BUY_QUALITY_SCORE:
+            continue
+
+        if scan["short_momentum"] < MIN_BUY_SHORT_MOMENTUM:
+            continue
+
+        if PREFER_POSITIVE_MOMENTUM and scan["short_momentum"] < 0:
+            continue
+
+        if SNIPER_MODE_ENABLED:
+            sniper_ok, sniper_reason = sniper_passes(scan)
+            if not sniper_ok:
+                print(f"SNIPER SKIP {symbol} | {sniper_reason}")
+                continue
+
+        if PROFIT_MODE_ENABLED:
+            if scan["quality_score"] < MIN_BUY_QUALITY_SCORE:
+                continue
+
+            if scan["short_momentum"] < MIN_BUY_SHORT_MOMENTUM:
+                continue
+
+            if PREFER_POSITIVE_MOMENTUM and scan["short_momentum"] < 0:
+                continue
+
+            if get_daily_pnl() <= PAUSE_NEW_BUYS_IF_DAILY_PNL_BELOW:
+                continue
+
+            if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
+                continue
+
+        if not scan["ready_to_buy"]:
+            continue
+
+        candidates.append(scan)
+
+    candidates.sort(key=lambda x: (-x["quality_score"], -x["short_momentum"], x["spread"]))
+    return candidates[0] if candidates else None
+
+
+def get_weakest_position_for_rotation():
+    positions = get_all_positions()
+    managed = [p for p in positions if p["symbol"] in current_universe]
+
+    if not managed:
+        return None
+
+    managed.sort(key=lambda p: (p["pnlPct"], p.get("spread", 0.0), -abs(p.get("marketValue", 0.0))))
+    return managed[0]
+
+
+def can_rotate_now():
+    if not PROFIT_MODE_ENABLED or not ROTATION_MODE_ENABLED:
+        return False, "rotation disabled"
+
+    if emergency_stop:
+        return False, "emergency stop active"
+
+    if manual_override:
+        return False, "manual override active"
+
+    if time.time() - last_rotation_ts < ROTATION_COOLDOWN_SECONDS:
+        return False, "rotation cooldown active"
+
+    blocked, reason = risk_blocked()
+    if blocked:
+        return False, reason
+
+    daily_pnl = get_daily_pnl()
+    if daily_pnl <= PAUSE_NEW_BUYS_IF_DAILY_PNL_BELOW:
+        return False, f"daily pnl below buy threshold: {daily_pnl:.2f}"
+
+    return True, ""
+
+
+def maybe_rotate_weakest_into_best(scans):
+    global last_rotation_ts
+
+    allowed, reason = can_rotate_now()
+    if not allowed:
+        return f"ROTATION SKIP | {reason}"
+
+    best = get_best_profit_candidate(scans)
+    if not best:
+        return "ROTATION SKIP | no strong candidate"
+
+    weakest = get_weakest_position_for_rotation()
+    if not weakest:
+        return "ROTATION SKIP | no position to rotate"
+
+    if weakest["symbol"] == best["symbol"]:
+        return "ROTATION SKIP | best candidate already held"
+
+    if weakest["pnlPct"] > ROTATE_ONLY_IF_WEAKEST_PNL_BELOW:
+        return f"ROTATION SKIP | weakest {weakest['symbol']} still acceptable pnl={weakest['pnlPct']:.2f}%"
+
+    quality_edge = best["quality_score"] - max(0.0, weakest["pnlPct"] / 100.0)
+
+    if quality_edge < ROTATION_MIN_QUALITY_EDGE:
+        return f"ROTATION SKIP | edge too small best={best['symbol']} edge={quality_edge:.4f}"
+
+    try:
+        if pdt_aware_should_avoid_sell(weakest["symbol"], f"PROFIT MODE ROTATE OUT FOR {best['symbol']}", weakest["pnlPct"], allow_hard_stop=False):
+            return f"ROTATION SKIP | PDT-aware hold for {weakest['symbol']} until next day reset"
+
+        sell_result = close_position(weakest, reason=f"PROFIT MODE ROTATE OUT FOR {best['symbol']}")
+
+        if not sell_result.get("ok"):
+            return f"ROTATION SELL BLOCKED | {sell_result.get('message', 'unknown')}"
+
+        time.sleep(2)
+
+        notional = calculate_new_position_notional()
+
+        if notional < MIN_ORDER_NOTIONAL:
+            return f"ROTATION BUY SKIP | not enough usable cash after sell: {notional:.2f}"
+
+        market_buy_notional(best["symbol"], notional, reason=f"PROFIT MODE ROTATE INTO FROM {weakest['symbol']}")
+        state[best["symbol"]]["ref"] = best["price"]
+        state[best["symbol"]]["highest_since_entry"] = best["price"]
+        last_rotation_ts = time.time()
+
+        return f"ROTATION DONE | sold {weakest['symbol']} -> bought {best['symbol']} ${notional:.2f}"
+
+    except Exception as e:
+        return f"ROTATION ERROR | {e}"
+
+
 def pick_money_mode_stocks(scans):
     candidates = []
 
@@ -1063,6 +1515,28 @@ def pick_money_mode_stocks(scans):
             print(f"SKIP BUY {symbol} | spread too wide: {scan['spread']:.4f}")
             continue
 
+        if SNIPER_MODE_ENABLED:
+            sniper_ok, sniper_reason = sniper_passes(scan)
+            if not sniper_ok:
+                print(f"SNIPER SKIP {symbol} | {sniper_reason}")
+                continue
+
+        if PROFIT_MODE_ENABLED:
+            if scan["quality_score"] < MIN_BUY_QUALITY_SCORE:
+                continue
+
+            if scan["short_momentum"] < MIN_BUY_SHORT_MOMENTUM:
+                continue
+
+            if PREFER_POSITIVE_MOMENTUM and scan["short_momentum"] < 0:
+                continue
+
+            if get_daily_pnl() <= PAUSE_NEW_BUYS_IF_DAILY_PNL_BELOW:
+                continue
+
+            if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
+                continue
+
         if not scan["ready_to_buy"]:
             continue
 
@@ -1071,6 +1545,96 @@ def pick_money_mode_stocks(scans):
     candidates.sort(key=lambda x: (-x["quality_score"], x["spread"]))
     return candidates
 
+
+
+# =========================
+# PDT-AWARE HELPERS
+# =========================
+def get_today_buy_event(symbol: str):
+    today = today_str()
+    for event in reversed(trade_events):
+        if event.get("symbol") == symbol and event.get("side") == "BUY" and event.get("day") == today:
+            return event
+    return None
+
+
+def was_bought_today(symbol: str):
+    return get_today_buy_event(symbol) is not None
+
+
+def minutes_since_today_buy(symbol: str):
+    buy = get_today_buy_event(symbol)
+    if not buy:
+        return 999999
+
+    try:
+        buy_time = datetime.strptime(f"{buy['day']} {buy['time']}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        now = datetime.now(UTC)
+        return max(0, int((now - buy_time).total_seconds() / 60))
+    except Exception:
+        return 0
+
+
+def today_buy_count():
+    today = today_str()
+    return len([t for t in trade_events if t.get("side") == "BUY" and t.get("day") == today])
+
+
+def add_pdt_warning(symbol: str, reason: str):
+    event = {
+        "day": today_str(),
+        "time": now_time(),
+        "symbol": symbol,
+        "reason": reason,
+        "message": f"PDT AWARE | {symbol}: {reason}",
+    }
+
+    if pdt_warning_events:
+        last = pdt_warning_events[-1]
+        if last.get("symbol") == symbol and last.get("reason") == reason and last.get("day") == today_str():
+            return
+
+    pdt_warning_events.append(event)
+
+    if len(pdt_warning_events) > 100:
+        pdt_warning_events.pop(0)
+
+    print(event["message"])
+
+
+def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_hard_stop: bool = False):
+    if not PDT_AWARE_MODE_ENABLED:
+        return False
+
+    if not was_bought_today(symbol):
+        return False
+
+    # Hard stop loss still attempts to sell.
+    if allow_hard_stop and pnl_pct <= HARD_STOP_LOSS_PCT:
+        add_pdt_warning(symbol, f"hard stop override: attempting sell despite same-day buy, pnl={pnl_pct:.2f}%")
+        return False
+
+    mins = minutes_since_today_buy(symbol)
+
+    if "ROTATE" in reason.upper():
+        if AVOID_SAME_DAY_ROTATION_SELLS:
+            add_pdt_warning(symbol, f"rotation skipped because {symbol} was bought today; hold until next day reset")
+            return True
+
+        if mins < MIN_HOLD_MINUTES_BEFORE_ROTATION:
+            add_pdt_warning(symbol, f"rotation skipped; held only {mins} mins, minimum {MIN_HOLD_MINUTES_BEFORE_ROTATION}")
+            return True
+
+    if "TRAILING" in reason.upper() or "PROFIT" in reason.upper():
+        if AVOID_SAME_DAY_PROFIT_SELLS:
+            add_pdt_warning(symbol, f"profit sell skipped because {symbol} was bought today; hold until next day reset")
+            return True
+
+        if mins < MIN_HOLD_MINUTES_BEFORE_PROFIT_SELL:
+            add_pdt_warning(symbol, f"profit sell skipped; held only {mins} mins, minimum {MIN_HOLD_MINUTES_BEFORE_PROFIT_SELL}")
+            return True
+
+    return False
 
 # =========================
 # POSITION MANAGEMENT
@@ -1109,6 +1673,8 @@ def manage_money_mode_positions():
 
         if price <= stop_price:
             try:
+                if pdt_aware_should_avoid_sell(symbol, "MONEY MODE STOP LOSS", position["pnlPct"], allow_hard_stop=True):
+                    continue
                 market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
                 state[symbol]["highest_since_entry"] = None
                 print(f"MONEY MODE STOP LOSS SELL {qty:.6f} {symbol} | locked until tomorrow")
@@ -1124,6 +1690,8 @@ def manage_money_mode_positions():
 
             if price <= trail_floor:
                 try:
+                    if pdt_aware_should_avoid_sell(symbol, "MONEY MODE TRAILING PROFIT", position["pnlPct"], allow_hard_stop=False):
+                        continue
                     market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
                     state[symbol]["highest_since_entry"] = None
                     print(f"MONEY MODE TRAILING PROFIT SELL {qty:.6f} {symbol} | locked until tomorrow")
@@ -1164,6 +1732,9 @@ def money_mode_buy(scans, manual=False):
     if allowed_new_position_count() <= 0:
         return f"BUY BLOCKED | max positions reached ({MAX_POSITIONS})"
 
+    if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
+        return f"BUY BLOCKED | PDT-aware max new buys today reached ({MAX_NEW_BUYS_PER_DAY_PDT_AWARE})"
+
     picks = pick_money_mode_stocks(scans)
 
     if manual and not picks:
@@ -1181,11 +1752,6 @@ def money_mode_buy(scans, manual=False):
 
     if not picks:
         return "No money-mode candidates ready, or all candidates locked/held."
-
-    notional = calculate_new_position_notional()
-
-    if notional < MIN_ORDER_NOTIONAL:
-        return f"Not enough usable cash to buy. notional={notional:.2f}"
 
     bought = 0
     messages = []
@@ -1206,12 +1772,19 @@ def money_mode_buy(scans, manual=False):
             continue
 
         try:
-            reason = "MANUAL MONEY MODE BUY" if manual else "AUTO MONEY MODE BUY"
+            notional = confidence_notional(candidate)
+
+            if notional < MIN_ORDER_NOTIONAL:
+                messages.append(f"SKIP {symbol} | not enough usable cash to buy. notional={notional:.2f}")
+                continue
+
+            confidence, confidence_label = calculate_confidence(candidate)
+            reason = f"{'MANUAL' if manual else 'AUTO'} SNIPER {confidence_label} BUY"
             market_buy_notional(symbol, notional, reason=reason)
             state[symbol]["ref"] = candidate["price"]
             state[symbol]["highest_since_entry"] = candidate["price"]
             bought += 1
-            messages.append(f"{reason} ${notional:.2f} of {symbol}")
+            messages.append(f"{reason} ${notional:.2f} of {symbol} | confidence={confidence:.2f}")
         except Exception as e:
             messages.append(f"BUY ERROR {symbol}: {e}")
 
@@ -1337,10 +1910,19 @@ def build_status_payload(bot_name, scans):
         "emergencyStop": emergency_stop,
         "riskBlocked": blocked,
         "riskReason": risk_reason,
-        "mode": "CUSTOM_BUY_STRICT_LOCKOUT_MONEY_MODE",
+        "mode": "PROFIT_MODE_CUSTOM_BUY_STRICT_LOCKOUT",
         "market": market_status,
         "strictOneCyclePerStockPerDay": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
         "allowCustomBuy": ALLOW_CUSTOM_BUY,
+        "profitModeEnabled": PROFIT_MODE_ENABLED,
+        "rotationModeEnabled": ROTATION_MODE_ENABLED,
+        "rotationCooldownSeconds": ROTATION_COOLDOWN_SECONDS,
+        "minBuyQualityScore": MIN_BUY_QUALITY_SCORE,
+        "rotationMinQualityEdge": ROTATION_MIN_QUALITY_EDGE,
+        "pdtAwareModeEnabled": PDT_AWARE_MODE_ENABLED,
+        "pdtWarningEvents": pdt_warning_events[-50:],
+        "todayBuyCount": today_buy_count(),
+        "maxNewBuysPerDayPdtAware": MAX_NEW_BUYS_PER_DAY_PDT_AWARE,
         "alpacaRejectionEvents": alpaca_rejection_events[-50:],
         "pdtRejectionEvents": [e for e in alpaca_rejection_events[-50:] if e.get("type") == "PDT BLOCK"],
         "lockedSymbolsToday": locked_symbols,
@@ -1370,6 +1952,13 @@ def build_status_payload(bot_name, scans):
             "trailGiveback": TRAIL_GIVEBACK,
             "maxDailyLoss": MAX_DAILY_LOSS,
             "maxTradesPerDay": MAX_TRADES_PER_DAY,
+            "pdtAwareModeEnabled": PDT_AWARE_MODE_ENABLED,
+            "avoidSameDayProfitSells": AVOID_SAME_DAY_PROFIT_SELLS,
+            "avoidSameDayRotationSells": AVOID_SAME_DAY_ROTATION_SELLS,
+            "minHoldMinutesBeforeProfitSell": MIN_HOLD_MINUTES_BEFORE_PROFIT_SELL,
+            "minHoldMinutesBeforeRotation": MIN_HOLD_MINUTES_BEFORE_ROTATION,
+            "hardStopLossPct": HARD_STOP_LOSS_PCT,
+            "maxNewBuysPerDayPdtAware": MAX_NEW_BUYS_PER_DAY_PDT_AWARE,
         },
         "account": {
             "equity": float(account.equity),
@@ -1406,11 +1995,18 @@ def build_status_payload(bot_name, scans):
                 "custom": bool(scan.get("custom", False)),
                 "done": bool(scan["locked_today"]),
                 "priceCurve": scan.get("price_curve", []),
+                "confidence": float(scan.get("confidence", 0.0)),
+                "confidenceLabel": scan.get("confidence_label", "LOW"),
+                "sniperPass": bool(scan.get("sniper_pass", False)),
+                "sniperReason": scan.get("sniper_reason", ""),
             }
             for scan in scans
         ],
         "logs": [
-            f"MODE | CUSTOM_BUY_STRICT_LOCKOUT_MONEY_MODE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()} | next_notional={notional:.2f}",
+            f"MODE | PROFIT_MODE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()} | next_notional={notional:.2f}",
+            f"PROFIT | enabled={PROFIT_MODE_ENABLED} | rotation={ROTATION_MODE_ENABLED} | min_quality={MIN_BUY_QUALITY_SCORE} | min_momentum={MIN_BUY_SHORT_MOMENTUM}",
+            f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
+            f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline_events={len(trade_history)}",
             f"MARKET | {market_status.get('label', 'UNKNOWN')} | next_open={market_status.get('nextOpen', '')} | next_close={market_status.get('nextClose', '')}",
             f"CUSTOM | enabled={ALLOW_CUSTOM_BUY} | custom_symbols={', '.join(sorted(custom_symbols.keys())) if custom_symbols else 'none'}",
             f"LOCKOUT | strict={STRICT_ONE_CYCLE_PER_STOCK_PER_DAY} | locked_today={', '.join(locked_symbols) if locked_symbols else 'none'}",
@@ -1425,6 +2021,11 @@ def build_status_payload(bot_name, scans):
         ],
         "trades": trade_events[-50:],
         "equityCurve": equity_curve[-240:],
+        "tradeTimeline": trade_timeline_payload(),
+        "stockMemory": stock_memory_payload(),
+        "sniperModeEnabled": SNIPER_MODE_ENABLED,
+        "confidenceSizingEnabled": CONFIDENCE_SIZING_ENABLED,
+        "stockMemoryEnabled": STOCK_MEMORY_ENABLED,
     }
 
     return payload
@@ -1484,6 +2085,11 @@ def run_bot_loop():
 
                 if bot_enabled and not emergency_stop:
                     manage_money_mode_positions()
+
+                    if PROFIT_MODE_ENABLED and ROTATION_MODE_ENABLED:
+                        rotation_result = maybe_rotate_weakest_into_best(scans)
+                        if rotation_result:
+                            print(rotation_result)
 
                     if not manual_override:
                         result = money_mode_buy(scans, manual=False)
