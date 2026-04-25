@@ -1,5 +1,6 @@
 
 import os
+import sqlite3
 import json
 import time
 import math
@@ -160,6 +161,12 @@ MEMORY_BAD_WINRATE = 0.35
 MEMORY_GOOD_WINRATE = 0.58
 MEMORY_BAD_MULTIPLIER = 0.70
 MEMORY_GOOD_MULTIPLIER = 1.15
+
+
+# SQLite persistent trade memory
+SQLITE_ENABLED = True
+SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "trades.db")
+BACKFILL_ORDER_LIMIT = 500
 
 TRADE_HISTORY_FILE = "trade_history.json"
 STOCK_MEMORY_FILE = "stock_memory.json"
@@ -788,6 +795,7 @@ def add_trade_history_event(event: Dict[str, Any]):
     if len(trade_history) > 2000:
         del trade_history[:-2000]
     save_trade_history()
+    save_trade_to_db(item, source="bot")
 
 
 def stock_memory_payload():
@@ -1337,6 +1345,364 @@ def buy_custom_symbol(symbol: str):
     return {"ok": True, "message": f"CUSTOM BUY ${notional:.2f} of {symbol}. Added to managed universe."}
 
 
+
+# =========================
+# SQLITE PERSISTENT STORAGE
+# =========================
+def db_connect():
+    conn = sqlite3.connect(SQLITE_DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    if not SQLITE_ENABLED:
+        return
+
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alpaca_order_id TEXT UNIQUE,
+            timestamp TEXT NOT NULL,
+            day TEXT,
+            time TEXT,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            qty REAL,
+            price REAL,
+            amount REAL,
+            amount_gbp REAL,
+            pnl REAL,
+            pnl_gbp REAL,
+            pnl_pct REAL,
+            reason TEXT,
+            equity REAL,
+            equity_gbp REAL,
+            fx_rate REAL,
+            source TEXT DEFAULT 'bot'
+        )
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_trades_timestamp
+        ON trades(timestamp)
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_trades_symbol
+        ON trades(symbol)
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def save_trade_to_db(event: Dict[str, Any], source: str = "bot"):
+    if not SQLITE_ENABLED:
+        return
+
+    try:
+        init_db()
+        conn = db_connect()
+        cur = conn.cursor()
+
+        timestamp = event.get("timestamp") or datetime.now(UTC).isoformat()
+        equity = float(event.get("equity") or 0.0)
+        equity_gbp = float(event.get("equityGbp") or money_gbp(equity))
+        fx_rate = float(event.get("fxRate") or get_usd_to_gbp_rate())
+
+        cur.execute("""
+            INSERT OR IGNORE INTO trades (
+                alpaca_order_id, timestamp, day, time, symbol, side, qty, price,
+                amount, amount_gbp, pnl, pnl_gbp, pnl_pct, reason,
+                equity, equity_gbp, fx_rate, source
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            event.get("alpacaOrderId"),
+            timestamp,
+            event.get("day"),
+            event.get("time"),
+            event.get("symbol"),
+            event.get("side"),
+            float(event.get("qty") or 0.0),
+            float(event.get("price") or 0.0),
+            float(event.get("amount") or 0.0),
+            float(event.get("amountGbp") or money_gbp(float(event.get("amount") or 0.0))),
+            float(event.get("pnl") or 0.0),
+            float(event.get("pnlGbp") or money_gbp(float(event.get("pnl") or 0.0))),
+            float(event.get("pnlPct") or 0.0),
+            event.get("reason", ""),
+            equity,
+            equity_gbp,
+            fx_rate,
+            source,
+        ))
+
+        conn.commit()
+        conn.close()
+
+    except Exception as e:
+        print(f"DB SAVE ERROR: {e}")
+
+
+def trades_from_db(limit: int = 1000):
+    if not SQLITE_ENABLED:
+        return trade_history[-limit:]
+
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute("""
+            SELECT * FROM trades
+            ORDER BY timestamp ASC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        conn.close()
+
+        items = []
+        for r in rows:
+            items.append({
+                "id": r["id"],
+                "alpacaOrderId": r["alpaca_order_id"],
+                "timestamp": r["timestamp"],
+                "day": r["day"],
+                "time": r["time"],
+                "symbol": r["symbol"],
+                "side": r["side"],
+                "qty": r["qty"],
+                "price": r["price"],
+                "amount": r["amount"],
+                "amountGbp": r["amount_gbp"],
+                "pnl": r["pnl"],
+                "pnlGbp": r["pnl_gbp"],
+                "pnlPct": r["pnl_pct"],
+                "reason": r["reason"],
+                "equity": r["equity"],
+                "equityGbp": r["equity_gbp"],
+                "fxRate": r["fx_rate"],
+                "source": r["source"],
+            })
+        return items
+    except Exception as e:
+        print(f"DB READ ERROR: {e}")
+        return trade_history[-limit:]
+
+
+def stock_memory_from_db():
+    trades = trades_from_db(5000)
+    memory: Dict[str, Dict[str, Any]] = {}
+
+    for t in trades:
+        if t.get("side") != "SELL":
+            continue
+
+        symbol = str(t.get("symbol", "")).upper()
+        if not symbol:
+            continue
+
+        if symbol not in memory:
+            memory[symbol] = {
+                "wins": 0,
+                "losses": 0,
+                "trades": 0,
+                "totalPnl": 0.0,
+                "totalPnlGbp": 0.0,
+                "totalPnlPct": 0.0,
+                "avgPnl": 0.0,
+                "avgPnlGbp": 0.0,
+                "avgPnlPct": 0.0,
+                "winRate": 0.0,
+                "trust": "NEW",
+                "lastResult": "—",
+            }
+
+        m = memory[symbol]
+        pnl = float(t.get("pnl") or 0.0)
+        pnl_gbp = float(t.get("pnlGbp") or 0.0)
+        pnl_pct = float(t.get("pnlPct") or 0.0)
+
+        m["trades"] += 1
+        m["totalPnl"] += pnl
+        m["totalPnlGbp"] += pnl_gbp
+        m["totalPnlPct"] += pnl_pct
+
+        if pnl >= 0:
+            m["wins"] += 1
+            m["lastResult"] = "WIN"
+        else:
+            m["losses"] += 1
+            m["lastResult"] = "LOSS"
+
+    for symbol, m in memory.items():
+        m["winRate"] = m["wins"] / max(1, m["trades"])
+        m["avgPnl"] = m["totalPnl"] / max(1, m["trades"])
+        m["avgPnlGbp"] = m["totalPnlGbp"] / max(1, m["trades"])
+        m["avgPnlPct"] = m["totalPnlPct"] / max(1, m["trades"])
+
+        if m["trades"] < MEMORY_MIN_TRADES_FOR_TRUST:
+            m["trust"] = "NEW"
+        elif m["winRate"] >= MEMORY_GOOD_WINRATE:
+            m["trust"] = "GOOD"
+        elif m["winRate"] <= MEMORY_BAD_WINRATE:
+            m["trust"] = "BAD"
+        else:
+            m["trust"] = "NEUTRAL"
+
+    items = [{"symbol": s, **m} for s, m in memory.items()]
+    items.sort(key=lambda x: (-x.get("totalPnl", 0), -x.get("winRate", 0), -x.get("trades", 0)))
+    return items
+
+
+def db_summary_payload():
+    trades = trades_from_db(5000)
+    sells = [t for t in trades if t.get("side") == "SELL"]
+    wins = [t for t in sells if float(t.get("pnl") or 0.0) >= 0]
+    total_pnl = sum(float(t.get("pnl") or 0.0) for t in sells)
+    total_pnl_gbp = sum(float(t.get("pnlGbp") or 0.0) for t in sells)
+
+    return {
+        "enabled": SQLITE_ENABLED,
+        "dbFile": SQLITE_DB_FILE,
+        "totalTrades": len(trades),
+        "sellTrades": len(sells),
+        "wins": len(wins),
+        "losses": max(0, len(sells) - len(wins)),
+        "winRate": len(wins) / max(1, len(sells)),
+        "totalPnl": total_pnl,
+        "totalPnlGbp": total_pnl_gbp,
+    }
+
+
+def parse_order_timestamp(order):
+    for attr in ["filled_at", "updated_at", "submitted_at", "created_at"]:
+        try:
+            value = getattr(order, attr, None)
+            if value:
+                return value
+        except Exception:
+            pass
+    return datetime.now(UTC)
+
+
+def backfill_trades_from_alpaca():
+    init_db()
+
+    request = GetOrdersRequest(
+        status=QueryOrderStatus.CLOSED,
+        limit=BACKFILL_ORDER_LIMIT,
+    )
+
+    orders = trading_client.get_orders(filter=request)
+    imported = 0
+    skipped = 0
+    rate = get_usd_to_gbp_rate()
+
+    # Keep a simple FIFO-ish entry tracker for pnl approximation.
+    open_entries: Dict[str, List[Dict[str, float]]] = {}
+
+    sorted_orders = sorted(orders, key=lambda o: str(parse_order_timestamp(o)))
+
+    for order in sorted_orders:
+        try:
+            status = str(getattr(order, "status", "")).lower()
+            filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+
+            if filled_qty <= 0:
+                skipped += 1
+                continue
+
+            symbol = str(getattr(order, "symbol", "")).upper()
+            side = str(getattr(order, "side", "")).upper()
+            filled_avg_price = float(getattr(order, "filled_avg_price", 0) or 0)
+            timestamp_obj = parse_order_timestamp(order)
+
+            if hasattr(timestamp_obj, "isoformat"):
+                timestamp = timestamp_obj.isoformat()
+                day = timestamp_obj.astimezone(UTC).strftime("%Y-%m-%d") if hasattr(timestamp_obj, "astimezone") else today_str()
+                tm = timestamp_obj.astimezone(UTC).strftime("%H:%M:%S") if hasattr(timestamp_obj, "astimezone") else now_time()
+            else:
+                timestamp = str(timestamp_obj)
+                day = today_str()
+                tm = now_time()
+
+            amount = filled_qty * filled_avg_price
+            pnl = 0.0
+            pnl_pct = 0.0
+
+            if side == "BUY":
+                open_entries.setdefault(symbol, []).append({
+                    "qty": filled_qty,
+                    "price": filled_avg_price,
+                })
+
+            if side == "SELL":
+                remaining = filled_qty
+                cost = 0.0
+                matched_qty = 0.0
+                entries = open_entries.setdefault(symbol, [])
+
+                while remaining > 0 and entries:
+                    entry = entries[0]
+                    use_qty = min(remaining, entry["qty"])
+                    cost += use_qty * entry["price"]
+                    matched_qty += use_qty
+                    entry["qty"] -= use_qty
+                    remaining -= use_qty
+
+                    if entry["qty"] <= 1e-9:
+                        entries.pop(0)
+
+                if matched_qty > 0 and cost > 0:
+                    proceeds = matched_qty * filled_avg_price
+                    pnl = proceeds - cost
+                    avg_entry = cost / matched_qty
+                    pnl_pct = ((filled_avg_price / avg_entry) - 1.0) * 100.0
+
+            event = {
+                "alpacaOrderId": str(getattr(order, "id", "")),
+                "timestamp": timestamp,
+                "day": day,
+                "time": tm,
+                "side": side,
+                "symbol": symbol,
+                "qty": filled_qty,
+                "price": filled_avg_price,
+                "amount": amount if side == "BUY" else 0.0,
+                "amountGbp": amount * rate if side == "BUY" else 0.0,
+                "pnl": round(pnl, 4),
+                "pnlGbp": round(pnl * rate, 4),
+                "pnlPct": round(pnl_pct, 4),
+                "reason": "ALPACA BACKFILL",
+                "equity": 0.0,
+                "equityGbp": 0.0,
+                "fxRate": rate,
+            }
+
+            before = len(trades_from_db(10000))
+            save_trade_to_db(event, source="alpaca_backfill")
+            after = len(trades_from_db(10000))
+
+            if after > before:
+                imported += 1
+            else:
+                skipped += 1
+
+        except Exception as e:
+            print(f"BACKFILL ORDER ERROR: {e}")
+            skipped += 1
+
+    return {
+        "ok": True,
+        "message": f"Backfill complete. Imported {imported}, skipped {skipped}.",
+        "imported": imported,
+        "skipped": skipped,
+    }
+
+
 # =========================
 # STATUS
 # =========================
@@ -1445,6 +1811,7 @@ def build_status_payload(bot_name, scans):
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
             f"FX | USDGBP={get_usd_to_gbp_rate():.4f} | source={fx_cache.get('source', 'fallback')}",
+            f"DB | sqlite={SQLITE_ENABLED} | trades={db_summary_payload().get('totalTrades', 0)} | pnl_gbp={db_summary_payload().get('totalPnlGbp', 0):.2f}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
@@ -1453,8 +1820,9 @@ def build_status_payload(bot_name, scans):
             f"LOCKOUT | locked_today={', '.join(locked_symbols) if locked_symbols else 'none'}",
         ],
         "trades": trade_events[-50:],
-        "tradeTimeline": trade_history[-1000:],
-        "stockMemory": stock_memory_payload(),
+        "tradeTimeline": trades_from_db(1000),
+        "stockMemory": stock_memory_from_db(),
+        "dbSummary": db_summary_payload(),
         "equityCurve": equity_curve[-240:],
         "alpacaRejectionEvents": alpaca_rejection_events[-50:],
         "pdtWarningEvents": pdt_warning_events[-50:],
@@ -1566,11 +1934,22 @@ def emergency_sell(request: Request):
         return {**result, "emergencyStop": True, "botEnabled": False}
 
 
+
+@app.post("/backfill-trades")
+def backfill_trades(request: Request):
+    verify_api_key(request)
+    with bot_lock:
+        result = backfill_trades_from_alpaca()
+        update_status(BOT_NAME, latest_scans)
+        return result
+
+
 # =========================
 # LOOP
 # =========================
 def run_bot_loop():
     print("Rebuilt Sniper Profit Bot started...")
+    init_db()
     load_persistent_state()
     refresh_universe_if_needed(force=True)
     reset_daily_flags_if_needed()

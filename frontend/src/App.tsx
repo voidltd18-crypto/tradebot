@@ -291,7 +291,21 @@ export default function App() {
               </p>
             </div>
 
-            <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(250,204,21,0.45)" }}>
+            
+            <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(20,184,166,0.45)" }}>
+              <h3>Persistent Trade Database</h3>
+              <p style={{ color: "#2dd4bf", fontWeight: 700 }}>
+                SQLite {data.dbSummary?.enabled ? "ON" : "OFF"} · Trades {data.dbSummary?.totalTrades || 0} · Win rate {pct((data.dbSummary?.winRate || 0) * 100)}
+              </p>
+              <p style={{ color: Number(data.dbSummary?.totalPnl || 0) >= 0 ? "#22c55e" : "#f87171" }}>
+                Total Realised PnL: {usd(data.dbSummary?.totalPnl || 0)} / {gbpValue(data.dbSummary?.totalPnlGbp || 0)}
+              </p>
+              <p style={{ color: "#94a3b8" }}>
+                Use “Backfill Alpaca Trades” once to import old filled orders into the timeline and stock memory.
+              </p>
+            </div>
+
+<div style={{ ...panel, marginBottom: 12, borderColor: "rgba(250,204,21,0.45)" }}>
               <h3>Strategy Modes</h3>
               <p style={{ color: "#facc15", fontWeight: 700 }}>
                 Sniper {data.sniperModeEnabled ? "ON" : "OFF"} · A+ Gate {data.aPlusGateEnabled ? "ON" : "OFF"} · Confidence Sizing {data.confidenceSizingEnabled ? "ON" : "OFF"} · Stock Memory {data.stockMemoryEnabled ? "ON" : "OFF"} · PDT-Aware {data.pdtAwareModeEnabled ? "ON" : "OFF"}
@@ -303,6 +317,7 @@ export default function App() {
         <div style={{ ...panel, marginBottom: 12 }}>
           <h3>Controls</h3>
           <button style={btn("#2563eb")} onClick={fetchData}>Refresh</button>
+          <button style={btn("#0f766e")} onClick={() => action("/backfill-trades")}>Backfill Alpaca Trades</button>
           <button style={btn("#16a34a")} onClick={() => action("/manual-buy")}>Money Buy</button>
           <button style={btn("#dc2626")} onClick={() => action("/manual-sell")}>Sell Worst</button>
           <button style={btn("#7f1d1d")} onClick={() => action("/emergency-sell")}>EMERGENCY SELL ALL</button>
