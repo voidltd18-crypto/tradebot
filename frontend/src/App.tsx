@@ -54,6 +54,8 @@ type Scan = {
   confidenceLabel?: string;
   sniperPass?: boolean;
   sniperReason?: string;
+  aPlusPass?: boolean;
+  aPlusReason?: string;
   priceCurve?: { t: string; value: number }[];
 };
 
@@ -226,10 +228,22 @@ export default function App() {
           <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.45)" }}>
             <h3>Strategy Modes</h3>
             <p style={{ color: "#22c55e", fontWeight: 700 }}>
-              Sniper {data.sniperModeEnabled ? "ON" : "OFF"} · Confidence Sizing {data.confidenceSizingEnabled ? "ON" : "OFF"} · Stock Memory {data.stockMemoryEnabled ? "ON" : "OFF"} · PDT-Aware {data.pdtAwareModeEnabled ? "ON" : "OFF"}
+              Sniper {data.sniperModeEnabled ? "ON" : "OFF"} · A+ Gate {data.aPlusGateEnabled ? "ON" : "OFF"} · Confidence Sizing {data.confidenceSizingEnabled ? "ON" : "OFF"} · Stock Memory {data.stockMemoryEnabled ? "ON" : "OFF"} · PDT-Aware {data.pdtAwareModeEnabled ? "ON" : "OFF"}
             </p>
             <p style={{ color: "#94a3b8" }}>
-              Sniper decides IF to buy. Confidence decides HOW MUCH. Memory learns which stocks work best.
+              A+ Gate only allows the highest quality trades. Sniper decides IF to buy. Confidence decides HOW MUCH. Memory learns which stocks work best.
+            </p>
+          </div>
+        )}
+
+        {data && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(250,204,21,0.45)" }}>
+            <h3>A+ Trade Quality Gate</h3>
+            <p style={{ color: "#facc15", fontWeight: 700 }}>
+              {data.aPlusGateEnabled ? "ACTIVE" : "OFF"} · Minimum confidence {data.aPlusMinConfidence} · Minimum quality {data.aPlusMinQuality}
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              Money Buy is blocked unless an A+ candidate is available. Temporary blacklist: {Object.keys(data.tempBlacklist || {}).length} stocks.
             </p>
           </div>
         )}
@@ -346,7 +360,7 @@ export default function App() {
                 <div key={s.symbol} style={{ background: s.sniperPass ? "rgba(22,163,74,0.18)" : "#020617", borderRadius: 14, padding: 12, marginBottom: 8 }}>
                   <b>{s.symbol}</b> | {money(s.price)} | trigger {money(s.trigger)} | spread {(s.spread * 100).toFixed(2)}%
                   <br />
-                  quality {(s.qualityScore || 0).toFixed(4)} | confidence {(s.confidence || 0).toFixed(2)} {s.confidenceLabel} | {s.sniperPass ? "SNIPER PASS" : `SNIPER WAIT: ${s.sniperReason}`}
+                  quality {(s.qualityScore || 0).toFixed(4)} | confidence {(s.confidence || 0).toFixed(2)} {s.confidenceLabel} | {s.aPlusPass ? "A+ PASS" : `A+ WAIT: ${s.aPlusReason || s.sniperReason}`}
                 </div>
               ))}
             </div>

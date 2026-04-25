@@ -127,6 +127,21 @@ SNIPER_MIN_PULLBACK = 0.0015
 SNIPER_MAX_PULLBACK = 0.035
 SNIPER_MIN_MOMENTUM = -0.003
 
+# A+ trade quality gate
+A_PLUS_GATE_ENABLED = True
+A_PLUS_MIN_CONFIDENCE = 0.70
+A_PLUS_MIN_QUALITY = 0.026
+A_PLUS_MAX_SPREAD = 0.010
+A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM = True
+A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY = True
+
+# Temporary loser blacklist
+LOSER_BLACKLIST_ENABLED = True
+LOSER_BLACKLIST_LOSS_STREAK = 2
+LOSER_BLACKLIST_MIN_TRADES = 3
+LOSER_BLACKLIST_HOURS = 24
+TEMP_BLACKLIST_FILE = "temp_blacklist.json"
+
 LOW_CONFIDENCE_SIZE_MULTIPLIER = 0.65
 MEDIUM_CONFIDENCE_SIZE_MULTIPLIER = 1.00
 HIGH_CONFIDENCE_SIZE_MULTIPLIER = 1.35
@@ -173,6 +188,7 @@ latest_scans: List[Dict[str, Any]] = []
 trade_events: List[Dict[str, Any]] = []
 trade_history: List[Dict[str, Any]] = []
 stock_memory: Dict[str, Dict[str, Any]] = {}
+temp_blacklist: Dict[str, Any] = {}
 alpaca_rejection_events: List[Dict[str, Any]] = []
 pdt_warning_events: List[Dict[str, Any]] = []
 equity_curve: List[Dict[str, Any]] = []
@@ -261,9 +277,10 @@ def safe_save_json(path: str, data):
 
 
 def load_persistent_state():
-    global trade_history, stock_memory
+    global trade_history, stock_memory, temp_blacklist
     trade_history = safe_load_json(TRADE_HISTORY_FILE, [])
     stock_memory = safe_load_json(STOCK_MEMORY_FILE, {})
+    temp_blacklist = safe_load_json(TEMP_BLACKLIST_FILE, {})
 
 
 def save_trade_history():
@@ -272,6 +289,111 @@ def save_trade_history():
 
 def save_stock_memory():
     safe_save_json(STOCK_MEMORY_FILE, stock_memory)
+
+
+def save_temp_blacklist():
+    safe_save_json(TEMP_BLACKLIST_FILE, temp_blacklist)
+
+
+def cleanup_temp_blacklist():
+    now = datetime.now(UTC)
+    changed = False
+
+    for symbol, data in list(temp_blacklist.items()):
+        try:
+            until = datetime.fromisoformat(data.get("until", ""))
+            if until <= now:
+                del temp_blacklist[symbol]
+                changed = True
+        except Exception:
+            del temp_blacklist[symbol]
+            changed = True
+
+    if changed:
+        save_temp_blacklist()
+
+
+def is_temp_blacklisted(symbol: str):
+    if not LOSER_BLACKLIST_ENABLED:
+        return False, ""
+
+    cleanup_temp_blacklist()
+    data = temp_blacklist.get(symbol.upper())
+
+    if not data:
+        return False, ""
+
+    return True, data.get("reason", "temporarily blacklisted")
+
+
+def add_temp_blacklist(symbol: str, reason: str):
+    if not LOSER_BLACKLIST_ENABLED:
+        return
+
+    until = datetime.now(UTC) + timedelta(hours=LOSER_BLACKLIST_HOURS)
+    temp_blacklist[symbol.upper()] = {
+        "reason": reason,
+        "until": until.isoformat(),
+    }
+    save_temp_blacklist()
+    print(f"BLACKLIST | {symbol} | {reason} until {until.isoformat()}")
+
+
+def current_loss_streak(symbol: str):
+    streak = 0
+    for event in reversed(trade_history):
+        if event.get("symbol") != symbol or event.get("side") != "SELL":
+            continue
+        if float(event.get("pnl", 0.0)) < 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def refresh_blacklist_from_memory(symbol: str):
+    if not LOSER_BLACKLIST_ENABLED:
+        return
+
+    m = get_memory(symbol)
+
+    if m.get("trades", 0) < LOSER_BLACKLIST_MIN_TRADES:
+        return
+
+    streak = current_loss_streak(symbol)
+
+    if streak >= LOSER_BLACKLIST_LOSS_STREAK:
+        add_temp_blacklist(symbol, f"{streak} loss streak")
+
+
+def a_plus_gate(scan: Dict[str, Any]):
+    if not A_PLUS_GATE_ENABLED:
+        return True, "A+ gate off"
+
+    symbol = scan.get("symbol", "")
+    blacklisted, reason = is_temp_blacklisted(symbol)
+    if blacklisted:
+        return False, f"blacklisted: {reason}"
+
+    confidence = float(scan.get("confidence", 0.0))
+    quality = float(scan.get("quality_score", scan.get("qualityScore", 0.0)))
+    spread = float(scan.get("spread", 1.0))
+    momentum = float(scan.get("short_momentum", scan.get("shortMomentum", 0.0)))
+
+    if confidence < A_PLUS_MIN_CONFIDENCE:
+        return False, f"confidence {confidence:.2f} below A+ {A_PLUS_MIN_CONFIDENCE:.2f}"
+
+    if quality < A_PLUS_MIN_QUALITY:
+        return False, f"quality {quality:.4f} below A+ {A_PLUS_MIN_QUALITY:.4f}"
+
+    if spread > A_PLUS_MAX_SPREAD:
+        return False, f"spread {spread:.4f} above A+ {A_PLUS_MAX_SPREAD:.4f}"
+
+    if A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM and momentum < 0:
+        return False, f"momentum negative {momentum:.4f}"
+
+    return True, "A+ PASS"
+
 
 
 def ensure_symbol_state(symbol: str, custom=False):
@@ -550,6 +672,7 @@ def update_stock_memory_from_sell(symbol: str, pnl: float, pnl_pct: float):
     else:
         m["trust"] = "NEUTRAL"
     save_stock_memory()
+    refresh_blacklist_from_memory(symbol)
 
 
 def memory_multiplier(symbol: str):
@@ -690,7 +813,8 @@ def compute_scan(symbol: str):
         "short_momentum": short_momentum, "pullback": pullback,
     }
     confidence, confidence_label = calculate_confidence(temp)
-    sniper_ok, sniper_reason = sniper_passes({**temp, "ready_to_buy": ready_to_buy})
+    sniper_ok, sniper_reason = sniper_passes({**temp, "ready_to_buy": ready_to_buy, "confidence": confidence})
+    aplus_ok, aplus_reason = a_plus_gate({**temp, "confidence": confidence})
 
     return {
         "symbol": symbol,
@@ -714,6 +838,8 @@ def compute_scan(symbol: str):
         "confidence_label": confidence_label,
         "sniper_pass": sniper_ok,
         "sniper_reason": sniper_reason,
+        "a_plus_pass": aplus_ok,
+        "a_plus_reason": aplus_reason,
     }
 
 
@@ -945,6 +1071,11 @@ def pick_money_mode_stocks(scans):
         if not sniper_ok:
             print(f"SNIPER SKIP {symbol} | {sniper_reason}")
             continue
+
+        aplus_ok, aplus_reason = a_plus_gate(scan)
+        if not aplus_ok:
+            print(f"A+ SKIP {symbol} | {aplus_reason}")
+            continue
         if not scan["ready_to_buy"]:
             continue
         candidates.append(scan)
@@ -1045,6 +1176,8 @@ def money_mode_buy(scans, manual=False):
 
     picks = pick_money_mode_stocks(scans)
     if manual and not picks:
+        if A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY:
+            return "No A+ sniper candidates ready. Manual Money Buy blocked by Trade Quality Gate."
         picks = [s for s in scans if can_buy_symbol(s["symbol"])[0] and s["spread"] <= MAX_SPREAD]
         picks.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
 
@@ -1137,6 +1270,10 @@ def build_status_payload(bot_name, scans):
         "sniperModeEnabled": SNIPER_MODE_ENABLED,
         "confidenceSizingEnabled": CONFIDENCE_SIZING_ENABLED,
         "stockMemoryEnabled": STOCK_MEMORY_ENABLED,
+        "aPlusGateEnabled": A_PLUS_GATE_ENABLED,
+        "aPlusMinConfidence": A_PLUS_MIN_CONFIDENCE,
+        "aPlusMinQuality": A_PLUS_MIN_QUALITY,
+        "tempBlacklist": temp_blacklist,
         "todayBuyCount": today_buy_count(),
         "maxNewBuysPerDayPdtAware": MAX_NEW_BUYS_PER_DAY_PDT_AWARE,
         "lockedSymbolsToday": locked_symbols,
@@ -1186,11 +1323,14 @@ def build_status_payload(bot_name, scans):
                 "confidenceLabel": s.get("confidence_label", "LOW"),
                 "sniperPass": bool(s.get("sniper_pass", False)),
                 "sniperReason": s.get("sniper_reason", ""),
+                "aPlusPass": bool(s.get("a_plus_pass", False)),
+                "aPlusReason": s.get("a_plus_reason", ""),
             } for s in scans
         ],
         "logs": [
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
+            f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f}",
@@ -1325,6 +1465,7 @@ def run_bot_loop():
         try:
             with bot_lock:
                 reset_daily_flags_if_needed()
+                cleanup_temp_blacklist()
                 refresh_universe_if_needed()
                 clock = trading_client.get_clock()
 
