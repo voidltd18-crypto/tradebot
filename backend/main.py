@@ -1396,6 +1396,38 @@ def init_db():
         ON trades(symbol)
     """)
 
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS closed_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_sell_order_id TEXT,
+            source_buy_order_id TEXT,
+            timestamp TEXT NOT NULL,
+            day TEXT,
+            time TEXT,
+            symbol TEXT NOT NULL,
+            qty REAL,
+            entry_price REAL,
+            exit_price REAL,
+            pnl REAL,
+            pnl_gbp REAL,
+            pnl_pct REAL,
+            fx_rate REAL,
+            reason TEXT,
+            source TEXT DEFAULT 'matcher'
+        )
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_closed_trades_timestamp
+        ON closed_trades(timestamp)
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_closed_trades_symbol
+        ON closed_trades(symbol)
+    """)
+
     conn.commit()
     conn.close()
 
@@ -1588,6 +1620,277 @@ def parse_order_timestamp(order):
     return datetime.now(UTC)
 
 
+
+def clear_closed_trades():
+    if not SQLITE_ENABLED:
+        return
+    init_db()
+    conn = db_connect()
+    conn.execute("DELETE FROM closed_trades")
+    conn.commit()
+    conn.close()
+
+
+def save_closed_trade_to_db(trade: Dict[str, Any]):
+    if not SQLITE_ENABLED:
+        return
+
+    init_db()
+    conn = db_connect()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO closed_trades (
+            source_sell_order_id, source_buy_order_id, timestamp, day, time,
+            symbol, qty, entry_price, exit_price, pnl, pnl_gbp, pnl_pct,
+            fx_rate, reason, source
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        trade.get("sourceSellOrderId"),
+        trade.get("sourceBuyOrderId"),
+        trade.get("timestamp"),
+        trade.get("day"),
+        trade.get("time"),
+        trade.get("symbol"),
+        float(trade.get("qty") or 0.0),
+        float(trade.get("entryPrice") or 0.0),
+        float(trade.get("exitPrice") or 0.0),
+        float(trade.get("pnl") or 0.0),
+        float(trade.get("pnlGbp") or 0.0),
+        float(trade.get("pnlPct") or 0.0),
+        float(trade.get("fxRate") or get_usd_to_gbp_rate()),
+        trade.get("reason", ""),
+        trade.get("source", "matcher"),
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def closed_trades_from_db(limit: int = 1000):
+    if not SQLITE_ENABLED:
+        return []
+
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute("""
+            SELECT * FROM closed_trades
+            ORDER BY timestamp ASC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        conn.close()
+
+        return [
+            {
+                "id": r["id"],
+                "timestamp": r["timestamp"],
+                "day": r["day"],
+                "time": r["time"],
+                "symbol": r["symbol"],
+                "side": "SELL",
+                "qty": r["qty"],
+                "entryPrice": r["entry_price"],
+                "exitPrice": r["exit_price"],
+                "price": r["exit_price"],
+                "pnl": r["pnl"],
+                "pnlGbp": r["pnl_gbp"],
+                "pnlPct": r["pnl_pct"],
+                "fxRate": r["fx_rate"],
+                "reason": r["reason"],
+                "source": r["source"],
+                "equity": 0.0,
+                "equityGbp": 0.0,
+            }
+            for r in rows
+        ]
+
+    except Exception as e:
+        print(f"CLOSED TRADES READ ERROR: {e}")
+        return []
+
+
+def rebuild_closed_trades_from_orders():
+    """
+    Reads raw BUY/SELL rows from trades table and rebuilds completed trades
+    using FIFO matching. This is the important fix for realised PnL.
+    """
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+
+    init_db()
+    clear_closed_trades()
+
+    conn = db_connect()
+    rows = conn.execute("""
+        SELECT *
+        FROM trades
+        WHERE symbol IS NOT NULL
+          AND side IN ('BUY', 'SELL')
+          AND qty > 0
+        ORDER BY timestamp ASC, id ASC
+    """).fetchall()
+    conn.close()
+
+    open_lots: Dict[str, List[Dict[str, Any]]] = {}
+    closed_count = 0
+    unmatched_sells = 0
+    rate = get_usd_to_gbp_rate()
+
+    for r in rows:
+        symbol = str(r["symbol"]).upper()
+        side = str(r["side"]).upper()
+        qty = float(r["qty"] or 0.0)
+        price = float(r["price"] or 0.0)
+
+        # Backfilled BUY rows may have amount but no price in older DB rows.
+        if price <= 0 and qty > 0:
+            amount = float(r["amount"] or 0.0)
+            if amount > 0:
+                price = amount / qty
+
+        if qty <= 0 or price <= 0:
+            continue
+
+        if side == "BUY":
+            open_lots.setdefault(symbol, []).append({
+                "qty": qty,
+                "price": price,
+                "order_id": r["alpaca_order_id"],
+                "timestamp": r["timestamp"],
+            })
+            continue
+
+        if side == "SELL":
+            remaining = qty
+            lots = open_lots.setdefault(symbol, [])
+
+            while remaining > 1e-9 and lots:
+                lot = lots[0]
+                used_qty = min(remaining, float(lot["qty"]))
+                entry_price = float(lot["price"])
+                exit_price = price
+
+                pnl = (exit_price - entry_price) * used_qty
+                pnl_pct = ((exit_price / entry_price) - 1.0) * 100.0 if entry_price > 0 else 0.0
+
+                trade = {
+                    "sourceSellOrderId": r["alpaca_order_id"],
+                    "sourceBuyOrderId": lot.get("order_id"),
+                    "timestamp": r["timestamp"],
+                    "day": r["day"],
+                    "time": r["time"],
+                    "symbol": symbol,
+                    "qty": used_qty,
+                    "entryPrice": entry_price,
+                    "exitPrice": exit_price,
+                    "pnl": round(pnl, 6),
+                    "pnlGbp": round(pnl * rate, 6),
+                    "pnlPct": round(pnl_pct, 6),
+                    "fxRate": rate,
+                    "reason": "FIFO MATCHED CLOSED TRADE",
+                    "source": "fifo_matcher",
+                }
+
+                save_closed_trade_to_db(trade)
+                closed_count += 1
+
+                lot["qty"] = float(lot["qty"]) - used_qty
+                remaining -= used_qty
+
+                if lot["qty"] <= 1e-9:
+                    lots.pop(0)
+
+            if remaining > 1e-9:
+                unmatched_sells += 1
+
+    return {
+        "ok": True,
+        "message": f"Closed-trade rebuild complete. Matched {closed_count} closed trades. Unmatched sells: {unmatched_sells}.",
+        "matchedClosedTrades": closed_count,
+        "unmatchedSells": unmatched_sells,
+    }
+
+
+def closed_trade_summary_payload():
+    closed = closed_trades_from_db(10000)
+    wins = [t for t in closed if float(t.get("pnl") or 0.0) >= 0]
+    losses = [t for t in closed if float(t.get("pnl") or 0.0) < 0]
+    total_pnl = sum(float(t.get("pnl") or 0.0) for t in closed)
+    total_pnl_gbp = sum(float(t.get("pnlGbp") or 0.0) for t in closed)
+
+    return {
+        "closedTrades": len(closed),
+        "wins": len(wins),
+        "losses": len(losses),
+        "winRate": len(wins) / max(1, len(closed)),
+        "totalPnl": total_pnl,
+        "totalPnlGbp": total_pnl_gbp,
+    }
+
+
+def stock_memory_from_closed_trades():
+    closed = closed_trades_from_db(10000)
+    memory: Dict[str, Dict[str, Any]] = {}
+
+    for t in closed:
+        symbol = str(t.get("symbol", "")).upper()
+        if not symbol:
+            continue
+
+        if symbol not in memory:
+            memory[symbol] = {
+                "wins": 0,
+                "losses": 0,
+                "trades": 0,
+                "totalPnl": 0.0,
+                "totalPnlGbp": 0.0,
+                "totalPnlPct": 0.0,
+                "avgPnl": 0.0,
+                "avgPnlGbp": 0.0,
+                "avgPnlPct": 0.0,
+                "winRate": 0.0,
+                "trust": "NEW",
+                "lastResult": "—",
+            }
+
+        m = memory[symbol]
+        pnl = float(t.get("pnl") or 0.0)
+        pnl_gbp = float(t.get("pnlGbp") or 0.0)
+        pnl_pct = float(t.get("pnlPct") or 0.0)
+
+        m["trades"] += 1
+        m["totalPnl"] += pnl
+        m["totalPnlGbp"] += pnl_gbp
+        m["totalPnlPct"] += pnl_pct
+
+        if pnl >= 0:
+            m["wins"] += 1
+            m["lastResult"] = "WIN"
+        else:
+            m["losses"] += 1
+            m["lastResult"] = "LOSS"
+
+    for symbol, m in memory.items():
+        m["winRate"] = m["wins"] / max(1, m["trades"])
+        m["avgPnl"] = m["totalPnl"] / max(1, m["trades"])
+        m["avgPnlGbp"] = m["totalPnlGbp"] / max(1, m["trades"])
+        m["avgPnlPct"] = m["totalPnlPct"] / max(1, m["trades"])
+
+        if m["trades"] < MEMORY_MIN_TRADES_FOR_TRUST:
+            m["trust"] = "NEW"
+        elif m["winRate"] >= MEMORY_GOOD_WINRATE:
+            m["trust"] = "GOOD"
+        elif m["winRate"] <= MEMORY_BAD_WINRATE:
+            m["trust"] = "BAD"
+        else:
+            m["trust"] = "NEUTRAL"
+
+    items = [{"symbol": s, **m} for s, m in memory.items()]
+    items.sort(key=lambda x: (-x.get("totalPnl", 0), -x.get("winRate", 0), -x.get("trades", 0)))
+    return items
+
 def backfill_trades_from_alpaca():
     init_db()
 
@@ -1695,11 +1998,14 @@ def backfill_trades_from_alpaca():
             print(f"BACKFILL ORDER ERROR: {e}")
             skipped += 1
 
+    match_result = rebuild_closed_trades_from_orders()
+
     return {
         "ok": True,
-        "message": f"Backfill complete. Imported {imported}, skipped {skipped}.",
+        "message": f"Backfill complete. Imported {imported}, skipped {skipped}. {match_result.get('message', '')}",
         "imported": imported,
         "skipped": skipped,
+        **match_result,
     }
 
 
@@ -1811,7 +2117,7 @@ def build_status_payload(bot_name, scans):
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
             f"FX | USDGBP={get_usd_to_gbp_rate():.4f} | source={fx_cache.get('source', 'fallback')}",
-            f"DB | sqlite={SQLITE_ENABLED} | trades={db_summary_payload().get('totalTrades', 0)} | pnl_gbp={db_summary_payload().get('totalPnlGbp', 0):.2f}",
+            f"DB | sqlite={SQLITE_ENABLED} | raw_trades={db_summary_payload().get('totalTrades', 0)} | closed={closed_trade_summary_payload().get('closedTrades', 0)} | pnl_gbp={closed_trade_summary_payload().get('totalPnlGbp', 0):.2f}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
@@ -1821,8 +2127,9 @@ def build_status_payload(bot_name, scans):
         ],
         "trades": trade_events[-50:],
         "tradeTimeline": trades_from_db(1000),
-        "stockMemory": stock_memory_from_db(),
-        "dbSummary": db_summary_payload(),
+        "closedTrades": closed_trades_from_db(1000),
+        "stockMemory": stock_memory_from_closed_trades(),
+        "dbSummary": {**db_summary_payload(), **closed_trade_summary_payload()},
         "equityCurve": equity_curve[-240:],
         "alpacaRejectionEvents": alpaca_rejection_events[-50:],
         "pdtWarningEvents": pdt_warning_events[-50:],
@@ -1933,6 +2240,16 @@ def emergency_sell(request: Request):
         update_status(BOT_NAME, latest_scans)
         return {**result, "emergencyStop": True, "botEnabled": False}
 
+
+
+
+@app.post("/rebuild-closed-trades")
+def rebuild_closed_trades(request: Request):
+    verify_api_key(request)
+    with bot_lock:
+        result = rebuild_closed_trades_from_orders()
+        update_status(BOT_NAME, latest_scans)
+        return result
 
 
 @app.post("/backfill-trades")

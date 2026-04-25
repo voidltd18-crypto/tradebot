@@ -1,22 +1,31 @@
-# SQLite Persistent Trade Memory Package
+# SQLite Trade Matching Fixed Package
 
-Adds proper persistent trade storage and Alpaca backfill.
+This package fixes the 0% win-rate / $0 PnL issue by adding proper FIFO BUY → SELL matching.
 
-## New features
-- SQLite database: trades.db
-- Every bot BUY/SELL saved to DB
-- Timeline loaded from DB
-- Stock memory calculated from DB
-- Backfill old filled Alpaca orders
-- Realised PnL summary in USD and GBP
-- Dashboard button: Backfill Alpaca Trades
+## What changed
+- Adds `closed_trades` SQLite table
+- Backfill imports raw Alpaca orders
+- Rebuild PnL Matching pairs BUY lots to SELL orders using FIFO
+- Calculates realised PnL, GBP PnL, win rate and stock memory from matched closed trades
+- Dashboard shows:
+  - Raw orders
+  - Closed trades
+  - Win rate
+  - Total realised PnL
+  - Matched closed trades list
 
-## Important Render note
-For truly permanent storage across redeploys, attach a Render Persistent Disk and set:
+## How to use after deploy
+1. Open dashboard
+2. Click `Backfill Alpaca Trades`
+3. Click `Rebuild PnL Matching`
+4. Click Refresh
+
+## Render Persistent Disk
+For permanent DB storage across redeploys, set:
 
 SQLITE_DB_FILE=/var/data/trades.db
 
-If you do not set a persistent disk path, SQLite will work but may reset on redeploy/rebuild depending on Render storage behavior.
+and attach a Render persistent disk mounted at `/var/data`.
 
 ## Render settings
 Build:
@@ -24,12 +33,3 @@ pip install -r backend/requirements.txt
 
 Start:
 uvicorn backend.main:app --host 0.0.0.0 --port $PORT
-
-## Required env
-APCA_API_KEY_ID
-APCA_API_SECRET_KEY
-DASHBOARD_API_KEY
-PAPER=false
-
-## Optional env for persistent disk
-SQLITE_DB_FILE=/var/data/trades.db
