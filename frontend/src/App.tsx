@@ -305,7 +305,7 @@ export default function App() {
                 Total Realised PnL: {usd(data.dbSummary?.totalPnl || 0)} / {gbpValue(data.dbSummary?.totalPnlGbp || 0)}
               </p>
               <p style={{ color: "#94a3b8" }}>
-                Use “Full Backfill Alpaca Trades” to import old orders, then “Rebuild PnL Matching” to pair BUY → SELL and calculate realised PnL.
+                Use “Full Backfill ALL Alpaca Orders” to import old orders, then “Rebuild PnL Matching” to pair BUY → SELL and calculate realised PnL.
               </p>
             </div>
 
@@ -321,7 +321,7 @@ export default function App() {
         <div style={{ ...panel, marginBottom: 12 }}>
           <h3>Controls</h3>
           <button style={btn("#2563eb")} onClick={fetchData}>Refresh</button>
-          <button style={btn("#0f766e")} onClick={() => action("/backfill-trades")}>Full Backfill Alpaca Trades</button>
+          <button style={btn("#0f766e")} onClick={() => action("/backfill-trades")}>Full Backfill ALL Alpaca Orders</button>
           <button style={btn("#0d9488")} onClick={() => action("/rebuild-closed-trades")}>Rebuild PnL Matching</button>
           <button style={btn("#16a34a")} onClick={() => action("/manual-buy")}>Money Buy</button>
           <button style={btn("#dc2626")} onClick={() => action("/manual-sell")}>Sell Worst</button>

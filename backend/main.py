@@ -2082,10 +2082,19 @@ def get_order_id(order):
         return ""
 
 
-def fetch_all_closed_orders_paginated():
+
+def get_query_order_status_all():
+    try:
+        return QueryOrderStatus.ALL
+    except Exception:
+        # Some alpaca-py versions represent all as lowercase string.
+        return "all"
+
+
+def fetch_all_orders_paginated():
     """
     Alpaca-py pagination/backfill.
-    Pulls orders backwards in chunks using `until`, same idea as the user-provided snippet.
+    Pulls ALL orders backwards in chunks using `until`, same idea as the user-provided snippet.
     """
     all_orders = []
     until = datetime.now(UTC)
@@ -2094,7 +2103,7 @@ def fetch_all_closed_orders_paginated():
     for page in range(BACKFILL_MAX_PAGES):
         try:
             req = GetOrdersRequest(
-                status=QueryOrderStatus.ALL,
+                status=get_query_order_status_all(),
                 limit=BACKFILL_CHUNK_SIZE,
                 until=until,
                 direction="desc",
@@ -2103,7 +2112,7 @@ def fetch_all_closed_orders_paginated():
         except TypeError:
             # Some alpaca-py versions may not accept nested.
             req = GetOrdersRequest(
-                status=QueryOrderStatus.CLOSED,
+                status=get_query_order_status_all(),
                 limit=BACKFILL_CHUNK_SIZE,
                 until=until,
                 direction="desc",
@@ -2156,7 +2165,7 @@ def fetch_all_closed_orders_paginated():
 def backfill_trades_from_alpaca_full():
     init_db()
 
-    orders = fetch_all_closed_orders_paginated()
+    orders = fetch_all_orders_paginated()
     imported = 0
     skipped = 0
     rate = get_usd_to_gbp_rate()
@@ -2239,7 +2248,7 @@ def backfill_trades_from_alpaca_full():
 
     return {
         "ok": True,
-        "message": f"Full backfill complete. Orders fetched {len(orders)}. Imported {imported}, skipped {skipped}. {match_result.get('message', '')}",
+        "message": f"Full ALL-orders backfill complete. Orders fetched {len(orders)}. Imported {imported}, skipped {skipped}. {match_result.get('message', '')}",
         "ordersFetched": len(orders),
         "imported": imported,
         "skipped": skipped,
@@ -2251,7 +2260,7 @@ def backfill_trades_from_alpaca():
     init_db()
 
     request = GetOrdersRequest(
-        status=QueryOrderStatus.CLOSED,
+        status=get_query_order_status_all(),
         limit=BACKFILL_ORDER_LIMIT,
     )
 
@@ -2514,6 +2523,33 @@ def update_status(bot_name, scans):
 # =========================
 # ROUTES
 # =========================
+
+@app.get("/debug-orders")
+def debug_orders():
+    try:
+        req = GetOrdersRequest(
+            status=get_query_order_status_all(),
+            limit=10,
+            direction="desc",
+        )
+        orders = trading_client.get_orders(filter=req)
+        sample = []
+        for o in orders[:10]:
+            sample.append({
+                "id": str(getattr(o, "id", "")),
+                "symbol": str(getattr(o, "symbol", "")),
+                "side": str(getattr(o, "side", "")),
+                "status": str(getattr(o, "status", "")),
+                "filled_qty": str(getattr(o, "filled_qty", "")),
+                "filled_avg_price": str(getattr(o, "filled_avg_price", "")),
+                "submitted_at": str(getattr(o, "submitted_at", "")),
+                "filled_at": str(getattr(o, "filled_at", "")),
+            })
+        return {"ok": True, "count": len(orders), "sample": sample}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/")
 def root():
     return {"message": "Rebuilt Sniper Profit Bot running", "status": "/status", "paperMode": PAPER}

@@ -1,22 +1,34 @@
-# Faster Exit + Full Order Backfill Package
+# Faster Exit + Full ALL Orders Backfill Package
 
-This adds your paginated old-order backfill idea.
+This fixes the backfill filter by requesting ALL Alpaca orders instead of only CLOSED orders.
 
-## What changed
-- `/backfill-trades` now fetches old Alpaca orders in 500-order chunks
-- It pages backwards using `until`, like your sample code
-- Stores raw filled BUY/SELL orders into SQLite
-- Rebuilds closed trades with FIFO BUY → SELL matching
-- Updates realised PnL, GBP PnL, win rate and stock memory
+## Why this matters
+Some Alpaca setups return zero orders when using CLOSED filtering.
+This version uses ALL orders, then filters locally for filled orders.
 
-## Buttons
-- Full Backfill Alpaca Trades
-- Rebuild PnL Matching
+## Includes
+- Faster Exit / Partial Profit Mode
+- SQLite persistent trade memory
+- Full paginated backfill in 500-order chunks
+- ALL order status backfill
+- FIFO BUY → SELL closed-trade matching
+- GBP conversion
+- Debug endpoint: /debug-orders
 
-## Important
-If Closed Trades still shows 0 after this, Alpaca is returning only BUY orders or there are no filled SELL orders in the account history being fetched.
+## After deploy
+1. Open dashboard
+2. Click `Full Backfill ALL Alpaca Orders`
+3. Click `Rebuild PnL Matching`
+4. Click Refresh
 
-## Render
+## Debug
+Open:
+https://YOUR_RENDER_URL/debug-orders
+
+If count is 0, Alpaca is returning no orders for those API keys.
+If count > 0, backfill should import them.
+
+## Render settings
 Build:
 pip install -r backend/requirements.txt
 
@@ -24,7 +36,8 @@ Start:
 uvicorn backend.main:app --host 0.0.0.0 --port $PORT
 
 ## Persistent DB recommended
-Set:
+Set env:
 SQLITE_DB_FILE=/var/data/trades.db
 
-and attach a Render persistent disk at `/var/data`.
+Attach Render persistent disk at:
+/var/data
