@@ -2094,7 +2094,7 @@ def fetch_all_closed_orders_paginated():
     for page in range(BACKFILL_MAX_PAGES):
         try:
             req = GetOrdersRequest(
-                status=QueryOrderStatus.CLOSED,
+                status=QueryOrderStatus.ALL,
                 limit=BACKFILL_CHUNK_SIZE,
                 until=until,
                 direction="desc",
