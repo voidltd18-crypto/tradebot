@@ -1,4 +1,3 @@
-
 import React, { useEffect, useMemo, useState } from "react";
 import {
   LineChart,
@@ -8,6 +7,7 @@ import {
   Tooltip,
   ResponsiveContainer,
   CartesianGrid,
+  ReferenceDot,
 } from "recharts";
 
 const API_URL = "https://tradebot-0myo.onrender.com";
@@ -34,26 +34,26 @@ type Position = {
   trailStartPrice: number;
   trailFloor: number;
   trailingActive: boolean;
-  inUniverse: boolean;
   custom?: boolean;
   lockedToday?: boolean;
+  boughtToday?: boolean;
+  minutesSinceBuy?: number;
 };
 
 type Scan = {
   symbol: string;
   price: number;
-  ref: number;
   trigger: number;
   spread: number;
-  qty: number;
-  score: number;
   pullback?: number;
   shortMomentum?: number;
   qualityScore?: number;
   readyToBuy?: boolean;
   lockedToday?: boolean;
-  custom?: boolean;
-  done: boolean;
+  confidence?: number;
+  confidenceLabel?: string;
+  sniperPass?: boolean;
+  sniperReason?: string;
   priceCurve?: { t: string; value: number }[];
 };
 
@@ -83,20 +83,25 @@ function pct(n: number) {
   return `${Number(n || 0).toFixed(2)}%`;
 }
 
-function niceDate(s: string) {
-  if (!s) return "—";
-  const d = new Date(s);
-  if (Number.isNaN(d.getTime())) return s;
-  return d.toLocaleString();
+function daysAgo(days: number) {
+  return Date.now() - days * 24 * 60 * 60 * 1000;
+}
+
+function timelineFilterMs(filter: string) {
+  if (filter === "day") return daysAgo(1);
+  if (filter === "week") return daysAgo(7);
+  if (filter === "month") return daysAgo(30);
+  return 0;
 }
 
 export default function App() {
   const [data, setData] = useState<any>(null);
   const [status, setStatus] = useState("Connecting...");
   const [message, setMessage] = useState("");
-  const [selectedSymbol, setSelectedSymbol] = useState("");
-  const [customTicker, setCustomTicker] = useState("");
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("dashboard_api_key") || "");
+  const [customTicker, setCustomTicker] = useState("");
+  const [selectedSymbol, setSelectedSymbol] = useState("");
+  const [timelineRange, setTimelineRange] = useState("day");
 
   const fetchData = async () => {
     try {
@@ -104,9 +109,7 @@ export default function App() {
       const json = await res.json();
       setData(json);
       setStatus("Connected");
-      if (!selectedSymbol && json.scans?.length) {
-        setSelectedSymbol(json.scans[0].symbol);
-      }
+      if (!selectedSymbol && json.scans?.length) setSelectedSymbol(json.scans[0].symbol);
     } catch {
       setStatus("Connection failed");
     }
@@ -123,12 +126,6 @@ export default function App() {
     setMessage("Dashboard key saved on this device");
   };
 
-  const clearApiKey = () => {
-    localStorage.removeItem("dashboard_api_key");
-    setApiKey("");
-    setMessage("Dashboard key cleared");
-  };
-
   const action = async (endpoint: string) => {
     if (!apiKey.trim()) {
       setMessage("Enter your dashboard password first");
@@ -138,11 +135,8 @@ export default function App() {
     try {
       const res = await fetch(`${API_URL}${endpoint}`, {
         method: "POST",
-        headers: {
-          "x-api-key": apiKey.trim(),
-        },
+        headers: { "x-api-key": apiKey.trim() },
       });
-
       const json = await res.json();
 
       if (!res.ok) {
@@ -157,129 +151,85 @@ export default function App() {
     }
   };
 
-  const sellSymbol = async (symbol: string) => {
-    const ok = confirm(`Sell ${symbol}? It will be locked from rebuying until tomorrow.`);
-    if (!ok) return;
-    await action(`/sell/${symbol}`);
-  };
-
   const customBuy = async () => {
     const symbol = customTicker.trim().toUpperCase();
-    if (!symbol) {
-      setMessage("Enter a ticker first");
-      return;
-    }
-
-    const ok = confirm(`Custom buy ${symbol}? It will be added to the managed universe.`);
-    if (!ok) return;
-
+    if (!symbol) return setMessage("Enter a ticker first");
+    if (!confirm(`Custom buy ${symbol}?`)) return;
     await action(`/custom-buy/${symbol}`);
     setCustomTicker("");
   };
 
-  const selectedScan: Scan | undefined = useMemo(() => {
-    return data?.scans?.find((s: Scan) => s.symbol === selectedSymbol);
-  }, [data, selectedSymbol]);
+  const selectedScan: Scan | undefined = useMemo(
+    () => data?.scans?.find((s: Scan) => s.symbol === selectedSymbol),
+    [data, selectedSymbol]
+  );
 
-  const bestCandidate: Scan | undefined = useMemo(() => {
-    return [...(data?.scans || [])]
-      .filter((s: Scan) => !s.lockedToday)
-      .sort((a: Scan, b: Scan) => (b.qualityScore || 0) - (a.qualityScore || 0))[0];
-  }, [data]);
+  const timeline = useMemo(() => {
+    const start = timelineFilterMs(timelineRange);
+    return (data?.tradeTimeline || [])
+      .filter((e: any) => !start || new Date(e.timestamp).getTime() >= start)
+      .map((e: any, i: number) => ({
+        ...e,
+        idx: i,
+        label: `${e.time || ""} ${e.symbol || ""}`,
+      }));
+  }, [data, timelineRange]);
+
+  const timelineChart = useMemo(() => {
+    return timeline.map((e: any, i: number) => ({
+      idx: i,
+      equity: e.equity || 0,
+      symbol: e.symbol,
+      side: e.side,
+      time: e.time,
+      reason: e.reason,
+      pnl: e.pnl,
+      pnlPct: e.pnlPct,
+    }));
+  }, [timeline]);
 
   return (
-    <div
-      style={{
-        minHeight: "100vh",
-        background: "#020617",
-        color: "white",
-        padding: 14,
-        fontFamily: "Arial, sans-serif",
-      }}
-    >
+    <div style={{ minHeight: "100vh", background: "#020617", color: "white", padding: 14, fontFamily: "Arial" }}>
       <div style={{ maxWidth: 1350, margin: "0 auto" }}>
         <h1 style={{ textAlign: "center", fontSize: "clamp(28px, 6vw, 48px)" }}>
-          🎯 Custom Buy Money Mode
+          🎯 Sniper Profit Bot
         </h1>
 
-        <div style={{ textAlign: "center", marginBottom: 10 }}>
-          <span style={{ color: status === "Connected" ? "#22c55e" : "#f87171", fontWeight: 700 }}>
-            {status}
-          </span>
+        <div style={{ textAlign: "center", color: status === "Connected" ? "#22c55e" : "#f87171", fontWeight: 700 }}>
+          {status}
         </div>
 
         {data && (
           <div style={{ textAlign: "center", color: "#94a3b8", marginBottom: 12 }}>
-            {data.name} · {data.paperMode ? "PAPER" : "LIVE"} · Bot {data.botEnabled ? "ON" : "OFF"} ·{" "}
-            Market {data.market?.label || "UNKNOWN"} · {data.mode} · {data.allowedNewPositions} buy slots open · Emergency {data.emergencyStop ? "ON" : "OFF"}
-          </div>
-        )}
-
-        <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(250,204,21,0.35)" }}>
-          <h3>Protection Rule</h3>
-          <p style={{ color: "#facc15", fontWeight: 700 }}>
-            BUY → HOLD → SELL → that symbol is locked until tomorrow.
-          </p>
-          <p style={{ color: "#94a3b8" }}>
-            Custom buys are added to the managed universe, so trailing/stop protection applies after buying.
-          </p>
-          {data && (
-            <p>
-              Locked today:{" "}
-              <b style={{ color: data.lockedSymbolsToday?.length ? "#f87171" : "#22c55e" }}>
-                {data.lockedSymbolsToday?.length ? data.lockedSymbolsToday.join(", ") : "none"}
-              </b>
-              {" · "}
-              Custom:{" "}
-              <b style={{ color: data.customSymbols?.length ? "#38bdf8" : "#94a3b8" }}>
-                {data.customSymbols?.length ? data.customSymbols.join(", ") : "none"}
-              </b>
-            </p>
-          )}
-        </div>
-
-        {data && (
-          <div
-            style={{
-              ...panel,
-              marginBottom: 12,
-              borderColor: data.market?.isOpen ? "rgba(34,197,94,0.45)" : "rgba(239,68,68,0.45)",
-            }}
-          >
-            <h3>Market Status</h3>
-            <p style={{ fontSize: 22, fontWeight: 800, color: data.market?.isOpen ? "#22c55e" : "#f87171" }}>
-              {data.market?.isOpen ? "🟢 Market Open" : "🔴 Market Closed"}
-            </p>
-            <p style={{ color: "#94a3b8" }}>Current market time: {niceDate(data.market?.timestamp || "")}</p>
-            <p style={{ color: "#94a3b8" }}>Next open: {niceDate(data.market?.nextOpen || "")}</p>
-            <p style={{ color: "#94a3b8" }}>Next close: {niceDate(data.market?.nextClose || "")}</p>
+            {data.name} · {data.paperMode ? "PAPER" : "LIVE"} · Bot {data.botEnabled ? "ON" : "OFF"} · Market{" "}
+            {data.market?.label || "UNKNOWN"} · {data.mode}
           </div>
         )}
 
         <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(56,189,248,0.45)" }}>
           <h3>Security</h3>
-          <p style={{ color: "#94a3b8" }}>
-            Enter your dashboard password to enable trading buttons on this device.
-          </p>
-          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-            <input
-              type="password"
-              value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
-              placeholder="Dashboard password"
-              style={{
-                padding: 11,
-                borderRadius: 12,
-                border: "1px solid rgba(255,255,255,0.18)",
-                background: "#020617",
-                color: "white",
-                minWidth: 220,
-              }}
-            />
-            <button style={btn("#2563eb")} onClick={saveApiKey}>Save Key</button>
-            <button style={btn("#4b5563")} onClick={clearApiKey}>Clear</button>
-          </div>
+          <input
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder="Dashboard password"
+            style={{ padding: 11, borderRadius: 12, background: "#020617", color: "white", border: "1px solid rgba(255,255,255,0.18)", minWidth: 220 }}
+          />
+          <button style={btn("#2563eb")} onClick={saveApiKey}>Save Key</button>
+          {message && <span style={{ color: "#facc15", marginLeft: 8 }}>{message}</span>}
         </div>
+
+        {data && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.45)" }}>
+            <h3>Strategy Modes</h3>
+            <p style={{ color: "#22c55e", fontWeight: 700 }}>
+              Sniper {data.sniperModeEnabled ? "ON" : "OFF"} · Confidence Sizing {data.confidenceSizingEnabled ? "ON" : "OFF"} · Stock Memory {data.stockMemoryEnabled ? "ON" : "OFF"} · PDT-Aware {data.pdtAwareModeEnabled ? "ON" : "OFF"}
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              Sniper decides IF to buy. Confidence decides HOW MUCH. Memory learns which stocks work best.
+            </p>
+          </div>
+        )}
 
         <div style={{ ...panel, marginBottom: 12 }}>
           <h3>Controls</h3>
@@ -292,66 +242,72 @@ export default function App() {
           <button style={btn("#f59e0b")} onClick={() => action("/manual-override/on")}>Override ON</button>
           <button style={btn("#4b5563")} onClick={() => action("/manual-override/off")}>Override OFF</button>
 
-          <div style={{ marginTop: 14, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+          <div style={{ marginTop: 12 }}>
             <input
               value={customTicker}
               onChange={(e) => setCustomTicker(e.target.value.toUpperCase())}
               placeholder="Ticker e.g. AMD"
-              style={{
-                padding: 11,
-                borderRadius: 12,
-                border: "1px solid rgba(255,255,255,0.18)",
-                background: "#020617",
-                color: "white",
-                minWidth: 160,
-              }}
+              style={{ padding: 11, borderRadius: 12, background: "#020617", color: "white", border: "1px solid rgba(255,255,255,0.18)", minWidth: 160 }}
             />
             <button style={btn("#22c55e")} onClick={customBuy}>Buy Custom</button>
           </div>
-
-          {message && <div style={{ marginTop: 10, color: "#facc15" }}>{message}</div>}
         </div>
 
         {!data && <p>Loading...</p>}
 
         {data && (
           <>
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                gap: 12,
-                marginBottom: 12,
-              }}
-            >
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12, marginBottom: 12 }}>
               <div style={panel}>Equity<br /><b>{money(data.account.equity)}</b></div>
               <div style={panel}>Buying Power<br /><b>{money(data.account.buyingPower)}</b></div>
-              <div style={panel}>Cash<br /><b>{money(data.account.cash)}</b></div>
               <div style={panel}>Day PnL<br /><b style={{ color: data.account.pnlDay >= 0 ? "#22c55e" : "#f87171" }}>{money(data.account.pnlDay)}</b></div>
               <div style={panel}>Positions<br /><b>{(data.positions || []).length}/{data.maxPositions}</b></div>
               <div style={panel}>Next Buy Size<br /><b>{money(data.newPositionNotional || 0)}</b></div>
               <div style={panel}>Risk<br /><b style={{ color: data.riskBlocked ? "#f87171" : "#22c55e" }}>{data.riskBlocked ? "BLOCKED" : "OK"}</b></div>
-              <div style={panel}>Market<br /><b style={{ color: data.market?.isOpen ? "#22c55e" : "#f87171" }}>{data.market?.label || "UNKNOWN"}</b></div>
+            </div>
+
+            <div style={{ ...panel, marginBottom: 12 }}>
+              <h3>Trade Timeline</h3>
+              <div>
+                {["day", "week", "month", "total"].map((r) => (
+                  <button key={r} style={btn(timelineRange === r ? "#2563eb" : "#334155")} onClick={() => setTimelineRange(r)}>
+                    {r.toUpperCase()}
+                  </button>
+                ))}
+              </div>
+              <div style={{ height: 320 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={timelineChart}>
+                    <CartesianGrid stroke="rgba(255,255,255,0.1)" />
+                    <XAxis dataKey="idx" />
+                    <YAxis />
+                    <Tooltip />
+                    <Line type="monotone" dataKey="equity" stroke="#22c55e" strokeWidth={2} dot={false} />
+                    {timelineChart.map((e: any) => (
+                      <ReferenceDot
+                        key={`${e.idx}-${e.symbol}-${e.side}`}
+                        x={e.idx}
+                        y={e.equity}
+                        r={5}
+                        fill={e.side === "BUY" ? "#22c55e" : "#ef4444"}
+                        stroke="white"
+                        label={{ value: e.symbol, position: "top", fill: "white", fontSize: 11 }}
+                      />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+              {timeline.length === 0 && <p style={{ color: "#94a3b8" }}>No timeline trades yet.</p>}
             </div>
 
             <div style={{ ...panel, marginBottom: 12 }}>
               <h3>All Positions</h3>
               {(data.positions || []).length === 0 && <p>No open positions.</p>}
               {(data.positions || []).map((p: Position) => (
-                <div
-                  key={p.symbol}
-                  style={{
-                    background: "#020617",
-                    borderRadius: 14,
-                    padding: 12,
-                    marginBottom: 8,
-                    border: "1px solid rgba(255,255,255,0.08)",
-                  }}
-                >
+                <div key={p.symbol} style={{ background: "#020617", borderRadius: 14, padding: 12, marginBottom: 8 }}>
                   <b>{p.symbol}</b>
-                  {p.custom ? <span style={{ color: "#38bdf8" }}> · CUSTOM</span> : null}
+                  {p.boughtToday ? <span style={{ color: "#facc15" }}> · BOUGHT TODAY · {p.minutesSinceBuy}m held</span> : null}
                   {" · "}Qty {Number(p.qty).toFixed(4)} · Entry {money(p.entry)} · Price {money(p.price)} · Value {money(p.marketValue)}
-                  {p.lockedToday ? <span style={{ color: "#f87171" }}> · LOCKED AFTER SELL</span> : null}
                   <br />
                   <span style={{ color: p.pnlPct >= 0 ? "#22c55e" : "#f87171" }}>
                     PnL {money(p.pnl)} / {pct(p.pnlPct)}
@@ -360,44 +316,15 @@ export default function App() {
                   <span style={{ color: p.trailingActive ? "#22c55e" : "#facc15" }}>
                     {p.trailingActive ? `Trailing floor ${money(p.trailFloor)}` : `Trail starts ${money(p.trailStartPrice)}`}
                   </span>
-                  {" · "}
-                  <button style={btn("#dc2626")} onClick={() => sellSymbol(p.symbol)}>Sell {p.symbol}</button>
+                  <button style={btn("#dc2626")} onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button>
                 </div>
               ))}
             </div>
 
             <div style={{ ...panel, marginBottom: 12 }}>
-              <h3>Equity Chart</h3>
-              <div style={{ height: 260 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={data.equityCurve || []}>
-                    <CartesianGrid stroke="rgba(255,255,255,0.1)" />
-                    <XAxis dataKey="t" />
-                    <YAxis />
-                    <Tooltip />
-                    <Line type="monotone" dataKey="value" stroke="#22c55e" strokeWidth={2} dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-
-            <div style={{ ...panel, marginBottom: 12 }}>
               <h3>Money Mode Scanner</h3>
-              {bestCandidate && (
-                <p style={{ color: "#facc15" }}>
-                  Best unlocked: {bestCandidate.symbol} · quality {(bestCandidate.qualityScore || 0).toFixed(4)} ·{" "}
-                  {bestCandidate.readyToBuy ? "READY" : "WATCHING"}
-                </p>
-              )}
-
-              <select
-                value={selectedSymbol}
-                onChange={(e) => setSelectedSymbol(e.target.value)}
-                style={{ padding: 10, borderRadius: 10, marginBottom: 10 }}
-              >
-                {(data.scans || []).map((s: Scan) => (
-                  <option key={s.symbol} value={s.symbol}>{s.symbol}{s.custom ? " (CUSTOM)" : ""}</option>
-                ))}
+              <select value={selectedSymbol} onChange={(e) => setSelectedSymbol(e.target.value)} style={{ padding: 10, borderRadius: 10, marginBottom: 10 }}>
+                {(data.scans || []).map((s: Scan) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
               </select>
 
               <div style={{ height: 220, marginBottom: 12 }}>
@@ -412,28 +339,21 @@ export default function App() {
                 </ResponsiveContainer>
               </div>
 
-              {(data.scans || []).length === 0 && <p>No scan data yet</p>}
               {(data.scans || []).map((s: Scan) => (
-                <div
-                  key={s.symbol}
-                  style={{
-                    background: s.lockedToday
-                      ? "rgba(239,68,68,0.18)"
-                      : s.readyToBuy
-                        ? "rgba(22,163,74,0.18)"
-                        : "#020617",
-                    borderRadius: 14,
-                    padding: 12,
-                    marginBottom: 8,
-                    border: "1px solid rgba(255,255,255,0.08)",
-                  }}
-                >
-                  <b>{s.symbol}</b>
-                  {s.custom ? <span style={{ color: "#38bdf8" }}> · CUSTOM</span> : null}
-                  {" | "}{money(s.price)} | trigger {money(s.trigger)} | spread {(s.spread * 100).toFixed(2)}%
+                <div key={s.symbol} style={{ background: s.sniperPass ? "rgba(22,163,74,0.18)" : "#020617", borderRadius: 14, padding: 12, marginBottom: 8 }}>
+                  <b>{s.symbol}</b> | {money(s.price)} | trigger {money(s.trigger)} | spread {(s.spread * 100).toFixed(2)}%
                   <br />
-                  pullback {pct((s.pullback || 0) * 100)} | momentum {pct((s.shortMomentum || 0) * 100)} | quality {(s.qualityScore || 0).toFixed(4)} |{" "}
-                  {s.lockedToday ? "LOCKED UNTIL TOMORROW" : s.readyToBuy ? "READY" : "watching"}
+                  quality {(s.qualityScore || 0).toFixed(4)} | confidence {(s.confidence || 0).toFixed(2)} {s.confidenceLabel} | {s.sniperPass ? "SNIPER PASS" : `SNIPER WAIT: ${s.sniperReason}`}
+                </div>
+              ))}
+            </div>
+
+            <div style={{ ...panel, marginBottom: 12 }}>
+              <h3>Stock Memory</h3>
+              {(data.stockMemory || []).length === 0 && <p style={{ color: "#94a3b8" }}>No completed sell history yet.</p>}
+              {(data.stockMemory || []).slice(0, 20).map((m: any) => (
+                <div key={m.symbol} style={{ background: "#020617", borderRadius: 12, padding: 10, marginBottom: 6 }}>
+                  <b>{m.symbol}</b> · Trust {m.trust} · Trades {m.trades} · Win rate {pct((m.winRate || 0) * 100)} · Avg PnL {money(m.avgPnl || 0)}
                 </div>
               ))}
             </div>
@@ -448,28 +368,10 @@ export default function App() {
               ))}
             </div>
 
-            <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(251,191,36,0.45)" }}>
-              <h3>Alpaca Sell Rejection / PDT Log</h3>
-              <p style={{ color: "#94a3b8" }}>
-                The bot still attempts sells. This panel only shows when Alpaca rejects a sell, including PDT blocks.
-              </p>
-              {(data.alpacaRejectionEvents || []).length === 0 && (
-                <p style={{ color: "#94a3b8" }}>No Alpaca sell rejections yet.</p>
-              )}
-              {(data.alpacaRejectionEvents || []).map((e: any, i: number) => (
-                <div key={i} style={{ color: e.type === "PDT BLOCK" ? "#facc15" : "#f87171", marginBottom: 8, fontWeight: 700 }}>
-                  {e.time} | {e.message} | {e.reason}
-                  <div style={{ color: "#94a3b8", fontWeight: 400, fontSize: 12 }}>
-                    {e.error}
-                  </div>
-                </div>
-              ))}
-            </div>
-
-            <div style={panel}>
+            <div style={{ ...panel, marginBottom: 12 }}>
               <h3>Logs</h3>
               {(data.logs || []).map((l: string, i: number) => (
-                <div key={i} style={{ color: l.includes("PDT") || l.includes("REJECTION") ? "#facc15" : "#94a3b8", fontSize: 12 }}>
+                <div key={i} style={{ color: l.includes("SNIPER") ? "#38bdf8" : l.includes("PDT") ? "#facc15" : l.includes("PROFIT") ? "#22c55e" : "#94a3b8", fontSize: 12 }}>
                   {l}
                 </div>
               ))}
