@@ -124,6 +124,19 @@ MIN_HOLD_MINUTES_BEFORE_ROTATION = 60
 HARD_STOP_LOSS_PCT = -3.50
 MAX_NEW_BUYS_PER_DAY_PDT_AWARE = 6
 
+# Faster Exit / Partial Profit Mode
+FAST_EXIT_MODE_ENABLED = True
+PARTIAL_PROFIT_ENABLED = True
+PARTIAL_PROFIT_TRIGGER_PCT = 1.00
+PARTIAL_PROFIT_SELL_PCT = 0.50
+POST_PARTIAL_TRAIL_GIVEBACK = 0.996
+FAST_STOP_LOSS_PCT = -1.20
+STALL_EXIT_ENABLED = True
+STALL_EXIT_AFTER_MINUTES = 90
+STALL_EXIT_MIN_PNL_PCT = 0.30
+MIN_SELL_NOTIONAL = 1.00
+
+
 SNIPER_MODE_ENABLED = True
 CONFIDENCE_SIZING_ENABLED = True
 STOCK_MEMORY_ENABLED = True
@@ -167,6 +180,8 @@ MEMORY_GOOD_MULTIPLIER = 1.15
 SQLITE_ENABLED = True
 SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "trades.db")
 BACKFILL_ORDER_LIMIT = 500
+BACKFILL_CHUNK_SIZE = 500
+BACKFILL_MAX_PAGES = 50
 
 TRADE_HISTORY_FILE = "trade_history.json"
 STOCK_MEMORY_FILE = "stock_memory.json"
@@ -206,6 +221,7 @@ stock_memory: Dict[str, Dict[str, Any]] = {}
 temp_blacklist: Dict[str, Any] = {}
 alpaca_rejection_events: List[Dict[str, Any]] = []
 pdt_warning_events: List[Dict[str, Any]] = []
+partial_profit_taken: Dict[str, str] = {}
 equity_curve: List[Dict[str, Any]] = []
 
 bot_enabled = True
@@ -441,6 +457,10 @@ def reset_daily_flags_if_needed():
     for symbol, day in list(locked_today.items()):
         if day != today:
             del locked_today[symbol]
+
+    for symbol, day in list(partial_profit_taken.items()):
+        if day != today:
+            del partial_profit_taken[symbol]
 
     if starting_equity_day != today:
         try:
@@ -678,6 +698,10 @@ def get_all_positions():
                 "lockedToday": is_locked_today(symbol),
                 "boughtToday": was_bought_today(symbol),
                 "minutesSinceBuy": minutes_since_today_buy(symbol),
+                "partialProfitTaken": has_taken_partial_profit(symbol),
+                "partialProfitTriggerPct": PARTIAL_PROFIT_TRIGGER_PCT,
+                "fastStopLossPct": FAST_STOP_LOSS_PCT,
+                "stallExitAfterMinutes": STALL_EXIT_AFTER_MINUTES,
             })
         except Exception:
             continue
@@ -1158,6 +1182,78 @@ def close_all_positions(reason="EMERGENCY SELL"):
     return {"ok": True, "message": f"{reason} attempted for {len(positions)} positions.", "results": results}
 
 
+
+# =========================
+# FASTER EXIT HELPERS
+# =========================
+def has_taken_partial_profit(symbol: str):
+    return partial_profit_taken.get(symbol.upper()) == today_str()
+
+
+def mark_partial_profit_taken(symbol: str):
+    partial_profit_taken[symbol.upper()] = today_str()
+
+
+def sell_notional_ok(qty: float, price: float):
+    return (float(qty) * float(price)) >= MIN_SELL_NOTIONAL
+
+
+def partial_profit_qty(position: Dict[str, Any]):
+    qty = float(position.get("qty") or 0.0)
+    return floor_qty(qty * PARTIAL_PROFIT_SELL_PCT, 6)
+
+
+def should_partial_profit(position: Dict[str, Any]):
+    if not FAST_EXIT_MODE_ENABLED or not PARTIAL_PROFIT_ENABLED:
+        return False, "partial profit disabled"
+
+    symbol = position["symbol"]
+    if has_taken_partial_profit(symbol):
+        return False, "partial profit already taken today"
+
+    pnl_pct = float(position.get("pnlPct") or 0.0)
+    price = float(position.get("price") or 0.0)
+    qty_to_sell = partial_profit_qty(position)
+
+    if pnl_pct < PARTIAL_PROFIT_TRIGGER_PCT:
+        return False, f"pnl {pnl_pct:.2f}% below partial trigger {PARTIAL_PROFIT_TRIGGER_PCT:.2f}%"
+
+    if qty_to_sell <= DUST_THRESHOLD:
+        return False, "partial qty too small"
+
+    if not sell_notional_ok(qty_to_sell, price):
+        return False, "partial sell notional too small"
+
+    return True, "partial profit trigger"
+
+
+def should_fast_stop(position: Dict[str, Any]):
+    if not FAST_EXIT_MODE_ENABLED:
+        return False, "fast exit disabled"
+
+    pnl_pct = float(position.get("pnlPct") or 0.0)
+    return pnl_pct <= FAST_STOP_LOSS_PCT, f"fast stop pnl={pnl_pct:.2f}%"
+
+
+def should_stall_exit(position: Dict[str, Any]):
+    if not FAST_EXIT_MODE_ENABLED or not STALL_EXIT_ENABLED:
+        return False, "stall exit disabled"
+
+    symbol = position["symbol"]
+    minutes = int(position.get("minutesSinceBuy") or 999999)
+    pnl_pct = float(position.get("pnlPct") or 0.0)
+
+    if minutes < STALL_EXIT_AFTER_MINUTES:
+        return False, f"held {minutes}m below stall timer"
+
+    if pnl_pct > STALL_EXIT_MIN_PNL_PCT:
+        return False, f"pnl {pnl_pct:.2f}% above stall minimum"
+
+    if was_bought_today(symbol) and PDT_AWARE_MODE_ENABLED:
+        return False, "PDT-aware hold; stall exit skipped today"
+
+    return True, f"stall exit: held {minutes}m pnl={pnl_pct:.2f}%"
+
 # =========================
 # STRATEGY
 # =========================
@@ -1243,15 +1339,32 @@ def maybe_rotate_weakest_into_best(scans):
 def manage_money_mode_positions():
     for p in get_all_positions():
         symbol = p["symbol"]
+
         if not MANAGE_OUTSIDE_UNIVERSE_POSITIONS and symbol not in current_universe:
             continue
+
         if has_open_order(symbol):
             continue
-        price = p["price"]
-        entry = p["entry"]
-        qty = p["qty"]
+
+        price = float(p["price"])
+        entry = float(p["entry"])
+        qty = float(p["qty"])
         highest = p["highest"]
-        if price <= 0 or entry <= 0:
+
+        if price <= 0 or entry <= 0 or qty <= DUST_THRESHOLD:
+            continue
+
+        fast_stop, fast_stop_reason = should_fast_stop(p)
+        if fast_stop:
+            try:
+                if pdt_aware_should_avoid_sell(symbol, "FAST EXIT STOP LOSS", p["pnlPct"], allow_hard_stop=True):
+                    continue
+
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason="FAST EXIT STOP LOSS")
+                state[symbol]["highest_since_entry"] = None
+                print(f"FAST EXIT STOP LOSS SELL {qty:.6f} {symbol}")
+            except Exception as e:
+                print(f"SELL ERROR {symbol}: {e}")
             continue
 
         stop_price = entry * STOP_LOSS
@@ -1259,24 +1372,55 @@ def manage_money_mode_positions():
             try:
                 if pdt_aware_should_avoid_sell(symbol, "MONEY MODE STOP LOSS", p["pnlPct"], allow_hard_stop=True):
                     continue
+
                 market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
                 state[symbol]["highest_since_entry"] = None
             except Exception as e:
                 print(f"SELL ERROR {symbol}: {e}")
             continue
 
+        partial_ok, partial_reason = should_partial_profit(p)
+        if partial_ok:
+            try:
+                if pdt_aware_should_avoid_sell(symbol, "PARTIAL PROFIT TAKE", p["pnlPct"], allow_hard_stop=False):
+                    continue
+
+                sell_qty = partial_profit_qty(p)
+                market_sell_qty(symbol, sell_qty, entry=entry, price=price, reason="PARTIAL PROFIT TAKE")
+                mark_partial_profit_taken(symbol)
+                print(f"PARTIAL PROFIT SELL {sell_qty:.6f} {symbol}")
+            except Exception as e:
+                print(f"PARTIAL SELL ERROR {symbol}: {e}")
+            continue
+
+        stall_ok, stall_reason = should_stall_exit(p)
+        if stall_ok:
+            try:
+                if pdt_aware_should_avoid_sell(symbol, "STALL EXIT", p["pnlPct"], allow_hard_stop=False):
+                    continue
+
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason="STALL EXIT")
+                state[symbol]["highest_since_entry"] = None
+                print(f"STALL EXIT SELL {qty:.6f} {symbol} | {stall_reason}")
+            except Exception as e:
+                print(f"STALL SELL ERROR {symbol}: {e}")
+            continue
+
         trail_start_price = entry * TRAIL_START
         if price >= trail_start_price and highest is not None:
-            trail_floor = highest * TRAIL_GIVEBACK
+            giveback = POST_PARTIAL_TRAIL_GIVEBACK if has_taken_partial_profit(symbol) else TRAIL_GIVEBACK
+            trail_floor = highest * giveback
+
             if price <= trail_floor:
                 try:
                     if pdt_aware_should_avoid_sell(symbol, "MONEY MODE TRAILING PROFIT", p["pnlPct"]):
                         continue
+
                     market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
                     state[symbol]["highest_since_entry"] = None
                 except Exception as e:
                     print(f"SELL ERROR {symbol}: {e}")
-
+                continue
 
 def money_mode_buy(scans, manual=False):
     if emergency_stop:
@@ -1891,6 +2035,218 @@ def stock_memory_from_closed_trades():
     items.sort(key=lambda x: (-x.get("totalPnl", 0), -x.get("winRate", 0), -x.get("trades", 0)))
     return items
 
+
+def order_is_filled(order):
+    try:
+        filled_qty = float(getattr(order, "filled_qty", 0) or 0)
+        return filled_qty > 0
+    except Exception:
+        return False
+
+
+def get_order_side(order):
+    return str(getattr(order, "side", "")).upper()
+
+
+def get_order_symbol(order):
+    return str(getattr(order, "symbol", "")).upper()
+
+
+def get_order_price(order):
+    try:
+        price = float(getattr(order, "filled_avg_price", 0) or 0)
+        if price > 0:
+            return price
+    except Exception:
+        pass
+    try:
+        limit_price = float(getattr(order, "limit_price", 0) or 0)
+        if limit_price > 0:
+            return limit_price
+    except Exception:
+        pass
+    return 0.0
+
+
+def get_order_qty(order):
+    try:
+        return float(getattr(order, "filled_qty", 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def get_order_id(order):
+    try:
+        return str(getattr(order, "id", ""))
+    except Exception:
+        return ""
+
+
+def fetch_all_closed_orders_paginated():
+    """
+    Alpaca-py pagination/backfill.
+    Pulls orders backwards in chunks using `until`, same idea as the user-provided snippet.
+    """
+    all_orders = []
+    until = datetime.now(UTC)
+    seen_ids = set()
+
+    for page in range(BACKFILL_MAX_PAGES):
+        try:
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                limit=BACKFILL_CHUNK_SIZE,
+                until=until,
+                direction="desc",
+                nested=False,
+            )
+        except TypeError:
+            # Some alpaca-py versions may not accept nested.
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                limit=BACKFILL_CHUNK_SIZE,
+                until=until,
+                direction="desc",
+            )
+
+        chunk = trading_client.get_orders(filter=req)
+
+        if not chunk:
+            break
+
+        new_count = 0
+        earliest = None
+
+        for order in chunk:
+            oid = get_order_id(order)
+            if oid and oid in seen_ids:
+                continue
+
+            if oid:
+                seen_ids.add(oid)
+
+            all_orders.append(order)
+            new_count += 1
+
+            ts = parse_order_timestamp(order)
+            if earliest is None or str(ts) < str(earliest):
+                earliest = ts
+
+        print(f"BACKFILL PAGE {page + 1}: fetched={len(chunk)} new={new_count}")
+
+        if new_count == 0 or len(chunk) < BACKFILL_CHUNK_SIZE:
+            break
+
+        # Move until backwards to the earliest order timestamp in this chunk.
+        if earliest:
+            try:
+                until = earliest - timedelta(microseconds=1)
+            except Exception:
+                # If alpaca returns string timestamps.
+                try:
+                    until = datetime.fromisoformat(str(earliest).replace("Z", "+00:00")) - timedelta(microseconds=1)
+                except Exception:
+                    break
+        else:
+            break
+
+    return all_orders
+
+
+def backfill_trades_from_alpaca_full():
+    init_db()
+
+    orders = fetch_all_closed_orders_paginated()
+    imported = 0
+    skipped = 0
+    rate = get_usd_to_gbp_rate()
+
+    # Sort oldest -> newest before saving/matching.
+    sorted_orders = sorted(orders, key=lambda o: str(parse_order_timestamp(o)))
+
+    for order in sorted_orders:
+        try:
+            if not order_is_filled(order):
+                skipped += 1
+                continue
+
+            symbol = get_order_symbol(order)
+            side = get_order_side(order)
+            qty = get_order_qty(order)
+            price = get_order_price(order)
+            oid = get_order_id(order)
+
+            if not symbol or side not in ["BUY", "SELL"] or qty <= 0:
+                skipped += 1
+                continue
+
+            # If price is missing, skip for PnL safety.
+            if price <= 0:
+                skipped += 1
+                continue
+
+            timestamp_obj = parse_order_timestamp(order)
+
+            if hasattr(timestamp_obj, "isoformat"):
+                timestamp = timestamp_obj.isoformat()
+                try:
+                    day = timestamp_obj.astimezone(UTC).strftime("%Y-%m-%d")
+                    tm = timestamp_obj.astimezone(UTC).strftime("%H:%M:%S")
+                except Exception:
+                    day = today_str()
+                    tm = now_time()
+            else:
+                timestamp = str(timestamp_obj)
+                day = today_str()
+                tm = now_time()
+
+            amount = qty * price
+
+            event = {
+                "alpacaOrderId": oid,
+                "timestamp": timestamp,
+                "day": day,
+                "time": tm,
+                "side": side,
+                "symbol": symbol,
+                "qty": qty,
+                "price": price,
+                "amount": amount if side == "BUY" else 0.0,
+                "amountGbp": amount * rate if side == "BUY" else 0.0,
+                "pnl": 0.0,
+                "pnlGbp": 0.0,
+                "pnlPct": 0.0,
+                "reason": "ALPACA FULL BACKFILL",
+                "equity": 0.0,
+                "equityGbp": 0.0,
+                "fxRate": rate,
+            }
+
+            before = db_summary_payload().get("totalTrades", 0)
+            save_trade_to_db(event, source="alpaca_full_backfill")
+            after = db_summary_payload().get("totalTrades", 0)
+
+            if after > before:
+                imported += 1
+            else:
+                skipped += 1
+
+        except Exception as e:
+            print(f"FULL BACKFILL ORDER ERROR: {e}")
+            skipped += 1
+
+    match_result = rebuild_closed_trades_from_orders()
+
+    return {
+        "ok": True,
+        "message": f"Full backfill complete. Orders fetched {len(orders)}. Imported {imported}, skipped {skipped}. {match_result.get('message', '')}",
+        "ordersFetched": len(orders),
+        "imported": imported,
+        "skipped": skipped,
+        **match_result,
+    }
+
+
 def backfill_trades_from_alpaca():
     init_db()
 
@@ -2051,6 +2407,13 @@ def build_status_payload(bot_name, scans):
         "sniperModeEnabled": SNIPER_MODE_ENABLED,
         "confidenceSizingEnabled": CONFIDENCE_SIZING_ENABLED,
         "stockMemoryEnabled": STOCK_MEMORY_ENABLED,
+        "fastExitModeEnabled": FAST_EXIT_MODE_ENABLED,
+        "partialProfitEnabled": PARTIAL_PROFIT_ENABLED,
+        "partialProfitTriggerPct": PARTIAL_PROFIT_TRIGGER_PCT,
+        "partialProfitSellPct": PARTIAL_PROFIT_SELL_PCT,
+        "fastStopLossPct": FAST_STOP_LOSS_PCT,
+        "stallExitEnabled": STALL_EXIT_ENABLED,
+        "stallExitAfterMinutes": STALL_EXIT_AFTER_MINUTES,
         "aPlusGateEnabled": A_PLUS_GATE_ENABLED,
         "aPlusMinConfidence": A_PLUS_MIN_CONFIDENCE,
         "aPlusMinQuality": A_PLUS_MIN_QUALITY,
@@ -2071,6 +2434,11 @@ def build_status_payload(bot_name, scans):
             "stopLoss": STOP_LOSS,
             "trailStart": TRAIL_START,
             "trailGiveback": TRAIL_GIVEBACK,
+            "fastExitModeEnabled": FAST_EXIT_MODE_ENABLED,
+            "partialProfitTriggerPct": PARTIAL_PROFIT_TRIGGER_PCT,
+            "partialProfitSellPct": PARTIAL_PROFIT_SELL_PCT,
+            "fastStopLossPct": FAST_STOP_LOSS_PCT,
+            "stallExitAfterMinutes": STALL_EXIT_AFTER_MINUTES,
             "sniperMinConfidence": SNIPER_MIN_CONFIDENCE,
             "sniperMinQuality": SNIPER_MIN_QUALITY,
         },
@@ -2118,8 +2486,10 @@ def build_status_payload(bot_name, scans):
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
             f"FX | USDGBP={get_usd_to_gbp_rate():.4f} | source={fx_cache.get('source', 'fallback')}",
             f"DB | sqlite={SQLITE_ENABLED} | raw_trades={db_summary_payload().get('totalTrades', 0)} | closed={closed_trade_summary_payload().get('closedTrades', 0)} | pnl_gbp={closed_trade_summary_payload().get('totalPnlGbp', 0):.2f}",
+            f"BACKFILL | chunk={BACKFILL_CHUNK_SIZE} | max_pages={BACKFILL_MAX_PAGES}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
+            f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f}",
             f"POSITIONS | {len(positions)}",
@@ -2252,11 +2622,21 @@ def rebuild_closed_trades(request: Request):
         return result
 
 
+
+@app.post("/backfill-trades-limited")
+def backfill_trades_limited(request: Request):
+    verify_api_key(request)
+    with bot_lock:
+        result = backfill_trades_from_alpaca()
+        update_status(BOT_NAME, latest_scans)
+        return result
+
+
 @app.post("/backfill-trades")
 def backfill_trades(request: Request):
     verify_api_key(request)
     with bot_lock:
-        result = backfill_trades_from_alpaca()
+        result = backfill_trades_from_alpaca_full()
         update_status(BOT_NAME, latest_scans)
         return result
 

@@ -1,35 +1,30 @@
-# SQLite Trade Matching Fixed Package
+# Faster Exit + Full Order Backfill Package
 
-This package fixes the 0% win-rate / $0 PnL issue by adding proper FIFO BUY → SELL matching.
+This adds your paginated old-order backfill idea.
 
 ## What changed
-- Adds `closed_trades` SQLite table
-- Backfill imports raw Alpaca orders
-- Rebuild PnL Matching pairs BUY lots to SELL orders using FIFO
-- Calculates realised PnL, GBP PnL, win rate and stock memory from matched closed trades
-- Dashboard shows:
-  - Raw orders
-  - Closed trades
-  - Win rate
-  - Total realised PnL
-  - Matched closed trades list
+- `/backfill-trades` now fetches old Alpaca orders in 500-order chunks
+- It pages backwards using `until`, like your sample code
+- Stores raw filled BUY/SELL orders into SQLite
+- Rebuilds closed trades with FIFO BUY → SELL matching
+- Updates realised PnL, GBP PnL, win rate and stock memory
 
-## How to use after deploy
-1. Open dashboard
-2. Click `Backfill Alpaca Trades`
-3. Click `Rebuild PnL Matching`
-4. Click Refresh
+## Buttons
+- Full Backfill Alpaca Trades
+- Rebuild PnL Matching
 
-## Render Persistent Disk
-For permanent DB storage across redeploys, set:
+## Important
+If Closed Trades still shows 0 after this, Alpaca is returning only BUY orders or there are no filled SELL orders in the account history being fetched.
 
-SQLITE_DB_FILE=/var/data/trades.db
-
-and attach a Render persistent disk mounted at `/var/data`.
-
-## Render settings
+## Render
 Build:
 pip install -r backend/requirements.txt
 
 Start:
 uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+
+## Persistent DB recommended
+Set:
+SQLITE_DB_FILE=/var/data/trades.db
+
+and attach a Render persistent disk at `/var/data`.
