@@ -1,22 +1,40 @@
-# Weekly Universe Visible Panel Package
+# Profit Optimised Trading Bot Package
 
-This package fixes the missing weekly watchlist display.
+Proper deployable package using your real project structure.
 
-Includes:
-- Visible Weekly Auto Universe panel
-- Top 12 watchlist built directly from Stock Memory / closed trades
-- Backend endpoint: GET /weekly-universe
-- Refresh Weekly Universe button support
-- Keeps current trading features: SQLite, Alpaca backfill, PnL matching, optimiser, analytics, GBP conversion
+## Structure
 
-After deploy:
-1. Open dashboard
-2. Data & Maintenance Tools
-3. Press Full Backfill ALL Alpaca Orders if needed
-4. Press Rebuild PnL Matching
-5. Press Refresh Weekly Universe
-6. The Weekly Auto Universe panel should show the selected stocks
+backend/
+  main.py
 
-Render:
-Build: pip install -r backend/requirements.txt
-Start: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+frontend/
+  src/
+    App.tsx
+    main.tsx
+
+## Includes
+
+- Profit optimisation
+- Weekly Auto Universe panel
+- Stock Memory
+- SQLite trade storage
+- Alpaca full-order backfill
+- PnL matching
+- GBP conversion
+- Mobile-friendly collapsible controls
+- Safe one-cycle-per-stock behaviour
+
+## Render settings
+
+Build command:
+pip install -r backend/requirements.txt
+
+Start command:
+uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+
+## Important env vars
+
+APCA_API_KEY_ID
+APCA_API_SECRET_KEY
+DASHBOARD_API_KEY
+SQLITE_DB_FILE=/var/data/trades.db
