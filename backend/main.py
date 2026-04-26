@@ -226,6 +226,22 @@ if PROFIT_OPTIMIZER_ENABLED:
     PARTIAL_PROFIT_TRIGGER_PCT = OPTIMIZED_PARTIAL_PROFIT_TRIGGER_PCT
     PARTIAL_PROFIT_SELL_PCT = OPTIMIZED_PARTIAL_PROFIT_SELL_PCT
 
+
+# Weekly Auto Universe Rotation
+AUTO_UNIVERSE_ENABLED = True
+AUTO_UNIVERSE_SIZE = 12
+AUTO_UNIVERSE_REFRESH_DAY = 0
+AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 12
+AUTO_UNIVERSE_KEEP_WINNERS = True
+AUTO_UNIVERSE_KEEP_WINNER_MIN_PNL = 0.50
+AUTO_UNIVERSE_KEEP_WINNER_MIN_WINRATE = 0.55
+AUTO_UNIVERSE_REMOVE_LOSER_MAX_WINRATE = 0.35
+AUTO_UNIVERSE_REMOVE_LOSER_MAX_PNL = -1.00
+AUTO_UNIVERSE_MIN_PRICE = 1.00
+AUTO_UNIVERSE_MAX_PRICE = 800.00
+AUTO_UNIVERSE_MAX_SPREAD = 0.020
+AUTO_UNIVERSE_CANDIDATE_POOL = ["SOFI","PLTR","F","RIVN","LCID","AAL","NIO","PLUG","OPEN","PFE","T","NVDA","MSFT","AAPL","GOOGL","AMZN","META","AVGO","AMD","XOM","TSLA","MARA","RIOT","COIN","HOOD","SHOP","SQ","PYPL","UBER","ABNB","DKNG","RBLX","SNAP","ROKU","BABA","INTC","MU","BAC","C","WFC","GM","CCL","DAL","UAL","DIS","NKE","WMT","CVS","KO","JPM"]
+
 # =========================
 # CLIENTS
 # =========================
@@ -1303,6 +1319,16 @@ def should_stall_exit(position: Dict[str, Any]):
 # =========================
 def refresh_universe_if_needed(force=False):
     global current_universe, last_universe_refresh_ts
+
+    if AUTO_UNIVERSE_ENABLED:
+        try:
+            result = build_weekly_universe(force=force)
+            if result.get("ok"):
+                last_universe_refresh_ts = time.time()
+                return
+        except Exception as e:
+            print(f"AUTO UNIVERSE ERROR: {e}")
+
     now = time.time()
     if not force and (now - last_universe_refresh_ts) < UNIVERSE_REFRESH_SECONDS:
         return
@@ -1614,6 +1640,29 @@ def init_db():
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_closed_trades_symbol
         ON closed_trades(symbol)
+    """)
+
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS weekly_universe (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            week_start TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            score REAL,
+            reason TEXT,
+            status TEXT DEFAULT 'active',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(week_start, symbol)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS universe_refresh_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            refreshed_at TEXT NOT NULL,
+            week_start TEXT NOT NULL,
+            symbols TEXT,
+            reason TEXT
+        )
     """)
 
     conn.commit()
@@ -2557,6 +2606,7 @@ def optimiser_payload():
     return {
         "enabled": PROFIT_OPTIMIZER_ENABLED,
         "autoImproveEnabled": AUTO_IMPROVE_ENABLED,
+        "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
         "buyBlocked": blocked,
         "blockReason": reason,
         "dailyProfitTarget": DAILY_PROFIT_TARGET,
@@ -2569,6 +2619,173 @@ def optimiser_payload():
         "autoBoostMultiplier": AUTO_BOOST_MULTIPLIER,
         "autoReduceMultiplier": AUTO_REDUCE_MULTIPLIER,
     }
+
+
+# =========================
+# WEEKLY AUTO UNIVERSE ROTATION
+# =========================
+def week_start_str(dt=None):
+    dt = dt or datetime.now(UTC)
+    monday = dt - timedelta(days=dt.weekday())
+    return monday.strftime("%Y-%m-%d")
+
+def get_weekly_universe_from_db(week_start=None):
+    if not SQLITE_ENABLED:
+        return []
+    week_start = week_start or week_start_str()
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute("SELECT symbol, score, reason, status FROM weekly_universe WHERE week_start=? AND status='active' ORDER BY score DESC", (week_start,)).fetchall()
+        conn.close()
+        return [{"symbol": r["symbol"], "score": r["score"], "reason": r["reason"], "status": r["status"]} for r in rows]
+    except Exception as e:
+        print(f"WEEKLY UNIVERSE READ ERROR: {e}")
+        return []
+
+def get_last_universe_refresh():
+    if not SQLITE_ENABLED:
+        return None
+    try:
+        init_db()
+        conn = db_connect()
+        row = conn.execute("SELECT refreshed_at FROM universe_refresh_log ORDER BY refreshed_at DESC LIMIT 1").fetchone()
+        conn.close()
+        return row["refreshed_at"] if row else None
+    except Exception:
+        return None
+
+def save_weekly_universe(rows, reason="weekly refresh"):
+    if not SQLITE_ENABLED:
+        return
+    week = week_start_str()
+    init_db()
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE weekly_universe SET status='removed' WHERE week_start=?", (week,))
+    for r in rows:
+        cur.execute("INSERT OR REPLACE INTO weekly_universe (week_start, symbol, score, reason, status) VALUES (?, ?, ?, ?, 'active')", (week, r["symbol"], float(r.get("score") or 0), r.get("reason", "")))
+    cur.execute("INSERT INTO universe_refresh_log (refreshed_at, week_start, symbols, reason) VALUES (?, ?, ?, ?)", (datetime.now(UTC).isoformat(), week, ",".join([r["symbol"] for r in rows]), reason))
+    conn.commit()
+    conn.close()
+
+def should_refresh_weekly_universe(force=False):
+    if force:
+        return True
+    if not AUTO_UNIVERSE_ENABLED:
+        return False
+    if not get_weekly_universe_from_db():
+        return True
+    last = get_last_universe_refresh()
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+        if (datetime.now(UTC) - last_dt).total_seconds() / 3600 < AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH:
+            return False
+    except Exception:
+        pass
+    return datetime.now(UTC).weekday() == AUTO_UNIVERSE_REFRESH_DAY
+
+def _memory_for_symbol(symbol):
+    try:
+        for row in analytics_payload().get("bestStocks", []) + analytics_payload().get("worstStocks", []):
+            if row.get("symbol") == symbol:
+                return row
+    except Exception:
+        pass
+    return {"symbol": symbol, "trades": 0, "winRate": 0, "totalPnl": 0, "totalPnlGbp": 0, "trust": "NEW"}
+
+def score_candidate_symbol(symbol):
+    symbol = symbol.upper()
+    score = 1.0
+    reasons = []
+    mem = _memory_for_symbol(symbol)
+    trades = int(mem.get("trades") or 0)
+    win_rate = float(mem.get("winRate") or 0)
+    pnl = float(mem.get("totalPnl") or 0)
+    if trades:
+        score += min(trades, 10) * 0.4 + win_rate * 8 + max(-5, min(5, pnl)) * 0.6
+        reasons.append(f"history trades={trades} winRate={win_rate:.2f} pnl=${pnl:.2f}")
+    else:
+        reasons.append("new candidate")
+    if trades >= 4 and win_rate <= AUTO_UNIVERSE_REMOVE_LOSER_MAX_WINRATE and pnl <= AUTO_UNIVERSE_REMOVE_LOSER_MAX_PNL:
+        score -= 20
+        reasons.append("penalty weak history")
+    if AUTO_UNIVERSE_KEEP_WINNERS and trades >= 2 and win_rate >= AUTO_UNIVERSE_KEEP_WINNER_MIN_WINRATE and pnl >= AUTO_UNIVERSE_KEEP_WINNER_MIN_PNL:
+        score += 12
+        reasons.append("protected winner")
+    try:
+        q = get_quote(symbol)
+        price = float(q["mid"])
+        spread = float(q["spread"])
+        if AUTO_UNIVERSE_MIN_PRICE <= price <= AUTO_UNIVERSE_MAX_PRICE:
+            score += 2
+            reasons.append(f"price ok ${price:.2f}")
+        else:
+            score -= 15
+            reasons.append(f"price out of range ${price:.2f}")
+        if spread <= AUTO_UNIVERSE_MAX_SPREAD:
+            score += max(0, 4 - spread * 200)
+            reasons.append(f"spread ok {spread:.4f}")
+        else:
+            score -= 10
+            reasons.append(f"spread wide {spread:.4f}")
+    except Exception:
+        score -= 3
+        reasons.append("quote unavailable")
+    try:
+        qty, _ = get_position(symbol)
+        if qty > DUST_THRESHOLD:
+            score += 8
+            reasons.append("currently held")
+    except Exception:
+        pass
+    return {"symbol": symbol, "score": round(score, 4), "reason": " | ".join(reasons)}
+
+def build_weekly_universe(force=False):
+    global current_universe
+    if not AUTO_UNIVERSE_ENABLED:
+        return {"ok": False, "message": "Auto universe disabled", "symbols": current_universe}
+    if not should_refresh_weekly_universe(force):
+        active = get_weekly_universe_from_db()
+        if active:
+            current_universe = [r["symbol"] for r in active]
+            for s in current_universe:
+                ensure_symbol_state(s, custom=s in custom_symbols)
+            return {"ok": True, "message": "Weekly universe already fresh", "symbols": current_universe, "rows": active}
+    pool = list(dict.fromkeys(AUTO_UNIVERSE_CANDIDATE_POOL + list(custom_symbols.keys()) + list(current_universe)))
+    scored = []
+    for symbol in pool:
+        try:
+            scored.append(score_candidate_symbol(symbol))
+        except Exception as e:
+            print(f"UNIVERSE SCORE ERROR {symbol}: {e}")
+    scored.sort(key=lambda r: r["score"], reverse=True)
+    chosen = []
+    seen = set()
+    for r in scored:
+        if len(chosen) >= AUTO_UNIVERSE_SIZE:
+            break
+        if r["symbol"] in seen or r["score"] <= -5:
+            continue
+        chosen.append(r)
+        seen.add(r["symbol"])
+    for symbol in SAFE_UNIVERSE:
+        if len(chosen) >= AUTO_UNIVERSE_SIZE:
+            break
+        if symbol not in seen:
+            chosen.append({"symbol": symbol, "score": 0, "reason": "fallback safe universe"})
+            seen.add(symbol)
+    save_weekly_universe(chosen, "forced refresh" if force else "weekly refresh")
+    current_universe = [r["symbol"] for r in chosen]
+    for s in current_universe:
+        ensure_symbol_state(s, custom=s in custom_symbols)
+    return {"ok": True, "message": f"Weekly universe updated with {len(current_universe)} symbols", "symbols": current_universe, "rows": chosen}
+
+def auto_universe_payload():
+    active = get_weekly_universe_from_db()
+    return {"enabled": AUTO_UNIVERSE_ENABLED, "size": AUTO_UNIVERSE_SIZE, "weekStart": week_start_str(), "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe), "rows": active, "lastRefresh": get_last_universe_refresh(), "candidatePoolSize": len(AUTO_UNIVERSE_CANDIDATE_POOL), "keepWinners": AUTO_UNIVERSE_KEEP_WINNERS}
 
 # =========================
 # STATUS
@@ -2604,6 +2821,7 @@ def build_status_payload(bot_name, scans):
         "mode": "SNIPER_CONFIDENCE_MEMORY_TIMELINE_GBP",
         "market": market_status,
         "fx": fx_payload(),
+        "autoUniverse": auto_universe_payload(),
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
         "strictOneCyclePerStockPerDay": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
@@ -2617,6 +2835,7 @@ def build_status_payload(bot_name, scans):
         "profitOptimizerEnabled": PROFIT_OPTIMIZER_ENABLED,
         "analyticsEnabled": ANALYTICS_ENABLED,
         "autoImproveEnabled": AUTO_IMPROVE_ENABLED,
+        "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
         "fastExitModeEnabled": FAST_EXIT_MODE_ENABLED,
         "partialProfitEnabled": PARTIAL_PROFIT_ENABLED,
         "partialProfitTriggerPct": PARTIAL_PROFIT_TRIGGER_PCT,
@@ -2868,6 +3087,16 @@ def backfill_trades_limited(request: Request):
     verify_api_key(request)
     with bot_lock:
         result = backfill_trades_from_alpaca()
+        update_status(BOT_NAME, latest_scans)
+        return result
+
+
+
+@app.post("/refresh-universe")
+def refresh_universe(request: Request):
+    verify_api_key(request)
+    with bot_lock:
+        result = build_weekly_universe(force=True)
         update_status(BOT_NAME, latest_scans)
         return result
 
