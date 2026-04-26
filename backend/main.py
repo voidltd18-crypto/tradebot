@@ -2622,6 +2622,7 @@ def optimiser_payload():
     }
 
 
+
 # =========================
 # WEEKLY AUTO UNIVERSE ROTATION
 # =========================
@@ -2630,19 +2631,6 @@ def week_start_str(dt=None):
     monday = dt - timedelta(days=dt.weekday())
     return monday.strftime("%Y-%m-%d")
 
-def get_weekly_universe_from_db(week_start=None):
-    if not SQLITE_ENABLED:
-        return []
-    week_start = week_start or week_start_str()
-    try:
-        init_db()
-        conn = db_connect()
-        rows = conn.execute("SELECT symbol, score, reason, status FROM weekly_universe WHERE week_start=? AND status='active' ORDER BY score DESC", (week_start,)).fetchall()
-        conn.close()
-        return [{"symbol": r["symbol"], "score": r["score"], "reason": r["reason"], "status": r["status"]} for r in rows]
-    except Exception as e:
-        print(f"WEEKLY UNIVERSE READ ERROR: {e}")
-        return []
 
 def get_last_universe_refresh():
     if not SQLITE_ENABLED:
@@ -2650,11 +2638,39 @@ def get_last_universe_refresh():
     try:
         init_db()
         conn = db_connect()
-        row = conn.execute("SELECT refreshed_at FROM universe_refresh_log ORDER BY refreshed_at DESC LIMIT 1").fetchone()
+        row = conn.execute("""
+            SELECT refreshed_at FROM universe_refresh_log
+            ORDER BY refreshed_at DESC
+            LIMIT 1
+        """).fetchone()
         conn.close()
         return row["refreshed_at"] if row else None
     except Exception:
         return None
+
+
+def get_weekly_universe_from_db(week_start=None):
+    if not SQLITE_ENABLED:
+        return []
+    week_start = week_start or week_start_str()
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute("""
+            SELECT symbol, score, reason, status
+            FROM weekly_universe
+            WHERE week_start = ? AND status = 'active'
+            ORDER BY score DESC
+        """, (week_start,)).fetchall()
+        conn.close()
+        return [
+            {"symbol": r["symbol"], "score": r["score"], "reason": r["reason"], "status": r["status"]}
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"WEEKLY UNIVERSE READ ERROR: {e}")
+        return []
+
 
 def save_weekly_universe(rows, reason="weekly refresh"):
     if not SQLITE_ENABLED:
@@ -2664,11 +2680,25 @@ def save_weekly_universe(rows, reason="weekly refresh"):
     conn = db_connect()
     cur = conn.cursor()
     cur.execute("UPDATE weekly_universe SET status='removed' WHERE week_start=?", (week,))
+
     for r in rows:
-        cur.execute("INSERT OR REPLACE INTO weekly_universe (week_start, symbol, score, reason, status) VALUES (?, ?, ?, ?, 'active')", (week, r["symbol"], float(r.get("score") or 0), r.get("reason", "")))
-    cur.execute("INSERT INTO universe_refresh_log (refreshed_at, week_start, symbols, reason) VALUES (?, ?, ?, ?)", (datetime.now(UTC).isoformat(), week, ",".join([r["symbol"] for r in rows]), reason))
+        cur.execute("""
+            INSERT OR REPLACE INTO weekly_universe (week_start, symbol, score, reason, status)
+            VALUES (?, ?, ?, ?, 'active')
+        """, (week, r["symbol"], float(r.get("score") or 0), r.get("reason", "")))
+
+    cur.execute("""
+        INSERT INTO universe_refresh_log (refreshed_at, week_start, symbols, reason)
+        VALUES (?, ?, ?, ?)
+    """, (
+        datetime.now(UTC).isoformat(),
+        week,
+        ",".join([r["symbol"] for r in rows]),
+        reason,
+    ))
     conn.commit()
     conn.close()
+
 
 def should_refresh_weekly_universe(force=False):
     if force:
@@ -2677,116 +2707,213 @@ def should_refresh_weekly_universe(force=False):
         return False
     if not get_weekly_universe_from_db():
         return True
+
     last = get_last_universe_refresh()
     if not last:
         return True
+
     try:
         last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
-        if (datetime.now(UTC) - last_dt).total_seconds() / 3600 < AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH:
+        hours = (datetime.now(UTC) - last_dt).total_seconds() / 3600
+        if hours < AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH:
             return False
     except Exception:
         pass
+
     return datetime.now(UTC).weekday() == AUTO_UNIVERSE_REFRESH_DAY
 
-def _memory_for_symbol(symbol):
+
+def universe_rows_from_stock_memory():
+    """
+    Build a visible top-12 watchlist directly from the already-working stock memory.
+    This is intentionally based on closed-trade performance so the panel always lines up
+    with what the user sees in Stock Memory.
+    """
+    rows = []
+
     try:
-        for row in analytics_payload().get("bestStocks", []) + analytics_payload().get("worstStocks", []):
-            if row.get("symbol") == symbol:
-                return row
+        memory = stock_memory_from_closed_trades()
     except Exception:
-        pass
-    return {"symbol": symbol, "trades": 0, "winRate": 0, "totalPnl": 0, "totalPnlGbp": 0, "trust": "NEW"}
+        try:
+            memory = stock_memory_from_db()
+        except Exception:
+            memory = []
+
+    for m in memory:
+        symbol = str(m.get("symbol", "")).upper()
+        if not symbol:
+            continue
+
+        trades = int(m.get("trades") or 0)
+        win_rate = float(m.get("winRate") or 0.0)
+        avg_pnl = float(m.get("avgPnl") or 0.0)
+        total_pnl = float(m.get("totalPnl") or 0.0)
+        trust = str(m.get("trust") or "NEW")
+
+        # Balanced score: rewards enough history, high win-rate, positive average PnL,
+        # and good total PnL. Penalises weak performers.
+        score = 0.0
+        score += min(trades, 20) * 0.6
+        score += win_rate * 12.0
+        score += avg_pnl * 3.0
+        score += max(-10.0, min(10.0, total_pnl)) * 0.5
+
+        if trust.upper() == "GOOD":
+            score += 5.0
+        elif trust.upper() == "BAD":
+            score -= 8.0
+
+        reason = (
+            f"trust {trust} | trades={trades} | "
+            f"winRate={win_rate*100:.2f}% | avgPnL=${avg_pnl:.2f} | totalPnL=${total_pnl:.2f}"
+        )
+
+        rows.append({
+            "symbol": symbol,
+            "score": round(score, 4),
+            "reason": reason,
+            "status": "active",
+        })
+
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    return rows
+
 
 def score_candidate_symbol(symbol):
+    """
+    Fallback/new-candidate scoring for symbols not yet in stock memory.
+    """
     symbol = symbol.upper()
     score = 1.0
-    reasons = []
-    mem = _memory_for_symbol(symbol)
-    trades = int(mem.get("trades") or 0)
-    win_rate = float(mem.get("winRate") or 0)
-    pnl = float(mem.get("totalPnl") or 0)
-    if trades:
-        score += min(trades, 10) * 0.4 + win_rate * 8 + max(-5, min(5, pnl)) * 0.6
-        reasons.append(f"history trades={trades} winRate={win_rate:.2f} pnl=${pnl:.2f}")
-    else:
-        reasons.append("new candidate")
-    if trades >= 4 and win_rate <= AUTO_UNIVERSE_REMOVE_LOSER_MAX_WINRATE and pnl <= AUTO_UNIVERSE_REMOVE_LOSER_MAX_PNL:
-        score -= 20
-        reasons.append("penalty weak history")
-    if AUTO_UNIVERSE_KEEP_WINNERS and trades >= 2 and win_rate >= AUTO_UNIVERSE_KEEP_WINNER_MIN_WINRATE and pnl >= AUTO_UNIVERSE_KEEP_WINNER_MIN_PNL:
-        score += 12
-        reasons.append("protected winner")
+    reasons = ["candidate pool"]
+
     try:
         q = get_quote(symbol)
         price = float(q["mid"])
         spread = float(q["spread"])
-        if AUTO_UNIVERSE_MIN_PRICE <= price <= AUTO_UNIVERSE_MAX_PRICE:
-            score += 2
+
+        if 1 <= price <= 800:
+            score += 2.0
             reasons.append(f"price ok ${price:.2f}")
         else:
-            score -= 15
+            score -= 10.0
             reasons.append(f"price out of range ${price:.2f}")
-        if spread <= AUTO_UNIVERSE_MAX_SPREAD:
-            score += max(0, 4 - spread * 200)
+
+        if spread <= 0.02:
+            score += max(0.0, 4.0 - spread * 200)
             reasons.append(f"spread ok {spread:.4f}")
         else:
-            score -= 10
+            score -= 5.0
             reasons.append(f"spread wide {spread:.4f}")
     except Exception:
-        score -= 3
+        score -= 2.0
         reasons.append("quote unavailable")
+
     try:
         qty, _ = get_position(symbol)
         if qty > DUST_THRESHOLD:
-            score += 8
+            score += 8.0
             reasons.append("currently held")
     except Exception:
         pass
-    return {"symbol": symbol, "score": round(score, 4), "reason": " | ".join(reasons)}
+
+    return {"symbol": symbol, "score": round(score, 4), "reason": " | ".join(reasons), "status": "active"}
+
 
 def build_weekly_universe(force=False):
     global current_universe
+
     if not AUTO_UNIVERSE_ENABLED:
         return {"ok": False, "message": "Auto universe disabled", "symbols": current_universe}
-    if not should_refresh_weekly_universe(force):
+
+    if not should_refresh_weekly_universe(force=force):
         active = get_weekly_universe_from_db()
         if active:
             current_universe = [r["symbol"] for r in active]
             for s in current_universe:
                 ensure_symbol_state(s, custom=s in custom_symbols)
             return {"ok": True, "message": "Weekly universe already fresh", "symbols": current_universe, "rows": active}
-    pool = list(dict.fromkeys(AUTO_UNIVERSE_CANDIDATE_POOL + list(custom_symbols.keys()) + list(current_universe)))
-    scored = []
-    for symbol in pool:
-        try:
-            scored.append(score_candidate_symbol(symbol))
-        except Exception as e:
-            print(f"UNIVERSE SCORE ERROR {symbol}: {e}")
-    scored.sort(key=lambda r: r["score"], reverse=True)
+
+    rows = universe_rows_from_stock_memory()
+
+    # Add currently held symbols so open positions don't disappear from management.
+    held_rows = []
+    try:
+        for p in get_all_positions():
+            symbol = str(p.get("symbol", "")).upper()
+            if symbol and symbol not in [r["symbol"] for r in rows]:
+                held_rows.append({
+                    "symbol": symbol,
+                    "score": 20.0,
+                    "reason": "currently held position",
+                    "status": "active",
+                })
+    except Exception:
+        pass
+
+    combined = held_rows + rows
+
+    # Fill empty slots with candidate pool.
+    existing = {r["symbol"] for r in combined}
+    for symbol in AUTO_UNIVERSE_CANDIDATE_POOL:
+        if len(combined) >= AUTO_UNIVERSE_SIZE * 2:
+            break
+        if symbol not in existing:
+            combined.append(score_candidate_symbol(symbol))
+            existing.add(symbol)
+
+    combined.sort(key=lambda r: r["score"], reverse=True)
+
     chosen = []
     seen = set()
-    for r in scored:
+    for r in combined:
         if len(chosen) >= AUTO_UNIVERSE_SIZE:
             break
-        if r["symbol"] in seen or r["score"] <= -5:
+        if r["symbol"] in seen:
             continue
         chosen.append(r)
         seen.add(r["symbol"])
-    for symbol in SAFE_UNIVERSE:
-        if len(chosen) >= AUTO_UNIVERSE_SIZE:
-            break
-        if symbol not in seen:
-            chosen.append({"symbol": symbol, "score": 0, "reason": "fallback safe universe"})
-            seen.add(symbol)
+
+    if not chosen:
+        chosen = [{"symbol": s, "score": 0, "reason": "fallback safe universe", "status": "active"} for s in SAFE_UNIVERSE[:AUTO_UNIVERSE_SIZE]]
+
     save_weekly_universe(chosen, "forced refresh" if force else "weekly refresh")
     current_universe = [r["symbol"] for r in chosen]
+
     for s in current_universe:
         ensure_symbol_state(s, custom=s in custom_symbols)
-    return {"ok": True, "message": f"Weekly universe updated with {len(current_universe)} symbols", "symbols": current_universe, "rows": chosen}
+
+    return {
+        "ok": True,
+        "message": f"Weekly universe updated with {len(current_universe)} symbols",
+        "symbols": current_universe,
+        "rows": chosen,
+    }
+
 
 def auto_universe_payload():
     active = get_weekly_universe_from_db()
-    return {"enabled": AUTO_UNIVERSE_ENABLED, "size": AUTO_UNIVERSE_SIZE, "weekStart": week_start_str(), "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe), "rows": active, "lastRefresh": get_last_universe_refresh(), "candidatePoolSize": len(AUTO_UNIVERSE_CANDIDATE_POOL), "keepWinners": AUTO_UNIVERSE_KEEP_WINNERS}
+
+    # If DB has not been populated yet but stock memory exists, show live preview.
+    if not active:
+        preview = universe_rows_from_stock_memory()[:AUTO_UNIVERSE_SIZE]
+        active = preview
+
+    return {
+        "enabled": AUTO_UNIVERSE_ENABLED,
+        "size": AUTO_UNIVERSE_SIZE,
+        "weekStart": week_start_str(),
+        "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe),
+        "rows": active,
+        "lastRefresh": get_last_universe_refresh(),
+        "candidatePoolSize": len(AUTO_UNIVERSE_CANDIDATE_POOL),
+        "keepWinners": True,
+    }
+
+
+@app.get("/weekly-universe")
+def weekly_universe_public():
+    return auto_universe_payload()
 
 # =========================
 # STATUS
