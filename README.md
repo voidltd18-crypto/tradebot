@@ -1,20 +1,24 @@
-# Weekly Auto Universe + Collapsible Controls Package
+# Final Mobile Trading Bot Package
 
-Adds:
+This is the full drop-in package for GitHub upload.
+
+Includes:
+- Working Alpaca full order backfill
+- SQLite trade memory
+- Matched BUY → SELL closed trades
+- GBP conversion
+- Profit optimiser
+- Analytics dashboard
+- Auto-improve logic
 - Weekly Auto Universe Rotation
-- Top 12 weekly active stocks
-- Keeps proven winners
-- Removes weak performers
-- Stores chosen universe in SQLite
-- Dashboard panel showing selected tickers and reasons
-- Collapsible dashboard controls:
-  - Main Controls
-  - Safety Controls
-  - Data & Maintenance Tools
+- Visible Weekly Auto Universe panel
+- Collapsible mobile-friendly control sections
+- Timeline fallback to closed trades
 
 Deploy:
 Render build: pip install -r backend/requirements.txt
 Render start: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
 
-Keep persistent DB:
+Recommended env:
 SQLITE_DB_FILE=/var/data/trades.db
+DASHBOARD_API_KEY=your-password
