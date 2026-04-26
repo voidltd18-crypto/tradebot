@@ -1,15 +1,20 @@
-# Profit Optimiser + Analytics + Auto-Improve Package
+# Weekly Auto Universe + Collapsible Controls Package
 
-Includes:
-- Profit optimiser with daily target/loss guardrails
-- Analytics dashboard with profit factor and average win/loss
-- Best and worst stocks
-- Auto-blacklist, auto-reduce, and auto-boost based on matched closed trades
-- Builds on your working SQLite + full Alpaca backfill system
+Adds:
+- Weekly Auto Universe Rotation
+- Top 12 weekly active stocks
+- Keeps proven winners
+- Removes weak performers
+- Stores chosen universe in SQLite
+- Dashboard panel showing selected tickers and reasons
+- Collapsible dashboard controls:
+  - Main Controls
+  - Safety Controls
+  - Data & Maintenance Tools
 
-Render:
-Build: pip install -r backend/requirements.txt
-Start: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+Deploy:
+Render build: pip install -r backend/requirements.txt
+Render start: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
 
 Keep persistent DB:
 SQLITE_DB_FILE=/var/data/trades.db
