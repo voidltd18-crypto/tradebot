@@ -132,6 +132,19 @@ function DualMoney({
   );
 }
 
+
+function CollapsibleSection({ title, defaultOpen = false, children }: { title: string; defaultOpen?: boolean; children: React.ReactNode }) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div style={{ ...panel, marginBottom: 12 }}>
+      <button onClick={() => setOpen(!open)} style={{ width: "100%", textAlign: "left", padding: "12px 14px", borderRadius: 14, border: "1px solid rgba(255,255,255,0.12)", background: "#020617", color: "white", cursor: "pointer", fontWeight: 800, fontSize: 16 }}>
+        {open ? "▼" : "▶"} {title}
+      </button>
+      {open && <div style={{ marginTop: 12 }}>{children}</div>}
+    </div>
+  );
+}
+
 export default function App() {
   const [data, setData] = useState<any>(null);
   const [status, setStatus] = useState("Connecting...");
@@ -312,35 +325,36 @@ export default function App() {
 <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(250,204,21,0.45)" }}>
               <h3>Strategy Modes</h3>
               <p style={{ color: "#facc15", fontWeight: 700 }}>
-                Sniper {data.sniperModeEnabled ? "ON" : "OFF"} · A+ Gate {data.aPlusGateEnabled ? "ON" : "OFF"} · Optimiser {data.profitOptimizerEnabled ? "ON" : "OFF"} · Analytics {data.analyticsEnabled ? "ON" : "OFF"} · Auto-Improve {data.autoImproveEnabled ? "ON" : "OFF"} · PDT-Aware {data.pdtAwareModeEnabled ? "ON" : "OFF"}
+                Sniper {data.sniperModeEnabled ? "ON" : "OFF"} · A+ Gate {data.aPlusGateEnabled ? "ON" : "OFF"} · Optimiser {data.profitOptimizerEnabled ? "ON" : "OFF"} · Analytics {data.analyticsEnabled ? "ON" : "OFF"} · Auto-Improve {data.autoImproveEnabled ? "ON" : "OFF"} · Auto Universe {data.autoUniverseEnabled ? "ON" : "OFF"} · PDT-Aware {data.pdtAwareModeEnabled ? "ON" : "OFF"}
               </p>
             </div>
           </>
         )}
 
-        <div style={{ ...panel, marginBottom: 12 }}>
-          <h3>Controls</h3>
-          <button style={btn("#2563eb")} onClick={fetchData}>Refresh</button>
-          <button style={btn("#0f766e")} onClick={() => action("/backfill-trades")}>Full Backfill ALL Alpaca Orders</button>
-          <button style={btn("#0d9488")} onClick={() => action("/rebuild-closed-trades")}>Rebuild PnL Matching</button>
+        <CollapsibleSection title="Main Controls" defaultOpen={true}>
+          <button style={btn("#2563eb")} onClick={fetchData}>Refresh Data</button>
           <button style={btn("#16a34a")} onClick={() => action("/manual-buy")}>Money Buy</button>
-          <button style={btn("#dc2626")} onClick={() => action("/manual-sell")}>Sell Worst</button>
-          <button style={btn("#7f1d1d")} onClick={() => action("/emergency-sell")}>EMERGENCY SELL ALL</button>
-          <button style={btn("#9333ea")} onClick={() => action("/pause")}>Pause</button>
-          <button style={btn("#0891b2")} onClick={() => action("/resume")}>Resume</button>
-          <button style={btn("#f59e0b")} onClick={() => action("/manual-override/on")}>Override ON</button>
-          <button style={btn("#4b5563")} onClick={() => action("/manual-override/off")}>Override OFF</button>
-
           <div style={{ marginTop: 12 }}>
-            <input
-              value={customTicker}
-              onChange={(e) => setCustomTicker(e.target.value.toUpperCase())}
-              placeholder="Ticker e.g. AMD"
-              style={{ padding: 11, borderRadius: 12, background: "#020617", color: "white", border: "1px solid rgba(255,255,255,0.18)", minWidth: 160 }}
-            />
+            <input value={customTicker} onChange={(e) => setCustomTicker(e.target.value.toUpperCase())} placeholder="Ticker e.g. AMD" style={{ padding: 11, borderRadius: 12, background: "#020617", color: "white", border: "1px solid rgba(255,255,255,0.18)", minWidth: 160 }} />
             <button style={btn("#22c55e")} onClick={customBuy}>Buy Custom</button>
           </div>
-        </div>
+        </CollapsibleSection>
+
+        <CollapsibleSection title="Safety Controls">
+          <button style={btn("#dc2626")} onClick={() => action("/manual-sell")}>Sell Worst</button>
+          <button style={btn("#7f1d1d")} onClick={() => action("/emergency-sell")}>EMERGENCY SELL ALL</button>
+          <button style={btn("#9333ea")} onClick={() => action("/pause")}>Pause Bot</button>
+          <button style={btn("#0891b2")} onClick={() => action("/resume")}>Resume Bot</button>
+          <button style={btn("#f59e0b")} onClick={() => action("/manual-override/on")}>Manual Override ON</button>
+          <button style={btn("#4b5563")} onClick={() => action("/manual-override/off")}>Manual Override OFF</button>
+        </CollapsibleSection>
+
+        <CollapsibleSection title="Data & Maintenance Tools">
+          <button style={btn("#0f766e")} onClick={() => action("/backfill-trades")}>Full Backfill ALL Alpaca Orders</button>
+          <button style={btn("#0d9488")} onClick={() => action("/rebuild-closed-trades")}>Rebuild PnL Matching</button>
+          <button style={btn("#0ea5e9")} onClick={() => action("/refresh-universe")}>Refresh Weekly Universe</button>
+          <p style={{ color: "#94a3b8", marginTop: 8 }}>Use these when importing order history, rebuilding analytics, or forcing the weekly stock list to refresh.</p>
+        </CollapsibleSection>
 
         {!data && <p>Loading...</p>}
 
