@@ -233,6 +233,17 @@ export default function App() {
     setCustomTicker("");
   };
 
+
+  const timelineSource = useMemo(() => {
+    const raw = Array.isArray(data?.tradeTimeline) && data.tradeTimeline.length
+      ? data.tradeTimeline
+      : Array.isArray(data?.closedTrades)
+        ? data.closedTrades
+        : [];
+
+    return raw;
+  }, [data]);
+
   const selectedScan: Scan | undefined = useMemo(() => {
     if (!scans.length) return undefined;
     return scans.find((s) => s.symbol === selectedSymbol) || scans[0];
