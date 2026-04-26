@@ -333,6 +333,31 @@ export default function App() {
               </p>
             </div>
 
+
+        {data && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(14,165,233,0.55)" }}>
+            <h3>Weekly Auto Universe</h3>
+            <p style={{ color: "#38bdf8", fontWeight: 700 }}>
+              {data.autoUniverse?.enabled ? "ON" : "OFF"} · Week {data.autoUniverse?.weekStart || "—"} · Active {data.autoUniverse?.activeSymbols?.length || 0}/{data.autoUniverse?.size || 12}
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              These are the stocks the bot is prioritising this week. It keeps winners, removes weak performers, and refreshes weekly or when you press Refresh Weekly Universe.
+            </p>
+            {(data.autoUniverse?.rows || []).length === 0 && (
+              <p style={{ color: "#facc15" }}>No weekly universe yet. Open Data & Maintenance Tools, then press Refresh Weekly Universe.</p>
+            )}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 8 }}>
+              {(data.autoUniverse?.rows || []).slice(0, 12).map((r: any) => (
+                <div key={r.symbol} style={{ background: "#020617", borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,0.08)" }}>
+                  <b style={{ fontSize: 18 }}>{r.symbol}</b>
+                  <div style={{ color: "#38bdf8", fontWeight: 700 }}>Score {Number(r.score || 0).toFixed(2)}</div>
+                  <div style={{ color: "#94a3b8", fontSize: 12 }}>{r.reason}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
 <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(250,204,21,0.45)" }}>
               <h3>Strategy Modes</h3>
               <p style={{ color: "#facc15", fontWeight: 700 }}>
