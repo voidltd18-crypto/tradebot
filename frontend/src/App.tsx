@@ -244,6 +244,35 @@ export default function App() {
     return raw;
   }, [data]);
 
+
+  const universeDisplayRows = useMemo(() => {
+    const rows = Array.isArray(data?.autoUniverse?.rows) ? data.autoUniverse.rows : [];
+    const symbols = Array.isArray(data?.autoUniverse?.activeSymbols) ? data.autoUniverse.activeSymbols : [];
+    const seen = new Set<string>();
+    const merged: any[] = [];
+
+    for (const r of rows) {
+      const sym = String(r?.symbol || "").toUpperCase();
+      if (!sym || seen.has(sym)) continue;
+      merged.push(r);
+      seen.add(sym);
+    }
+
+    for (const symRaw of symbols) {
+      const sym = String(symRaw || "").toUpperCase();
+      if (!sym || seen.has(sym)) continue;
+      merged.push({
+        symbol: sym,
+        score: 0,
+        reason: "active weekly universe symbol",
+        status: "active",
+      });
+      seen.add(sym);
+    }
+
+    return merged.slice(0, data?.autoUniverse?.size || 20);
+  }, [data]);
+
   const selectedScan: Scan | undefined = useMemo(() => {
     if (!scans.length) return undefined;
     return scans.find((s) => s.symbol === selectedSymbol) || scans[0];
@@ -356,14 +385,14 @@ export default function App() {
             <p style={{ color: "#94a3b8" }}>
               These are the stocks the bot is prioritising this week. It keeps winners, removes weak performers, and refreshes weekly or when you press Refresh Weekly Universe.
             </p>
-            {(data.autoUniverse?.rows || []).length === 0 && (
+            {universeDisplayRows.length === 0 && (
               <p style={{ color: "#facc15" }}>No weekly universe yet. Open Data & Maintenance Tools, then press Refresh Weekly Universe.</p>
             )}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 8 }}>
-              {(data.autoUniverse?.rows || []).slice(0, 20).map((r: any) => (
+              {universeDisplayRows.map((r: any) => (
                 <div key={r.symbol} style={{ background: "#020617", borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,0.08)" }}>
                   <b style={{ fontSize: 18 }}>{r.symbol}</b>
-                  <div style={{ color: "#38bdf8", fontWeight: 700 }}>Score {Number(r.score || 0).toFixed(2)}</div>
+                  <div style={{ color: "#38bdf8", fontWeight: 700 }}>{Number(r.score || 0) > 0 ? `Score ${Number(r.score || 0).toFixed(2)}` : 'Active symbol'}</div>
                   <div style={{ color: "#94a3b8", fontSize: 12 }}>{r.reason}</div>
                 </div>
               ))}
