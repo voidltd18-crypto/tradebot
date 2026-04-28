@@ -121,10 +121,6 @@ function DualMoney({
   gbpValue?: number;
   rate: number;
 }) {
-
-  const marketLabel = liveMarket?.label || data?.market?.label || (data?.market?.isOpen ? "OPEN" : "CLOSED");
-  const marketIsOpen = liveMarket?.isOpen ?? data?.market?.isOpen;
-
   return (
     <>
       <b>{usd(usdValue)}</b>
@@ -150,12 +146,20 @@ function CollapsibleSection({ title, defaultOpen = false, children }: { title: s
 }
 
 export default function App() {
+  const [data, setData] = useState<any>(null);
+  const [status, setStatus] = useState("Connecting...");
+  const [message, setMessage] = useState("");
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem("dashboard_api_key") || "");
+  const [customTicker, setCustomTicker] = useState("");
+  const [selectedSymbol, setSelectedSymbol] = useState("");
+  const [timelineRange, setTimelineRange] = useState("day");
+  const [chartCurrency, setChartCurrency] = useState<"USD" | "GBP">("GBP");
 
   const [liveMarket, setLiveMarket] = useState<any>(null);
 
   const fetchLiveMarketStatus = async () => {
     try {
-      const res = await fetch(`${API_BASE}/market-status`);
+      const res = await fetch(`${API_URL}/market-status`);
       const json = await res.json();
       setLiveMarket(json);
     } catch {
@@ -169,16 +173,6 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
-
-  const [data, setData] = useState<any>(null);
-  const [status, setStatus] = useState("Connecting...");
-  const [message, setMessage] = useState("");
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem("dashboard_api_key") || "");
-  const [customTicker, setCustomTicker] = useState("");
-  const [selectedSymbol, setSelectedSymbol] = useState("");
-  const [timelineRange, setTimelineRange] = useState("day");
-  const [chartCurrency, setChartCurrency] = useState<"USD" | "GBP">("GBP");
-
   const scans: Scan[] = Array.isArray(data?.scans) ? data.scans : [];
   const positions: Position[] = Array.isArray(data?.positions) ? data.positions : [];
   const trades: Trade[] = Array.isArray(data?.trades) ? data.trades : [];
@@ -188,6 +182,9 @@ export default function App() {
   const alpacaRejectionEvents: any[] = Array.isArray(data?.alpacaRejectionEvents) ? data.alpacaRejectionEvents : [];
   const pdtWarningEvents: any[] = Array.isArray(data?.pdtWarningEvents) ? data.pdtWarningEvents : [];
   const rate = Number(data?.fx?.usdToGbp || 0.78);
+
+  const marketLabel = liveMarket?.label || data?.market?.label || (data?.market?.isOpen ? "OPEN" : "CLOSED");
+  const marketIsOpen = liveMarket?.isOpen ?? data?.market?.isOpen;
 
   const fetchData = async () => {
     try {
