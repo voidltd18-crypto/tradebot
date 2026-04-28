@@ -155,24 +155,6 @@ export default function App() {
   const [timelineRange, setTimelineRange] = useState("day");
   const [chartCurrency, setChartCurrency] = useState<"USD" | "GBP">("GBP");
 
-  const [liveMarket, setLiveMarket] = useState<any>(null);
-
-  const fetchLiveMarketStatus = async () => {
-    try {
-      const res = await fetch(`${API_URL}/market-status`);
-      const json = await res.json();
-      setLiveMarket(json);
-    } catch {
-      setLiveMarket(null);
-    }
-  };
-
-  useEffect(() => {
-    fetchLiveMarketStatus();
-    const timer = setInterval(fetchLiveMarketStatus, 10000);
-    return () => clearInterval(timer);
-  }, []);
-
   const scans: Scan[] = Array.isArray(data?.scans) ? data.scans : [];
   const positions: Position[] = Array.isArray(data?.positions) ? data.positions : [];
   const trades: Trade[] = Array.isArray(data?.trades) ? data.trades : [];
@@ -182,9 +164,6 @@ export default function App() {
   const alpacaRejectionEvents: any[] = Array.isArray(data?.alpacaRejectionEvents) ? data.alpacaRejectionEvents : [];
   const pdtWarningEvents: any[] = Array.isArray(data?.pdtWarningEvents) ? data.pdtWarningEvents : [];
   const rate = Number(data?.fx?.usdToGbp || 0.78);
-
-  const marketLabel = liveMarket?.label || data?.market?.label || (data?.market?.isOpen ? "OPEN" : "CLOSED");
-  const marketIsOpen = liveMarket?.isOpen ?? data?.market?.isOpen;
 
   const fetchData = async () => {
     try {
@@ -265,35 +244,6 @@ export default function App() {
     return raw;
   }, [data]);
 
-
-  const universeDisplayRows = useMemo(() => {
-    const rows = Array.isArray(data?.autoUniverse?.rows) ? data.autoUniverse.rows : [];
-    const symbols = Array.isArray(data?.autoUniverse?.activeSymbols) ? data.autoUniverse.activeSymbols : [];
-    const seen = new Set<string>();
-    const merged: any[] = [];
-
-    for (const r of rows) {
-      const sym = String(r?.symbol || "").toUpperCase();
-      if (!sym || seen.has(sym)) continue;
-      merged.push(r);
-      seen.add(sym);
-    }
-
-    for (const symRaw of symbols) {
-      const sym = String(symRaw || "").toUpperCase();
-      if (!sym || seen.has(sym)) continue;
-      merged.push({
-        symbol: sym,
-        score: 0,
-        reason: "active weekly universe symbol",
-        status: "active",
-      });
-      seen.add(sym);
-    }
-
-    return merged.slice(0, data?.autoUniverse?.size || 20);
-  }, [data]);
-
   const selectedScan: Scan | undefined = useMemo(() => {
     if (!scans.length) return undefined;
     return scans.find((s) => s.symbol === selectedSymbol) || scans[0];
@@ -357,20 +307,7 @@ export default function App() {
           {message && <span style={{ color: "#facc15", marginLeft: 8 }}>{message}</span>}
         </div>
 
-        
         {data && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: marketIsOpen ? "rgba(34,197,94,0.55)" : "rgba(249,115,22,0.55)" }}>
-            <h3>Live Market Clock</h3>
-            <p style={{ color: marketIsOpen ? "#22c55e" : "#f97316", fontWeight: 700 }}>
-              Market {marketLabel} · source {liveMarket?.source || "status"}
-            </p>
-            <p style={{ color: "#94a3b8" }}>
-              Next open: {liveMarket?.nextOpen || data.market?.nextOpen || "—"} · Next close: {liveMarket?.nextClose || data.market?.nextClose || "—"}
-            </p>
-          </div>
-        )}
-
-{data && (
           <>
             <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.45)" }}>
               <h3>GBP Conversion</h3>
@@ -397,49 +334,23 @@ export default function App() {
             </div>
 
 
-        
-        
         {data && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(16,185,129,0.65)" }}>
-            <h3>Phase 3 Scaling + Compounding</h3>
-            <p style={{ color: "#10b981", fontWeight: 700 }}>
-              {data.phase3?.enabled ? "ON" : "OFF"} · Total size x{Number(data.phase3?.totalSizeMultiplier || 1).toFixed(2)} · Loss protection {data.phase3?.lossProtectionActive ? "ACTIVE" : "ready"}
-            </p>
-            <p style={{ color: "#94a3b8" }}>
-              Capital scaling x{Number(data.phase3?.capitalMultiplier || 1).toFixed(2)} · Compounding x{Number(data.phase3?.compoundingMultiplier || 1).toFixed(2)} · Adjusted confidence {Number(data.phase3?.adjustedMinConfidence || 0).toFixed(2)} · Early cut {Number(data.phase3?.adjustedEarlyLossCutPct || -2.5).toFixed(1)}%
-            </p>
-          </div>
-        )}
-
-{data && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,211,238,0.60)" }}>
-            <h3>Phase 2 Profit Filter</h3>
-            <p style={{ color: "#22d3ee", fontWeight: 700 }}>
-              {data.phase2?.enabled ? "ON" : "OFF"} · Universe {data.phase2?.universeSize || 20} · Max positions {data.phase2?.maxPositions || 20}
-            </p>
-            <p style={{ color: "#94a3b8" }}>
-              New entries require confidence ≥ {Number(data.phase2?.minConfidence || 0).toFixed(2)}, quality ≥ {Number(data.phase2?.minQuality || 0).toFixed(3)}, and tight spread. Early loss cut: {Number(data.phase2?.earlyLossCutPct || -2.5).toFixed(1)}%.
-            </p>
-          </div>
-        )}
-
-{data && (
           <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(14,165,233,0.55)" }}>
             <h3>Weekly Auto Universe</h3>
             <p style={{ color: "#38bdf8", fontWeight: 700 }}>
-              {data.autoUniverse?.enabled ? "ON" : "OFF"} · Week {data.autoUniverse?.weekStart || "—"} · Active {data.autoUniverse?.activeSymbols?.length || 0}/{data.autoUniverse?.size || 20}
+              {data.autoUniverse?.enabled ? "ON" : "OFF"} · Week {data.autoUniverse?.weekStart || "—"} · Active {data.autoUniverse?.activeSymbols?.length || 0}/{data.autoUniverse?.size || 12}
             </p>
             <p style={{ color: "#94a3b8" }}>
               These are the stocks the bot is prioritising this week. It keeps winners, removes weak performers, and refreshes weekly or when you press Refresh Weekly Universe.
             </p>
-            {universeDisplayRows.length === 0 && (
+            {(data.autoUniverse?.rows || []).length === 0 && (
               <p style={{ color: "#facc15" }}>No weekly universe yet. Open Data & Maintenance Tools, then press Refresh Weekly Universe.</p>
             )}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 8 }}>
-              {universeDisplayRows.map((r: any) => (
+              {(data.autoUniverse?.rows || []).slice(0, 12).map((r: any) => (
                 <div key={r.symbol} style={{ background: "#020617", borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,0.08)" }}>
                   <b style={{ fontSize: 18 }}>{r.symbol}</b>
-                  <div style={{ color: "#38bdf8", fontWeight: 700 }}>{Number(r.score || 0) > 0 ? `Score ${Number(r.score || 0).toFixed(2)}` : 'Active symbol'}</div>
+                  <div style={{ color: "#38bdf8", fontWeight: 700 }}>Score {Number(r.score || 0).toFixed(2)}</div>
                   <div style={{ color: "#94a3b8", fontSize: 12 }}>{r.reason}</div>
                 </div>
               ))}
@@ -589,7 +500,7 @@ export default function App() {
                     <div key={s.symbol} style={{ background: s.aPlusPass || s.sniperPass ? "rgba(22,163,74,0.18)" : "#020617", borderRadius: 14, padding: 12, marginBottom: 8 }}>
                       <b>{s.symbol}</b> | {usd(s.price)} / {gbpFromUsd(s.price, rate)} | trigger {usd(s.trigger)} | spread {(Number(s.spread || 0) * 100).toFixed(2)}%
                       <br />
-                      quality {(s.qualityScore || 0).toFixed(4)} | confidence {(s.confidence || 0).toFixed(2)} {s.confidenceLabel} | {(s as any).optimiserDecision?.action || "NORMAL"} | {(s as any).phase2EntryPass ? "PHASE2 PASS" : `PHASE2 WAIT: ${(s as any).phase2EntryReason || ""}`} | {(s.aPlusPass || s.sniperPass) ? "PASS" : `WAIT: ${s.aPlusReason || s.sniperReason || "not ready"}`}
+                      quality {(s.qualityScore || 0).toFixed(4)} | confidence {(s.confidence || 0).toFixed(2)} {s.confidenceLabel} | {(s as any).optimiserDecision?.action || "NORMAL"} | {(s.aPlusPass || s.sniperPass) ? "PASS" : `WAIT: ${s.aPlusReason || s.sniperReason || "not ready"}`}
                     </div>
                   ))}
                 </>
