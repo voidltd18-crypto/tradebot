@@ -2945,6 +2945,23 @@ def auto_universe_payload():
         preview = universe_rows_from_stock_memory()[:AUTO_UNIVERSE_SIZE]
         active = preview
 
+    # ALL20_ROWS_PADDING_FIX
+    try:
+        existing = {str(r.get("symbol", "")).upper() for r in active}
+        source_symbols = list(current_universe) if "current_universe" in globals() else []
+        for sym in source_symbols:
+            sym = str(sym).upper()
+            if sym and sym not in existing and len(active) < AUTO_UNIVERSE_SIZE:
+                active.append({
+                    "symbol": sym,
+                    "score": 0,
+                    "reason": "active weekly universe symbol",
+                    "status": "active",
+                })
+                existing.add(sym)
+    except Exception:
+        pass
+
     return {
         "enabled": AUTO_UNIVERSE_ENABLED,
         "size": AUTO_UNIVERSE_SIZE,
