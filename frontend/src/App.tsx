@@ -364,7 +364,20 @@ export default function App() {
 
 
         
+        
         {data && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(16,185,129,0.65)" }}>
+            <h3>Phase 3 Scaling + Compounding</h3>
+            <p style={{ color: "#10b981", fontWeight: 700 }}>
+              {data.phase3?.enabled ? "ON" : "OFF"} · Total size x{Number(data.phase3?.totalSizeMultiplier || 1).toFixed(2)} · Loss protection {data.phase3?.lossProtectionActive ? "ACTIVE" : "ready"}
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              Capital scaling x{Number(data.phase3?.capitalMultiplier || 1).toFixed(2)} · Compounding x{Number(data.phase3?.compoundingMultiplier || 1).toFixed(2)} · Adjusted confidence {Number(data.phase3?.adjustedMinConfidence || 0).toFixed(2)} · Early cut {Number(data.phase3?.adjustedEarlyLossCutPct || -2.5).toFixed(1)}%
+            </p>
+          </div>
+        )}
+
+{data && (
           <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,211,238,0.60)" }}>
             <h3>Phase 2 Profit Filter</h3>
             <p style={{ color: "#22d3ee", fontWeight: 700 }}>
