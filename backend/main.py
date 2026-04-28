@@ -271,6 +271,37 @@ PHASE2_MAX_POSITION_PCT = 0.16
 PHASE2_WINNER_BOOST_ENABLED = True
 PHASE2_WINNER_BOOST_MULT = 1.25
 
+
+# Phase 3 Scaling + Compounding + Loss Protection
+PHASE3_SCALING_COMPOUNDING_ENABLED = True
+
+# Automatic capital growth scaling
+CAPITAL_SCALING_ENABLED = True
+CAPITAL_SCALE_250_MULT = 1.00
+CAPITAL_SCALE_300_MULT = 1.10
+CAPITAL_SCALE_400_MULT = 1.20
+CAPITAL_SCALE_500_MULT = 1.35
+CAPITAL_SCALE_750_MULT = 1.50
+CAPITAL_SCALE_1000_MULT = 1.75
+CAPITAL_SCALE_1500_MULT = 2.00
+
+# Profit compounding mode
+PROFIT_COMPOUNDING_ENABLED = True
+COMPOUNDING_PROFIT_FACTOR_MIN = 1.10
+COMPOUNDING_WIN_RATE_MIN = 0.52
+COMPOUNDING_BOOST_MULT = 1.10
+COMPOUNDING_MAX_BOOST_MULT = 1.25
+
+# Risk tightening after losses
+LOSS_PROTECTION_ENABLED = True
+LOSS_PROTECTION_WIN_RATE_CUTOFF = 0.45
+LOSS_PROTECTION_PROFIT_FACTOR_CUTOFF = 0.90
+LOSS_PROTECTION_DAILY_LOSS_CUTOFF = -3.00
+LOSS_PROTECTION_SIZE_MULT = 0.65
+LOSS_PROTECTION_CONFIDENCE_ADD = 0.08
+LOSS_PROTECTION_QUALITY_ADD = 0.015
+LOSS_PROTECTION_EARLY_LOSS_CUT_PCT = -1.80
+
 # =========================
 # CLIENTS
 # =========================
@@ -2995,11 +3026,14 @@ def phase2_entry_passes(scan: Dict[str, Any]):
     quality = float(scan.get("quality_score") or scan.get("qualityScore") or 0.0)
     spread = float(scan.get("spread") or 0.0)
 
-    if confidence < PHASE2_MIN_CONFIDENCE:
-        return False, f"confidence {confidence:.2f} below {PHASE2_MIN_CONFIDENCE:.2f}"
+    adj_confidence, adj_quality = phase3_adjusted_entry_thresholds()
+    # PHASE3_ENTRY_THRESHOLD_PATCH
 
-    if quality < PHASE2_MIN_QUALITY:
-        return False, f"quality {quality:.4f} below {PHASE2_MIN_QUALITY:.4f}"
+    if confidence < adj_confidence:
+        return False, f"confidence {confidence:.2f} below {adj_confidence:.2f}"
+
+    if quality < adj_quality:
+        return False, f"quality {quality:.4f} below {adj_quality:.4f}"
 
     if spread > PHASE2_MAX_SPREAD:
         return False, f"spread {spread:.4f} above {PHASE2_MAX_SPREAD:.4f}"
@@ -3046,6 +3080,8 @@ def phase2_dynamic_base_notional(symbol: str = ""):
     notional = base * mult
     notional = min(notional, equity * PHASE2_MAX_POSITION_PCT)
     notional = min(notional, max(0.0, buying_power - CASH_BUFFER))
+    notional = phase3_scaled_notional(notional)
+    # PHASE3_NOTIONAL_PATCH
     return round(max(0.0, notional), 2)
 
 
@@ -3112,8 +3148,10 @@ def phase2_early_loss_should_sell(position: Dict[str, Any]):
     if minutes < PHASE2_EARLY_LOSS_MIN_HOLD_MINUTES:
         return False, ""
 
-    if pnl_pct <= PHASE2_EARLY_LOSS_CUT_PCT:
-        return True, f"PHASE 2 EARLY LOSS CUT {pnl_pct:.2f}%"
+    adjusted_cut = phase3_adjusted_early_loss_cut()
+    # PHASE3_LOSS_CUT_PATCH
+    if pnl_pct <= adjusted_cut:
+        return True, f"PHASE 3 LOSS PROTECTION CUT {pnl_pct:.2f}%"
 
     return False, ""
 
@@ -3135,6 +3173,156 @@ def phase2_payload():
         "maxPositionPct": PHASE2_MAX_POSITION_PCT,
         "winnerBoost": PHASE2_WINNER_BOOST_ENABLED,
         "winnerBoostMultiplier": PHASE2_WINNER_BOOST_MULT,
+    }
+
+
+# =========================
+# PHASE 3 SCALING / COMPOUNDING / LOSS PROTECTION
+# =========================
+def phase3_account_equity():
+    try:
+        return float(get_account().equity)
+    except Exception:
+        return 0.0
+
+
+def phase3_analytics():
+    try:
+        return analytics_payload()
+    except Exception:
+        return {}
+
+
+def phase3_capital_scaling_multiplier():
+    if not CAPITAL_SCALING_ENABLED:
+        return 1.0
+
+    equity = phase3_account_equity()
+
+    if equity >= 1500:
+        return CAPITAL_SCALE_1500_MULT
+    if equity >= 1000:
+        return CAPITAL_SCALE_1000_MULT
+    if equity >= 750:
+        return CAPITAL_SCALE_750_MULT
+    if equity >= 500:
+        return CAPITAL_SCALE_500_MULT
+    if equity >= 400:
+        return CAPITAL_SCALE_400_MULT
+    if equity >= 300:
+        return CAPITAL_SCALE_300_MULT
+    if equity >= 250:
+        return CAPITAL_SCALE_250_MULT
+
+    return 0.90
+
+
+def phase3_compounding_multiplier():
+    if not PROFIT_COMPOUNDING_ENABLED:
+        return 1.0
+
+    analytics = phase3_analytics()
+    win_rate = float(analytics.get("winRate") or 0.0)
+    profit_factor = float(analytics.get("profitFactor") or 0.0)
+    total_pnl = float(analytics.get("totalPnl") or analytics.get("realisedPnl") or analytics.get("realizedPnl") or 0.0)
+
+    if total_pnl > 0 and win_rate >= COMPOUNDING_WIN_RATE_MIN and profit_factor >= COMPOUNDING_PROFIT_FACTOR_MIN:
+        return min(COMPOUNDING_MAX_BOOST_MULT, COMPOUNDING_BOOST_MULT)
+
+    return 1.0
+
+
+def phase3_loss_protection_active():
+    if not LOSS_PROTECTION_ENABLED:
+        return False
+
+    analytics = phase3_analytics()
+    win_rate = float(analytics.get("winRate") or 0.0)
+    profit_factor = float(analytics.get("profitFactor") or 0.0)
+
+    try:
+        account = get_account()
+        # prefer live day pnl from status if available elsewhere; this is defensive
+        day_pnl = float(getattr(account, "equity", 0)) - float(getattr(account, "last_equity", getattr(account, "equity", 0)))
+    except Exception:
+        day_pnl = 0.0
+
+    # If analytics not mature yet, don't over-trigger.
+    total_trades = int(analytics.get("closedTrades") or analytics.get("trades") or 0)
+    if total_trades >= 10 and (win_rate < LOSS_PROTECTION_WIN_RATE_CUTOFF or profit_factor < LOSS_PROTECTION_PROFIT_FACTOR_CUTOFF):
+        return True
+
+    if day_pnl <= LOSS_PROTECTION_DAILY_LOSS_CUTOFF:
+        return True
+
+    return False
+
+
+def phase3_total_size_multiplier():
+    if not PHASE3_SCALING_COMPOUNDING_ENABLED:
+        return 1.0
+
+    mult = phase3_capital_scaling_multiplier()
+    mult *= phase3_compounding_multiplier()
+
+    if phase3_loss_protection_active():
+        mult *= LOSS_PROTECTION_SIZE_MULT
+
+    return max(0.40, min(mult, 2.50))
+
+
+def phase3_adjusted_entry_thresholds():
+    confidence = PHASE2_MIN_CONFIDENCE if "PHASE2_MIN_CONFIDENCE" in globals() else 0.75
+    quality = PHASE2_MIN_QUALITY if "PHASE2_MIN_QUALITY" in globals() else 0.040
+
+    if phase3_loss_protection_active():
+        confidence += LOSS_PROTECTION_CONFIDENCE_ADD
+        quality += LOSS_PROTECTION_QUALITY_ADD
+
+    return confidence, quality
+
+
+def phase3_adjusted_early_loss_cut():
+    if phase3_loss_protection_active():
+        return LOSS_PROTECTION_EARLY_LOSS_CUT_PCT
+    return PHASE2_EARLY_LOSS_CUT_PCT if "PHASE2_EARLY_LOSS_CUT_PCT" in globals() else -2.50
+
+
+def phase3_scaled_notional(notional: float):
+    if not PHASE3_SCALING_COMPOUNDING_ENABLED:
+        return notional
+
+    try:
+        equity = float(get_account().equity)
+        buying_power = float(get_account().buying_power)
+    except Exception:
+        return notional
+
+    scaled = float(notional) * phase3_total_size_multiplier()
+
+    max_pct = PHASE2_MAX_POSITION_PCT if "PHASE2_MAX_POSITION_PCT" in globals() else 0.16
+    scaled = min(scaled, equity * max_pct)
+    scaled = min(scaled, max(0.0, buying_power - CASH_BUFFER))
+
+    return round(max(0.0, scaled), 2)
+
+
+def phase3_payload():
+    analytics = phase3_analytics()
+    return {
+        "enabled": PHASE3_SCALING_COMPOUNDING_ENABLED,
+        "capitalScaling": CAPITAL_SCALING_ENABLED,
+        "capitalMultiplier": phase3_capital_scaling_multiplier(),
+        "profitCompounding": PROFIT_COMPOUNDING_ENABLED,
+        "compoundingMultiplier": phase3_compounding_multiplier(),
+        "lossProtection": LOSS_PROTECTION_ENABLED,
+        "lossProtectionActive": phase3_loss_protection_active(),
+        "totalSizeMultiplier": phase3_total_size_multiplier(),
+        "adjustedMinConfidence": phase3_adjusted_entry_thresholds()[0],
+        "adjustedMinQuality": phase3_adjusted_entry_thresholds()[1],
+        "adjustedEarlyLossCutPct": phase3_adjusted_early_loss_cut(),
+        "winRate": float(analytics.get("winRate") or 0.0),
+        "profitFactor": float(analytics.get("profitFactor") or 0.0),
     }
 
 # =========================
@@ -3173,6 +3361,7 @@ def build_status_payload(bot_name, scans):
         "fx": fx_payload(),
         "autoUniverse": auto_universe_payload(),
         "phase2": phase2_payload(),
+        "phase3": phase3_payload(),
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
         "strictOneCyclePerStockPerDay": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
