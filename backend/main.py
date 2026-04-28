@@ -3325,6 +3325,47 @@ def phase3_payload():
         "profitFactor": float(analytics.get("profitFactor") or 0.0),
     }
 
+
+# =========================
+# LIVE MARKET STATUS FIX
+# =========================
+def live_market_clock_payload():
+    try:
+        clock = trading_client.get_clock() if "trading_client" in globals() else api.get_clock()
+        is_open = bool(getattr(clock, "is_open", False))
+
+        def clean_dt(x):
+            try:
+                return x.isoformat()
+            except Exception:
+                return str(x) if x is not None else None
+
+        return {
+            "ok": True,
+            "isOpen": is_open,
+            "label": "OPEN" if is_open else "CLOSED",
+            "timestamp": clean_dt(getattr(clock, "timestamp", None)),
+            "nextOpen": clean_dt(getattr(clock, "next_open", None)),
+            "nextClose": clean_dt(getattr(clock, "next_close", None)),
+            "source": "alpaca_clock_live",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "isOpen": False,
+            "label": "UNKNOWN",
+            "timestamp": datetime.now(UTC).isoformat(),
+            "nextOpen": None,
+            "nextClose": None,
+            "source": "alpaca_clock_error",
+            "error": str(e),
+        }
+
+
+@app.get("/market-status")
+def market_status_endpoint():
+    return live_market_clock_payload()
+
 # =========================
 # STATUS
 # =========================
