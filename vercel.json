@@ -1,8 +1,0 @@
-{
-  "rewrites": [
-    {
-      "source": "/market-status",
-      "destination": "/api/market-status"
-    }
-  ]
-}
