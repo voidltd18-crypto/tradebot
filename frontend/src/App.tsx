@@ -121,6 +121,10 @@ function DualMoney({
   gbpValue?: number;
   rate: number;
 }) {
+
+  const marketLabel = liveMarket?.label || data?.market?.label || (data?.market?.isOpen ? "OPEN" : "CLOSED");
+  const marketIsOpen = liveMarket?.isOpen ?? data?.market?.isOpen;
+
   return (
     <>
       <b>{usd(usdValue)}</b>
@@ -146,6 +150,26 @@ function CollapsibleSection({ title, defaultOpen = false, children }: { title: s
 }
 
 export default function App() {
+
+  const [liveMarket, setLiveMarket] = useState<any>(null);
+
+  const fetchLiveMarketStatus = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/market-status`);
+      const json = await res.json();
+      setLiveMarket(json);
+    } catch {
+      setLiveMarket(null);
+    }
+  };
+
+  useEffect(() => {
+    fetchLiveMarketStatus();
+    const timer = setInterval(fetchLiveMarketStatus, 10000);
+    return () => clearInterval(timer);
+  }, []);
+
+
   const [data, setData] = useState<any>(null);
   const [status, setStatus] = useState("Connecting...");
   const [message, setMessage] = useState("");
@@ -336,7 +360,20 @@ export default function App() {
           {message && <span style={{ color: "#facc15", marginLeft: 8 }}>{message}</span>}
         </div>
 
+        
         {data && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: marketIsOpen ? "rgba(34,197,94,0.55)" : "rgba(249,115,22,0.55)" }}>
+            <h3>Live Market Clock</h3>
+            <p style={{ color: marketIsOpen ? "#22c55e" : "#f97316", fontWeight: 700 }}>
+              Market {marketLabel} · source {liveMarket?.source || "status"}
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              Next open: {liveMarket?.nextOpen || data.market?.nextOpen || "—"} · Next close: {liveMarket?.nextClose || data.market?.nextClose || "—"}
+            </p>
+          </div>
+        )}
+
+{data && (
           <>
             <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.45)" }}>
               <h3>GBP Conversion</h3>
