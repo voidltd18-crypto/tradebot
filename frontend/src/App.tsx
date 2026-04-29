@@ -365,6 +365,19 @@ export default function App() {
           </div>
         )}
 
+
+        {data && data.eliteMode && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(168,85,247,0.75)" }}>
+            <h3>Elite Mode</h3>
+            <p style={{ color: "#a855f7", fontWeight: 700 }}>
+              {data.eliteMode?.enabled ? "ON" : "OFF"} · Loss cut {Number(data.eliteMode?.lossCutPct || 0).toFixed(2)}% after {Number(data.eliteMode?.lossCutMinutes || 0).toFixed(0)}m · Hard cut {Number(data.eliteMode?.hardLossCutPct || 0).toFixed(2)}%
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              Protect winners from {Number(data.eliteMode?.profitProtectStartPct || 0).toFixed(2)}% · Trail {Number(data.eliteMode?.trailDistancePct || 0).toFixed(2)}% · Fast take {Number(data.eliteMode?.fastProfitTakePct || 0).toFixed(2)}%
+            </p>
+          </div>
+        )}
+
 {data && (
           <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(14,165,233,0.55)" }}>
             <h3>Weekly Auto Universe</h3>
