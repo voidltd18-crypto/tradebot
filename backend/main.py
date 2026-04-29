@@ -266,7 +266,7 @@ AUTO_UNIVERSE_CANDIDATE_POOL = ["SOFI","PLTR","F","RIVN","LCID","AAL","NIO","PLU
 
 # Aggressive Profit Taking Upgrade
 AGGRESSIVE_PROFIT_TAKING_ENABLED = True
-AGGRESSIVE_TRAIL_START_PCT = 0.60
+AGGRESSIVE_TRAIL_START_PCT = ELITE_PROFIT_PROTECT_START_PCT if ELITE_MODE_ENABLED else 1.20
 AGGRESSIVE_TRAIL_DISTANCE_PCT = 0.65
 AGGRESSIVE_SMALL_PROFIT_TAKE_PCT = 1.20
 AGGRESSIVE_SMALL_PROFIT_MIN_HOLD_MINUTES = 12
@@ -278,6 +278,23 @@ AGGRESSIVE_STALE_MAX_PNL_PCT = 0.20
 AGGRESSIVE_EOD_PROTECTION_ENABLED = True
 AGGRESSIVE_EOD_MINUTES_BEFORE_CLOSE = 20
 AGGRESSIVE_EOD_MIN_PROFIT_PCT = 0.25
+
+
+# Elite Mode Risk + Profit Engine
+ELITE_MODE_ENABLED = True
+ELITE_LOSS_CUT_PCT = -1.80
+ELITE_LOSS_CUT_MINUTES = 5
+ELITE_HARD_LOSS_CUT_PCT = -3.00
+ELITE_PROFIT_PROTECT_START_PCT = 0.55
+ELITE_TRAIL_DISTANCE_PCT = 0.55
+ELITE_FAST_PROFIT_TAKE_PCT = 1.50
+ELITE_FAST_PROFIT_MINUTES = 10
+ELITE_STALE_EXIT_ENABLED = True
+ELITE_STALE_EXIT_MINUTES = 60
+ELITE_STALE_EXIT_MAX_PNL_PCT = 0.15
+ELITE_EOD_LOCK_ENABLED = True
+ELITE_EOD_MINUTES_BEFORE_CLOSE = 30
+ELITE_EOD_LOCK_MIN_PNL_PCT = 0.10
 
 # =========================
 # CLIENTS
@@ -1485,6 +1502,17 @@ def manage_money_mode_positions():
                 print(f"SELL ERROR {symbol}: {e}")
             continue
         # AGGRESSIVE_EXIT_PATCH
+
+        elite_sell, elite_reason = elite_exit_decision(position)
+        if elite_sell:
+            try:
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason=elite_reason)
+                state[symbol]["highest_since_entry"] = None
+                print(f"{elite_reason} SELL {qty:.6f} {symbol}")
+            except Exception as e:
+                print(f"SELL ERROR {symbol}: {e}")
+            continue
+        # ELITE_EXIT_PATCH
 
         if price <= stop_price:
             try:
@@ -3233,6 +3261,64 @@ def aggressive_profit_payload():
         "minutesUntilClose": aggressive_minutes_until_close(),
     }
 
+
+# =========================
+# ELITE MODE EXIT ENGINE
+# =========================
+def elite_minutes_until_close():
+    try:
+        clock = trading_client.get_clock() if "trading_client" in globals() else api.get_clock()
+        next_close = getattr(clock, "next_close", None)
+        if not next_close:
+            return 999999
+        now = datetime.now(UTC)
+        if getattr(next_close, "tzinfo", None) is None:
+            next_close = next_close.replace(tzinfo=UTC)
+        return max(0, (next_close - now).total_seconds() / 60)
+    except Exception:
+        return 999999
+
+
+def elite_exit_decision(position: Dict[str, Any]):
+    if not ELITE_MODE_ENABLED:
+        return False, ""
+
+    symbol = str(position.get("symbol", ""))
+    pnl_pct = float(position.get("pnlPct") or 0.0)
+    minutes = float(position.get("minutesSinceBuy") or 0.0)
+
+    if pnl_pct <= ELITE_HARD_LOSS_CUT_PCT:
+        return True, f"ELITE HARD LOSS CUT {symbol} {pnl_pct:.2f}%"
+
+    if minutes >= ELITE_LOSS_CUT_MINUTES and pnl_pct <= ELITE_LOSS_CUT_PCT:
+        return True, f"ELITE LOSS CUT {symbol} {pnl_pct:.2f}%"
+
+    if minutes >= ELITE_FAST_PROFIT_MINUTES and pnl_pct >= ELITE_FAST_PROFIT_TAKE_PCT:
+        return True, f"ELITE FAST PROFIT TAKE {symbol} {pnl_pct:.2f}%"
+
+    if ELITE_STALE_EXIT_ENABLED and minutes >= ELITE_STALE_EXIT_MINUTES and pnl_pct <= ELITE_STALE_EXIT_MAX_PNL_PCT:
+        return True, f"ELITE STALE EXIT {symbol} {pnl_pct:.2f}% after {minutes:.0f}m"
+
+    if ELITE_EOD_LOCK_ENABLED and elite_minutes_until_close() <= ELITE_EOD_MINUTES_BEFORE_CLOSE and pnl_pct >= ELITE_EOD_LOCK_MIN_PNL_PCT:
+        return True, f"ELITE EOD PROFIT LOCK {symbol} {pnl_pct:.2f}%"
+
+    return False, ""
+
+
+def elite_mode_payload():
+    return {
+        "enabled": ELITE_MODE_ENABLED,
+        "lossCutPct": ELITE_LOSS_CUT_PCT,
+        "lossCutMinutes": ELITE_LOSS_CUT_MINUTES,
+        "hardLossCutPct": ELITE_HARD_LOSS_CUT_PCT,
+        "profitProtectStartPct": ELITE_PROFIT_PROTECT_START_PCT,
+        "trailDistancePct": ELITE_TRAIL_DISTANCE_PCT,
+        "fastProfitTakePct": ELITE_FAST_PROFIT_TAKE_PCT,
+        "staleExitMinutes": ELITE_STALE_EXIT_MINUTES,
+        "eodLock": ELITE_EOD_LOCK_ENABLED,
+        "minutesUntilClose": elite_minutes_until_close(),
+    }
+
 # =========================
 # STATUS
 # =========================
@@ -3270,6 +3356,7 @@ def build_status_payload(bot_name, scans):
         "autoUniverse": auto_universe_payload(),
         "autoDiscovery": auto_discovery_payload(),
         "aggressiveProfitTaking": aggressive_profit_payload(),
+        "eliteMode": elite_mode_payload(),
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
         "strictOneCyclePerStockPerDay": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
