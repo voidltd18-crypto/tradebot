@@ -231,10 +231,20 @@ if PROFIT_OPTIMIZER_ENABLED:
 # Auto Stock Discovery - primary source for weekly universe
 AUTO_DISCOVERY_ENABLED = True
 AUTO_DISCOVERY_SIZE = 20
-AUTO_DISCOVERY_MIN_PRICE = 1.00
-AUTO_DISCOVERY_MAX_PRICE = 800.00
-AUTO_DISCOVERY_MAX_SPREAD = 0.025
+AUTO_DISCOVERY_MIN_PRICE = 0.75
+AUTO_DISCOVERY_MAX_PRICE = 1200.00
+AUTO_DISCOVERY_MAX_SPREAD = 0.040
 AUTO_DISCOVERY_REFRESH_SECONDS = 60 * 60 * 6
+
+
+# Elite Auto Discovery - stronger discovery before fallback
+ELITE_AUTO_DISCOVERY_ENABLED = True
+AUTO_DISCOVERY_ALLOW_FALLBACK = True
+AUTO_DISCOVERY_TARGET_BEFORE_FALLBACK = 20
+AUTO_DISCOVERY_MIN_PRICE = 0.75
+AUTO_DISCOVERY_MAX_PRICE = 1200.00
+AUTO_DISCOVERY_MAX_SPREAD = 0.040
+AUTO_DISCOVERY_MIN_SCORE = 0.50
 
 # SAFE_UNIVERSE is now fallback only
 
@@ -2842,55 +2852,91 @@ auto_discovery_fallback_symbols = []
 
 def get_auto_discovery_seed_symbols():
     """
-    This is only a broad discovery seed, not the final watchlist.
-    The bot scores this pool and automatically chooses the best 20.
-    SAFE_UNIVERSE remains fallback only.
+    Larger liquid discovery seed. This is NOT the final watchlist.
+    The bot scores this pool and picks the best 20 automatically.
     """
     return list(dict.fromkeys([
-        "NVDA","AMD","AAPL","MSFT","META","AMZN","GOOGL","AVGO","TSLA","NFLX",
-        "QCOM","MU","SMCI","ARM","ORCL","CRM","ADBE","INTC","CSCO","IBM",
+        # mega/large cap tech
+        "NVDA","AMD","AAPL","MSFT","META","AMZN","GOOGL","GOOG","AVGO","TSLA",
+        "NFLX","QCOM","MU","SMCI","ARM","ORCL","CRM","ADBE","INTC","CSCO",
+        "IBM","DELL","HPQ","TXN","AMAT","LRCX","MRVL","NOW","PANW","CRWD",
+
+        # high-volume momentum / retail active
         "PLTR","SOFI","RIVN","LCID","NIO","F","GM","AAL","UAL","DAL",
         "MARA","RIOT","COIN","HOOD","SNAP","WBD","PARA","PYPL","UBER","LYFT",
-        "BBAI","SOUN","AI","UPST","AFRM","RBLX","DKNG","SHOP","NET","CRWD",
+        "BBAI","SOUN","AI","UPST","AFRM","RBLX","DKNG","SHOP","NET","ROKU",
+
+        # financials / energy / defensive liquid
+        "BAC","JPM","C","WFC","V","MA","PYPL","SQ","XOM","CVX",
+        "KO","PEP","PFE","MRK","T","VZ","WMT","DIS","NKE","SBUX",
+
+        # smaller active / low priced
         "PLUG","OPEN","NUVB","ONVO","WWR","GITS","BB","AMC","TLRY","CHPT",
-        "KO","PFE","T","XOM","CVX","WMT","DIS","BAC","JPM","V",
-        "TQQQ","SOXL","LABU","SPY","QQQ"
+        "DNA","IONQ","ACHR","JOBY","QS","LAZR","WULF","HUT","BITF","RUN",
+
+        # ETFs - reliable liquidity if individual names are weak
+        "SPY","QQQ","IWM","DIA","TQQQ","SQQQ","SOXL","SOXS","LABU","XLF",
+        "XLK","XLE","XBI","ARKK","KRE"
     ]))
 
 
 def auto_discovery_quote_score(symbol: str):
     """
-    Uses existing get_quote() so no new Alpaca imports are needed.
-    Returns a candidate row or None if quote/price/spread is not acceptable.
+    Elite scoring:
+    - accepts quote or trade fallback
+    - penalises bad spread instead of instantly rejecting unless extreme
+    - boosts strong stock memory
+    - favours liquid/affordable names for small accounts
     """
     symbol = symbol.upper()
+
     try:
         q = get_quote(symbol)
         price = float(q["mid"])
         spread = float(q["spread"])
+        source = "quote"
     except Exception:
+        try:
+            trade = data_client.get_latest_trade(symbol)
+            price = float(getattr(trade, "price", 0) or 0)
+            spread = 0.015
+            source = "trade_fallback"
+        except Exception:
+            return None
+
+    if price <= 0:
         return None
 
     if price < AUTO_DISCOVERY_MIN_PRICE or price > AUTO_DISCOVERY_MAX_PRICE:
         return None
 
-    if spread > AUTO_DISCOVERY_MAX_SPREAD:
+    # Extreme spread still rejected. Mildly wide spread only penalised.
+    if spread > max(AUTO_DISCOVERY_MAX_SPREAD, 0.06):
         return None
 
     score = 0.0
-    reasons = [f"auto discovery | price ${price:.2f} | spread {spread:.4f}"]
+    reasons = [f"elite discovery | ${price:.2f} | spread {spread:.4f} | {source}"]
 
-    # Liquidity proxy: tighter spread = better.
-    score += max(0.0, 10.0 - (spread * 300))
+    # Spread score: tighter is better
+    score += max(0.0, 12.0 - (spread * 220))
 
-    # Small-account usefulness: favour tradable/affordable stocks but avoid junk.
-    if 2 <= price <= 100:
-        score += 4.0
+    # Account-friendly price score
+    if 2 <= price <= 80:
+        score += 6.0
         reasons.append("small-account friendly")
-    elif price <= 250:
+    elif price <= 150:
+        score += 4.0
+    elif price <= 300:
         score += 2.0
+    else:
+        score += 0.5
 
-    # Existing bot memory gives a real edge.
+    # ETF/liquid mega-cap reliability boost
+    if symbol in {"SPY","QQQ","IWM","DIA","TQQQ","SOXL","NVDA","AMD","MSFT","META","AMZN","GOOGL","AAPL","TSLA"}:
+        score += 4.0
+        reasons.append("liquid leader")
+
+    # Existing memory boost
     try:
         mem = get_stock_memory(symbol)
     except Exception:
@@ -2902,20 +2948,23 @@ def auto_discovery_quote_score(symbol: str):
         avg_pnl = float(mem.get("avgPnl") or mem.get("averagePnl") or 0.0)
         total_pnl = float(mem.get("totalPnl") or 0.0)
 
-        score += min(10, trades) * 0.5
-        score += win_rate * 12
-        score += max(-5, min(10, avg_pnl * 2))
-        score += max(-5, min(10, total_pnl * 0.25))
+        score += min(12, trades) * 0.45
+        score += win_rate * 14
+        score += max(-6, min(12, avg_pnl * 2.5))
+        score += max(-8, min(14, total_pnl * 0.30))
         reasons.append(f"memory trades={trades} winRate={win_rate:.2f} pnl=${total_pnl:.2f}")
 
-    # Existing held positions should stay manageable.
+    # Held positions stay visible/manageable
     try:
         qty, _ = get_position(symbol)
         if qty > DUST_THRESHOLD:
-            score += 12
+            score += 15
             reasons.append("currently held")
     except Exception:
         pass
+
+    if score < AUTO_DISCOVERY_MIN_SCORE:
+        return None
 
     return {
         "symbol": symbol,
@@ -2960,9 +3009,9 @@ def discover_best_stocks(force=False):
 
     auto_discovery_fallback_symbols = []
 
-    # Emergency fallback only if discovery can't fill 20.
-    # AUTO_DISCOVERY_FALLBACK_TRACKING_PATCH
-    if len(picked) < AUTO_DISCOVERY_SIZE:
+    # Fallback only if elite discovery cannot fill the target.
+    auto_discovery_fallback_symbols = []
+    if len(picked) < AUTO_DISCOVERY_TARGET_BEFORE_FALLBACK and AUTO_DISCOVERY_ALLOW_FALLBACK:
         for symbol in SAFE_UNIVERSE:
             if symbol not in picked:
                 picked.append(symbol)
@@ -2982,6 +3031,8 @@ def auto_discovery_payload():
     fallback_count = len(auto_discovery_fallback_symbols)
     return {
         "enabled": AUTO_DISCOVERY_ENABLED,
+        "eliteMode": ELITE_AUTO_DISCOVERY_ENABLED,
+        "fallbackAllowed": AUTO_DISCOVERY_ALLOW_FALLBACK,
         "size": AUTO_DISCOVERY_SIZE,
         "symbols": auto_discovered_symbols,
         "lastRefresh": last_auto_discovery_ts,
