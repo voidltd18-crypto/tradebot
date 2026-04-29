@@ -2837,6 +2837,7 @@ def score_candidate_symbol(symbol):
 # =========================
 last_auto_discovery_ts = 0
 auto_discovered_symbols = []
+auto_discovery_fallback_symbols = []
 
 
 def get_auto_discovery_seed_symbols():
@@ -2929,7 +2930,7 @@ def discover_best_stocks(force=False):
     Finds the best 20 automatically.
     This does NOT run at module import; only during universe refresh.
     """
-    global last_auto_discovery_ts, auto_discovered_symbols
+    global last_auto_discovery_ts, auto_discovered_symbols, auto_discovery_fallback_symbols
 
     now = time.time()
     if (
@@ -2957,11 +2958,15 @@ def discover_best_stocks(force=False):
     rows.sort(key=lambda r: r["score"], reverse=True)
     picked = [r["symbol"] for r in rows[:AUTO_DISCOVERY_SIZE]]
 
+    auto_discovery_fallback_symbols = []
+
     # Emergency fallback only if discovery can't fill 20.
+    # AUTO_DISCOVERY_FALLBACK_TRACKING_PATCH
     if len(picked) < AUTO_DISCOVERY_SIZE:
         for symbol in SAFE_UNIVERSE:
             if symbol not in picked:
                 picked.append(symbol)
+                auto_discovery_fallback_symbols.append(symbol)
             if len(picked) >= AUTO_DISCOVERY_SIZE:
                 break
 
@@ -2973,13 +2978,19 @@ def discover_best_stocks(force=False):
 
 
 def auto_discovery_payload():
+    discovered_count = max(0, len(auto_discovered_symbols) - len(auto_discovery_fallback_symbols))
+    fallback_count = len(auto_discovery_fallback_symbols)
     return {
         "enabled": AUTO_DISCOVERY_ENABLED,
         "size": AUTO_DISCOVERY_SIZE,
         "symbols": auto_discovered_symbols,
         "lastRefresh": last_auto_discovery_ts,
-        "seedCount": len(get_auto_discovery_seed_symbols()),
-        "fallbackOnly": False,
+        "seedCount": len(get_auto_discovery_seed_symbols()) if "get_auto_discovery_seed_symbols" in globals() else 0,
+        "discoveredCount": discovered_count,
+        "fallbackCount": fallback_count,
+        "fallbackSymbols": auto_discovery_fallback_symbols,
+        "usingFallback": fallback_count > 0,
+        "fallbackOnly": discovered_count == 0 and fallback_count > 0,
     }
 
 
