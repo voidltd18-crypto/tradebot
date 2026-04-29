@@ -368,7 +368,7 @@ export default function App() {
 
         {data && data.eliteMode && (
           <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(168,85,247,0.75)" }}>
-            <h3>Elite Mode</h3>
+            <h3>Clean Elite Mode</h3>
             <p style={{ color: "#a855f7", fontWeight: 700 }}>
               {data.eliteMode?.enabled ? "ON" : "OFF"} · Loss cut {Number(data.eliteMode?.lossCutPct || 0).toFixed(2)}% after {Number(data.eliteMode?.lossCutMinutes || 0).toFixed(0)}m · Hard cut {Number(data.eliteMode?.hardLossCutPct || 0).toFixed(2)}%
             </p>
