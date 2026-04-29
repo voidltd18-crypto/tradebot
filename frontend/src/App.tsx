@@ -334,7 +334,25 @@ export default function App() {
             </div>
 
 
-        {data && (
+        
+        {data && data.autoDiscovery && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: data.autoDiscovery?.usingFallback ? "rgba(249,115,22,0.65)" : "rgba(34,197,94,0.55)" }}>
+            <h3>Auto Discovery Status</h3>
+            <p style={{ color: data.autoDiscovery?.usingFallback ? "#f97316" : "#22c55e", fontWeight: 700 }}>
+              {data.autoDiscovery?.usingFallback ? "Fallback Used" : "Fully Discovered"} · {data.autoDiscovery?.discoveredCount || 0}/{data.autoDiscovery?.size || 20} discovered · {data.autoDiscovery?.fallbackCount || 0} fallback
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              The bot automatically finds the weekly stock list. Fallback only fills empty slots if discovery cannot find enough valid stocks.
+            </p>
+            {(data.autoDiscovery?.fallbackSymbols || []).length > 0 && (
+              <p style={{ color: "#facc15" }}>
+                Fallback symbols: {(data.autoDiscovery?.fallbackSymbols || []).join(", ")}
+              </p>
+            )}
+          </div>
+        )}
+
+{data && (
           <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(14,165,233,0.55)" }}>
             <h3>Weekly Auto Universe</h3>
             <p style={{ color: "#38bdf8", fontWeight: 700 }}>
