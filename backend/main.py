@@ -228,15 +228,15 @@ if PROFIT_OPTIMIZER_ENABLED:
 
 
 
-# Auto Stock Discovery - primary universe source
+# Auto Stock Discovery - primary source for weekly universe
 AUTO_DISCOVERY_ENABLED = True
 AUTO_DISCOVERY_SIZE = 20
-AUTO_DISCOVERY_REFRESH_SECONDS = 60 * 60 * 6
 AUTO_DISCOVERY_MIN_PRICE = 1.00
 AUTO_DISCOVERY_MAX_PRICE = 800.00
 AUTO_DISCOVERY_MAX_SPREAD = 0.025
-AUTO_DISCOVERY_MIN_VOLUME = 500000
-AUTO_DISCOVERY_LOOKBACK_DAYS = 5
+AUTO_DISCOVERY_REFRESH_SECONDS = 60 * 60 * 6
+
+# SAFE_UNIVERSE is now fallback only
 
 # Weekly Auto Universe Rotation
 AUTO_UNIVERSE_ENABLED = True
@@ -263,7 +263,7 @@ data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
 # =========================
 # STATE
 # =========================
-current_universe = list(dict.fromkeys(discover_best_stocks(force=force)))
+current_universe = list(dict.fromkeys(SAFE_UNIVERSE))
 state: Dict[str, Dict[str, Any]] = {}
 
 for symbol in current_universe:
@@ -1343,7 +1343,7 @@ def refresh_universe_if_needed(force=False):
     now = time.time()
     if not force and (now - last_universe_refresh_ts) < UNIVERSE_REFRESH_SECONDS:
         return
-    current_universe = list(dict.fromkeys(discover_best_stocks(force=force) + list(custom_symbols.keys())))
+    current_universe = list(dict.fromkeys(SAFE_UNIVERSE + list(custom_symbols.keys())))
     for s in current_universe:
         ensure_symbol_state(s, custom=s in custom_symbols)
     last_universe_refresh_ts = now
@@ -2831,6 +2831,158 @@ def score_candidate_symbol(symbol):
     return {"symbol": symbol, "score": round(score, 4), "reason": " | ".join(reasons), "status": "active"}
 
 
+
+# =========================
+# AUTO STOCK DISCOVERY
+# =========================
+last_auto_discovery_ts = 0
+auto_discovered_symbols = []
+
+
+def get_auto_discovery_seed_symbols():
+    """
+    This is only a broad discovery seed, not the final watchlist.
+    The bot scores this pool and automatically chooses the best 20.
+    SAFE_UNIVERSE remains fallback only.
+    """
+    return list(dict.fromkeys([
+        "NVDA","AMD","AAPL","MSFT","META","AMZN","GOOGL","AVGO","TSLA","NFLX",
+        "QCOM","MU","SMCI","ARM","ORCL","CRM","ADBE","INTC","CSCO","IBM",
+        "PLTR","SOFI","RIVN","LCID","NIO","F","GM","AAL","UAL","DAL",
+        "MARA","RIOT","COIN","HOOD","SNAP","WBD","PARA","PYPL","UBER","LYFT",
+        "BBAI","SOUN","AI","UPST","AFRM","RBLX","DKNG","SHOP","NET","CRWD",
+        "PLUG","OPEN","NUVB","ONVO","WWR","GITS","BB","AMC","TLRY","CHPT",
+        "KO","PFE","T","XOM","CVX","WMT","DIS","BAC","JPM","V",
+        "TQQQ","SOXL","LABU","SPY","QQQ"
+    ]))
+
+
+def auto_discovery_quote_score(symbol: str):
+    """
+    Uses existing get_quote() so no new Alpaca imports are needed.
+    Returns a candidate row or None if quote/price/spread is not acceptable.
+    """
+    symbol = symbol.upper()
+    try:
+        q = get_quote(symbol)
+        price = float(q["mid"])
+        spread = float(q["spread"])
+    except Exception:
+        return None
+
+    if price < AUTO_DISCOVERY_MIN_PRICE or price > AUTO_DISCOVERY_MAX_PRICE:
+        return None
+
+    if spread > AUTO_DISCOVERY_MAX_SPREAD:
+        return None
+
+    score = 0.0
+    reasons = [f"auto discovery | price ${price:.2f} | spread {spread:.4f}"]
+
+    # Liquidity proxy: tighter spread = better.
+    score += max(0.0, 10.0 - (spread * 300))
+
+    # Small-account usefulness: favour tradable/affordable stocks but avoid junk.
+    if 2 <= price <= 100:
+        score += 4.0
+        reasons.append("small-account friendly")
+    elif price <= 250:
+        score += 2.0
+
+    # Existing bot memory gives a real edge.
+    try:
+        mem = get_stock_memory(symbol)
+    except Exception:
+        mem = None
+
+    if mem:
+        trades = int(mem.get("trades") or 0)
+        win_rate = float(mem.get("winRate") or 0.0)
+        avg_pnl = float(mem.get("avgPnl") or mem.get("averagePnl") or 0.0)
+        total_pnl = float(mem.get("totalPnl") or 0.0)
+
+        score += min(10, trades) * 0.5
+        score += win_rate * 12
+        score += max(-5, min(10, avg_pnl * 2))
+        score += max(-5, min(10, total_pnl * 0.25))
+        reasons.append(f"memory trades={trades} winRate={win_rate:.2f} pnl=${total_pnl:.2f}")
+
+    # Existing held positions should stay manageable.
+    try:
+        qty, _ = get_position(symbol)
+        if qty > DUST_THRESHOLD:
+            score += 12
+            reasons.append("currently held")
+    except Exception:
+        pass
+
+    return {
+        "symbol": symbol,
+        "score": round(score, 4),
+        "reason": " | ".join(reasons),
+        "status": "active",
+    }
+
+
+def discover_best_stocks(force=False):
+    """
+    Finds the best 20 automatically.
+    This does NOT run at module import; only during universe refresh.
+    """
+    global last_auto_discovery_ts, auto_discovered_symbols
+
+    now = time.time()
+    if (
+        not force
+        and auto_discovered_symbols
+        and now - last_auto_discovery_ts < AUTO_DISCOVERY_REFRESH_SECONDS
+    ):
+        return auto_discovered_symbols[:AUTO_DISCOVERY_SIZE]
+
+    if not AUTO_DISCOVERY_ENABLED:
+        return SAFE_UNIVERSE[:AUTO_DISCOVERY_SIZE]
+
+    rows = []
+    seen = set()
+
+    # Score broad discovery seed.
+    for symbol in get_auto_discovery_seed_symbols():
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        row = auto_discovery_quote_score(symbol)
+        if row:
+            rows.append(row)
+
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    picked = [r["symbol"] for r in rows[:AUTO_DISCOVERY_SIZE]]
+
+    # Emergency fallback only if discovery can't fill 20.
+    if len(picked) < AUTO_DISCOVERY_SIZE:
+        for symbol in SAFE_UNIVERSE:
+            if symbol not in picked:
+                picked.append(symbol)
+            if len(picked) >= AUTO_DISCOVERY_SIZE:
+                break
+
+    auto_discovered_symbols = picked[:AUTO_DISCOVERY_SIZE]
+    last_auto_discovery_ts = now
+
+    print("AUTO DISCOVERY SELECTED:", ", ".join(auto_discovered_symbols))
+    return auto_discovered_symbols
+
+
+def auto_discovery_payload():
+    return {
+        "enabled": AUTO_DISCOVERY_ENABLED,
+        "size": AUTO_DISCOVERY_SIZE,
+        "symbols": auto_discovered_symbols,
+        "lastRefresh": last_auto_discovery_ts,
+        "seedCount": len(get_auto_discovery_seed_symbols()),
+        "fallbackOnly": False,
+    }
+
+
 def build_weekly_universe(force=False):
     global current_universe
 
@@ -2864,9 +3016,19 @@ def build_weekly_universe(force=False):
 
     combined = held_rows + rows
 
-    # Fill empty slots with candidate pool.
+    # Fill empty slots with automatically discovered stocks.
     existing = {r["symbol"] for r in combined}
-    for symbol in AUTO_UNIVERSE_CANDIDATE_POOL:
+    discovered_symbols = discover_best_stocks(force=force)
+    for symbol in discovered_symbols:
+        if len(combined) >= AUTO_UNIVERSE_SIZE * 2:
+            break
+        if symbol not in existing:
+            row = auto_discovery_quote_score(symbol) or score_candidate_symbol(symbol)
+            combined.append(row)
+            existing.add(symbol)
+
+    # Fallback only if discovery could not fill enough candidates.
+    for symbol in SAFE_UNIVERSE:
         if len(combined) >= AUTO_UNIVERSE_SIZE * 2:
             break
         if symbol not in existing:
@@ -2925,181 +3087,6 @@ def auto_universe_payload():
 @app.get("/weekly-universe")
 def weekly_universe_public():
     return auto_universe_payload()
-
-
-# =========================
-# AUTO STOCK DISCOVERY
-# =========================
-last_auto_discovery_ts = 0
-auto_discovered_symbols = []
-
-
-def safe_float(value, default=0.0):
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except Exception:
-        return default
-
-
-def get_discovery_candidate_pool():
-    """
-    Wide liquid pool used only as a seed.
-    The bot scores this and automatically selects the best 20.
-    """
-    return list(dict.fromkeys([
-        "NVDA","AMD","AAPL","MSFT","META","AMZN","GOOGL","AVGO","TSLA","NFLX",
-        "QCOM","MU","SMCI","ARM","ORCL","CRM","ADBE","INTC","CSCO","IBM",
-        "PLTR","SOFI","RIVN","LCID","NIO","F","GM","AAL","UAL","DAL",
-        "MARA","RIOT","COIN","HOOD","SNAP","WBD","PARA","PYPL","UBER","LYFT",
-        "BBAI","SOUN","AI","UPST","AFRM","RBLX","DKNG","SHOP","NET","CRWD",
-        "PLUG","OPEN","NUVB","ONVO","WWR","GITS","BB","AMC","TLRY","CHPT",
-        "KO","PFE","T","XOM","CVX","WMT","DIS","BAC","JPM","V",
-        "TQQQ","SOXL","LABU","SPY","QQQ"
-    ]))
-
-
-def discovery_price(symbol: str):
-    symbol = symbol.upper()
-    try:
-        quote = data_client.get_latest_quote(symbol)
-        bid = safe_float(getattr(quote, "bid_price", None))
-        ask = safe_float(getattr(quote, "ask_price", None))
-        if bid > 0 and ask > 0 and ask >= bid:
-            mid = (bid + ask) / 2
-            spread = (ask - bid) / mid if mid > 0 else 999
-            return mid, spread, "quote"
-    except Exception:
-        pass
-
-    try:
-        trade = data_client.get_latest_trade(symbol)
-        price = safe_float(getattr(trade, "price", None))
-        if price > 0:
-            return price, 0.01, "trade_fallback"
-    except Exception:
-        pass
-
-    return None, 999, "unavailable"
-
-
-def discovery_volume_and_momentum(symbol: str):
-    try:
-        end = datetime.now(UTC)
-        start = end - timedelta(days=AUTO_DISCOVERY_LOOKBACK_DAYS + 5)
-        req = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Day,
-            start=start,
-            end=end,
-            feed=DataFeed.IEX,
-        )
-        bars = data_client.get_stock_bars(req)
-        df = bars.df
-        if df is None or len(df) == 0:
-            return 0, 0.0
-
-        if hasattr(df.index, "names") and "symbol" in df.index.names:
-            try:
-                df = df.xs(symbol)
-            except Exception:
-                pass
-
-        vol = float(df["volume"].tail(3).mean()) if "volume" in df else 0
-        closes = list(df["close"].tail(AUTO_DISCOVERY_LOOKBACK_DAYS)) if "close" in df else []
-        momentum = 0.0
-        if len(closes) >= 2 and closes[0] > 0:
-            momentum = ((closes[-1] - closes[0]) / closes[0]) * 100
-            momentum = max(-5.0, min(20.0, momentum))
-        return vol, momentum
-    except Exception:
-        return 0, 0.0
-
-
-def discover_best_stocks(force=False):
-    """
-    Automatically finds the best 20 stocks from market data.
-    SAFE_UNIVERSE is now fallback only.
-    """
-    global last_auto_discovery_ts, auto_discovered_symbols
-
-    now = time.time()
-    if not force and auto_discovered_symbols and now - last_auto_discovery_ts < AUTO_DISCOVERY_REFRESH_SECONDS:
-        return auto_discovered_symbols[:AUTO_DISCOVERY_SIZE]
-
-    if not AUTO_DISCOVERY_ENABLED:
-        return SAFE_UNIVERSE[:AUTO_DISCOVERY_SIZE]
-
-    scored = []
-    for symbol in get_discovery_candidate_pool():
-        price, spread, source = discovery_price(symbol)
-
-        if price is None:
-            continue
-        if price < AUTO_DISCOVERY_MIN_PRICE or price > AUTO_DISCOVERY_MAX_PRICE:
-            continue
-        if spread > AUTO_DISCOVERY_MAX_SPREAD:
-            continue
-
-        volume, momentum = discovery_volume_and_momentum(symbol)
-        if volume < AUTO_DISCOVERY_MIN_VOLUME:
-            continue
-
-        memory_score = 0.0
-        try:
-            mem = get_stock_memory(symbol)
-            if mem:
-                trades = int(mem.get("trades") or 0)
-                win_rate = safe_float(mem.get("winRate"), 0.0)
-                avg_pnl = safe_float(mem.get("avgPnl") or mem.get("averagePnl"), 0.0)
-                total_pnl = safe_float(mem.get("totalPnl"), 0.0)
-                memory_score += min(10, trades) * 0.4
-                memory_score += win_rate * 10
-                memory_score += max(-5, min(10, avg_pnl * 2))
-                memory_score += max(-5, min(10, total_pnl * 0.2))
-        except Exception:
-            pass
-
-        volume_score = min(15.0, volume / 5_000_000)
-        price_score = 3.0 if 2 <= price <= 100 else 1.0
-        score = momentum + volume_score + memory_score + price_score
-
-        scored.append({
-            "symbol": symbol,
-            "score": round(score, 4),
-            "price": round(price, 4),
-            "spread": round(spread, 5),
-            "volume": int(volume),
-            "momentum": round(momentum, 4),
-            "source": source,
-        })
-
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    picked = [x["symbol"] for x in scored[:AUTO_DISCOVERY_SIZE]]
-
-    # fallback fill only if discovery didn't find enough
-    if len(picked) < AUTO_DISCOVERY_SIZE:
-        for symbol in SAFE_UNIVERSE:
-            if symbol not in picked:
-                picked.append(symbol)
-            if len(picked) >= AUTO_DISCOVERY_SIZE:
-                break
-
-    auto_discovered_symbols = picked[:AUTO_DISCOVERY_SIZE]
-    last_auto_discovery_ts = now
-    print("AUTO DISCOVERY UNIVERSE:", ", ".join(auto_discovered_symbols))
-    return auto_discovered_symbols
-
-
-def auto_discovery_payload():
-    return {
-        "enabled": AUTO_DISCOVERY_ENABLED,
-        "size": AUTO_DISCOVERY_SIZE,
-        "symbols": auto_discovered_symbols,
-        "lastRefresh": last_auto_discovery_ts,
-        "fallbackOnly": False,
-    }
 
 # =========================
 # STATUS
@@ -3484,10 +3471,10 @@ def run_bot_loop():
 
 
 @app.post("/auto-discovery/refresh")
-def refresh_auto_discovery(x_api_key: str = Header(default="")):
-    check_key(x_api_key)
+def refresh_auto_discovery(request: Request):
+    verify_api_key(request)
     symbols = discover_best_stocks(force=True)
-    refresh_universe(force=True)
+    build_weekly_universe(force=True)
     return {"ok": True, "count": len(symbols), "symbols": symbols}
 
 
