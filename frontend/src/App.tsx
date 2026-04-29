@@ -368,12 +368,12 @@ export default function App() {
 
         {data && data.eliteMode && (
           <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(168,85,247,0.75)" }}>
-            <h3>Clean Elite Mode</h3>
+            <h3>Full Elite Mode</h3>
             <p style={{ color: "#a855f7", fontWeight: 700 }}>
               {data.eliteMode?.enabled ? "ON" : "OFF"} · Loss cut {Number(data.eliteMode?.lossCutPct || 0).toFixed(2)}% after {Number(data.eliteMode?.lossCutMinutes || 0).toFixed(0)}m · Hard cut {Number(data.eliteMode?.hardLossCutPct || 0).toFixed(2)}%
             </p>
             <p style={{ color: "#94a3b8" }}>
-              Protect winners from {Number(data.eliteMode?.profitProtectStartPct || 0).toFixed(2)}% · Trail {Number(data.eliteMode?.trailDistancePct || 0).toFixed(2)}% · Fast take {Number(data.eliteMode?.fastProfitTakePct || 0).toFixed(2)}%
+              Fast take {Number(data.eliteMode?.fastProfitTakePct || 0).toFixed(2)}% · Stale exit {Number(data.eliteMode?.staleExitMinutes || 0).toFixed(0)}m · EOD lock {data.eliteMode?.eodLock ? "ON" : "OFF"}
             </p>
           </div>
         )}
@@ -550,7 +550,7 @@ export default function App() {
                 </>
               ) : (
                 <div style={{ color: "#94a3b8", padding: 20, border: "1px dashed rgba(255,255,255,0.15)", borderRadius: 14 }}>
-                  No scan data yet. This is normal while the market is closed.
+                  No scan data yet — waiting for the next scan cycle.
                 </div>
               )}
             </div>
