@@ -352,6 +352,19 @@ export default function App() {
           </div>
         )}
 
+
+        {data && data.aggressiveProfitTaking && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.65)" }}>
+            <h3>Aggressive Profit Taking</h3>
+            <p style={{ color: "#22c55e", fontWeight: 700 }}>
+              {data.aggressiveProfitTaking?.enabled ? "ON" : "OFF"} · Trail starts {Number(data.aggressiveProfitTaking?.trailStartPct || 0).toFixed(2)}% · Trail distance {Number(data.aggressiveProfitTaking?.trailDistancePct || 0).toFixed(2)}%
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              Early loss cut {Number(data.aggressiveProfitTaking?.earlyLossCutPct || 0).toFixed(2)}% · Small profit take {Number(data.aggressiveProfitTaking?.smallProfitTakePct || 0).toFixed(2)}% · EOD protection active
+            </p>
+          </div>
+        )}
+
 {data && (
           <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(14,165,233,0.55)" }}>
             <h3>Weekly Auto Universe</h3>
