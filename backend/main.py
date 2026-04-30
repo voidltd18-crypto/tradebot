@@ -220,9 +220,9 @@ SNIPER_MIN_MOMENTUM = -0.003
 
 # A+ trade quality gate
 A_PLUS_GATE_ENABLED = True
-A_PLUS_MIN_CONFIDENCE = 0.50
-A_PLUS_MIN_QUALITY = 0.026
-A_PLUS_MAX_SPREAD = 0.010
+A_PLUS_MIN_CONFIDENCE = UNLOCKED_A_PLUS_MIN_CONFIDENCE
+A_PLUS_MIN_QUALITY = UNLOCKED_A_PLUS_MIN_QUALITY
+A_PLUS_MAX_SPREAD = UNLOCKED_A_PLUS_MAX_SPREAD
 A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM = True
 A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY = True
 
@@ -391,7 +391,7 @@ SNIPER_AI_PROFIT_RUN_TARGET_PCT = 2.50
 # MONEY MODE ENTRY PATCH
 # =========================
 MONEY_MODE_ENABLED = True
-MONEY_MODE_CONFIDENCE_FLOOR = 0.50
+MONEY_MODE_CONFIDENCE_FLOOR = 0.42
 MONEY_MODE_GOOD_CONFIDENCE = 0.55
 MONEY_MODE_MOMENTUM_FLOOR = -0.012
 MONEY_MODE_QUALITY_FLOOR = 0.010
@@ -433,6 +433,20 @@ AGGRESSIVE_SMART_HARD_CUT_PCT = -2.25
 # Profit behaviour: take small wins but let strong runners breathe
 AGGRESSIVE_SMART_FAST_PROFIT_PCT = 1.20
 AGGRESSIVE_SMART_RUNNER_PROFIT_PCT = 2.50
+
+
+# =========================
+# UNLOCKED AGGRESSIVE BACKEND
+# =========================
+UNLOCKED_AGGRESSIVE_ENABLED = True
+UNLOCKED_A_PLUS_MIN_CONFIDENCE = 0.42
+UNLOCKED_A_PLUS_MIN_QUALITY = 0.015
+UNLOCKED_A_PLUS_MAX_SPREAD = 0.015
+UNLOCKED_BUY_CONFIDENCE = 0.55
+UNLOCKED_BUY_QUALITY = 0.015
+UNLOCKED_MOMENTUM_OVERRIDE = 0.010
+UNLOCKED_MOMENTUM_CONFIDENCE = 0.55
+UNLOCKED_MAX_SPREAD_ABSOLUTE = 0.020
 
 # =========================
 # CLIENTS
@@ -1535,6 +1549,15 @@ def pick_money_mode_stocks(scans):
     candidates = []
     for scan in scans:
         symbol = scan["symbol"]
+
+        if UNLOCKED_AGGRESSIVE_ENABLED:
+            unlocked_ok, unlocked_reason = unlocked_aggressive_entry_allowed(scan)
+            if unlocked_ok:
+                scan["ready_to_buy"] = True
+                scan["unlockedAggressive"] = True
+                scan["unlockedAggressiveReason"] = unlocked_reason
+                print(f"UNLOCKED AGGRESSIVE {symbol} | {unlocked_reason}")
+        # UNLOCKED_AGGRESSIVE_BUY_GATE
 
         if AGGRESSIVE_SMART_MODE_ENABLED:
             smart_ok, smart_reason = aggressive_smart_entry_allowed(scan)
@@ -3490,6 +3513,7 @@ def build_status_payload(bot_name, scans):
         "moneyMode": money_mode_payload(),
         "earlyEntry": early_entry_payload(),
         "aggressiveSmart": aggressive_smart_payload(),
+        "unlockedAggressive": unlocked_aggressive_payload(),
         "aggressiveProfitTaking": aggressive_profit_payload(),
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
@@ -4274,6 +4298,47 @@ def aggressive_smart_payload():
         "earlyEntryMaxGapPct": AGGRESSIVE_SMART_EARLY_ENTRY_MAX_GAP_PCT,
         "lossCutPct": AGGRESSIVE_SMART_LOSS_CUT_PCT,
         "hardCutPct": AGGRESSIVE_SMART_HARD_CUT_PCT,
+    }
+
+
+# =========================
+# UNLOCKED AGGRESSIVE ENTRY OVERRIDE
+# =========================
+def unlocked_aggressive_entry_allowed(scan: Dict[str, Any]):
+    if not UNLOCKED_AGGRESSIVE_ENABLED:
+        return False, "off"
+    try:
+        confidence = float(scan.get("confidence", 0) or 0)
+        quality = float(scan.get("quality_score", scan.get("quality", 0)) or 0)
+        spread = float(scan.get("spread", scan.get("spread_pct", 0)) or 0)
+        momentum = float(scan.get("momentum", scan.get("momentum_score", 0)) or 0)
+
+        if spread > UNLOCKED_MAX_SPREAD_ABSOLUTE:
+            return False, f"spread {spread:.4f} too high"
+
+        if confidence >= UNLOCKED_BUY_CONFIDENCE and quality >= UNLOCKED_BUY_QUALITY:
+            return True, f"unlocked buy conf {confidence:.2f} quality {quality:.4f}"
+
+        if momentum > UNLOCKED_MOMENTUM_OVERRIDE and confidence >= UNLOCKED_MOMENTUM_CONFIDENCE:
+            return True, f"unlocked momentum buy {momentum:.4f}"
+
+        if confidence >= UNLOCKED_A_PLUS_MIN_CONFIDENCE and quality >= UNLOCKED_A_PLUS_MIN_QUALITY and momentum >= -0.012:
+            return True, f"unlocked medium buy conf {confidence:.2f}"
+
+        return False, f"blocked conf {confidence:.2f} quality {quality:.4f}"
+    except Exception as e:
+        return False, str(e)
+
+
+def unlocked_aggressive_payload():
+    return {
+        "enabled": UNLOCKED_AGGRESSIVE_ENABLED,
+        "aPlusMinConfidence": UNLOCKED_A_PLUS_MIN_CONFIDENCE,
+        "aPlusMinQuality": UNLOCKED_A_PLUS_MIN_QUALITY,
+        "aPlusMaxSpread": UNLOCKED_A_PLUS_MAX_SPREAD,
+        "buyConfidence": UNLOCKED_BUY_CONFIDENCE,
+        "buyQuality": UNLOCKED_BUY_QUALITY,
+        "momentumOverride": UNLOCKED_MOMENTUM_OVERRIDE,
     }
 
 @app.get("/status")
