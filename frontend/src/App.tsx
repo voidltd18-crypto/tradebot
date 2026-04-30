@@ -315,6 +315,19 @@ export default function App() {
           </div>
         )}
 
+
+        {data && data.moneyMode && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.8)" }}>
+            <h3>Money Mode</h3>
+            <p style={{ color: "#22c55e", fontWeight: 700 }}>
+              {data.moneyMode?.enabled ? "ON" : "OFF"} · Confidence floor {Number(data.moneyMode?.confidenceFloor || 0).toFixed(2)} · Good trades {Number(data.moneyMode?.goodConfidence || 0).toFixed(2)}+
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              Momentum floor {Number(data.moneyMode?.momentumFloor || 0).toFixed(3)} · Quality floor {Number(data.moneyMode?.qualityFloor || 0).toFixed(3)}
+            </p>
+          </div>
+        )}
+
 {data && (
           <div style={{ textAlign: "center", color: "#94a3b8", marginBottom: 12 }}>
             {data.name || "Trading Bot"} · {data.paperMode ? "PAPER" : "LIVE"} · Bot {data.botEnabled ? "ON" : "OFF"} · Market{" "}
@@ -446,7 +459,7 @@ export default function App() {
               <p style={{ color: "#facc15" }}>No weekly universe yet. Open Data & Maintenance Tools, then press Refresh Weekly Universe.</p>
             )}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 8 }}>
-              {(data.autoUniverse?.rows || []).slice(0, 20).map((r: any) => (
+              {(data.autoUniverse?.rows || []).slice(0, 12).map((r: any) => (
                 <div key={r.symbol} style={{ background: "#020617", borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,0.08)" }}>
                   <b style={{ fontSize: 18 }}>{r.symbol}</b>
                   <div style={{ color: "#38bdf8", fontWeight: 700 }}>Score {Number(r.score || 0).toFixed(2)}</div>
