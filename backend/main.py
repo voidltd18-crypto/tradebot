@@ -106,7 +106,8 @@ ELITE_EOD_LOCK_MIN_PNL_PCT = 0.10
 
 
 SAFE_UNIVERSE = [
-    "TTWO", "APPL",
+    "SOFI", "PLTR", "F", "RIVN", "LCID", "AAL", "NIO", "PLUG", "OPEN", "PFE", "T",
+    "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "AMD", "XOM"
 ]
 
 CHECK_INTERVAL = 60
@@ -299,7 +300,7 @@ AUTO_UNIVERSE_REMOVE_LOSER_MAX_PNL = -1.00
 AUTO_UNIVERSE_MIN_PRICE = 1.00
 AUTO_UNIVERSE_MAX_PRICE = 800.00
 AUTO_UNIVERSE_MAX_SPREAD = 0.020
-AUTO_UNIVERSE_CANDIDATE_POOL = ["TTWO","PLTR","F","RIVN","LCID","AAL","NIO","PLUG","OPEN","PFE","T","NVDA","MSFT","AAPL","GOOGL","AMZN","META","AVGO","AMD","XOM","TSLA","MARA","RIOT","COIN","HOOD","SHOP","SQ","PYPL","UBER","ABNB","DKNG","RBLX","SNAP","ROKU","BABA","INTC","MU","BAC","C","WFC","GM","CCL","DAL","UAL","DIS","NKE","WMT","CVS","KO","JPM"]
+AUTO_UNIVERSE_CANDIDATE_POOL = ["SOFI","PLTR","F","RIVN","LCID","AAL","NIO","PLUG","OPEN","PFE","T","NVDA","MSFT","AAPL","GOOGL","AMZN","META","AVGO","AMD","XOM","TSLA","MARA","RIOT","COIN","HOOD","SHOP","SQ","PYPL","UBER","ABNB","DKNG","RBLX","SNAP","ROKU","BABA","INTC","MU","BAC","C","WFC","GM","CCL","DAL","UAL","DIS","NKE","WMT","CVS","KO","JPM"]
 
 
 # Aggressive Profit Taking Upgrade
@@ -357,6 +358,33 @@ TURBO_TRAIL_DISTANCE_PCT = 0.55
 # Faster loss control
 TURBO_LOSS_CUT_PCT = -1.25
 TURBO_HARD_LOSS_CUT_PCT = -2.50
+
+
+# =========================
+# REAL-TIME MODE
+# =========================
+REALTIME_MODE_ENABLED = True
+REALTIME_SCAN_INTERVAL_SECONDS = 8
+REALTIME_BACKGROUND_ERRORS_MAX = 20
+
+
+# =========================
+# SNIPER AI MODE
+# =========================
+SNIPER_AI_ENABLED = True
+SNIPER_AI_MIN_SCORE = 8.0
+SNIPER_AI_STRONG_SCORE = 12.0
+SNIPER_AI_TOP_N = 6
+SNIPER_AI_MIN_5M_CHANGE = 0.20
+SNIPER_AI_MAX_5M_CHANGE = 3.50
+SNIPER_AI_MIN_15M_CHANGE = 0.15
+SNIPER_AI_MAX_SPREAD = 0.030
+SNIPER_AI_MIN_PRICE = 1.00
+SNIPER_AI_MAX_PRICE = 400.00
+SNIPER_AI_FAKEOUT_CUT_PCT = -0.85
+SNIPER_AI_HARD_CUT_PCT = -2.20
+SNIPER_AI_PROFIT_TRAIL_START_PCT = 0.85
+SNIPER_AI_PROFIT_RUN_TARGET_PCT = 2.50
 
 # =========================
 # CLIENTS
@@ -1459,6 +1487,15 @@ def pick_money_mode_stocks(scans):
     candidates = []
     for scan in scans:
         symbol = scan["symbol"]
+
+        if SNIPER_AI_ENABLED:
+            sniper_row = sniper_ai_score_symbol(symbol)
+            if not sniper_row or sniper_row.get("score", 0) < SNIPER_AI_MIN_SCORE:
+                print(f"SNIPER AI SKIP {symbol} | no early breakout")
+                continue
+            scan["sniperAiScore"] = sniper_row.get("score", 0)
+            scan["sniperAiReason"] = sniper_row.get("reason", "")
+        # SNIPER_AI_BUY_GATE
 
         if TURBO_MODE_ENABLED:
             turbo_score = turbo_score_for_scan(scan)
@@ -3383,6 +3420,8 @@ def build_status_payload(bot_name, scans):
         "eliteMode": elite_mode_payload(),
         "momentumHunter": momentum_hunter_payload(),
         "turboMode": turbo_mode_payload(),
+        "realTimeMode": realtime_snapshot_payload(),
+        "sniperAI": sniper_ai_payload(),
         "aggressiveProfitTaking": aggressive_profit_payload(),
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
@@ -3833,6 +3872,234 @@ def turbo_should_stack(symbol: str, pnl_pct: float, current_value: float, equity
 def turbo_register_stack(symbol: str):
     turbo_stack_counts[symbol] = int(turbo_stack_counts.get(symbol, 0)) + 1
 
+
+# =========================
+# REAL-TIME MODE ENGINE
+# =========================
+realtime_cache = {
+    "scan": None,
+    "scan_ts": 0,
+    "market": None,
+    "market_ts": 0,
+    "running": False,
+    "errors": [],
+    "lastLoop": None,
+}
+
+def realtime_add_error(err):
+    try:
+        realtime_cache["errors"].append({"time": datetime.now(UTC).isoformat(), "error": str(err)})
+        realtime_cache["errors"] = realtime_cache["errors"][-REALTIME_BACKGROUND_ERRORS_MAX:]
+    except Exception:
+        pass
+
+def realtime_market_payload():
+    try:
+        if "live_market_clock_payload" in globals():
+            return live_market_clock_payload()
+    except Exception:
+        pass
+    try:
+        clock = trading_client.get_clock() if "trading_client" in globals() else api.get_clock()
+        return {"ok": True, "isOpen": bool(clock.is_open), "label": "OPEN" if clock.is_open else "CLOSED"}
+    except Exception as e:
+        return {"ok": False, "isOpen": False, "label": "UNKNOWN", "error": str(e)}
+
+def realtime_refresh_scan():
+    try:
+        if "momentum_hunter_rank" in globals():
+            payload = {"ok": True, "source": "momentum_hunter", "rows": momentum_hunter_rank()}
+        elif "scan_all" in globals():
+            payload = scan_all()
+        elif "scan_market" in globals():
+            payload = scan_market()
+        else:
+            payload = {"ok": True, "source": "realtime", "message": "No scanner function found; cache active for market/status."}
+        realtime_cache["scan"] = payload
+        realtime_cache["scan_ts"] = time.time()
+        return payload
+    except Exception as e:
+        realtime_add_error(e)
+        payload = {"ok": False, "error": str(e)}
+        realtime_cache["scan"] = payload
+        realtime_cache["scan_ts"] = time.time()
+        return payload
+
+def realtime_snapshot_payload():
+    now = time.time()
+    return {
+        "enabled": REALTIME_MODE_ENABLED,
+        "running": realtime_cache.get("running", False),
+        "scanIntervalSeconds": REALTIME_SCAN_INTERVAL_SECONDS,
+        "scanAgeSeconds": round(now - float(realtime_cache.get("scan_ts") or 0), 2),
+        "marketAgeSeconds": round(now - float(realtime_cache.get("market_ts") or 0), 2),
+        "lastLoop": realtime_cache.get("lastLoop"),
+        "errors": realtime_cache.get("errors", [])[-5:],
+        "cachedScanAvailable": realtime_cache.get("scan") is not None,
+    }
+
+def realtime_background_loop():
+    realtime_cache["running"] = True
+    while True:
+        try:
+            if REALTIME_MODE_ENABLED:
+                realtime_cache["market"] = realtime_market_payload()
+                realtime_cache["market_ts"] = time.time()
+                realtime_refresh_scan()
+                realtime_cache["lastLoop"] = datetime.now(UTC).isoformat()
+        except Exception as e:
+            realtime_add_error(e)
+        time.sleep(REALTIME_SCAN_INTERVAL_SECONDS)
+
+
+# =========================
+# SNIPER AI ENGINE
+# =========================
+last_sniper_ai_rows = []
+
+def sniper_ai_seed_symbols():
+    symbols = []
+    try:
+        if "momentum_hunter_seed_symbols" in globals():
+            symbols += momentum_hunter_seed_symbols()
+    except Exception:
+        pass
+    try:
+        symbols += list(current_universe)
+    except Exception:
+        pass
+    symbols += [
+        "NVDA","AMD","TSLA","META","AMZN","GOOGL","MSFT","AAPL","AVGO","NFLX",
+        "SMCI","ARM","MU","QCOM","PLTR","SOFI","RIVN","LCID","NIO","F",
+        "MARA","RIOT","COIN","HOOD","BBAI","SOUN","AI","UPST","AFRM","RBLX",
+        "DKNG","SHOP","NET","CRWD","ROKU","UBER","AAL","UAL","DAL",
+        "SPY","QQQ","IWM","TQQQ","SOXL","LABU","XBI","ARKK"
+    ]
+    return list(dict.fromkeys([s.upper() for s in symbols if s]))
+
+def sniper_ai_quote(symbol: str):
+    try:
+        q = get_quote(symbol)
+        price = float(q.get("mid", 0))
+        spread = float(q.get("spread", 999))
+        if price > 0:
+            return price, spread
+    except Exception:
+        pass
+    try:
+        trade = data_client.get_latest_trade(symbol)
+        price = float(getattr(trade, "price", 0) or 0)
+        if price > 0:
+            return price, 0.015
+    except Exception:
+        pass
+    return None, 999
+
+def sniper_ai_bar_features(symbol: str):
+    try:
+        end = datetime.now(UTC)
+        start = end - timedelta(minutes=35)
+        req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, start=start, end=end, feed=DataFeed.IEX)
+        bars = data_client.get_stock_bars(req)
+        df = bars.df
+        if df is None or len(df) < 8:
+            return None
+        if hasattr(df.index, "names") and "symbol" in df.index.names:
+            try:
+                df = df.xs(symbol)
+            except Exception:
+                pass
+        closes = list(df["close"].tail(20))
+        highs = list(df["high"].tail(20)) if "high" in df else closes
+        vols = list(df["volume"].tail(20)) if "volume" in df else []
+        if len(closes) < 8 or closes[0] <= 0:
+            return None
+        change_5 = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if closes[-5] > 0 else 0
+        change_15 = ((closes[-1] - closes[0]) / closes[0]) * 100 if closes[0] > 0 else 0
+        prior_high = max(highs[:-3]) if len(highs) > 6 else max(highs)
+        breakout = 1.0 if closes[-1] >= prior_high * 0.998 else 0.0
+        ma_fast = sum(closes[-3:]) / 3
+        ma_slow = sum(closes[-8:]) / 8
+        trend = 1.0 if ma_fast > ma_slow and closes[-1] > ma_fast else 0.0
+        pullback_resume = 0.0
+        if len(closes) >= 8:
+            had_pullback = min(closes[-6:-2]) < max(closes[-8:-3]) * 0.995
+            resumed = closes[-1] > closes[-2] > closes[-3]
+            pullback_resume = 1.0 if had_pullback and resumed else 0.0
+        vol_ratio = 1.0
+        if len(vols) >= 10:
+            recent_vol = max(1, sum(vols[-3:]) / 3)
+            avg_vol = max(1, sum(vols[:-3]) / max(1, len(vols[:-3])))
+            vol_ratio = recent_vol / avg_vol
+        overextended_penalty = 4.0 if change_5 > SNIPER_AI_MAX_5M_CHANGE else 0.0
+        return {
+            "change5": change_5,
+            "change15": change_15,
+            "breakout": breakout,
+            "trend": trend,
+            "pullbackResume": pullback_resume,
+            "volRatio": vol_ratio,
+            "overextendedPenalty": overextended_penalty,
+        }
+    except Exception:
+        return None
+
+def sniper_ai_score_symbol(symbol: str):
+    symbol = symbol.upper()
+    price, spread = sniper_ai_quote(symbol)
+    if price is None:
+        return None
+    if price < SNIPER_AI_MIN_PRICE or price > SNIPER_AI_MAX_PRICE:
+        return None
+    if spread > SNIPER_AI_MAX_SPREAD:
+        return None
+    feat = sniper_ai_bar_features(symbol)
+    if not feat:
+        return None
+    if feat["change5"] < SNIPER_AI_MIN_5M_CHANGE or feat["change15"] < SNIPER_AI_MIN_15M_CHANGE:
+        return None
+    score = 0.0
+    score += feat["change5"] * 1.7
+    score += feat["change15"] * 1.1
+    score += feat["breakout"] * 3.0
+    score += feat["trend"] * 2.5
+    score += feat["pullbackResume"] * 2.0
+    score += min(3.0, max(0.0, (feat["volRatio"] - 1.0) * 1.5))
+    score -= feat["overextendedPenalty"]
+    if symbol in {"SOXL","TQQQ","QQQ","SPY","NVDA","AMD","TSLA","MARA","RIOT","COIN","PLTR","SOFI"}:
+        score += 1.0
+    reason = f"sniper ai | 5m={feat['change5']:.2f}% 15m={feat['change15']:.2f}% breakout={feat['breakout']:.0f} trend={feat['trend']:.0f} resume={feat['pullbackResume']:.0f} volx={feat['volRatio']:.2f}"
+    return {
+        "symbol": symbol,
+        "price": round(price, 4),
+        "spread": round(spread, 5),
+        "score": round(score, 4),
+        "reason": reason,
+        "ready": score >= SNIPER_AI_MIN_SCORE,
+        "strong": score >= SNIPER_AI_STRONG_SCORE,
+    }
+
+def sniper_ai_rank():
+    global last_sniper_ai_rows
+    rows = []
+    for symbol in sniper_ai_seed_symbols():
+        row = sniper_ai_score_symbol(symbol)
+        if row:
+            rows.append(row)
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    last_sniper_ai_rows = rows[:30]
+    return last_sniper_ai_rows
+
+def sniper_ai_payload():
+    return {
+        "enabled": SNIPER_AI_ENABLED,
+        "minScore": SNIPER_AI_MIN_SCORE,
+        "strongScore": SNIPER_AI_STRONG_SCORE,
+        "topN": SNIPER_AI_TOP_N,
+        "rows": last_sniper_ai_rows[:15],
+        "readySymbols": [r["symbol"] for r in last_sniper_ai_rows if r.get("ready")][:SNIPER_AI_TOP_N],
+    }
+
 @app.get("/status")
 def get_status():
     return latest_status
@@ -4104,8 +4371,41 @@ def turbo_check_exits(request: Request):
     return {"ok": True, "sold": sold, "errors": errors}
 
 
+
+@app.get("/realtime")
+def realtime_endpoint():
+    return {
+        "ok": True,
+        "realtime": realtime_snapshot_payload(),
+        "market": realtime_cache.get("market"),
+        "scan": realtime_cache.get("scan"),
+    }
+
+@app.post("/realtime/refresh")
+def realtime_force_refresh(request: Request):
+    verify_api_key(request)
+    market = realtime_market_payload()
+    scan = realtime_refresh_scan()
+    realtime_cache["market"] = market
+    realtime_cache["market_ts"] = time.time()
+    return {"ok": True, "market": market, "scan": scan, "realtime": realtime_snapshot_payload()}
+
+
+
+@app.post("/sniper-ai/refresh")
+def refresh_sniper_ai(request: Request):
+    verify_api_key(request)
+    rows = sniper_ai_rank()
+    return {"ok": True, "count": len(rows), "ready": [r["symbol"] for r in rows if r.get("ready")], "rows": rows[:20]}
+
+
 @app.on_event("startup")
 def startup_event():
+    try:
+        threading.Thread(target=realtime_background_loop, daemon=True).start()
+        print("REALTIME_BACKGROUND_THREAD_STARTED")
+    except Exception as e:
+        print(f"REALTIME START ERROR: {e}")
     global bot_thread_started
     if bot_thread_started:
         return
