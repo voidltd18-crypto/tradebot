@@ -44,18 +44,16 @@ from alpaca.data.requests import StockLatestQuoteRequest
 # =========================
 # TURBO MODE
 # =========================
+
 # =========================
-# UNLOCKED AGGRESSIVE BACKEND
+# ULTRA AGGRESSIVE EARLY ENTRY
 # =========================
-UNLOCKED_AGGRESSIVE_ENABLED = True
-UNLOCKED_A_PLUS_MIN_CONFIDENCE = 0.42
-UNLOCKED_A_PLUS_MIN_QUALITY = 0.015
-UNLOCKED_A_PLUS_MAX_SPREAD = 0.015
-UNLOCKED_BUY_CONFIDENCE = 0.55
-UNLOCKED_BUY_QUALITY = 0.015
-UNLOCKED_MOMENTUM_OVERRIDE = 0.010
-UNLOCKED_MOMENTUM_CONFIDENCE = 0.55
-UNLOCKED_MAX_SPREAD_ABSOLUTE = 0.020
+ULTRA_ENABLED = True
+ULTRA_MIN_CONF = 0.48
+ULTRA_MIN_QUALITY = 0.012
+ULTRA_STRONG_CONF = 0.55
+ULTRA_MOMENTUM = 0.0
+ULTRA_MAX_SPREAD = 0.025
 
 TURBO_MODE_ENABLED = True
 TURBO_MIN_MOMENTUM_SCORE = 5.6
@@ -1550,6 +1548,13 @@ def pick_money_mode_stocks(scans):
     candidates = []
     for scan in scans:
         symbol = scan["symbol"]
+
+        # ULTRA ENTRY ACTIVE
+        if ULTRA_ENABLED:
+            if ultra_entry(scan):
+                scan["ready_to_buy"] = True
+                scan["ultra"] = True
+                print(f"ULTRA BUY {symbol}")
 
         if UNLOCKED_AGGRESSIVE_ENABLED:
             unlocked_ok, unlocked_reason = unlocked_aggressive_entry_allowed(scan)
@@ -4302,45 +4307,6 @@ def aggressive_smart_payload():
     }
 
 
-# =========================
-# UNLOCKED AGGRESSIVE ENTRY OVERRIDE
-# =========================
-def unlocked_aggressive_entry_allowed(scan: Dict[str, Any]):
-    if not UNLOCKED_AGGRESSIVE_ENABLED:
-        return False, "off"
-    try:
-        confidence = float(scan.get("confidence", 0) or 0)
-        quality = float(scan.get("quality_score", scan.get("quality", 0)) or 0)
-        spread = float(scan.get("spread", scan.get("spread_pct", 0)) or 0)
-        momentum = float(scan.get("momentum", scan.get("momentum_score", 0)) or 0)
-
-        if spread > UNLOCKED_MAX_SPREAD_ABSOLUTE:
-            return False, f"spread {spread:.4f} too high"
-
-        if confidence >= UNLOCKED_BUY_CONFIDENCE and quality >= UNLOCKED_BUY_QUALITY:
-            return True, f"unlocked buy conf {confidence:.2f} quality {quality:.4f}"
-
-        if momentum > UNLOCKED_MOMENTUM_OVERRIDE and confidence >= UNLOCKED_MOMENTUM_CONFIDENCE:
-            return True, f"unlocked momentum buy {momentum:.4f}"
-
-        if confidence >= UNLOCKED_A_PLUS_MIN_CONFIDENCE and quality >= UNLOCKED_A_PLUS_MIN_QUALITY and momentum >= -0.012:
-            return True, f"unlocked medium buy conf {confidence:.2f}"
-
-        return False, f"blocked conf {confidence:.2f} quality {quality:.4f}"
-    except Exception as e:
-        return False, str(e)
-
-
-def unlocked_aggressive_payload():
-    return {
-        "enabled": UNLOCKED_AGGRESSIVE_ENABLED,
-        "aPlusMinConfidence": UNLOCKED_A_PLUS_MIN_CONFIDENCE,
-        "aPlusMinQuality": UNLOCKED_A_PLUS_MIN_QUALITY,
-        "aPlusMaxSpread": UNLOCKED_A_PLUS_MAX_SPREAD,
-        "buyConfidence": UNLOCKED_BUY_CONFIDENCE,
-        "buyQuality": UNLOCKED_BUY_QUALITY,
-        "momentumOverride": UNLOCKED_MOMENTUM_OVERRIDE,
-    }
 
 @app.get("/status")
 def get_status():
@@ -4653,3 +4619,33 @@ def startup_event():
         return
     bot_thread_started = True
     threading.Thread(target=run_bot_loop, daemon=True).start()
+
+
+# =========================
+# ULTRA EARLY ENTRY LOGIC
+# =========================
+def ultra_entry(scan):
+    try:
+        conf = float(scan.get("confidence", 0) or 0)
+        qual = float(scan.get("quality_score", scan.get("quality", 0)) or 0)
+        spread = float(scan.get("spread", scan.get("spread_pct", 0)) or 0)
+        momentum = float(scan.get("momentum", scan.get("momentum_score", 0)) or 0)
+
+        if spread > ULTRA_MAX_SPREAD:
+            return False
+
+        # Strong entry
+        if conf >= ULTRA_STRONG_CONF and qual >= ULTRA_MIN_QUALITY:
+            return True
+
+        # Early entry
+        if conf >= ULTRA_MIN_CONF and qual >= ULTRA_MIN_QUALITY:
+            return True
+
+        # Momentum snipe
+        if conf >= ULTRA_MIN_CONF and momentum > ULTRA_MOMENTUM:
+            return True
+
+        return False
+    except:
+        return False
