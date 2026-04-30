@@ -106,8 +106,7 @@ ELITE_EOD_LOCK_MIN_PNL_PCT = 0.10
 
 
 SAFE_UNIVERSE = [
-    "SOFI", "PLTR", "F", "RIVN", "LCID", "AAL", "NIO", "PLUG", "OPEN", "PFE", "T",
-    "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "AMD", "XOM"
+    "TTWO", "APPL",
 ]
 
 CHECK_INTERVAL = 60
