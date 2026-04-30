@@ -459,7 +459,7 @@ export default function App() {
               <p style={{ color: "#facc15" }}>No weekly universe yet. Open Data & Maintenance Tools, then press Refresh Weekly Universe.</p>
             )}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 8 }}>
-              {(data.autoUniverse?.rows || []).slice(0, 20).map((r: any) => (
+              {(data.autoUniverse?.rows || []).slice(0, 12).map((r: any) => (
                 <div key={r.symbol} style={{ background: "#020617", borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,0.08)" }}>
                   <b style={{ fontSize: 18 }}>{r.symbol}</b>
                   <div style={{ color: "#38bdf8", fontWeight: 700 }}>Score {Number(r.score || 0).toFixed(2)}</div>
@@ -687,3 +687,16 @@ export default function App() {
     </div>
   );
 }
+
+        {data && data.earlyEntry && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(245,158,11,0.8)" }}>
+            <h3>Early Entry</h3>
+            <p style={{ color: "#f59e0b", fontWeight: 700 }}>
+              {data.earlyEntry?.enabled ? "ON" : "OFF"} · Confidence {Number(data.earlyEntry?.minConfidence || 0).toFixed(2)}+ · Max gap {Number(data.earlyEntry?.maxTriggerGapPct || 0).toFixed(2)}%
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              Allows strong setups to enter before trigger instead of waiting too late.
+            </p>
+          </div>
+        )}
+
