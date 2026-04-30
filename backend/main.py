@@ -45,7 +45,7 @@ from alpaca.data.requests import StockLatestQuoteRequest
 # TURBO MODE
 # =========================
 TURBO_MODE_ENABLED = True
-TURBO_MIN_MOMENTUM_SCORE = 7.5
+TURBO_MIN_MOMENTUM_SCORE = 6.2
 TURBO_STRONG_MOMENTUM_SCORE = 11.0
 TURBO_MAX_POSITIONS = 8
 TURBO_MAX_NEW_BUYS_PER_LOOP = 2
@@ -106,7 +106,7 @@ ELITE_EOD_LOCK_MIN_PNL_PCT = 0.10
 
 
 SAFE_UNIVERSE = [
-    "TTWO", "PLTR", "F", "RIVN", "LCID", "AAL", "NIO", "PLUG", "OPEN", "PFE", "T",
+    "SOFI", "PLTR", "F", "RIVN", "LCID", "AAL", "NIO", "PLUG", "OPEN", "PFE", "T",
     "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "AMD", "XOM"
 ]
 
@@ -136,7 +136,7 @@ TRAIL_START = 1.012
 TRAIL_GIVEBACK = 0.993
 
 MAX_DAILY_LOSS = -8.00
-MAX_TRADES_PER_DAY = 20
+MAX_TRADES_PER_DAY = 12
 DUST_THRESHOLD = 0.1
 
 STRICT_ONE_CYCLE_PER_STOCK_PER_DAY = True
@@ -220,7 +220,7 @@ SNIPER_MIN_MOMENTUM = -0.003
 
 # A+ trade quality gate
 A_PLUS_GATE_ENABLED = True
-A_PLUS_MIN_CONFIDENCE = 0.70
+A_PLUS_MIN_CONFIDENCE = 0.55
 A_PLUS_MIN_QUALITY = 0.026
 A_PLUS_MAX_SPREAD = 0.010
 A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM = True
@@ -300,7 +300,7 @@ AUTO_UNIVERSE_REMOVE_LOSER_MAX_PNL = -1.00
 AUTO_UNIVERSE_MIN_PRICE = 1.00
 AUTO_UNIVERSE_MAX_PRICE = 800.00
 AUTO_UNIVERSE_MAX_SPREAD = 0.020
-AUTO_UNIVERSE_CANDIDATE_POOL = ["TTWO","PLTR","F","RIVN","LCID","AAL","NIO","PLUG","OPEN","PFE","T","NVDA","MSFT","AAPL","GOOGL","AMZN","META","AVGO","AMD","XOM","TSLA","MARA","RIOT","COIN","HOOD","SHOP","SQ","PYPL","UBER","ABNB","DKNG","RBLX","SNAP","ROKU","BABA","INTC","MU","BAC","C","WFC","GM","CCL","DAL","UAL","DIS","NKE","WMT","CVS","KO","JPM"]
+AUTO_UNIVERSE_CANDIDATE_POOL = ["SOFI","PLTR","F","RIVN","LCID","AAL","NIO","PLUG","OPEN","PFE","T","NVDA","MSFT","AAPL","GOOGL","AMZN","META","AVGO","AMD","XOM","TSLA","MARA","RIOT","COIN","HOOD","SHOP","SQ","PYPL","UBER","ABNB","DKNG","RBLX","SNAP","ROKU","BABA","INTC","MU","BAC","C","WFC","GM","CCL","DAL","UAL","DIS","NKE","WMT","CVS","KO","JPM"]
 
 
 # Aggressive Profit Taking Upgrade
@@ -323,7 +323,7 @@ AGGRESSIVE_EOD_MIN_PROFIT_PCT = 0.25
 # MOMENTUM HUNTER MODE
 # =========================
 MOMENTUM_HUNTER_ENABLED = True
-MOMENTUM_HUNTER_MIN_SCORE = 7.5
+MOMENTUM_HUNTER_MIN_SCORE = 6.2
 MOMENTUM_HUNTER_STRONG_SCORE = 11.0
 MOMENTUM_HUNTER_TOP_N = 8
 MOMENTUM_HUNTER_MIN_PRICE = 1.00
@@ -335,7 +335,7 @@ MOMENTUM_HUNTER_HARD_CUT_PCT = -2.75
 
 
 # Turbo only acts on strong Momentum Hunter signals
-TURBO_MIN_MOMENTUM_SCORE = 7.5
+TURBO_MIN_MOMENTUM_SCORE = 6.2
 TURBO_STRONG_MOMENTUM_SCORE = 11.0
 
 # More active, but still capped for small account safety
@@ -372,12 +372,12 @@ REALTIME_BACKGROUND_ERRORS_MAX = 20
 # SNIPER AI MODE
 # =========================
 SNIPER_AI_ENABLED = True
-SNIPER_AI_MIN_SCORE = 8.0
-SNIPER_AI_STRONG_SCORE = 12.0
+SNIPER_AI_MIN_SCORE = 6.2
+SNIPER_AI_STRONG_SCORE = 9.5
 SNIPER_AI_TOP_N = 6
-SNIPER_AI_MIN_5M_CHANGE = 0.20
+SNIPER_AI_MIN_5M_CHANGE = 0.05
 SNIPER_AI_MAX_5M_CHANGE = 3.50
-SNIPER_AI_MIN_15M_CHANGE = 0.15
+SNIPER_AI_MIN_15M_CHANGE = -0.05
 SNIPER_AI_MAX_SPREAD = 0.030
 SNIPER_AI_MIN_PRICE = 1.00
 SNIPER_AI_MAX_PRICE = 400.00
@@ -385,6 +385,16 @@ SNIPER_AI_FAKEOUT_CUT_PCT = -0.85
 SNIPER_AI_HARD_CUT_PCT = -2.20
 SNIPER_AI_PROFIT_TRAIL_START_PCT = 0.85
 SNIPER_AI_PROFIT_RUN_TARGET_PCT = 2.50
+
+
+# =========================
+# MONEY MODE ENTRY PATCH
+# =========================
+MONEY_MODE_ENABLED = True
+MONEY_MODE_CONFIDENCE_FLOOR = 0.55
+MONEY_MODE_GOOD_CONFIDENCE = 0.65
+MONEY_MODE_MOMENTUM_FLOOR = -0.010
+MONEY_MODE_QUALITY_FLOOR = 0.012
 
 # =========================
 # CLIENTS
@@ -620,7 +630,7 @@ def a_plus_gate(scan: Dict[str, Any]):
     if spread > A_PLUS_MAX_SPREAD:
         return False, f"spread {spread:.4f} above A+ {A_PLUS_MAX_SPREAD:.4f}"
 
-    if A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM and momentum < 0:
+    if A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM and momentum < MONEY_MODE_MOMENTUM_FLOOR:
         return False, f"momentum negative {momentum:.4f}"
 
     return True, "A+ PASS"
@@ -3422,6 +3432,7 @@ def build_status_payload(bot_name, scans):
         "turboMode": turbo_mode_payload(),
         "realTimeMode": realtime_snapshot_payload(),
         "sniperAI": sniper_ai_payload(),
+        "moneyMode": money_mode_payload(),
         "aggressiveProfitTaking": aggressive_profit_payload(),
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
@@ -4098,6 +4109,19 @@ def sniper_ai_payload():
         "topN": SNIPER_AI_TOP_N,
         "rows": last_sniper_ai_rows[:15],
         "readySymbols": [r["symbol"] for r in last_sniper_ai_rows if r.get("ready")][:SNIPER_AI_TOP_N],
+    }
+
+
+# =========================
+# MONEY MODE PAYLOAD
+# =========================
+def money_mode_payload():
+    return {
+        "enabled": MONEY_MODE_ENABLED,
+        "confidenceFloor": MONEY_MODE_CONFIDENCE_FLOOR,
+        "goodConfidence": MONEY_MODE_GOOD_CONFIDENCE,
+        "momentumFloor": MONEY_MODE_MOMENTUM_FLOOR,
+        "qualityFloor": MONEY_MODE_QUALITY_FLOOR,
     }
 
 @app.get("/status")
