@@ -45,7 +45,7 @@ from alpaca.data.requests import StockLatestQuoteRequest
 # TURBO MODE
 # =========================
 TURBO_MODE_ENABLED = True
-TURBO_MIN_MOMENTUM_SCORE = 6.2
+TURBO_MIN_MOMENTUM_SCORE = 5.6
 TURBO_STRONG_MOMENTUM_SCORE = 11.0
 TURBO_MAX_POSITIONS = 8
 TURBO_MAX_NEW_BUYS_PER_LOOP = 2
@@ -58,8 +58,8 @@ TURBO_STACK_SIZE_MULTIPLIER = 0.45
 TURBO_QUICK_PROFIT_PCT = 1.50
 TURBO_TRAIL_START_PCT = 0.70
 TURBO_TRAIL_DISTANCE_PCT = 0.55
-TURBO_LOSS_CUT_PCT = -1.25
-TURBO_HARD_LOSS_CUT_PCT = -2.50
+TURBO_LOSS_CUT_PCT = -1.10
+TURBO_HARD_LOSS_CUT_PCT = -2.25
 
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
@@ -220,7 +220,7 @@ SNIPER_MIN_MOMENTUM = -0.003
 
 # A+ trade quality gate
 A_PLUS_GATE_ENABLED = True
-A_PLUS_MIN_CONFIDENCE = 0.55
+A_PLUS_MIN_CONFIDENCE = 0.50
 A_PLUS_MIN_QUALITY = 0.026
 A_PLUS_MAX_SPREAD = 0.010
 A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM = True
@@ -323,7 +323,7 @@ AGGRESSIVE_EOD_MIN_PROFIT_PCT = 0.25
 # MOMENTUM HUNTER MODE
 # =========================
 MOMENTUM_HUNTER_ENABLED = True
-MOMENTUM_HUNTER_MIN_SCORE = 6.2
+MOMENTUM_HUNTER_MIN_SCORE = 5.6
 MOMENTUM_HUNTER_STRONG_SCORE = 11.0
 MOMENTUM_HUNTER_TOP_N = 8
 MOMENTUM_HUNTER_MIN_PRICE = 1.00
@@ -335,7 +335,7 @@ MOMENTUM_HUNTER_HARD_CUT_PCT = -2.75
 
 
 # Turbo only acts on strong Momentum Hunter signals
-TURBO_MIN_MOMENTUM_SCORE = 6.2
+TURBO_MIN_MOMENTUM_SCORE = 5.6
 TURBO_STRONG_MOMENTUM_SCORE = 11.0
 
 # More active, but still capped for small account safety
@@ -356,8 +356,8 @@ TURBO_TRAIL_START_PCT = 0.70
 TURBO_TRAIL_DISTANCE_PCT = 0.55
 
 # Faster loss control
-TURBO_LOSS_CUT_PCT = -1.25
-TURBO_HARD_LOSS_CUT_PCT = -2.50
+TURBO_LOSS_CUT_PCT = -1.10
+TURBO_HARD_LOSS_CUT_PCT = -2.25
 
 
 # =========================
@@ -372,7 +372,7 @@ REALTIME_BACKGROUND_ERRORS_MAX = 20
 # SNIPER AI MODE
 # =========================
 SNIPER_AI_ENABLED = True
-SNIPER_AI_MIN_SCORE = 6.2
+SNIPER_AI_MIN_SCORE = 5.6
 SNIPER_AI_STRONG_SCORE = 9.5
 SNIPER_AI_TOP_N = 6
 SNIPER_AI_MIN_5M_CHANGE = 0.05
@@ -391,22 +391,48 @@ SNIPER_AI_PROFIT_RUN_TARGET_PCT = 2.50
 # MONEY MODE ENTRY PATCH
 # =========================
 MONEY_MODE_ENABLED = True
-MONEY_MODE_CONFIDENCE_FLOOR = 0.55
-MONEY_MODE_GOOD_CONFIDENCE = 0.65
-MONEY_MODE_MOMENTUM_FLOOR = -0.010
-MONEY_MODE_QUALITY_FLOOR = 0.012
+MONEY_MODE_CONFIDENCE_FLOOR = 0.50
+MONEY_MODE_GOOD_CONFIDENCE = 0.55
+MONEY_MODE_MOMENTUM_FLOOR = -0.012
+MONEY_MODE_QUALITY_FLOOR = 0.010
 
 
 # =========================
 # EARLY ENTRY MODE
 # =========================
 EARLY_ENTRY_ENABLED = True
-EARLY_ENTRY_MIN_CONFIDENCE = 0.65
-EARLY_ENTRY_MIN_QUALITY = 0.018
-EARLY_ENTRY_MAX_TRIGGER_GAP_PCT = 0.85
+EARLY_ENTRY_MIN_CONFIDENCE = 0.55
+EARLY_ENTRY_MIN_QUALITY = 0.010
+EARLY_ENTRY_MAX_TRIGGER_GAP_PCT = 1.20
 EARLY_ENTRY_ALLOW_BOOST = True
 EARLY_ENTRY_ALLOW_SNIPER = True
 EARLY_ENTRY_ALLOW_TURBO = True
+
+
+# =========================
+# AGGRESSIVE SMART PROFIT MODE
+# =========================
+AGGRESSIVE_SMART_MODE_ENABLED = True
+
+# Lower entry threshold, but only with enough quality/momentum
+AGGRESSIVE_SMART_BASE_CONFIDENCE = 0.50
+AGGRESSIVE_SMART_MOMENTUM_OVERRIDE_CONFIDENCE = 0.48
+AGGRESSIVE_SMART_GOOD_CONFIDENCE = 0.55
+AGGRESSIVE_SMART_MIN_QUALITY = 0.010
+AGGRESSIVE_SMART_GOOD_QUALITY = 0.018
+AGGRESSIVE_SMART_MOMENTUM_FLOOR = -0.012
+
+# Early entry is more active but still capped
+AGGRESSIVE_SMART_EARLY_ENTRY_CONFIDENCE = 0.55
+AGGRESSIVE_SMART_EARLY_ENTRY_MAX_GAP_PCT = 1.20
+
+# Protect losses quickly
+AGGRESSIVE_SMART_LOSS_CUT_PCT = -1.10
+AGGRESSIVE_SMART_HARD_CUT_PCT = -2.25
+
+# Profit behaviour: take small wins but let strong runners breathe
+AGGRESSIVE_SMART_FAST_PROFIT_PCT = 1.20
+AGGRESSIVE_SMART_RUNNER_PROFIT_PCT = 2.50
 
 # =========================
 # CLIENTS
@@ -1509,6 +1535,16 @@ def pick_money_mode_stocks(scans):
     candidates = []
     for scan in scans:
         symbol = scan["symbol"]
+
+        if AGGRESSIVE_SMART_MODE_ENABLED:
+            smart_ok, smart_reason = aggressive_smart_entry_allowed(scan)
+            if smart_ok:
+                scan["aggressiveSmart"] = True
+                scan["aggressiveSmartReason"] = smart_reason
+                if scan.get("confidence", 0) >= AGGRESSIVE_SMART_MOMENTUM_OVERRIDE_CONFIDENCE:
+                    scan["ready_to_buy"] = True
+                print(f"AGGRESSIVE SMART {symbol} | {smart_reason}")
+        # AGGRESSIVE_SMART_BUY_GATE
 
         if SNIPER_AI_ENABLED:
             sniper_row = sniper_ai_score_symbol(symbol)
@@ -3453,6 +3489,7 @@ def build_status_payload(bot_name, scans):
         "sniperAI": sniper_ai_payload(),
         "moneyMode": money_mode_payload(),
         "earlyEntry": early_entry_payload(),
+        "aggressiveSmart": aggressive_smart_payload(),
         "aggressiveProfitTaking": aggressive_profit_payload(),
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
@@ -4164,10 +4201,10 @@ def early_entry_allowed(scan: Dict[str, Any], price: float, trigger_price: float
         trigger_gap_pct = ((trigger_price - price) / price) * 100
         if trigger_gap_pct < 0:
             return True, "already through trigger"
-        if trigger_gap_pct > EARLY_ENTRY_MAX_TRIGGER_GAP_PCT:
+        if trigger_gap_pct > AGGRESSIVE_SMART_EARLY_ENTRY_MAX_GAP_PCT:
             return False, f"trigger gap {trigger_gap_pct:.2f}% too far"
 
-        if confidence >= EARLY_ENTRY_MIN_CONFIDENCE and quality >= EARLY_ENTRY_MIN_QUALITY:
+        if confidence >= AGGRESSIVE_SMART_EARLY_ENTRY_CONFIDENCE and quality >= AGGRESSIVE_SMART_MIN_QUALITY:
             return True, f"early entry confidence {confidence:.2f} quality {quality:.4f}"
         if EARLY_ENTRY_ALLOW_BOOST and "BOOST" in mode.upper() and confidence >= MONEY_MODE_CONFIDENCE_FLOOR:
             return True, f"early entry boost confidence {confidence:.2f}"
@@ -4188,6 +4225,55 @@ def early_entry_payload():
         "allowBoost": EARLY_ENTRY_ALLOW_BOOST,
         "allowSniper": EARLY_ENTRY_ALLOW_SNIPER,
         "allowTurbo": EARLY_ENTRY_ALLOW_TURBO,
+    }
+
+
+# =========================
+# AGGRESSIVE SMART PAYLOAD / ENTRY DECISION
+# =========================
+def aggressive_smart_entry_allowed(scan: Dict[str, Any]):
+    if not AGGRESSIVE_SMART_MODE_ENABLED:
+        return False, "aggressive smart off"
+
+    try:
+        confidence = float(scan.get("confidence", 0) or 0)
+        quality = float(scan.get("quality_score", scan.get("quality", 0)) or 0)
+        momentum = float(scan.get("momentum", scan.get("momentum_score", 0)) or 0)
+        mode = str(scan.get("mode", scan.get("boost", "NORMAL")) or "NORMAL").upper()
+        sniper_score = float(scan.get("sniperAiScore", 0) or 0)
+        turbo_score = float(scan.get("turboScore", scan.get("momentumHunterScore", 0)) or 0)
+
+        if confidence >= AGGRESSIVE_SMART_GOOD_CONFIDENCE and quality >= AGGRESSIVE_SMART_MIN_QUALITY:
+            return True, f"smart confidence {confidence:.2f} quality {quality:.4f}"
+
+        if confidence >= AGGRESSIVE_SMART_BASE_CONFIDENCE and quality >= AGGRESSIVE_SMART_GOOD_QUALITY:
+            return True, f"smart quality entry {confidence:.2f}/{quality:.4f}"
+
+        if confidence >= AGGRESSIVE_SMART_MOMENTUM_OVERRIDE_CONFIDENCE and momentum >= 0:
+            return True, f"smart momentum override conf {confidence:.2f} momentum {momentum:.4f}"
+
+        if "BOOST" in mode and confidence >= AGGRESSIVE_SMART_MOMENTUM_OVERRIDE_CONFIDENCE:
+            return True, f"smart boost override conf {confidence:.2f}"
+
+        if sniper_score >= 5.6 or turbo_score >= 5.6:
+            return True, f"smart score override sniper {sniper_score:.2f} turbo {turbo_score:.2f}"
+
+        return False, f"smart blocked conf {confidence:.2f} quality {quality:.4f} momentum {momentum:.4f}"
+    except Exception as e:
+        return False, f"smart error {e}"
+
+
+def aggressive_smart_payload():
+    return {
+        "enabled": AGGRESSIVE_SMART_MODE_ENABLED,
+        "baseConfidence": AGGRESSIVE_SMART_BASE_CONFIDENCE,
+        "momentumOverrideConfidence": AGGRESSIVE_SMART_MOMENTUM_OVERRIDE_CONFIDENCE,
+        "goodConfidence": AGGRESSIVE_SMART_GOOD_CONFIDENCE,
+        "minQuality": AGGRESSIVE_SMART_MIN_QUALITY,
+        "earlyEntryConfidence": AGGRESSIVE_SMART_EARLY_ENTRY_CONFIDENCE,
+        "earlyEntryMaxGapPct": AGGRESSIVE_SMART_EARLY_ENTRY_MAX_GAP_PCT,
+        "lossCutPct": AGGRESSIVE_SMART_LOSS_CUT_PCT,
+        "hardCutPct": AGGRESSIVE_SMART_HARD_CUT_PCT,
     }
 
 @app.get("/status")
