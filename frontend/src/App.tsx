@@ -286,7 +286,36 @@ export default function App() {
           {status}
         </div>
 
-        {data && (
+        
+        {data && data.realTimeMode && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(59,130,246,0.75)" }}>
+            <h3>Real-Time Mode</h3>
+            <p style={{ color: "#60a5fa", fontWeight: 700 }}>
+              {data.realTimeMode?.enabled ? "ON" : "OFF"} · Background {data.realTimeMode?.running ? "running" : "starting"} · Scan age {Number(data.realTimeMode?.scanAgeSeconds || 0).toFixed(1)}s
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              Cached scans refresh every {data.realTimeMode?.scanIntervalSeconds || 8}s so buttons feel faster.
+            </p>
+          </div>
+        )}
+
+
+        {data && data.sniperAI && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(236,72,153,0.75)" }}>
+            <h3>Sniper AI</h3>
+            <p style={{ color: "#ec4899", fontWeight: 700 }}>
+              {data.sniperAI?.enabled ? "ON" : "OFF"} · Ready {(data.sniperAI?.readySymbols || []).length}/{data.sniperAI?.topN || 6} · Min score {Number(data.sniperAI?.minScore || 0).toFixed(1)}
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              Detects early breakouts, pullback-resume setups and fake momentum before buying.
+            </p>
+            {(data.sniperAI?.readySymbols || []).length > 0 && (
+              <p style={{ color: "#facc15" }}>Ready: {(data.sniperAI?.readySymbols || []).join(", ")}</p>
+            )}
+          </div>
+        )}
+
+{data && (
           <div style={{ textAlign: "center", color: "#94a3b8", marginBottom: 12 }}>
             {data.name || "Trading Bot"} · {data.paperMode ? "PAPER" : "LIVE"} · Bot {data.botEnabled ? "ON" : "OFF"} · Market{" "}
             {data.market?.label || "UNKNOWN"} · USD/GBP {Number(rate).toFixed(4)}
@@ -417,7 +446,7 @@ export default function App() {
               <p style={{ color: "#facc15" }}>No weekly universe yet. Open Data & Maintenance Tools, then press Refresh Weekly Universe.</p>
             )}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 8 }}>
-              {(data.autoUniverse?.rows || []).slice(0, 20).map((r: any) => (
+              {(data.autoUniverse?.rows || []).slice(0, 12).map((r: any) => (
                 <div key={r.symbol} style={{ background: "#020617", borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,0.08)" }}>
                   <b style={{ fontSize: 18 }}>{r.symbol}</b>
                   <div style={{ color: "#38bdf8", fontWeight: 700 }}>Score {Number(r.score || 0).toFixed(2)}</div>
