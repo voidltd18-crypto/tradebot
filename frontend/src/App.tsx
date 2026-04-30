@@ -687,16 +687,3 @@ export default function App() {
     </div>
   );
 }
-
-        {data && data.earlyEntry && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(245,158,11,0.8)" }}>
-            <h3>Early Entry</h3>
-            <p style={{ color: "#f59e0b", fontWeight: 700 }}>
-              {data.earlyEntry?.enabled ? "ON" : "OFF"} · Confidence {Number(data.earlyEntry?.minConfidence || 0).toFixed(2)}+ · Max gap {Number(data.earlyEntry?.maxTriggerGapPct || 0).toFixed(2)}%
-            </p>
-            <p style={{ color: "#94a3b8" }}>
-              Allows strong setups to enter before trigger instead of waiting too late.
-            </p>
-          </div>
-        )}
-
