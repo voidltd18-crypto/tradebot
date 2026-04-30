@@ -307,7 +307,20 @@ export default function App() {
           {message && <span style={{ color: "#facc15", marginLeft: 8 }}>{message}</span>}
         </div>
 
-        {data && (
+        
+        {data && data.turboMode && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(250,204,21,0.75)" }}>
+            <h3>Turbo Mode</h3>
+            <p style={{ color: "#facc15", fontWeight: 700 }}>
+              {data.turboMode?.enabled ? "ON" : "OFF"} · Min score {Number(data.turboMode?.minMomentumScore || 0).toFixed(1)} · Max positions {data.turboMode?.maxPositions || 0}
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              Boost {Number(data.turboMode?.positionBoost || 0).toFixed(2)}x · Stack trigger {Number(data.turboMode?.stackTriggerPct || 0).toFixed(2)}% · Loss cut {Number(data.turboMode?.lossCutPct || 0).toFixed(2)}%
+            </p>
+          </div>
+        )}
+
+{data && (
           <>
             <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.45)" }}>
               <h3>GBP Conversion</h3>
@@ -375,6 +388,19 @@ export default function App() {
             <p style={{ color: "#94a3b8" }}>
               Fast take {Number(data.eliteMode?.fastProfitTakePct || 0).toFixed(2)}% · Stale exit {Number(data.eliteMode?.staleExitMinutes || 0).toFixed(0)}m · EOD lock {data.eliteMode?.eodLock ? "ON" : "OFF"}
             </p>
+          </div>
+        )}
+
+
+        {data && data.momentumHunter && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,211,238,0.75)" }}>
+            <h3>Momentum Hunter</h3>
+            <p style={{ color: "#22d3ee", fontWeight: 700 }}>
+              {data.momentumHunter?.enabled ? "ON" : "OFF"} · Ready {(data.momentumHunter?.readySymbols || []).length}/{data.momentumHunter?.topN || 8} · Min score {Number(data.momentumHunter?.minScore || 0).toFixed(1)}
+            </p>
+            {(data.momentumHunter?.readySymbols || []).length > 0 && (
+              <p style={{ color: "#facc15" }}>Ready: {(data.momentumHunter?.readySymbols || []).join(", ")}</p>
+            )}
           </div>
         )}
 
