@@ -48,6 +48,19 @@ from alpaca.data.requests import StockLatestQuoteRequest
 # =========================
 # ULTRA AGGRESSIVE EARLY ENTRY
 # =========================
+# =========================
+# FIXED UNLOCKED AGGRESSIVE DEFAULTS
+# =========================
+UNLOCKED_AGGRESSIVE_ENABLED = True
+UNLOCKED_A_PLUS_MIN_CONFIDENCE = 0.42
+UNLOCKED_A_PLUS_MIN_QUALITY = 0.012
+UNLOCKED_A_PLUS_MAX_SPREAD = 0.020
+UNLOCKED_BUY_CONFIDENCE = 0.48
+UNLOCKED_BUY_QUALITY = 0.012
+UNLOCKED_MOMENTUM_OVERRIDE = 0.000
+UNLOCKED_MOMENTUM_CONFIDENCE = 0.48
+UNLOCKED_MAX_SPREAD_ABSOLUTE = 0.025
+
 ULTRA_ENABLED = True
 ULTRA_MIN_CONF = 0.48
 ULTRA_MIN_QUALITY = 0.012
@@ -231,9 +244,9 @@ SNIPER_MIN_MOMENTUM = -0.003
 
 # A+ trade quality gate
 A_PLUS_GATE_ENABLED = True
-A_PLUS_MIN_CONFIDENCE = globals().get('UNLOCKED_A_PLUS_MIN_CONFIDENCE', 0.42)
-A_PLUS_MIN_QUALITY = globals().get('UNLOCKED_A_PLUS_MIN_QUALITY', 0.015)
-A_PLUS_MAX_SPREAD = globals().get('UNLOCKED_A_PLUS_MAX_SPREAD', 0.015)
+A_PLUS_MIN_CONFIDENCE = 0.42
+A_PLUS_MIN_QUALITY = 0.012
+A_PLUS_MAX_SPREAD = 0.020
 A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM = True
 A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY = True
 
@@ -1556,7 +1569,7 @@ def pick_money_mode_stocks(scans):
                 scan["ultra"] = True
                 print(f"ULTRA BUY {symbol}")
 
-        if UNLOCKED_AGGRESSIVE_ENABLED:
+        if globals().get('UNLOCKED_AGGRESSIVE_ENABLED', True):
             unlocked_ok, unlocked_reason = unlocked_aggressive_entry_allowed(scan)
             if unlocked_ok:
                 scan["ready_to_buy"] = True
