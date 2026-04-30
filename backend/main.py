@@ -93,8 +93,8 @@ SAFE_UNIVERSE = [
 CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
-MAX_POSITIONS = 20
-MAX_NEW_BUYS_PER_LOOP = 1
+MAX_POSITIONS = TURBO_MAX_POSITIONS if TURBO_MODE_ENABLED else 20
+MAX_NEW_BUYS_PER_LOOP = TURBO_MAX_NEW_BUYS_PER_LOOP if TURBO_MODE_ENABLED else 1
 MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
 MIN_ORDER_NOTIONAL = 1.00
@@ -297,6 +297,52 @@ AGGRESSIVE_STALE_MAX_PNL_PCT = 0.20
 AGGRESSIVE_EOD_PROTECTION_ENABLED = True
 AGGRESSIVE_EOD_MINUTES_BEFORE_CLOSE = 20
 AGGRESSIVE_EOD_MIN_PROFIT_PCT = 0.25
+
+
+# =========================
+# MOMENTUM HUNTER MODE
+# =========================
+MOMENTUM_HUNTER_ENABLED = True
+MOMENTUM_HUNTER_MIN_SCORE = 7.5
+MOMENTUM_HUNTER_STRONG_SCORE = 11.0
+MOMENTUM_HUNTER_TOP_N = 8
+MOMENTUM_HUNTER_MIN_PRICE = 1.00
+MOMENTUM_HUNTER_MAX_PRICE = 350.00
+MOMENTUM_HUNTER_MAX_SPREAD = 0.035
+MOMENTUM_HUNTER_PROFIT_RUN_PCT = 3.00
+MOMENTUM_HUNTER_FAST_CUT_PCT = -1.60
+MOMENTUM_HUNTER_HARD_CUT_PCT = -2.75
+
+
+# =========================
+# TURBO MODE
+# =========================
+TURBO_MODE_ENABLED = True
+
+# Turbo only acts on strong Momentum Hunter signals
+TURBO_MIN_MOMENTUM_SCORE = 7.5
+TURBO_STRONG_MOMENTUM_SCORE = 11.0
+
+# More active, but still capped for small account safety
+TURBO_MAX_POSITIONS = TURBO_MAX_POSITIONS if TURBO_MODE_ENABLED else 20
+TURBO_MAX_NEW_BUYS_PER_LOOP = TURBO_MAX_NEW_BUYS_PER_LOOP if TURBO_MODE_ENABLED else 1
+TURBO_POSITION_BOOST = 1.35
+TURBO_MAX_POSITION_VALUE_PCT = 0.18
+
+# Winner stacking
+TURBO_STACKING_ENABLED = True
+TURBO_STACK_TRIGGER_PCT = 0.90
+TURBO_MAX_STACKS_PER_SYMBOL = 1
+TURBO_STACK_SIZE_MULTIPLIER = 0.45
+
+# Faster profit management
+TURBO_QUICK_PROFIT_PCT = 1.50
+TURBO_TRAIL_START_PCT = 0.70
+TURBO_TRAIL_DISTANCE_PCT = 0.55
+
+# Faster loss control
+TURBO_LOSS_CUT_PCT = -1.25
+TURBO_HARD_LOSS_CUT_PCT = -2.50
 
 # =========================
 # CLIENTS
@@ -1399,6 +1445,22 @@ def pick_money_mode_stocks(scans):
     candidates = []
     for scan in scans:
         symbol = scan["symbol"]
+
+        if TURBO_MODE_ENABLED:
+            turbo_score = turbo_score_for_scan(scan)
+            if turbo_score < TURBO_MIN_MOMENTUM_SCORE:
+                print(f"TURBO SKIP {symbol} | score {turbo_score:.2f} below {TURBO_MIN_MOMENTUM_SCORE}")
+                continue
+            scan["turboScore"] = turbo_score
+        # TURBO_BUY_GATE
+
+        if MOMENTUM_HUNTER_ENABLED:
+            mh_row = momentum_hunter_score_symbol(symbol)
+            if not mh_row or mh_row.get("score", 0) < MOMENTUM_HUNTER_MIN_SCORE:
+                print(f"MOMENTUM HUNTER SKIP {symbol} | weak/no momentum")
+                continue
+            scan["momentumHunterScore"] = mh_row.get("score", 0)
+        # MOMENTUM_HUNTER_BUY_GATE
         can_buy, reason = can_buy_symbol(symbol)
         if not can_buy:
             continue
@@ -3305,6 +3367,8 @@ def build_status_payload(bot_name, scans):
         "autoUniverse": auto_universe_payload(),
         "autoDiscovery": auto_discovery_payload(),
         "eliteMode": elite_mode_payload(),
+        "momentumHunter": momentum_hunter_payload(),
+        "turboMode": turbo_mode_payload(),
         "aggressiveProfitTaking": aggressive_profit_payload(),
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
@@ -3523,6 +3587,237 @@ def elite_mode_payload():
         "eodLock": ELITE_EOD_LOCK_ENABLED,
         "minutesUntilClose": elite_minutes_until_close(),
     }
+
+
+# =========================
+# MOMENTUM HUNTER ENGINE
+# =========================
+last_momentum_hunter_rows = []
+
+
+def momentum_hunter_seed_symbols():
+    symbols = [
+        "NVDA","AMD","TSLA","META","AMZN","GOOGL","MSFT","AAPL","AVGO","NFLX",
+        "SMCI","ARM","MU","QCOM","PLTR","SOFI","RIVN","LCID","NIO","F",
+        "MARA","RIOT","COIN","HOOD","BBAI","SOUN","AI","UPST","AFRM","RBLX",
+        "DKNG","SHOP","NET","CRWD","ROKU","UBER","AAL","UAL","DAL","GM",
+        "PLUG","OPEN","CHPT","NUVB","ONVO","WWR","GITS","BB","AMC","TLRY",
+        "SPY","QQQ","IWM","TQQQ","SQQQ","SOXL","SOXS","LABU","XBI","ARKK"
+    ]
+    try:
+        symbols += list(current_universe)
+    except Exception:
+        pass
+    return list(dict.fromkeys([s.upper() for s in symbols if s]))
+
+
+def momentum_hunter_quote(symbol: str):
+    try:
+        q = get_quote(symbol)
+        price = float(q.get("mid", 0))
+        spread = float(q.get("spread", 999))
+        if price > 0:
+            return price, spread
+    except Exception:
+        pass
+    try:
+        trade = data_client.get_latest_trade(symbol)
+        price = float(getattr(trade, "price", 0) or 0)
+        if price > 0:
+            return price, 0.015
+    except Exception:
+        pass
+    return None, 999
+
+
+def momentum_hunter_bar_score(symbol: str):
+    try:
+        end = datetime.now(UTC)
+        start = end - timedelta(minutes=45)
+        req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Minute, start=start, end=end, feed=DataFeed.IEX)
+        bars = data_client.get_stock_bars(req)
+        df = bars.df
+        if df is None or len(df) < 5:
+            return 0.0, "bars unavailable"
+        if hasattr(df.index, "names") and "symbol" in df.index.names:
+            try:
+                df = df.xs(symbol)
+            except Exception:
+                pass
+        closes = list(df["close"].tail(20))
+        if len(closes) < 5 or closes[0] <= 0:
+            return 0.0, "not enough bars"
+        change_5 = ((closes[-1] - closes[-5]) / closes[-5]) * 100 if closes[-5] > 0 else 0
+        change_15 = ((closes[-1] - closes[0]) / closes[0]) * 100 if closes[0] > 0 else 0
+        trend = 1.0 if closes[-1] > (sum(closes[-5:]) / 5) else 0.0
+        score = max(0.0, (change_5 * 1.8) + (change_15 * 1.2) + (trend * 2.0))
+        return score, f"5m={change_5:.2f}% 15m={change_15:.2f}% trend={trend:.0f}"
+    except Exception as e:
+        return 0.0, f"bar error"
+
+
+def momentum_hunter_score_symbol(symbol: str):
+    symbol = symbol.upper()
+    price, spread = momentum_hunter_quote(symbol)
+    if price is None:
+        return None
+    if price < MOMENTUM_HUNTER_MIN_PRICE or price > MOMENTUM_HUNTER_MAX_PRICE:
+        return None
+    if spread > MOMENTUM_HUNTER_MAX_SPREAD:
+        return None
+
+    bar_score, reason = momentum_hunter_bar_score(symbol)
+    leader_boost = 1.5 if symbol in {"SOXL","TQQQ","QQQ","SPY","NVDA","AMD","TSLA","MARA","RIOT","COIN","PLTR","SOFI"} else 0.0
+    spread_score = max(0.0, 2.0 - (spread * 40))
+    memory_boost = 0.0
+    try:
+        mem = get_stock_memory(symbol)
+        if mem:
+            memory_boost += (float(mem.get("winRate") or 0.0) - 0.5) * 3.0
+            memory_boost += max(-2.0, min(2.0, float(mem.get("avgPnl") or mem.get("averagePnl") or 0.0)))
+    except Exception:
+        pass
+
+    score = bar_score + leader_boost + spread_score + memory_boost
+    return {
+        "symbol": symbol,
+        "price": round(price, 4),
+        "spread": round(spread, 5),
+        "score": round(score, 4),
+        "reason": f"momentum hunter | {reason} | spread={spread:.4f}",
+        "ready": score >= MOMENTUM_HUNTER_MIN_SCORE,
+        "strong": score >= MOMENTUM_HUNTER_STRONG_SCORE,
+    }
+
+
+def momentum_hunter_rank():
+    global last_momentum_hunter_rows
+    rows = []
+    for symbol in momentum_hunter_seed_symbols():
+        row = momentum_hunter_score_symbol(symbol)
+        if row:
+            rows.append(row)
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    last_momentum_hunter_rows = rows[:30]
+    return last_momentum_hunter_rows
+
+
+def momentum_hunter_pick_symbols():
+    return [r["symbol"] for r in momentum_hunter_rank() if r.get("ready")][:MOMENTUM_HUNTER_TOP_N]
+
+
+def momentum_hunter_payload():
+    return {
+        "enabled": MOMENTUM_HUNTER_ENABLED,
+        "minScore": MOMENTUM_HUNTER_MIN_SCORE,
+        "strongScore": MOMENTUM_HUNTER_STRONG_SCORE,
+        "topN": MOMENTUM_HUNTER_TOP_N,
+        "rows": last_momentum_hunter_rows[:15],
+        "readySymbols": [r["symbol"] for r in last_momentum_hunter_rows if r.get("ready")][:MOMENTUM_HUNTER_TOP_N],
+    }
+
+
+# =========================
+# TURBO MODE ENGINE
+# =========================
+turbo_stack_counts = {}
+
+
+def turbo_mode_payload():
+    return {
+        "enabled": TURBO_MODE_ENABLED,
+        "minMomentumScore": TURBO_MIN_MOMENTUM_SCORE,
+        "strongMomentumScore": TURBO_STRONG_MOMENTUM_SCORE,
+        "maxPositions": TURBO_MAX_POSITIONS,
+        "maxNewBuysPerLoop": TURBO_MAX_NEW_BUYS_PER_LOOP,
+        "positionBoost": TURBO_POSITION_BOOST,
+        "maxPositionValuePct": TURBO_MAX_POSITION_VALUE_PCT,
+        "stackingEnabled": TURBO_STACKING_ENABLED,
+        "stackTriggerPct": TURBO_STACK_TRIGGER_PCT,
+        "maxStacksPerSymbol": TURBO_MAX_STACKS_PER_SYMBOL,
+        "quickProfitPct": TURBO_QUICK_PROFIT_PCT,
+        "lossCutPct": TURBO_LOSS_CUT_PCT,
+        "hardLossCutPct": TURBO_HARD_LOSS_CUT_PCT,
+    }
+
+
+def turbo_score_for_scan(scan: Dict[str, Any]) -> float:
+    try:
+        if "momentumHunterScore" in scan:
+            return float(scan.get("momentumHunterScore") or 0)
+    except Exception:
+        pass
+
+    try:
+        symbol = scan.get("symbol")
+        if symbol and "momentum_hunter_score_symbol" in globals():
+            row = momentum_hunter_score_symbol(symbol)
+            if row:
+                return float(row.get("score") or 0)
+    except Exception:
+        pass
+
+    try:
+        return float(scan.get("confidence", 0)) * 10 + float(scan.get("quality_score", 0)) * 25
+    except Exception:
+        return 0.0
+
+
+def turbo_buy_value(base_value: float, scan: Dict[str, Any], equity: float) -> float:
+    if not TURBO_MODE_ENABLED:
+        return base_value
+
+    score = turbo_score_for_scan(scan)
+    value = base_value
+
+    if score >= TURBO_STRONG_MOMENTUM_SCORE:
+        value *= TURBO_POSITION_BOOST
+
+    cap = max(1.0, equity * TURBO_MAX_POSITION_VALUE_PCT)
+    return min(value, cap)
+
+
+def turbo_exit_decision(symbol: str, pnl_pct: float, minutes: float = 999):
+    if not TURBO_MODE_ENABLED:
+        return False, ""
+
+    if pnl_pct <= TURBO_HARD_LOSS_CUT_PCT:
+        return True, f"TURBO HARD LOSS CUT {symbol} {pnl_pct:.2f}%"
+
+    if pnl_pct <= TURBO_LOSS_CUT_PCT and minutes >= 3:
+        return True, f"TURBO LOSS CUT {symbol} {pnl_pct:.2f}%"
+
+    if pnl_pct >= TURBO_QUICK_PROFIT_PCT:
+        # Let existing trailing/profit logic continue for winners unless this is used by manual endpoint
+        return False, ""
+
+    return False, ""
+
+
+def turbo_should_stack(symbol: str, pnl_pct: float, current_value: float, equity: float):
+    if not TURBO_MODE_ENABLED or not TURBO_STACKING_ENABLED:
+        return False, 0.0, ""
+
+    if pnl_pct < TURBO_STACK_TRIGGER_PCT:
+        return False, 0.0, ""
+
+    count = int(turbo_stack_counts.get(symbol, 0))
+    if count >= TURBO_MAX_STACKS_PER_SYMBOL:
+        return False, 0.0, ""
+
+    add_value = current_value * TURBO_STACK_SIZE_MULTIPLIER
+    max_value = equity * TURBO_MAX_POSITION_VALUE_PCT
+    if current_value + add_value > max_value:
+        add_value = max(0.0, max_value - current_value)
+
+    if add_value <= 1:
+        return False, 0.0, ""
+
+    return True, add_value, f"TURBO STACK {symbol} pnl {pnl_pct:.2f}%"
+
+
+def turbo_register_stack(symbol: str):
+    turbo_stack_counts[symbol] = int(turbo_stack_counts.get(symbol, 0)) + 1
 
 @app.get("/status")
 def get_status():
@@ -3746,6 +4041,52 @@ def elite_check_exits(request: Request):
             except Exception as e:
                 errors.append(str(e))
         update_status(BOT_NAME, latest_scans)
+    return {"ok": True, "sold": sold, "errors": errors}
+
+
+
+@app.post("/momentum-hunter/refresh")
+def refresh_momentum_hunter(request: Request):
+    verify_api_key(request)
+    rows = momentum_hunter_rank()
+    return {"ok": True, "count": len(rows), "ready": [r["symbol"] for r in rows if r.get("ready")], "rows": rows[:20]}
+
+
+
+@app.post("/turbo/check-exits")
+def turbo_check_exits(request: Request):
+    verify_api_key(request)
+    sold = []
+    errors = []
+    try:
+        positions = trading_client.get_all_positions() if "trading_client" in globals() else api.list_positions()
+    except Exception as e:
+        return {"ok": False, "error": str(e), "sold": sold}
+
+    for p in positions:
+        try:
+            symbol = getattr(p, "symbol", "")
+            qty = float(getattr(p, "qty", 0) or 0)
+            entry = float(getattr(p, "avg_entry_price", 0) or 0)
+            price = float(getattr(p, "current_price", 0) or 0)
+            if qty <= 0 or entry <= 0 or price <= 0:
+                continue
+            pnl_pct = ((price - entry) / entry) * 100
+            try:
+                turbo_sell, turbo_reason = turbo_exit_decision(symbol, float(pnl_pct), 999)
+                if turbo_sell:
+                    market_sell_qty(symbol, qty, entry=entry, price=price, reason=turbo_reason)
+                    print(f"{turbo_reason} SELL {qty:.6f} {symbol}")
+                    continue
+            except Exception as e:
+                print(f"TURBO EXIT ERROR {symbol}: {e}")
+            # TURBO_EXIT_WIRED
+            sell, reason = turbo_exit_decision(symbol, pnl_pct, 999)
+            if sell:
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason=reason)
+                sold.append({"symbol": symbol, "qty": qty, "pnlPct": round(pnl_pct, 2), "reason": reason})
+        except Exception as e:
+            errors.append(f"{symbol}: {e}")
     return {"ok": True, "sold": sold, "errors": errors}
 
 
