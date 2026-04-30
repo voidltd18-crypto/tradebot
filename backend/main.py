@@ -3487,6 +3487,49 @@ def update_equity_curve(account):
         equity_curve.pop(0)
 
 
+
+# =========================
+# UNLOCKED AGGRESSIVE PAYLOAD HOTFIX
+# =========================
+def unlocked_aggressive_payload():
+    return {
+        "enabled": globals().get("UNLOCKED_AGGRESSIVE_ENABLED", True),
+        "aPlusMinConfidence": globals().get("UNLOCKED_A_PLUS_MIN_CONFIDENCE", 0.42),
+        "aPlusMinQuality": globals().get("UNLOCKED_A_PLUS_MIN_QUALITY", 0.015),
+        "aPlusMaxSpread": globals().get("UNLOCKED_A_PLUS_MAX_SPREAD", 0.015),
+        "buyConfidence": globals().get("UNLOCKED_BUY_CONFIDENCE", 0.55),
+        "buyQuality": globals().get("UNLOCKED_BUY_QUALITY", 0.015),
+        "momentumOverride": globals().get("UNLOCKED_MOMENTUM_OVERRIDE", 0.010),
+        "maxSpread": globals().get("UNLOCKED_MAX_SPREAD_ABSOLUTE", 0.020),
+    }
+
+
+# =========================
+# UNLOCKED AGGRESSIVE ENTRY HOTFIX
+# =========================
+def unlocked_aggressive_entry_allowed(scan):
+    try:
+        confidence = float(scan.get("confidence", 0) or 0)
+        quality = float(scan.get("quality_score", scan.get("quality", 0)) or 0)
+        spread = float(scan.get("spread", scan.get("spread_pct", 0)) or 0)
+        momentum = float(scan.get("momentum", scan.get("momentum_score", 0)) or 0)
+
+        if spread > globals().get("UNLOCKED_MAX_SPREAD_ABSOLUTE", 0.020):
+            return False, f"spread {spread:.4f} too high"
+
+        if confidence >= globals().get("UNLOCKED_BUY_CONFIDENCE", 0.55) and quality >= globals().get("UNLOCKED_BUY_QUALITY", 0.015):
+            return True, f"unlocked buy conf {confidence:.2f} quality {quality:.4f}"
+
+        if momentum > globals().get("UNLOCKED_MOMENTUM_OVERRIDE", 0.010) and confidence >= globals().get("UNLOCKED_MOMENTUM_CONFIDENCE", 0.55):
+            return True, f"unlocked momentum buy {momentum:.4f}"
+
+        if confidence >= globals().get("UNLOCKED_A_PLUS_MIN_CONFIDENCE", 0.42) and quality >= globals().get("UNLOCKED_A_PLUS_MIN_QUALITY", 0.015) and momentum >= -0.012:
+            return True, f"unlocked medium buy conf {confidence:.2f}"
+
+        return False, f"blocked conf {confidence:.2f} quality {quality:.4f}"
+    except Exception as e:
+        return False, str(e)
+
 def build_status_payload(bot_name, scans):
     account = get_account()
     update_equity_curve(account)
