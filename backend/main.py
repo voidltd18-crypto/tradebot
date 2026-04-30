@@ -396,6 +396,18 @@ MONEY_MODE_GOOD_CONFIDENCE = 0.65
 MONEY_MODE_MOMENTUM_FLOOR = -0.010
 MONEY_MODE_QUALITY_FLOOR = 0.012
 
+
+# =========================
+# EARLY ENTRY MODE
+# =========================
+EARLY_ENTRY_ENABLED = True
+EARLY_ENTRY_MIN_CONFIDENCE = 0.65
+EARLY_ENTRY_MIN_QUALITY = 0.018
+EARLY_ENTRY_MAX_TRIGGER_GAP_PCT = 0.85
+EARLY_ENTRY_ALLOW_BOOST = True
+EARLY_ENTRY_ALLOW_SNIPER = True
+EARLY_ENTRY_ALLOW_TURBO = True
+
 # =========================
 # CLIENTS
 # =========================
@@ -1537,7 +1549,14 @@ def pick_money_mode_stocks(scans):
             print(f"A+ SKIP {symbol} | {aplus_reason}")
             continue
         if not scan["ready_to_buy"]:
-            continue
+            early_ok, early_reason = early_entry_allowed(scan, float(scan.get("price", price if "price" in locals() else 0)), float(scan.get("trigger_price", scan.get("trigger", 0))))
+            if not early_ok:
+                continue
+            scan["ready_to_buy"] = True
+            scan["earlyEntry"] = True
+            scan["earlyEntryReason"] = early_reason
+            print(f"EARLY ENTRY {scan.get('symbol')} | {early_reason}")
+            # EARLY_ENTRY_READY_PATCH
         candidates.append(scan)
     candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
     return candidates
@@ -3433,6 +3452,7 @@ def build_status_payload(bot_name, scans):
         "realTimeMode": realtime_snapshot_payload(),
         "sniperAI": sniper_ai_payload(),
         "moneyMode": money_mode_payload(),
+        "earlyEntry": early_entry_payload(),
         "aggressiveProfitTaking": aggressive_profit_payload(),
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
@@ -4122,6 +4142,52 @@ def money_mode_payload():
         "goodConfidence": MONEY_MODE_GOOD_CONFIDENCE,
         "momentumFloor": MONEY_MODE_MOMENTUM_FLOOR,
         "qualityFloor": MONEY_MODE_QUALITY_FLOOR,
+    }
+
+
+# =========================
+# EARLY ENTRY ENGINE
+# =========================
+def early_entry_allowed(scan: Dict[str, Any], price: float, trigger_price: float):
+    if not EARLY_ENTRY_ENABLED:
+        return False, "early entry off"
+    try:
+        confidence = float(scan.get("confidence", 0) or 0)
+        quality = float(scan.get("quality_score", scan.get("quality", 0)) or 0)
+        mode = str(scan.get("mode", scan.get("boost", "NORMAL")) or "NORMAL")
+        sniper_score = float(scan.get("sniperAiScore", 0) or 0)
+        turbo_score = float(scan.get("turboScore", scan.get("momentumHunterScore", 0)) or 0)
+
+        if price <= 0 or trigger_price <= 0:
+            return False, "bad price"
+
+        trigger_gap_pct = ((trigger_price - price) / price) * 100
+        if trigger_gap_pct < 0:
+            return True, "already through trigger"
+        if trigger_gap_pct > EARLY_ENTRY_MAX_TRIGGER_GAP_PCT:
+            return False, f"trigger gap {trigger_gap_pct:.2f}% too far"
+
+        if confidence >= EARLY_ENTRY_MIN_CONFIDENCE and quality >= EARLY_ENTRY_MIN_QUALITY:
+            return True, f"early entry confidence {confidence:.2f} quality {quality:.4f}"
+        if EARLY_ENTRY_ALLOW_BOOST and "BOOST" in mode.upper() and confidence >= MONEY_MODE_CONFIDENCE_FLOOR:
+            return True, f"early entry boost confidence {confidence:.2f}"
+        if EARLY_ENTRY_ALLOW_SNIPER and sniper_score >= 6.2:
+            return True, f"early entry sniper score {sniper_score:.2f}"
+        if EARLY_ENTRY_ALLOW_TURBO and turbo_score >= 6.2:
+            return True, f"early entry turbo score {turbo_score:.2f}"
+        return False, f"early entry blocked confidence {confidence:.2f} quality {quality:.4f}"
+    except Exception as e:
+        return False, f"early entry error {e}"
+
+def early_entry_payload():
+    return {
+        "enabled": EARLY_ENTRY_ENABLED,
+        "minConfidence": EARLY_ENTRY_MIN_CONFIDENCE,
+        "minQuality": EARLY_ENTRY_MIN_QUALITY,
+        "maxTriggerGapPct": EARLY_ENTRY_MAX_TRIGGER_GAP_PCT,
+        "allowBoost": EARLY_ENTRY_ALLOW_BOOST,
+        "allowSniper": EARLY_ENTRY_ALLOW_SNIPER,
+        "allowTurbo": EARLY_ENTRY_ALLOW_TURBO,
     }
 
 @app.get("/status")
