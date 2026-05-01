@@ -2607,7 +2607,6 @@ def optimiser_payload():
         "enabled": PROFIT_OPTIMIZER_ENABLED,
         "autoImproveEnabled": AUTO_IMPROVE_ENABLED,
         "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
-        "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
         "buyBlocked": blocked,
         "blockReason": reason,
         "dailyProfitTarget": DAILY_PROFIT_TARGET,
@@ -2964,7 +2963,6 @@ def build_status_payload(bot_name, scans):
         "analyticsEnabled": ANALYTICS_ENABLED,
         "autoImproveEnabled": AUTO_IMPROVE_ENABLED,
         "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
-        "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
         "fastExitModeEnabled": FAST_EXIT_MODE_ENABLED,
         "partialProfitEnabled": PARTIAL_PROFIT_ENABLED,
         "partialProfitTriggerPct": PARTIAL_PROFIT_TRIGGER_PCT,
@@ -3105,6 +3103,31 @@ def debug_orders():
 @app.get("/")
 def root():
     return {"message": "Rebuilt Sniper Profit Bot running", "status": "/status", "paperMode": PAPER}
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "bot": BOT_NAME, "paperMode": PAPER}
+
+
+@app.get("/market-status")
+def market_status():
+    return get_market_status_payload()
+
+
+@app.get("/realtime-status")
+def realtime_status():
+    return {
+        "ok": True,
+        "botEnabled": bot_enabled,
+        "manualOverride": manual_override,
+        "emergencyStop": emergency_stop,
+        "threadStarted": bot_thread_started,
+        "scanCount": len(latest_scans),
+        "universeSize": len(current_universe),
+        "lastStatusReady": bool(latest_status),
+        "market": get_market_status_payload(),
+    }
 
 
 @app.get("/status")
