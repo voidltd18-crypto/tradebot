@@ -1528,6 +1528,8 @@ def manage_money_mode_positions():
             continue
 
         trail_start_price = entry * TRAIL_START
+        highest = state[symbol].get("highest_since_entry")
+
         if price >= trail_start_price and highest is not None:
             giveback = POST_PARTIAL_TRAIL_GIVEBACK if has_taken_partial_profit(symbol) else TRAIL_GIVEBACK
             trail_floor = highest * giveback
