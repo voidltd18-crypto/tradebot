@@ -68,7 +68,7 @@ BOT_NAME = "Rebuilt Sniper Profit Bot"
 
 SAFE_UNIVERSE = [
     "SOFI", "PLTR", "F", "RIVN", "LCID", "AAL", "NIO", "PLUG", "OPEN", "PFE", "T",
-    "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "AMD", "XOM"
+    "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "AMD", "XOM" "TSLA", "COIN", "SHOP", "SNOW", "CRM"
 ]
 
 CHECK_INTERVAL = 60
