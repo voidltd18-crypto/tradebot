@@ -1474,7 +1474,6 @@ def manage_money_mode_positions():
                 print(f"HARD FAST STOP LOSS ERROR {symbol}: {e}")
             continue
 
-        fast_stop, fast_stop_reason = should_fast_stop(p)
 
         fast_stop, fast_stop_reason = should_fast_stop(p)
         if fast_stop:
