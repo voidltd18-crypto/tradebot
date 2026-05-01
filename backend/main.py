@@ -233,7 +233,7 @@ if PROFIT_OPTIMIZER_ENABLED:
 # Refreshes once per day automatically, plus on-demand from the dashboard.
 AUTO_UNIVERSE_ENABLED = True
 AUTO_UNIVERSE_MODE = "DAILY_ADAPTIVE_TECH"
-AUTO_UNIVERSE_SIZE = 12
+AUTO_UNIVERSE_SIZE = 25
 AUTO_UNIVERSE_REFRESH_DAY = 0  # kept for backwards compatibility
 AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 18
 AUTO_UNIVERSE_KEEP_WINNERS = True
@@ -1090,6 +1090,59 @@ def confidence_notional(scan):
     return round(max(0.0, min(base * mult, cap)), 2)
 
 
+
+def adaptive_notional(scan):
+    """
+    Adaptive position sizing + volatility/spread scaling.
+    Keeps the original confidence sizing safety, but scales position size down
+    when spread/momentum conditions are weaker and up only on cleaner setups.
+    """
+    base = calculate_new_position_notional()
+
+    if not CONFIDENCE_SIZING_ENABLED:
+        return base
+
+    confidence, label = calculate_confidence(scan)
+    spread = float(scan.get("spread", 0.02) or 0.02)
+    momentum = float(scan.get("short_momentum", scan.get("shortMomentum", 0.0)) or 0.0)
+
+    # Confidence scaling
+    if label == "HIGH":
+        conf_mult = 1.30
+    elif label == "MEDIUM":
+        conf_mult = 1.00
+    else:
+        conf_mult = 0.60
+
+    # Spread risk scaling: tighter spread = safer fills
+    if spread <= 0.006:
+        spread_mult = 1.10
+    elif spread <= 0.012:
+        spread_mult = 1.00
+    else:
+        spread_mult = 0.70
+
+    # Momentum / volatility scaling: avoid oversizing weak or negative momentum
+    if momentum > 0.010:
+        vol_mult = 1.20
+    elif momentum > 0:
+        vol_mult = 1.00
+    else:
+        vol_mult = 0.75
+
+    final_mult = conf_mult * spread_mult * vol_mult
+
+    try:
+        equity = float(get_account().equity)
+    except Exception:
+        equity = 0.0
+
+    cap = equity * MAX_CONFIDENCE_POSITION_VALUE_PCT if equity > 0 else base
+    final_notional = round(max(0.0, min(base * final_mult, cap)), 2)
+
+    return final_notional
+
+
 def can_buy_symbol(symbol: str):
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and is_locked_today(symbol):
         return False, f"{symbol} locked until tomorrow"
@@ -1408,7 +1461,7 @@ def maybe_rotate_weakest_into_best(scans):
         if not sell_result.get("ok"):
             return f"ROTATION SELL BLOCKED | {sell_result.get('message')}"
         time.sleep(2)
-        notional = confidence_notional(best)
+        notional = adaptive_notional(best)
         if notional < MIN_ORDER_NOTIONAL:
             return "ROTATION BUY SKIP | no buying power"
         market_buy_notional(best["symbol"], notional, reason=f"PROFIT MODE ROTATE INTO FROM {weakest['symbol']}")
@@ -1535,7 +1588,7 @@ def money_mode_buy(scans, manual=False):
         if not can_buy:
             messages.append(f"SKIP {symbol} | {reason}")
             continue
-        notional = confidence_notional(c)
+        notional = adaptive_notional(c)
         if notional < MIN_ORDER_NOTIONAL:
             messages.append(f"SKIP {symbol} | notional too small {notional:.2f}")
             continue
@@ -1566,7 +1619,7 @@ def buy_custom_symbol(symbol: str):
         return {"ok": False, "message": f"BUY BLOCKED | {symbol} spread too wide: {quote['spread']:.4f}"}
     add_symbol_to_universe(symbol, custom=True)
     fake_scan = {"symbol": symbol, "quality_score": 0.03, "spread": quote["spread"], "short_momentum": 0, "pullback": 0.01}
-    notional = confidence_notional(fake_scan)
+    notional = adaptive_notional(fake_scan)
     market_buy_notional(symbol, notional, reason="CUSTOM SNIPER BUY")
     return {"ok": True, "message": f"CUSTOM BUY ${notional:.2f} of {symbol}. Added to managed universe."}
 
@@ -3006,6 +3059,7 @@ def build_status_payload(bot_name, scans):
         "pdtAwareModeEnabled": PDT_AWARE_MODE_ENABLED,
         "sniperModeEnabled": SNIPER_MODE_ENABLED,
         "confidenceSizingEnabled": CONFIDENCE_SIZING_ENABLED,
+        "adaptivePositionSizingEnabled": True,
         "stockMemoryEnabled": STOCK_MEMORY_ENABLED,
         "profitOptimizerEnabled": PROFIT_OPTIMIZER_ENABLED,
         "analyticsEnabled": ANALYTICS_ENABLED,
@@ -3035,6 +3089,8 @@ def build_status_payload(bot_name, scans):
             "maxPositions": MAX_POSITIONS,
             "targetPositionValuePct": TARGET_POSITION_VALUE_PCT,
             "maxPositionValuePct": MAX_POSITION_VALUE_PCT,
+            "autoUniverseSize": AUTO_UNIVERSE_SIZE,
+            "adaptivePositionSizingEnabled": True,
             "stopLoss": STOP_LOSS,
             "trailStart": TRAIL_START,
             "trailGiveback": TRAIL_GIVEBACK,
@@ -3088,13 +3144,14 @@ def build_status_payload(bot_name, scans):
         ],
         "logs": [
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
-            f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
+            f"SNIPER | enabled={SNIPER_MODE_ENABLED} | adaptive_sizing=True | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
             f"FX | USDGBP={get_usd_to_gbp_rate():.4f} | source={fx_cache.get('source', 'fallback')}",
             f"DB | sqlite={SQLITE_ENABLED} | raw_trades={db_summary_payload().get('totalTrades', 0)} | closed={closed_trade_summary_payload().get('closedTrades', 0)} | pnl_gbp={closed_trade_summary_payload().get('totalPnlGbp', 0):.2f}",
             f"BACKFILL | chunk={BACKFILL_CHUNK_SIZE} | max_pages={BACKFILL_MAX_PAGES}",
             f"OPTIMIZER | enabled={PROFIT_OPTIMIZER_ENABLED} | today_realised={today_realised_pnl():.2f} | block={profit_guardrail_status()[1] or 'none'}",
             f"ANALYTICS | profit_factor={analytics_payload().get('profitFactor', 0):.2f} | avg_win={analytics_payload().get('averageWin', 0):.2f} | avg_loss={analytics_payload().get('averageLoss', 0):.2f}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
+            f"AUTO UNIVERSE | size={AUTO_UNIVERSE_SIZE} | daily_adaptive=True",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
