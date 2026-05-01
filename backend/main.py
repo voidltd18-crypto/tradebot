@@ -74,7 +74,7 @@ SAFE_UNIVERSE = [
 CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
-MAX_POSITIONS = 25
+MAX_POSITIONS = 12
 MAX_NEW_BUYS_PER_LOOP = 1
 MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
@@ -232,9 +232,9 @@ if PROFIT_OPTIMIZER_ENABLED:
 # extra score to stocks that your own trade history proves are working.
 AUTO_UNIVERSE_ENABLED = True
 AUTO_UNIVERSE_MODE = "MONTHLY_TECH"
-AUTO_UNIVERSE_SIZE = 25
+AUTO_UNIVERSE_SIZE = 20
 AUTO_UNIVERSE_REFRESH_DAY = 0  # kept for backwards compatibility
-AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 0.5
+AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 24
 AUTO_UNIVERSE_KEEP_WINNERS = True
 AUTO_UNIVERSE_KEEP_WINNER_MIN_PNL = 0.50
 AUTO_UNIVERSE_KEEP_WINNER_MIN_WINRATE = 0.55
@@ -246,9 +246,11 @@ AUTO_UNIVERSE_MAX_SPREAD = 0.020
 AUTO_UNIVERSE_TECH_BIAS_BONUS = 5.0
 AUTO_UNIVERSE_HELD_POSITION_BONUS = 12.0
 AUTO_UNIVERSE_CANDIDATE_POOL = [
-    "NVDA","AMD","MSFT","AAPL","META","GOOGL","AMZN",
-    "TSLA","PLTR","COIN","SHOP","SNOW","NET","CRM",
-    "ADBE","INTC","MU","AVGO","QCOM","UBER","ABNB"
+    "NVDA", "MSFT", "AAPL", "AMZN", "META", "GOOGL", "AVGO", "AMD", "TSLA", "PLTR",
+    "ARM", "MU", "INTC", "ORCL", "CRM", "NOW", "ADBE", "SNOW", "SHOP", "UBER",
+    "PANW", "CRWD", "NET", "DDOG", "MDB", "TEAM", "WDAY", "ANET", "SMCI", "DELL",
+    "QCOM", "TXN", "AMAT", "LRCX", "KLAC", "ASML", "TSM", "MRVL", "SNPS", "CDNS",
+    "COIN", "HOOD", "SQ", "PYPL", "RBLX", "ROKU", "SOFI"
 ]
 
 # =========================
@@ -1387,33 +1389,54 @@ def get_weakest_position_for_rotation():
 
 
 def maybe_rotate_weakest_into_best(scans):
+    """Rotate only when the replacement is already validated.
+
+    Safer than the old version: it checks the new buy, notional and edge BEFORE
+    selling anything, so the bot does not dump a position then fail to rebuy.
+    """
     global last_rotation_ts
     if not PROFIT_MODE_ENABLED or not ROTATION_MODE_ENABLED or manual_override or emergency_stop:
         return ""
     if time.time() - last_rotation_ts < ROTATION_COOLDOWN_SECONDS:
         return "ROTATION SKIP | cooldown"
+
     best = get_best_profit_candidate(scans)
     weakest = get_weakest_position_for_rotation()
+
     if not best or not weakest or best["symbol"] == weakest["symbol"]:
         return "ROTATION SKIP | no useful rotation"
-    if weakest["pnlPct"] > ROTATE_ONLY_IF_WEAKEST_PNL_BELOW:
+
+    if float(weakest.get("pnlPct") or 0.0) > ROTATE_ONLY_IF_WEAKEST_PNL_BELOW:
         return f"ROTATION SKIP | weakest {weakest['symbol']} still okay"
+
+    best_quality = float(best.get("quality_score") or 0.0)
+    best_confidence = float(best.get("confidence") or 0.0)
+    if best_quality < ROTATION_MIN_QUALITY_EDGE:
+        return f"ROTATION SKIP | {best['symbol']} quality edge too small {best_quality:.4f}"
+    if best_confidence < SNIPER_MIN_CONFIDENCE:
+        return f"ROTATION SKIP | {best['symbol']} confidence too low {best_confidence:.2f}"
+
+    can_buy, buy_block_reason = can_buy_symbol(best["symbol"])
+    if not can_buy:
+        return f"ROTATION SKIP | replacement buy blocked: {buy_block_reason}"
+
+    notional = confidence_notional(best)
+    if notional < MIN_ORDER_NOTIONAL:
+        return "ROTATION SKIP | replacement notional too small / no buying power"
+
     if pdt_aware_should_avoid_sell(weakest["symbol"], f"PROFIT MODE ROTATE OUT FOR {best['symbol']}", weakest["pnlPct"]):
         return f"ROTATION SKIP | PDT-aware hold for {weakest['symbol']}"
+
     try:
         sell_result = close_position(weakest, reason=f"PROFIT MODE ROTATE OUT FOR {best['symbol']}")
         if not sell_result.get("ok"):
             return f"ROTATION SELL BLOCKED | {sell_result.get('message')}"
         time.sleep(2)
-        notional = confidence_notional(best)
-        if notional < MIN_ORDER_NOTIONAL:
-            return "ROTATION BUY SKIP | no buying power"
         market_buy_notional(best["symbol"], notional, reason=f"PROFIT MODE ROTATE INTO FROM {weakest['symbol']}")
         last_rotation_ts = time.time()
-        return f"ROTATION DONE | sold {weakest['symbol']} -> bought {best['symbol']} ${notional:.2f}"
+        return f"ROTATION DONE | sold {weakest['symbol']} -> bought {best['symbol']} ${notional:.2f} confidence={best_confidence:.2f}"
     except Exception as e:
         return f"ROTATION ERROR | {e}"
-
 
 def manage_money_mode_positions():
     for p in get_all_positions():
@@ -3122,8 +3145,11 @@ def quick_status():
         "market": latest_status.get("market", {}),
         "positionsCount": len(latest_status.get("positions", [])),
         "todayBuyCount": today_buy_count(),
+        "universeSize": len(current_universe),
+        "autoUniverseMode": AUTO_UNIVERSE_MODE if "AUTO_UNIVERSE_MODE" in globals() else "AUTO",
         "updatedAt": datetime.now(UTC).isoformat(),
     }
+
 
 @app.get("/debug-orders")
 def debug_orders():
