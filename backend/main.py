@@ -1307,8 +1307,20 @@ def should_fast_stop(position: Dict[str, Any]):
     if not FAST_EXIT_MODE_ENABLED:
         return False, "fast exit disabled"
 
-    pnl_pct = float(position.get("pnlPct") or 0.0)
-    return False, "fast stop disabled"
+    try:
+        price = float(position.get("price") or 0.0)
+        entry = float(position.get("entry") or 0.0)
+        if entry > 0 and price > 0:
+            pnl_pct = ((price / entry) - 1.0) * 100.0
+        else:
+            pnl_pct = float(position.get("pnlPct") or 0.0)
+    except Exception:
+        pnl_pct = float(position.get("pnlPct") or 0.0)
+
+    if pnl_pct <= FAST_STOP_LOSS_PCT:
+        return True, f"fast stop hit {pnl_pct:.2f}%"
+
+    return False, "no fast stop"
 
 
 def should_stall_exit(position: Dict[str, Any]):
@@ -1444,106 +1456,125 @@ def maybe_rotate_weakest_into_best(scans):
         return f"ROTATION ERROR | {e}"
 
 def manage_money_mode_positions():
+    """Manage open positions with a guaranteed hard stop first.
+
+    Important: the stop-loss check uses live price and entry directly, not a
+    cached pnlPct field. This prevents losers sitting open because of stale or
+    missing PnL values.
+    """
     for p in get_all_positions():
-        symbol = p["symbol"]
+        symbol = str(p.get("symbol", "")).upper()
 
-        if not MANAGE_OUTSIDE_UNIVERSE_POSITIONS and symbol not in current_universe:
-            continue
+        try:
+            if not symbol:
+                continue
 
-        if has_open_order(symbol):
-            continue
+            if not MANAGE_OUTSIDE_UNIVERSE_POSITIONS and symbol not in current_universe:
+                continue
 
-        price = float(p["price"])
-        entry = float(p["entry"])
-        qty = float(p["qty"])
-        pnl_pct = float(p.get("pnlPct") or 0.0)
+            if has_open_order(symbol):
+                print(f"POSITION SKIP {symbol} | existing open order")
+                continue
 
-        # 🚨 HARD STOP LOSS FIRST
-        if pnl_pct <= FAST_STOP_LOSS_PCT:
-            try:
-                market_sell_qty(
-                    symbol,
-                    qty,
-                    entry=entry,
-                    price=price,
-                    reason="HARD FAST STOP LOSS"
-                )
-                state[symbol]["highest_since_entry"] = None
-                print(f"HARD FAST STOP LOSS SELL {symbol} {pnl_pct:.2f}%")
-            except Exception as e:
-                print(f"HARD FAST STOP LOSS ERROR {symbol}: {e}")
-            continue
+            price = float(p.get("price") or 0.0)
+            entry = float(p.get("entry") or 0.0)
+            qty = float(p.get("qty") or 0.0)
 
+            if price <= 0 or entry <= 0 or qty <= DUST_THRESHOLD:
+                continue
 
-        fast_stop, fast_stop_reason = should_fast_stop(p)
-        if fast_stop:
-            try:
-                if pdt_aware_should_avoid_sell(symbol, "FAST EXIT STOP LOSS", p["pnlPct"], allow_hard_stop=True):
-                    continue
+            # Always calculate PnL from live price and entry.
+            pnl_pct = ((price / entry) - 1.0) * 100.0
+            p["pnlPct"] = pnl_pct
 
-                market_sell_qty(symbol, qty, entry=entry, price=price, reason="FAST EXIT STOP LOSS")
-                state[symbol]["highest_since_entry"] = None
-                print(f"FAST EXIT STOP LOSS SELL {qty:.6f} {symbol}")
-            except Exception as e:
-                print(f"SELL ERROR {symbol}: {e}")
-            continue
+            print(f"POSITION CHECK {symbol} | pnl={pnl_pct:.2f}% | stop={FAST_STOP_LOSS_PCT:.2f}%")
 
-        stop_price = entry * STOP_LOSS
-        if price <= stop_price:
-            try:
-                if pdt_aware_should_avoid_sell(symbol, "MONEY MODE STOP LOSS", p["pnlPct"], allow_hard_stop=True):
-                    continue
-
-                market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
-                state[symbol]["highest_since_entry"] = None
-            except Exception as e:
-                print(f"SELL ERROR {symbol}: {e}")
-            continue
-
-        partial_ok, partial_reason = should_partial_profit(p)
-        if partial_ok:
-            try:
-                if pdt_aware_should_avoid_sell(symbol, "PARTIAL PROFIT TAKE", p["pnlPct"], allow_hard_stop=False):
-                    continue
-
-                sell_qty = partial_profit_qty(p)
-                market_sell_qty(symbol, sell_qty, entry=entry, price=price, reason="PARTIAL PROFIT TAKE")
-                mark_partial_profit_taken(symbol)
-                print(f"PARTIAL PROFIT SELL {sell_qty:.6f} {symbol}")
-            except Exception as e:
-                print(f"PARTIAL SELL ERROR {symbol}: {e}")
-            continue
-
-        stall_ok, stall_reason = should_stall_exit(p)
-        if stall_ok:
-            try:
-                if pdt_aware_should_avoid_sell(symbol, "STALL EXIT", p["pnlPct"], allow_hard_stop=False):
-                    continue
-
-                market_sell_qty(symbol, qty, entry=entry, price=price, reason="STALL EXIT")
-                state[symbol]["highest_since_entry"] = None
-                print(f"STALL EXIT SELL {qty:.6f} {symbol} | {stall_reason}")
-            except Exception as e:
-                print(f"STALL SELL ERROR {symbol}: {e}")
-            continue
-
-        trail_start_price = entry * TRAIL_START
-        highest = state[symbol].get("highest_since_entry")
-
-        if price >= trail_start_price and highest is not None:
-            giveback = POST_PARTIAL_TRAIL_GIVEBACK if has_taken_partial_profit(symbol) else TRAIL_GIVEBACK
-            trail_floor = highest * giveback
-
-            if price <= trail_floor:
+            # 🚨 HARD STOP LOSS FIRST — do not let PDT/stall/trailing checks block this.
+            if pnl_pct <= FAST_STOP_LOSS_PCT:
                 try:
-                    if pdt_aware_should_avoid_sell(symbol, "MONEY MODE TRAILING PROFIT", p["pnlPct"]):
-                        continue
-
-                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
+                    market_sell_qty(
+                        symbol,
+                        qty,
+                        entry=entry,
+                        price=price,
+                        reason="HARD FAST STOP LOSS"
+                    )
                     state[symbol]["highest_since_entry"] = None
+                    print(f"HARD FAST STOP LOSS SELL {symbol} {pnl_pct:.2f}%")
+                except Exception as e:
+                    print(f"HARD FAST STOP LOSS ERROR {symbol}: {e}")
+                continue
+
+            # Secondary fast-stop helper kept for compatibility.
+            fast_stop, fast_stop_reason = should_fast_stop(p)
+            if fast_stop:
+                try:
+                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="FAST EXIT STOP LOSS")
+                    state[symbol]["highest_since_entry"] = None
+                    print(f"FAST EXIT STOP LOSS SELL {qty:.6f} {symbol} | {fast_stop_reason}")
                 except Exception as e:
                     print(f"SELL ERROR {symbol}: {e}")
                 continue
+
+            stop_price = entry * STOP_LOSS
+            if price <= stop_price:
+                try:
+                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
+                    state[symbol]["highest_since_entry"] = None
+                    print(f"MONEY MODE STOP LOSS SELL {symbol} {pnl_pct:.2f}%")
+                except Exception as e:
+                    print(f"SELL ERROR {symbol}: {e}")
+                continue
+
+            partial_ok, partial_reason = should_partial_profit(p)
+            if partial_ok:
+                try:
+                    if pdt_aware_should_avoid_sell(symbol, "PARTIAL PROFIT TAKE", pnl_pct, allow_hard_stop=False):
+                        continue
+
+                    sell_qty = partial_profit_qty(p)
+                    market_sell_qty(symbol, sell_qty, entry=entry, price=price, reason="PARTIAL PROFIT TAKE")
+                    mark_partial_profit_taken(symbol)
+                    print(f"PARTIAL PROFIT SELL {sell_qty:.6f} {symbol}")
+                except Exception as e:
+                    print(f"PARTIAL SELL ERROR {symbol}: {e}")
+                continue
+
+            stall_ok, stall_reason = should_stall_exit(p)
+            if stall_ok:
+                try:
+                    if pdt_aware_should_avoid_sell(symbol, "STALL EXIT", pnl_pct, allow_hard_stop=False):
+                        continue
+
+                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="STALL EXIT")
+                    state[symbol]["highest_since_entry"] = None
+                    print(f"STALL EXIT SELL {qty:.6f} {symbol} | {stall_reason}")
+                except Exception as e:
+                    print(f"STALL SELL ERROR {symbol}: {e}")
+                continue
+
+            trail_start_price = entry * TRAIL_START
+            highest = state[symbol].get("highest_since_entry")
+
+            if price >= trail_start_price and highest is not None:
+                giveback = POST_PARTIAL_TRAIL_GIVEBACK if has_taken_partial_profit(symbol) else TRAIL_GIVEBACK
+                trail_floor = highest * giveback
+
+                if price <= trail_floor:
+                    try:
+                        if pdt_aware_should_avoid_sell(symbol, "MONEY MODE TRAILING PROFIT", pnl_pct):
+                            continue
+
+                        market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
+                        state[symbol]["highest_since_entry"] = None
+                        print(f"TRAILING PROFIT SELL {symbol} pnl={pnl_pct:.2f}%")
+                    except Exception as e:
+                        print(f"SELL ERROR {symbol}: {e}")
+                    continue
+
+        except Exception as e:
+            print(f"POSITION LOOP ERROR {symbol or 'UNKNOWN'}: {e}")
+            continue
 
 def money_mode_buy(scans, manual=False):
     if emergency_stop:
