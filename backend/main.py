@@ -986,7 +986,7 @@ def compute_scan(symbol: str):
     locked = is_locked_today(symbol)
     ready_to_buy = (
         not locked and
-        price <= buy_trigger and short_momentum >=0
+        price <= buy_trigger and short_momentum >= 0
         spread <= MAX_SPREAD and
         MIN_PULLBACK <= pullback <= MAX_PULLBACK and
         short_momentum >= MIN_SHORT_MOMENTUM and
