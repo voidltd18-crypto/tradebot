@@ -1308,7 +1308,7 @@ def should_fast_stop(position: Dict[str, Any]):
         return False, "fast exit disabled"
 
     pnl_pct = float(position.get("pnlPct") or 0.0)
-    return (pnl_pct <= FAST_STOP_LOSS_PCT or pnl_pct <= -1.2), f"fast stop pnl={pnl_pct:.2f}%"
+    return False, "fast stop disabled"
 
 
 def should_stall_exit(position: Dict[str, Any]):
@@ -1460,6 +1460,29 @@ def manage_money_mode_positions():
 
         if price <= 0 or entry <= 0 or qty <= DUST_THRESHOLD:
             continue
+
+        pnl_pct = float(p.get("pnlPct") or 0.0)
+
+# 🚨 HARD FAST STOP LOSS - must run before EVERYTHING
+if pnl_pct <= FAST_STOP_LOSS_PCT:
+    try:
+        market_sell_qty(
+            symbol,
+            qty,
+            entry=entry,
+            price=price,
+            reason="HARD FAST STOP LOSS"
+        )
+
+        if symbol in state:
+            state[symbol]["highest_since_entry"] = None
+
+        print(f"HARD FAST STOP LOSS SELL {symbol} {pnl_pct:.2f}%")
+
+    except Exception as e:
+        print(f"HARD FAST STOP LOSS ERROR {symbol}: {e}")
+
+    continue
 
         fast_stop, fast_stop_reason = should_fast_stop(p)
         if fast_stop:
