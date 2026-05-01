@@ -250,7 +250,6 @@ AUTO_UNIVERSE_CANDIDATE_POOL = [
     "TSLA","PLTR","COIN","SHOP","SNOW","NET","CRM",
     "ADBE","INTC","MU","AVGO","QCOM","UBER","ABNB"
 ]
-]
 
 # =========================
 # CLIENTS
