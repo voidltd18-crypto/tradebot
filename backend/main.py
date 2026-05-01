@@ -71,7 +71,7 @@ SAFE_UNIVERSE = [
     "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "AMD", "XOM"
 ]
 
-CHECK_INTERVAL = 60
+CHECK_INTERVAL = 10
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
 MAX_POSITIONS = 25
@@ -1308,7 +1308,7 @@ def should_fast_stop(position: Dict[str, Any]):
         return False, "fast exit disabled"
 
     pnl_pct = float(position.get("pnlPct") or 0.0)
-    return pnl_pct <= FAST_STOP_LOSS_PCT, f"fast stop pnl={pnl_pct:.2f}%"
+    return (pnl_pct <= FAST_STOP_LOSS_PCT or pnl_pct <= -1.2), f"fast stop pnl={pnl_pct:.2f}%"
 
 
 def should_stall_exit(position: Dict[str, Any]):
