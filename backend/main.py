@@ -246,11 +246,11 @@ AUTO_UNIVERSE_MAX_SPREAD = 0.020
 AUTO_UNIVERSE_TECH_BIAS_BONUS = 5.0
 AUTO_UNIVERSE_HELD_POSITION_BONUS = 12.0
 AUTO_UNIVERSE_CANDIDATE_POOL = [
-    "NVDA", "MSFT", "AAPL", "AMZN", "META", "GOOGL", "AVGO", "AMD", "TSLA", "PLTR",
+    "NVDA", "MSFT", "AAPL", "AMZN", "META", "GOOGL", "AVGO", "AMD", "TSLA", "NYSE",
     "ARM", "MU", "INTC", "ORCL", "CRM", "NOW", "ADBE", "SNOW", "SHOP", "UBER",
     "PANW", "CRWD", "NET", "DDOG", "MDB", "TEAM", "WDAY", "ANET", "SMCI", "DELL",
     "QCOM", "TXN", "AMAT", "LRCX", "KLAC", "ASML", "TSM", "MRVL", "SNPS", "CDNS",
-    "COIN", "HOOD", "SQ", "PYPL", "RBLX", "ROKU", "SOFI"
+    "COIN", "HOOD", "SQ", "PYPL", "RBLX", "ROKU", "TTWO"
 ]
 
 # =========================
