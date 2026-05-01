@@ -985,13 +985,14 @@ def compute_scan(symbol: str):
     buy_trigger = ref * BUY_DIP
     locked = is_locked_today(symbol)
     ready_to_buy = (
-        not locked and
-        price <= buy_trigger and short_momentum >= 0
-        spread <= MAX_SPREAD and
-        MIN_PULLBACK <= pullback <= MAX_PULLBACK and
-        short_momentum >= MIN_SHORT_MOMENTUM and
-        len(curve) >= MIN_TICKS_BEFORE_BUY
-    )
+    not locked and
+    price <= buy_trigger and
+    short_momentum >= 0 and
+    spread <= MAX_SPREAD and
+    MIN_PULLBACK <= pullback <= MAX_PULLBACK and
+    short_momentum >= MIN_SHORT_MOMENTUM and
+    len(curve) >= MIN_TICKS_BEFORE_BUY
+)
 
     temp = {
         "symbol": symbol, "quality_score": quality_score, "spread": spread,
