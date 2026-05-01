@@ -286,49 +286,7 @@ export default function App() {
           {status}
         </div>
 
-        
-        {data && data.realTimeMode && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(59,130,246,0.75)" }}>
-            <h3>Real-Time Mode</h3>
-            <p style={{ color: "#60a5fa", fontWeight: 700 }}>
-              {data.realTimeMode?.enabled ? "ON" : "OFF"} · Background {data.realTimeMode?.running ? "running" : "starting"} · Scan age {Number(data.realTimeMode?.scanAgeSeconds || 0).toFixed(1)}s
-            </p>
-            <p style={{ color: "#94a3b8" }}>
-              Cached scans refresh every {data.realTimeMode?.scanIntervalSeconds || 8}s so buttons feel faster.
-            </p>
-          </div>
-        )}
-
-
-        {data && data.sniperAI && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(236,72,153,0.75)" }}>
-            <h3>Sniper AI</h3>
-            <p style={{ color: "#ec4899", fontWeight: 700 }}>
-              {data.sniperAI?.enabled ? "ON" : "OFF"} · Ready {(data.sniperAI?.readySymbols || []).length}/{data.sniperAI?.topN || 6} · Min score {Number(data.sniperAI?.minScore || 0).toFixed(1)}
-            </p>
-            <p style={{ color: "#94a3b8" }}>
-              Detects early breakouts, pullback-resume setups and fake momentum before buying.
-            </p>
-            {(data.sniperAI?.readySymbols || []).length > 0 && (
-              <p style={{ color: "#facc15" }}>Ready: {(data.sniperAI?.readySymbols || []).join(", ")}</p>
-            )}
-          </div>
-        )}
-
-
-        {data && data.moneyMode && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.8)" }}>
-            <h3>Money Mode</h3>
-            <p style={{ color: "#22c55e", fontWeight: 700 }}>
-              {data.moneyMode?.enabled ? "ON" : "OFF"} · Confidence floor {Number(data.moneyMode?.confidenceFloor || 0).toFixed(2)} · Good trades {Number(data.moneyMode?.goodConfidence || 0).toFixed(2)}+
-            </p>
-            <p style={{ color: "#94a3b8" }}>
-              Momentum floor {Number(data.moneyMode?.momentumFloor || 0).toFixed(3)} · Quality floor {Number(data.moneyMode?.qualityFloor || 0).toFixed(3)}
-            </p>
-          </div>
-        )}
-
-{data && (
+        {data && (
           <div style={{ textAlign: "center", color: "#94a3b8", marginBottom: 12 }}>
             {data.name || "Trading Bot"} · {data.paperMode ? "PAPER" : "LIVE"} · Bot {data.botEnabled ? "ON" : "OFF"} · Market{" "}
             {data.market?.label || "UNKNOWN"} · USD/GBP {Number(rate).toFixed(4)}
@@ -349,20 +307,7 @@ export default function App() {
           {message && <span style={{ color: "#facc15", marginLeft: 8 }}>{message}</span>}
         </div>
 
-        
-        {data && data.turboMode && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(250,204,21,0.75)" }}>
-            <h3>Turbo Mode</h3>
-            <p style={{ color: "#facc15", fontWeight: 700 }}>
-              {data.turboMode?.enabled ? "ON" : "OFF"} · Min score {Number(data.turboMode?.minMomentumScore || 0).toFixed(1)} · Max positions {data.turboMode?.maxPositions || 0}
-            </p>
-            <p style={{ color: "#94a3b8" }}>
-              Boost {Number(data.turboMode?.positionBoost || 0).toFixed(2)}x · Stack trigger {Number(data.turboMode?.stackTriggerPct || 0).toFixed(2)}% · Loss cut {Number(data.turboMode?.lossCutPct || 0).toFixed(2)}%
-            </p>
-          </div>
-        )}
-
-{data && (
+        {data && (
           <>
             <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.45)" }}>
               <h3>GBP Conversion</h3>
@@ -389,64 +334,7 @@ export default function App() {
             </div>
 
 
-        
-        {data && data.autoDiscovery && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: data.autoDiscovery?.usingFallback ? "rgba(249,115,22,0.65)" : "rgba(34,197,94,0.55)" }}>
-            <h3>Auto Discovery Status</h3>
-            <p style={{ color: data.autoDiscovery?.usingFallback ? "#f97316" : "#22c55e", fontWeight: 700 }}>
-              {data.autoDiscovery?.usingFallback ? "Fallback Used" : "Fully Discovered"} · {data.autoDiscovery?.discoveredCount || 0}/{data.autoDiscovery?.size || 20} discovered · {data.autoDiscovery?.fallbackCount || 0} fallback
-            </p>
-            <p style={{ color: "#94a3b8" }}>
-              The bot automatically finds the weekly stock list. Fallback only fills empty slots if discovery cannot find enough valid stocks.
-            </p>
-            {(data.autoDiscovery?.fallbackSymbols || []).length > 0 && (
-              <p style={{ color: "#facc15" }}>
-                Fallback symbols: {(data.autoDiscovery?.fallbackSymbols || []).join(", ")}
-              </p>
-            )}
-          </div>
-        )}
-
-
-        {data && data.aggressiveProfitTaking && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.65)" }}>
-            <h3>Aggressive Profit Taking</h3>
-            <p style={{ color: "#22c55e", fontWeight: 700 }}>
-              {data.aggressiveProfitTaking?.enabled ? "ON" : "OFF"} · Trail starts {Number(data.aggressiveProfitTaking?.trailStartPct || 0).toFixed(2)}% · Trail distance {Number(data.aggressiveProfitTaking?.trailDistancePct || 0).toFixed(2)}%
-            </p>
-            <p style={{ color: "#94a3b8" }}>
-              Early loss cut {Number(data.aggressiveProfitTaking?.earlyLossCutPct || 0).toFixed(2)}% · Small profit take {Number(data.aggressiveProfitTaking?.smallProfitTakePct || 0).toFixed(2)}% · EOD protection active
-            </p>
-          </div>
-        )}
-
-
-        {data && data.eliteMode && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(168,85,247,0.75)" }}>
-            <h3>Full Elite Mode</h3>
-            <p style={{ color: "#a855f7", fontWeight: 700 }}>
-              {data.eliteMode?.enabled ? "ON" : "OFF"} · Loss cut {Number(data.eliteMode?.lossCutPct || 0).toFixed(2)}% after {Number(data.eliteMode?.lossCutMinutes || 0).toFixed(0)}m · Hard cut {Number(data.eliteMode?.hardLossCutPct || 0).toFixed(2)}%
-            </p>
-            <p style={{ color: "#94a3b8" }}>
-              Fast take {Number(data.eliteMode?.fastProfitTakePct || 0).toFixed(2)}% · Stale exit {Number(data.eliteMode?.staleExitMinutes || 0).toFixed(0)}m · EOD lock {data.eliteMode?.eodLock ? "ON" : "OFF"}
-            </p>
-          </div>
-        )}
-
-
-        {data && data.momentumHunter && (
-          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,211,238,0.75)" }}>
-            <h3>Momentum Hunter</h3>
-            <p style={{ color: "#22d3ee", fontWeight: 700 }}>
-              {data.momentumHunter?.enabled ? "ON" : "OFF"} · Ready {(data.momentumHunter?.readySymbols || []).length}/{data.momentumHunter?.topN || 8} · Min score {Number(data.momentumHunter?.minScore || 0).toFixed(1)}
-            </p>
-            {(data.momentumHunter?.readySymbols || []).length > 0 && (
-              <p style={{ color: "#facc15" }}>Ready: {(data.momentumHunter?.readySymbols || []).join(", ")}</p>
-            )}
-          </div>
-        )}
-
-{data && (
+        {data && (
           <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(14,165,233,0.55)" }}>
             <h3>Weekly Auto Universe</h3>
             <p style={{ color: "#38bdf8", fontWeight: 700 }}>
@@ -459,7 +347,7 @@ export default function App() {
               <p style={{ color: "#facc15" }}>No weekly universe yet. Open Data & Maintenance Tools, then press Refresh Weekly Universe.</p>
             )}
             <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 8 }}>
-              {(data.autoUniverse?.rows || []).slice(0, 20).map((r: any) => (
+              {(data.autoUniverse?.rows || []).slice(0, 12).map((r: any) => (
                 <div key={r.symbol} style={{ background: "#020617", borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,0.08)" }}>
                   <b style={{ fontSize: 18 }}>{r.symbol}</b>
                   <div style={{ color: "#38bdf8", fontWeight: 700 }}>Score {Number(r.score || 0).toFixed(2)}</div>
@@ -618,7 +506,7 @@ export default function App() {
                 </>
               ) : (
                 <div style={{ color: "#94a3b8", padding: 20, border: "1px dashed rgba(255,255,255,0.15)", borderRadius: 14 }}>
-                  No scan data yet — waiting for the next scan cycle.
+                  No scan data yet. This is normal while the market is closed.
                 </div>
               )}
             </div>
