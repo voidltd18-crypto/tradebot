@@ -74,7 +74,7 @@ SAFE_UNIVERSE = [
 CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
-MAX_POSITIONS = 25
+MAX_POSITIONS = 12
 MAX_NEW_BUYS_PER_LOOP = 1
 MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
@@ -130,7 +130,7 @@ PARTIAL_PROFIT_ENABLED = True
 PARTIAL_PROFIT_TRIGGER_PCT = 1.00
 PARTIAL_PROFIT_SELL_PCT = 0.50
 POST_PARTIAL_TRAIL_GIVEBACK = 0.996
-FAST_STOP_LOSS_PCT = -1.0
+FAST_STOP_LOSS_PCT = -1.20
 STALL_EXIT_ENABLED = True
 STALL_EXIT_AFTER_MINUTES = 90
 STALL_EXIT_MIN_PNL_PCT = 0.30
@@ -246,11 +246,11 @@ AUTO_UNIVERSE_MAX_SPREAD = 0.020
 AUTO_UNIVERSE_TECH_BIAS_BONUS = 5.0
 AUTO_UNIVERSE_HELD_POSITION_BONUS = 12.0
 AUTO_UNIVERSE_CANDIDATE_POOL = [
-    "NVDA", "MSFT", "AAPL", "AMZN", "META", "GOOGL", "AVGO", "AMD", "TSLA", "NYSE",
+    "NVDA", "MSFT", "AAPL", "AMZN", "META", "GOOGL", "AVGO", "AMD", "TSLA", "PLTR",
     "ARM", "MU", "INTC", "ORCL", "CRM", "NOW", "ADBE", "SNOW", "SHOP", "UBER",
     "PANW", "CRWD", "NET", "DDOG", "MDB", "TEAM", "WDAY", "ANET", "SMCI", "DELL",
     "QCOM", "TXN", "AMAT", "LRCX", "KLAC", "ASML", "TSM", "MRVL", "SNPS", "CDNS",
-    "COIN", "HOOD", "SQ", "PYPL", "RBLX", "ROKU", "TTWO"
+    "COIN", "HOOD", "SQ", "PYPL", "RBLX", "ROKU", "SOFI"
 ]
 
 # =========================
@@ -985,14 +985,13 @@ def compute_scan(symbol: str):
     buy_trigger = ref * BUY_DIP
     locked = is_locked_today(symbol)
     ready_to_buy = (
-    not locked and
-    price <= buy_trigger and
-    short_momentum >= 0 and
-    spread <= MAX_SPREAD and
-    MIN_PULLBACK <= pullback <= MAX_PULLBACK and
-    short_momentum >= MIN_SHORT_MOMENTUM and
-    len(curve) >= MIN_TICKS_BEFORE_BUY
-)
+        not locked and
+        price <= buy_trigger and
+        spread <= MAX_SPREAD and
+        MIN_PULLBACK <= pullback <= MAX_PULLBACK and
+        short_momentum >= MIN_SHORT_MOMENTUM and
+        len(curve) >= MIN_TICKS_BEFORE_BUY
+    )
 
     temp = {
         "symbol": symbol, "quality_score": quality_score, "spread": spread,
@@ -1127,9 +1126,14 @@ def add_pdt_warning(symbol: str, reason: str):
 def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_hard_stop=False):
     if not PDT_AWARE_MODE_ENABLED or not was_bought_today(symbol):
         return False
-    if allow_hard_stop and pnl_pct <= HARD_STOP_LOSS_PCT:
+
+    # Critical safety fix:
+    # FAST STOP / hard-stop exits must not be blocked by PDT-aware profit/rotation holds.
+    # This keeps losers capped at FAST_STOP_LOSS_PCT instead of waiting for HARD_STOP_LOSS_PCT.
+    if allow_hard_stop:
         add_pdt_warning(symbol, f"hard stop override: attempting sell despite same-day buy, pnl={pnl_pct:.2f}%")
         return False
+
     mins = minutes_since_today_buy(symbol)
     if "ROTATE" in reason.upper() and AVOID_SAME_DAY_ROTATION_SELLS:
         add_pdt_warning(symbol, f"rotation skipped because bought today; hold until next day reset")
