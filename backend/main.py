@@ -227,14 +227,15 @@ if PROFIT_OPTIMIZER_ENABLED:
     PARTIAL_PROFIT_SELL_PCT = OPTIMIZED_PARTIAL_PROFIT_SELL_PCT
 
 
-# Monthly Auto Universe Rotation
+# Daily Adaptive Auto Universe Rotation
 # Keeps the bot focused on liquid, tight-spread tech stocks, while still giving
 # extra score to stocks that your own trade history proves are working.
+# Refreshes once per day automatically, plus on-demand from the dashboard.
 AUTO_UNIVERSE_ENABLED = True
-AUTO_UNIVERSE_MODE = "MONTHLY_TECH"
+AUTO_UNIVERSE_MODE = "DAILY_ADAPTIVE_TECH"
 AUTO_UNIVERSE_SIZE = 12
 AUTO_UNIVERSE_REFRESH_DAY = 0  # kept for backwards compatibility
-AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 24
+AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 18
 AUTO_UNIVERSE_KEEP_WINNERS = True
 AUTO_UNIVERSE_KEEP_WINNER_MIN_PNL = 0.50
 AUTO_UNIVERSE_KEEP_WINNER_MIN_WINRATE = 0.55
@@ -2647,6 +2648,11 @@ def month_start_str(dt=None):
     return dt.strftime("%Y-%m-01")
 
 
+def day_start_str(dt=None):
+    dt = dt or datetime.now(UTC)
+    return dt.strftime("%Y-%m-%d")
+
+
 def get_last_universe_refresh():
     if not SQLITE_ENABLED:
         return None
@@ -2717,7 +2723,7 @@ def save_weekly_universe(rows, reason="weekly refresh"):
 
 def should_refresh_weekly_universe(force=False):
     """
-    Backwards-compatible name, but now refreshes the auto universe monthly.
+    Backwards-compatible name, but now refreshes the auto universe daily.
     Force refresh still works from the dashboard/manual endpoint.
     """
     if force:
@@ -2734,9 +2740,12 @@ def should_refresh_weekly_universe(force=False):
     try:
         last_dt = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
         hours = (datetime.now(UTC) - last_dt).total_seconds() / 3600
+
+        # Daily adaptive refresh: refresh once the minimum hours has passed
+        # and the calendar day has changed.
         if hours < AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH:
             return False
-        return month_start_str(last_dt) != month_start_str()
+        return day_start_str(last_dt) != day_start_str()
     except Exception:
         return True
 
@@ -2799,12 +2808,12 @@ def universe_rows_from_stock_memory():
 
 def score_candidate_symbol(symbol):
     """
-    Monthly tech-universe scoring for new candidates.
+    Daily adaptive tech-universe scoring for new candidates.
     Rewards liquid, tight-spread stocks that are suitable for sniper entries.
     """
     symbol = symbol.upper()
     score = 1.0
-    reasons = ["monthly tech candidate"]
+    reasons = ["daily adaptive tech candidate"]
 
     if symbol in AUTO_UNIVERSE_CANDIDATE_POOL:
         score += AUTO_UNIVERSE_TECH_BIAS_BONUS
@@ -2900,7 +2909,7 @@ def build_weekly_universe(force=False):
     if not chosen:
         chosen = [{"symbol": s, "score": 0, "reason": "fallback safe universe", "status": "active"} for s in SAFE_UNIVERSE[:AUTO_UNIVERSE_SIZE]]
 
-    save_weekly_universe(chosen, "forced refresh" if force else "weekly refresh")
+    save_weekly_universe(chosen, "forced daily adaptive refresh" if force else "daily adaptive refresh")
     current_universe = [r["symbol"] for r in chosen]
 
     for s in current_universe:
@@ -2928,6 +2937,8 @@ def auto_universe_payload():
         "size": AUTO_UNIVERSE_SIZE,
         "weekStart": week_start_str(),
         "monthStart": month_start_str(),
+        "dayStart": day_start_str(),
+        "refreshEveryHours": AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH,
         "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe),
         "rows": active,
         "lastRefresh": get_last_universe_refresh(),
@@ -2943,6 +2954,12 @@ def weekly_universe_public():
 
 @app.get("/monthly-universe")
 def monthly_universe_public():
+    # Backwards-compatible alias.
+    return auto_universe_payload()
+
+
+@app.get("/daily-universe")
+def daily_universe_public():
     return auto_universe_payload()
 
 # =========================
@@ -3286,6 +3303,16 @@ def refresh_universe(request: Request):
 
 @app.post("/refresh-monthly-universe")
 def refresh_monthly_universe(request: Request):
+    # Backwards-compatible alias.
+    verify_api_key(request)
+    with bot_lock:
+        result = build_weekly_universe(force=True)
+        update_status(BOT_NAME, latest_scans)
+        return result
+
+
+@app.post("/refresh-daily-universe")
+def refresh_daily_universe(request: Request):
     verify_api_key(request)
     with bot_lock:
         result = build_weekly_universe(force=True)
