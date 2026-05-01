@@ -68,13 +68,13 @@ BOT_NAME = "Rebuilt Sniper Profit Bot"
 
 SAFE_UNIVERSE = [
     "SOFI", "PLTR", "F", "RIVN", "LCID", "AAL", "NIO", "PLUG", "OPEN", "PFE", "T",
-    "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "AMD", "XOM" "TSLA", "COIN", "SHOP", "SNOW", "CRM"
+    "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "AMD", "XOM"
 ]
 
 CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
-MAX_POSITIONS = 25
+MAX_POSITIONS = 12
 MAX_NEW_BUYS_PER_LOOP = 1
 MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
@@ -172,7 +172,7 @@ CONFIDENCE_SIZING_ENABLED = True
 STOCK_MEMORY_ENABLED = True
 TRADE_TIMELINE_ENABLED = True
 
-SNIPER_MIN_CONFIDENCE = 0.55
+SNIPER_MIN_CONFIDENCE = 0.58
 SNIPER_MIN_QUALITY = 0.020
 SNIPER_MAX_SPREAD = 0.012
 SNIPER_MIN_PULLBACK = 0.0015
@@ -181,8 +181,8 @@ SNIPER_MIN_MOMENTUM = -0.003
 
 # A+ trade quality gate
 A_PLUS_GATE_ENABLED = True
-A_PLUS_MIN_CONFIDENCE = 0.62
-A_PLUS_MIN_QUALITY = 0.018
+A_PLUS_MIN_CONFIDENCE = 0.70
+A_PLUS_MIN_QUALITY = 0.026
 A_PLUS_MAX_SPREAD = 0.010
 A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM = True
 A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY = True
@@ -227,20 +227,31 @@ if PROFIT_OPTIMIZER_ENABLED:
     PARTIAL_PROFIT_SELL_PCT = OPTIMIZED_PARTIAL_PROFIT_SELL_PCT
 
 
-# Weekly Auto Universe Rotation
+# Monthly Auto Universe Rotation
+# Keeps the bot focused on liquid, tight-spread tech stocks, while still giving
+# extra score to stocks that your own trade history proves are working.
 AUTO_UNIVERSE_ENABLED = True
-AUTO_UNIVERSE_SIZE = 25
-AUTO_UNIVERSE_REFRESH_DAY = 0
-AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 12
+AUTO_UNIVERSE_MODE = "MONTHLY_TECH"
+AUTO_UNIVERSE_SIZE = 12
+AUTO_UNIVERSE_REFRESH_DAY = 0  # kept for backwards compatibility
+AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 24
 AUTO_UNIVERSE_KEEP_WINNERS = True
 AUTO_UNIVERSE_KEEP_WINNER_MIN_PNL = 0.50
 AUTO_UNIVERSE_KEEP_WINNER_MIN_WINRATE = 0.55
 AUTO_UNIVERSE_REMOVE_LOSER_MAX_WINRATE = 0.35
 AUTO_UNIVERSE_REMOVE_LOSER_MAX_PNL = -1.00
 AUTO_UNIVERSE_MIN_PRICE = 1.00
-AUTO_UNIVERSE_MAX_PRICE = 800.00
+AUTO_UNIVERSE_MAX_PRICE = 900.00
 AUTO_UNIVERSE_MAX_SPREAD = 0.020
-AUTO_UNIVERSE_CANDIDATE_POOL = ["SOFI","PLTR","F","RIVN","LCID","AAL","NIO","PLUG","OPEN","PFE","T","NVDA","MSFT","AAPL","GOOGL","AMZN","META","AVGO","AMD","XOM","TSLA","MARA","RIOT","COIN","HOOD","SHOP","SQ","PYPL","UBER","ABNB","DKNG","RBLX","SNAP","ROKU","BABA","INTC","MU","BAC","C","WFC","GM","CCL","DAL","UAL","DIS","NKE","WMT","CVS","KO","JPM"]
+AUTO_UNIVERSE_TECH_BIAS_BONUS = 5.0
+AUTO_UNIVERSE_HELD_POSITION_BONUS = 12.0
+AUTO_UNIVERSE_CANDIDATE_POOL = [
+    "NVDA", "MSFT", "AAPL", "AMZN", "META", "GOOGL", "AVGO", "AMD", "TSLA", "PLTR",
+    "ARM", "MU", "INTC", "ORCL", "CRM", "NOW", "ADBE", "SNOW", "SHOP", "UBER",
+    "PANW", "CRWD", "NET", "DDOG", "MDB", "TEAM", "WDAY", "ANET", "SMCI", "DELL",
+    "QCOM", "TXN", "AMAT", "LRCX", "KLAC", "ASML", "TSM", "MRVL", "SNPS", "CDNS",
+    "COIN", "HOOD", "SQ", "PYPL", "RBLX", "ROKU", "SOFI"
+]
 
 # =========================
 # CLIENTS
@@ -2631,6 +2642,11 @@ def week_start_str(dt=None):
     return monday.strftime("%Y-%m-%d")
 
 
+def month_start_str(dt=None):
+    dt = dt or datetime.now(UTC)
+    return dt.strftime("%Y-%m-01")
+
+
 def get_last_universe_refresh():
     if not SQLITE_ENABLED:
         return None
@@ -2700,6 +2716,10 @@ def save_weekly_universe(rows, reason="weekly refresh"):
 
 
 def should_refresh_weekly_universe(force=False):
+    """
+    Backwards-compatible name, but now refreshes the auto universe monthly.
+    Force refresh still works from the dashboard/manual endpoint.
+    """
     if force:
         return True
     if not AUTO_UNIVERSE_ENABLED:
@@ -2716,10 +2736,9 @@ def should_refresh_weekly_universe(force=False):
         hours = (datetime.now(UTC) - last_dt).total_seconds() / 3600
         if hours < AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH:
             return False
+        return month_start_str(last_dt) != month_start_str()
     except Exception:
-        pass
-
-    return datetime.now(UTC).weekday() == AUTO_UNIVERSE_REFRESH_DAY
+        return True
 
 
 def universe_rows_from_stock_memory():
@@ -2780,29 +2799,34 @@ def universe_rows_from_stock_memory():
 
 def score_candidate_symbol(symbol):
     """
-    Fallback/new-candidate scoring for symbols not yet in stock memory.
+    Monthly tech-universe scoring for new candidates.
+    Rewards liquid, tight-spread stocks that are suitable for sniper entries.
     """
     symbol = symbol.upper()
     score = 1.0
-    reasons = ["candidate pool"]
+    reasons = ["monthly tech candidate"]
+
+    if symbol in AUTO_UNIVERSE_CANDIDATE_POOL:
+        score += AUTO_UNIVERSE_TECH_BIAS_BONUS
+        reasons.append("tech bias")
 
     try:
         q = get_quote(symbol)
         price = float(q["mid"])
         spread = float(q["spread"])
 
-        if 1 <= price <= 800:
+        if AUTO_UNIVERSE_MIN_PRICE <= price <= AUTO_UNIVERSE_MAX_PRICE:
             score += 2.0
             reasons.append(f"price ok ${price:.2f}")
         else:
             score -= 10.0
             reasons.append(f"price out of range ${price:.2f}")
 
-        if spread <= 0.02:
-            score += max(0.0, 4.0 - spread * 200)
+        if spread <= AUTO_UNIVERSE_MAX_SPREAD:
+            score += max(0.0, 6.0 - spread * 250)
             reasons.append(f"spread ok {spread:.4f}")
         else:
-            score -= 5.0
+            score -= 6.0
             reasons.append(f"spread wide {spread:.4f}")
     except Exception:
         score -= 2.0
@@ -2811,7 +2835,7 @@ def score_candidate_symbol(symbol):
     try:
         qty, _ = get_position(symbol)
         if qty > DUST_THRESHOLD:
-            score += 8.0
+            score += AUTO_UNIVERSE_HELD_POSITION_BONUS
             reasons.append("currently held")
     except Exception:
         pass
@@ -2831,7 +2855,7 @@ def build_weekly_universe(force=False):
             current_universe = [r["symbol"] for r in active]
             for s in current_universe:
                 ensure_symbol_state(s, custom=s in custom_symbols)
-            return {"ok": True, "message": "Weekly universe already fresh", "symbols": current_universe, "rows": active}
+            return {"ok": True, "message": f"{AUTO_UNIVERSE_MODE} universe already fresh", "symbols": current_universe, "rows": active}
 
     rows = universe_rows_from_stock_memory()
 
@@ -2884,7 +2908,7 @@ def build_weekly_universe(force=False):
 
     return {
         "ok": True,
-        "message": f"Weekly universe updated with {len(current_universe)} symbols",
+        "message": f"{AUTO_UNIVERSE_MODE} universe updated with {len(current_universe)} symbols",
         "symbols": current_universe,
         "rows": chosen,
     }
@@ -2900,8 +2924,10 @@ def auto_universe_payload():
 
     return {
         "enabled": AUTO_UNIVERSE_ENABLED,
+        "mode": AUTO_UNIVERSE_MODE,
         "size": AUTO_UNIVERSE_SIZE,
         "weekStart": week_start_str(),
+        "monthStart": month_start_str(),
         "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe),
         "rows": active,
         "lastRefresh": get_last_universe_refresh(),
@@ -2912,6 +2938,11 @@ def auto_universe_payload():
 
 @app.get("/weekly-universe")
 def weekly_universe_public():
+    return auto_universe_payload()
+
+
+@app.get("/monthly-universe")
+def monthly_universe_public():
     return auto_universe_payload()
 
 # =========================
@@ -3246,6 +3277,15 @@ def backfill_trades_limited(request: Request):
 
 @app.post("/refresh-universe")
 def refresh_universe(request: Request):
+    verify_api_key(request)
+    with bot_lock:
+        result = build_weekly_universe(force=True)
+        update_status(BOT_NAME, latest_scans)
+        return result
+
+
+@app.post("/refresh-monthly-universe")
+def refresh_monthly_universe(request: Request):
     verify_api_key(request)
     with bot_lock:
         result = build_weekly_universe(force=True)
