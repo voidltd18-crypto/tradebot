@@ -250,7 +250,7 @@ AUTO_UNIVERSE_CANDIDATE_POOL = [
     "ARM", "MU", "INTC", "ORCL", "CRM", "NOW", "ADBE", "SNOW", "SHOP", "UBER",
     "PANW", "CRWD", "NET", "DDOG", "MDB", "TEAM", "WDAY", "ANET", "SMCI", "DELL",
     "QCOM", "TXN", "AMAT", "LRCX", "KLAC", "ASML", "TSM", "MRVL", "SNPS", "CDNS",
-    "COIN", "HOOD", "SQ", "PYPL", "RBLX", "ROKU", "NYSE"
+    "COIN", "HOOD", "SQ", "PYPL", "RBLX", "ROKU", "RDDT"
 ]
 
 # =========================
