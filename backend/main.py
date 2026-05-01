@@ -119,6 +119,13 @@ ROTATION_COOLDOWN_SECONDS = 60 * 20
 PDT_AWARE_MODE_ENABLED = True
 AVOID_SAME_DAY_PROFIT_SELLS = True
 AVOID_SAME_DAY_ROTATION_SELLS = True
+
+# SWING MODE / PDT-SAFE MODE
+# When enabled, the bot may BUY today but will not SELL anything bought today.
+# This avoids Alpaca pattern-day-trading protection on accounts under $25k.
+SWING_MODE_ENABLED = True
+NO_SAME_DAY_SELLS = True
+
 MIN_HOLD_MINUTES_BEFORE_PROFIT_SELL = 45
 MIN_HOLD_MINUTES_BEFORE_ROTATION = 60
 HARD_STOP_LOSS_PCT = -3.50
@@ -130,7 +137,7 @@ PARTIAL_PROFIT_ENABLED = True
 PARTIAL_PROFIT_TRIGGER_PCT = 1.00
 PARTIAL_PROFIT_SELL_PCT = 0.50
 POST_PARTIAL_TRAIL_GIVEBACK = 0.996
-FAST_STOP_LOSS_PCT = -1.0
+FAST_STOP_LOSS_PCT = -1.20
 STALL_EXIT_ENABLED = True
 STALL_EXIT_AFTER_MINUTES = 90
 STALL_EXIT_MIN_PNL_PCT = 0.30
@@ -1144,6 +1151,18 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
     return False
 
 
+def swing_mode_should_hold_today(symbol: str, reason: str = "SELL"):
+    """Return True when same-day selling must be skipped for PDT-safe swing mode."""
+    if not globals().get("SWING_MODE_ENABLED", False):
+        return False
+    if not globals().get("NO_SAME_DAY_SELLS", False):
+        return False
+    if was_bought_today(symbol):
+        add_pdt_warning(symbol, f"SWING MODE: {reason} skipped because {symbol} was bought today; earliest sell is next market day")
+        return True
+    return False
+
+
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
     order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
     trading_client.submit_order(order)
@@ -1307,14 +1326,11 @@ def should_fast_stop(position: Dict[str, Any]):
     if not FAST_EXIT_MODE_ENABLED:
         return False, "fast exit disabled"
 
-    try:
-        price = float(position.get("price") or 0.0)
-        entry = float(position.get("entry") or 0.0)
-        if entry > 0 and price > 0:
-            pnl_pct = ((price / entry) - 1.0) * 100.0
-        else:
-            pnl_pct = float(position.get("pnlPct") or 0.0)
-    except Exception:
+    price = float(position.get("price") or 0.0)
+    entry = float(position.get("entry") or 0.0)
+    if price > 0 and entry > 0:
+        pnl_pct = ((price - entry) / entry) * 100.0
+    else:
         pnl_pct = float(position.get("pnlPct") or 0.0)
 
     if pnl_pct <= FAST_STOP_LOSS_PCT:
@@ -1441,6 +1457,9 @@ def maybe_rotate_weakest_into_best(scans):
     if notional < MIN_ORDER_NOTIONAL:
         return "ROTATION SKIP | replacement notional too small / no buying power"
 
+    if swing_mode_should_hold_today(weakest["symbol"], f"rotation out for {best['symbol']}"):
+        return f"ROTATION SKIP | swing/PDT-safe hold for {weakest['symbol']}"
+
     if pdt_aware_should_avoid_sell(weakest["symbol"], f"PROFIT MODE ROTATE OUT FOR {best['symbol']}", weakest["pnlPct"]):
         return f"ROTATION SKIP | PDT-aware hold for {weakest['symbol']}"
 
@@ -1456,24 +1475,14 @@ def maybe_rotate_weakest_into_best(scans):
         return f"ROTATION ERROR | {e}"
 
 def manage_money_mode_positions():
-    """Manage open positions with a guaranteed hard stop first.
-
-    Important: the stop-loss check uses live price and entry directly, not a
-    cached pnlPct field. This prevents losers sitting open because of stale or
-    missing PnL values.
-    """
     for p in get_all_positions():
-        symbol = str(p.get("symbol", "")).upper()
-
         try:
-            if not symbol:
-                continue
+            symbol = p["symbol"]
 
             if not MANAGE_OUTSIDE_UNIVERSE_POSITIONS and symbol not in current_universe:
                 continue
 
             if has_open_order(symbol):
-                print(f"POSITION SKIP {symbol} | existing open order")
                 continue
 
             price = float(p.get("price") or 0.0)
@@ -1483,13 +1492,17 @@ def manage_money_mode_positions():
             if price <= 0 or entry <= 0 or qty <= DUST_THRESHOLD:
                 continue
 
-            # Always calculate PnL from live price and entry.
-            pnl_pct = ((price / entry) - 1.0) * 100.0
-            p["pnlPct"] = pnl_pct
+            # Always calculate live PnL from actual price/entry.
+            pnl_pct = ((price - entry) / entry) * 100.0
 
-            print(f"POSITION CHECK {symbol} | pnl={pnl_pct:.2f}% | stop={FAST_STOP_LOSS_PCT:.2f}%")
+            print(f"SWING CHECK {symbol} | pnl={pnl_pct:.2f}% | boughtToday={was_bought_today(symbol)} | price={price:.2f} | entry={entry:.2f}")
 
-            # 🚨 HARD STOP LOSS FIRST — do not let PDT/stall/trailing checks block this.
+            # PDT-safe swing protection: no same-day sells at all.
+            # This MUST be before hard stop, trailing, partial, stall and rotation exits.
+            if swing_mode_should_hold_today(symbol, "position exit"):
+                continue
+
+            # 🚨 HARD STOP LOSS FIRST, but only after same-day-sell protection.
             if pnl_pct <= FAST_STOP_LOSS_PCT:
                 try:
                     market_sell_qty(
@@ -1497,21 +1510,20 @@ def manage_money_mode_positions():
                         qty,
                         entry=entry,
                         price=price,
-                        reason="HARD FAST STOP LOSS"
+                        reason="SWING HARD STOP LOSS"
                     )
                     state[symbol]["highest_since_entry"] = None
-                    print(f"HARD FAST STOP LOSS SELL {symbol} {pnl_pct:.2f}%")
+                    print(f"SWING HARD STOP LOSS SELL {symbol} {pnl_pct:.2f}%")
                 except Exception as e:
-                    print(f"HARD FAST STOP LOSS ERROR {symbol}: {e}")
+                    print(f"SWING HARD STOP LOSS ERROR {symbol}: {e}")
                 continue
 
-            # Secondary fast-stop helper kept for compatibility.
             fast_stop, fast_stop_reason = should_fast_stop(p)
             if fast_stop:
                 try:
-                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="FAST EXIT STOP LOSS")
+                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="SWING FAST EXIT STOP LOSS")
                     state[symbol]["highest_since_entry"] = None
-                    print(f"FAST EXIT STOP LOSS SELL {qty:.6f} {symbol} | {fast_stop_reason}")
+                    print(f"SWING FAST EXIT STOP LOSS SELL {qty:.6f} {symbol}")
                 except Exception as e:
                     print(f"SELL ERROR {symbol}: {e}")
                 continue
@@ -1519,9 +1531,8 @@ def manage_money_mode_positions():
             stop_price = entry * STOP_LOSS
             if price <= stop_price:
                 try:
-                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
+                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="SWING STOP LOSS")
                     state[symbol]["highest_since_entry"] = None
-                    print(f"MONEY MODE STOP LOSS SELL {symbol} {pnl_pct:.2f}%")
                 except Exception as e:
                     print(f"SELL ERROR {symbol}: {e}")
                 continue
@@ -1529,13 +1540,10 @@ def manage_money_mode_positions():
             partial_ok, partial_reason = should_partial_profit(p)
             if partial_ok:
                 try:
-                    if pdt_aware_should_avoid_sell(symbol, "PARTIAL PROFIT TAKE", pnl_pct, allow_hard_stop=False):
-                        continue
-
                     sell_qty = partial_profit_qty(p)
-                    market_sell_qty(symbol, sell_qty, entry=entry, price=price, reason="PARTIAL PROFIT TAKE")
+                    market_sell_qty(symbol, sell_qty, entry=entry, price=price, reason="SWING PARTIAL PROFIT TAKE")
                     mark_partial_profit_taken(symbol)
-                    print(f"PARTIAL PROFIT SELL {sell_qty:.6f} {symbol}")
+                    print(f"SWING PARTIAL PROFIT SELL {sell_qty:.6f} {symbol}")
                 except Exception as e:
                     print(f"PARTIAL SELL ERROR {symbol}: {e}")
                 continue
@@ -1543,12 +1551,9 @@ def manage_money_mode_positions():
             stall_ok, stall_reason = should_stall_exit(p)
             if stall_ok:
                 try:
-                    if pdt_aware_should_avoid_sell(symbol, "STALL EXIT", pnl_pct, allow_hard_stop=False):
-                        continue
-
-                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="STALL EXIT")
+                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="SWING STALL EXIT")
                     state[symbol]["highest_since_entry"] = None
-                    print(f"STALL EXIT SELL {qty:.6f} {symbol} | {stall_reason}")
+                    print(f"SWING STALL EXIT SELL {qty:.6f} {symbol} | {stall_reason}")
                 except Exception as e:
                     print(f"STALL SELL ERROR {symbol}: {e}")
                 continue
@@ -1562,18 +1567,16 @@ def manage_money_mode_positions():
 
                 if price <= trail_floor:
                     try:
-                        if pdt_aware_should_avoid_sell(symbol, "MONEY MODE TRAILING PROFIT", pnl_pct):
-                            continue
-
-                        market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
+                        market_sell_qty(symbol, qty, entry=entry, price=price, reason="SWING TRAILING PROFIT")
                         state[symbol]["highest_since_entry"] = None
-                        print(f"TRAILING PROFIT SELL {symbol} pnl={pnl_pct:.2f}%")
                     except Exception as e:
                         print(f"SELL ERROR {symbol}: {e}")
                     continue
-
         except Exception as e:
-            print(f"POSITION LOOP ERROR {symbol or 'UNKNOWN'}: {e}")
+            try:
+                print(f"POSITION LOOP ERROR {p.get('symbol', 'UNKNOWN')}: {e}")
+            except Exception:
+                print(f"POSITION LOOP ERROR: {e}")
             continue
 
 def money_mode_buy(scans, manual=False):
@@ -3060,6 +3063,8 @@ def build_status_payload(bot_name, scans):
         "profitModeEnabled": PROFIT_MODE_ENABLED,
         "rotationModeEnabled": ROTATION_MODE_ENABLED,
         "pdtAwareModeEnabled": PDT_AWARE_MODE_ENABLED,
+        "swingModeEnabled": SWING_MODE_ENABLED,
+        "noSameDaySells": NO_SAME_DAY_SELLS,
         "sniperModeEnabled": SNIPER_MODE_ENABLED,
         "confidenceSizingEnabled": CONFIDENCE_SIZING_ENABLED,
         "stockMemoryEnabled": STOCK_MEMORY_ENABLED,
@@ -3088,6 +3093,8 @@ def build_status_payload(bot_name, scans):
         "universe": list(current_universe),
         "config": {
             "checkInterval": CHECK_INTERVAL,
+            "swingModeEnabled": SWING_MODE_ENABLED,
+            "noSameDaySells": NO_SAME_DAY_SELLS,
             "maxPositions": MAX_POSITIONS,
             "targetPositionValuePct": TARGET_POSITION_VALUE_PCT,
             "maxPositionValuePct": MAX_POSITION_VALUE_PCT,
@@ -3152,6 +3159,7 @@ def build_status_payload(bot_name, scans):
             f"ANALYTICS | profit_factor={analytics_payload().get('profitFactor', 0):.2f} | avg_win={analytics_payload().get('averageWin', 0):.2f} | avg_loss={analytics_payload().get('averageLoss', 0):.2f}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
+            f"SWING MODE | enabled={SWING_MODE_ENABLED} | no_same_day_sells={NO_SAME_DAY_SELLS}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f}",
