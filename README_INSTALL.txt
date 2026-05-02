@@ -1,22 +1,24 @@
-Weekly stock refresh update
+UI + reports + weekly refresh package
 
-Backend:
-- Replace backend/main.py with backend/main.py from this package.
-- This adds:
-  POST /refresh-universe
-  GET /weekly-refresh-status
-  weeklyRefresh in /status where possible
-  Monday auto-refresh watchdog
+Replace:
+backend/main.py
+frontend/package.json
+frontend/index.html
+frontend/src/main.tsx
+frontend/src/App.tsx
+frontend/src/styles.css
 
-Frontend:
-- Open frontend/README_FRONTEND_PATCH.txt and add the small button to your current App.tsx.
-- I did not overwrite App.tsx to avoid breaking your just-working UI.
+Then push to GitHub.
 
-After upload:
-- Render redeploys backend.
-- Vercel redeploys frontend if you add the UI button.
+Render:
+- redeploy backend
 
-Button calls:
-POST ${VITE_API_BASE}/refresh-universe
+Vercel:
+- redeploy frontend
+- make sure VITE_API_BASE=https://tradebot-0myo.onrender.com
 
-Requires your saved dashboard API key in the UI because backend protects trading/admin endpoints.
+What changed:
+- Weekly Stock Refresh button added to Overview
+- Reports page now has price/equity history chart
+- Reports page has closed trade history table
+- Backend adds /reports if missing
