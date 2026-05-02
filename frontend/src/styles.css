@@ -30,3 +30,5 @@ h2{margin:0 0 14px;font-size:20px}.muted,small{color:var(--muted)}
 .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid var(--line);padding:10px;text-align:left;color:#dbeafe}th{color:var(--muted)}
 .field{display:grid;gap:8px;margin-bottom:12px}.field span{color:var(--muted)}pre{background:#020617;border:1px solid var(--line);border-radius:16px;padding:14px;overflow:auto;color:#cbd5e1}
 @media(max-width:900px){.topbar,.position{flex-direction:column}.pills,.position-side{align-items:flex-start;text-align:left;justify-content:flex-start}.stats,.grid.two{grid-template-columns:1fr}h1{font-size:32px}}
+
+.small-chart{height:240px}

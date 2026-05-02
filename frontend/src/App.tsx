@@ -1,7 +1,7 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import {
-  Area, AreaChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis
+  Area, AreaChart, Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis
 } from "recharts";
 
 const API_URL = import.meta.env.VITE_API_BASE || "https://tradebot-0myo.onrender.com";
@@ -104,20 +104,51 @@ export default function App() {
     return scans.find((s: AnyObj) => s.symbol === selectedSymbol) || scans[0];
   }, [scans, selectedSymbol]);
 
+  function formatChartLabel(raw: any, fallback: number) {
+    if (!raw) return `#${fallback + 1}`;
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) return String(raw).slice(0, 16);
+    return d.toLocaleString(undefined, {
+      month: "short",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+
+  function formatChartDay(raw: any, fallback: number) {
+    if (!raw) return `Session ${fallback + 1}`;
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) return String(raw).slice(0, 10);
+    return d.toLocaleDateString(undefined, { month: "short", day: "2-digit" });
+  }
+
   const reportChart = useMemo(() => {
-    return equityHistory.map((e: AnyObj, i: number) => ({
-      idx: i,
-      equity: chartCurrency === "GBP"
-        ? Number(e.equityGbp ?? e.valueGbp ?? Number(e.equity || e.value || 0) * rate)
-        : Number(e.equity ?? e.value ?? 0),
-      pnl: chartCurrency === "GBP"
-        ? Number(e.pnlGbp ?? Number(e.pnl || 0) * rate)
-        : Number(e.pnl || 0),
-      label: e.time || e.timestamp || e.t || String(i),
-      symbol: e.symbol || "",
-      side: e.side || "",
-    }));
+    return equityHistory.map((e: AnyObj, i: number) => {
+      const rawTime = e.time || e.timestamp || e.t || e.label || "";
+      return {
+        idx: i,
+        label: formatChartLabel(rawTime, i),
+        day: formatChartDay(rawTime, i),
+        equity: chartCurrency === "GBP"
+          ? Number(e.equityGbp ?? e.valueGbp ?? Number(e.equity || e.value || 0) * rate)
+          : Number(e.equity ?? e.value ?? 0),
+        pnl: chartCurrency === "GBP"
+          ? Number(e.pnlGbp ?? Number(e.pnl || 0) * rate)
+          : Number(e.pnl || 0),
+        symbol: e.symbol || "",
+        side: e.side || "",
+      };
+    });
   }, [equityHistory, chartCurrency, rate]);
+
+  const dailyPnlChart = useMemo(() => {
+    const grouped: Record<string, number> = {};
+    for (const p of reportChart) {
+      grouped[p.day] = (grouped[p.day] || 0) + Number(p.pnl || 0);
+    }
+    return Object.entries(grouped).map(([day, pnl]) => ({ day, pnl }));
+  }, [reportChart]);
 
   const scannerChart = selectedScan?.priceCurve || [];
 
@@ -212,13 +243,29 @@ export default function App() {
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={reportChart}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#263450" />
-                    <XAxis dataKey="label" stroke="#94a3b8" />
+                    <XAxis dataKey="label" stroke="#94a3b8" minTickGap={28} />
                     <YAxis stroke="#94a3b8" />
                     <Tooltip formatter={(v: any) => chartCurrency === "GBP" ? gbp(v) : usd(v)} />
                     <Area type="monotone" dataKey="equity" stroke="#38bdf8" fill="#38bdf833" />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : <p className="muted">No price/equity history yet. It will build as trades are recorded.</p>}
+            </div>
+          </Card>
+
+          <Card title="Daily PnL">
+            <div className="chart small-chart">
+              {dailyPnlChart.length ? (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={dailyPnlChart}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#263450" />
+                    <XAxis dataKey="day" stroke="#94a3b8" />
+                    <YAxis stroke="#94a3b8" />
+                    <Tooltip formatter={(v: any) => chartCurrency === "GBP" ? gbp(v) : usd(v)} />
+                    <Bar dataKey="pnl" fill="#38bdf8" />
+                  </BarChart>
+                </ResponsiveContainer>
+              ) : <p className="muted">Daily PnL bars will appear as trades are recorded.</p>}
             </div>
           </Card>
 
