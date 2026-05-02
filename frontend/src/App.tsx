@@ -164,6 +164,7 @@ export default function App() {
   const alpacaRejectionEvents: any[] = Array.isArray(data?.alpacaRejectionEvents) ? data.alpacaRejectionEvents : [];
   const pdtWarningEvents: any[] = Array.isArray(data?.pdtWarningEvents) ? data.pdtWarningEvents : [];
   const rate = Number(data?.fx?.usdToGbp || 0.78);
+  const moneyReport = data?.moneyReport || {};
 
   const fetchData = async () => {
     try {
@@ -319,7 +320,54 @@ export default function App() {
               </p>
             </div>
 
-            
+
+
+            <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.65)" }}>
+              <h2 style={{ marginTop: 0 }}>💷 Money Report</h2>
+              {!moneyReport.depositConfigured && (
+                <p style={{ color: "#facc15", fontWeight: 700 }}>
+                  Set Render env var TOTAL_DEPOSITED_USD to your total deposited amount for true lifetime gain/loss.
+                </p>
+              )}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 10 }}>
+                <div style={{ ...panel, background: "#020617" }}>
+                  Deposited<br />
+                  <DualMoney usdValue={moneyReport.totalDeposited || 0} gbpValue={moneyReport.totalDepositedGbp} rate={rate} />
+                </div>
+                <div style={{ ...panel, background: "#020617" }}>
+                  Current Account Value<br />
+                  <DualMoney usdValue={moneyReport.currentEquity || 0} gbpValue={moneyReport.currentEquityGbp} rate={rate} />
+                </div>
+                <div style={{ ...panel, background: "#020617" }}>
+                  Total Gain / Loss<br />
+                  <b style={{ color: Number(moneyReport.totalGainLoss || 0) >= 0 ? "#22c55e" : "#f87171" }}>
+                    {usd(moneyReport.totalGainLoss || 0)}
+                  </b><br />
+                  <span style={{ color: Number(moneyReport.totalGainLoss || 0) >= 0 ? "#22c55e" : "#f87171" }}>
+                    {gbpValue(moneyReport.totalGainLossGbp || 0)} · {pct(moneyReport.returnPct || 0)}
+                  </span>
+                </div>
+                <div style={{ ...panel, background: "#020617" }}>
+                  Earned Since Deposit<br />
+                  <b style={{ color: "#22c55e" }}>{usd(moneyReport.earnedSinceDeposit || 0)}</b><br />
+                  <span style={{ color: "#22c55e" }}>{gbpValue(moneyReport.earnedSinceDepositGbp || 0)}</span>
+                </div>
+                <div style={{ ...panel, background: "#020617" }}>
+                  Lost Since Deposit<br />
+                  <b style={{ color: "#f87171" }}>{usd(moneyReport.lostSinceDeposit || 0)}</b><br />
+                  <span style={{ color: "#f87171" }}>{gbpValue(moneyReport.lostSinceDepositGbp || 0)}</span>
+                </div>
+                <div style={{ ...panel, background: "#020617" }}>
+                  Open PnL<br />
+                  <b style={{ color: Number(moneyReport.openPnl || 0) >= 0 ? "#22c55e" : "#f87171" }}>{usd(moneyReport.openPnl || 0)}</b><br />
+                  <span style={{ color: Number(moneyReport.openPnl || 0) >= 0 ? "#22c55e" : "#f87171" }}>{gbpValue(moneyReport.openPnlGbp || 0)}</span>
+                </div>
+              </div>
+              <p style={{ color: "#94a3b8" }}>
+                Gross earned: {usd(moneyReport.totalEarnedGross || 0)} / {gbpValue(moneyReport.totalEarnedGrossGbp || 0)} · Gross losses: {usd(moneyReport.totalLostGross || 0)} / {gbpValue(moneyReport.totalLostGrossGbp || 0)} · Realised net: {usd(moneyReport.realisedNet || 0)} / {gbpValue(moneyReport.realisedNetGbp || 0)}
+              </p>
+            </div>
+
             <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(20,184,166,0.45)" }}>
               <h3>Persistent Trade Database</h3>
               <p style={{ color: "#2dd4bf", fontWeight: 700 }}>
