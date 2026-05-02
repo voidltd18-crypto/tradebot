@@ -37,7 +37,7 @@ export default function App() {
   const [message, setMessage] = useState("");
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("dashboard_api_key") || "");
   const [selectedSymbol, setSelectedSymbol] = useState("");
-  const [chartCurrency, setChartCurrency] = useState<"USD" | "GBP">("USD");
+  const [chartCurrency, setChartCurrency] = useState<"USD" | "GBP">("GBP");
 
   const rate = Number(data?.fx?.usdToGbp || 0.78);
   const scans = Array.isArray(data?.scans) ? data.scans : [];
@@ -173,10 +173,10 @@ export default function App() {
       </header>
 
       <section className="stats">
-        <Stat label="Equity" value={usd(data?.account?.equity)} sub={gbp(Number(data?.account?.equity || 0) * rate)} />
-        <Stat label="Buying Power" value={usd(data?.account?.buyingPower)} sub={gbp(Number(data?.account?.buyingPower || 0) * rate)} />
-        <Stat label="Day PnL" value={usd(data?.account?.pnlDay)} sub={gbp(Number(data?.account?.pnlDay || 0) * rate)} className={tone(data?.account?.pnlDay)} />
-        <Stat label="Total Gain/Loss" value={usd(totalGainLoss)} sub={`Deposited ${usd(totalDeposited)}`} className={tone(totalGainLoss)} />
+        <Stat label="Equity" value={gbp(Number(data?.account?.equity || 0) * rate)} sub={usd(data?.account?.equity)} />
+        <Stat label="Buying Power" value={gbp(Number(data?.account?.buyingPower || 0) * rate)} sub={usd(data?.account?.buyingPower)} />
+        <Stat label="Day PnL" value={gbp(Number(data?.account?.pnlDay || 0) * rate)} sub={usd(data?.account?.pnlDay)} className={tone(data?.account?.pnlDay)} />
+        <Stat label="Total Gain/Loss" value={gbp(Number(totalGainLoss || 0) * rate)} sub={`Deposited ${gbp(Number(totalDeposited || 0) * rate)} / ${usd(totalDeposited)}`} className={tone(totalGainLoss)} />
       </section>
 
       <nav className="tabs">
@@ -227,16 +227,16 @@ export default function App() {
       {tab === "reports" && (
         <main>
           <section className="stats">
-            <Stat label="Deposited" value={usd(totalDeposited)} sub={reports.depositSource ? `Source: ${reports.depositSource}` : ""} />
-            <Stat label="Earned Since Deposit" value={usd(earned)} className={tone(earned)} />
-            <Stat label="Lost Since Deposit" value={usd(lost)} className="loss" />
-            <Stat label="Current Equity" value={usd(reports.currentEquity ?? data?.account?.equity)} />
+            <Stat label="Deposited" value={gbp(Number(totalDeposited || 0) * rate)} sub={`${usd(totalDeposited)} · ${reports.depositSource ? `Source: ${reports.depositSource}` : ""}`} />
+            <Stat label="Earned Since Deposit" value={gbp(Number(earned || 0) * rate)} sub={usd(earned)} className={tone(earned)} />
+            <Stat label="Lost Since Deposit" value={gbp(Number(lost || 0) * rate)} sub={usd(lost)} className="loss" />
+            <Stat label="Current Equity" value={gbp(Number(reports.currentEquity ?? data?.account?.equity || 0) * rate)} sub={usd(reports.currentEquity ?? data?.account?.equity)} />
           </section>
 
           <Card title="Price / Equity History">
             <div className="chart-controls">
-              <button className={chartCurrency === "USD" ? "active" : ""} onClick={() => setChartCurrency("USD")}>USD</button>
               <button className={chartCurrency === "GBP" ? "active" : ""} onClick={() => setChartCurrency("GBP")}>GBP</button>
+              <button className={chartCurrency === "USD" ? "active" : ""} onClick={() => setChartCurrency("USD")}>USD</button>
             </div>
             <div className="chart">
               {reportChart.length ? (
@@ -281,7 +281,7 @@ export default function App() {
                       <td>{usd(t.entryPrice)}</td>
                       <td>{usd(t.exitPrice)}</td>
                       <td>{Number(t.qty || 0).toFixed(4)}</td>
-                      <td className={tone(t.pnl)}>{usd(t.pnl)}</td>
+                      <td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td>
                       <td className={tone(t.pnl)}>{pct(t.pnlPct)}</td>
                     </tr>
                   ))}
@@ -301,10 +301,10 @@ export default function App() {
                 <div>
                   <h3>{p.symbol}</h3>
                   <p>Qty {Number(p.qty || 0).toFixed(4)} · Entry {usd(p.entry)} · Price {usd(p.price)}</p>
-                  <p>Value <b>{usd(p.marketValue)}</b> / {gbp(p.marketValueGbp ?? p.marketValue * rate)}</p>
+                  <p>Value <b>{gbp(p.marketValueGbp ?? p.marketValue * rate)}</b> / {usd(p.marketValue)}</p>
                 </div>
                 <div className="position-side">
-                  <b className={tone(p.pnl)}>PnL {usd(p.pnl)} / {gbp(p.pnlGbp ?? p.pnl * rate)} / {pct(p.pnlPct)}</b>
+                  <b className={tone(p.pnl)}>PnL {gbp(p.pnlGbp ?? p.pnl * rate)} / {usd(p.pnl)} / {pct(p.pnlPct)}</b>
                   <span>{p.trailingActive ? `Trailing floor ${usd(p.trailFloor)}` : `Trail starts ${usd(p.trailStartPrice)}`}</span>
                   <button className="danger" onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button>
                 </div>
