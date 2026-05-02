@@ -76,8 +76,8 @@ UNIVERSE_REFRESH_SECONDS = 60 * 30
 
 MAX_POSITIONS = 25
 MAX_NEW_BUYS_PER_LOOP = 1
-MAX_POSITION_VALUE_PCT = 0.15
-TARGET_POSITION_VALUE_PCT = 0.10
+MAX_POSITION_VALUE_PCT = 0.12
+TARGET_POSITION_VALUE_PCT = 0.08
 MIN_ORDER_NOTIONAL = 1.00
 CASH_BUFFER = 0.50
 
@@ -194,11 +194,6 @@ LOSER_BLACKLIST_MIN_TRADES = 3
 LOSER_BLACKLIST_HOURS = 24
 TEMP_BLACKLIST_FILE = "temp_blacklist.json"
 
-# Same-day re-buy lockout after a successful sell.
-# This prevents the bot from selling a stock and then buying that same symbol again later the same day.
-SOLD_TODAY_LOCK_ENABLED = True
-SOLD_TODAY_LOCK_FILE = "sold_today_locks.json"
-
 LOW_CONFIDENCE_SIZE_MULTIPLIER = 0.65
 MEDIUM_CONFIDENCE_SIZE_MULTIPLIER = 1.00
 HIGH_CONFIDENCE_SIZE_MULTIPLIER = 1.35
@@ -280,7 +275,6 @@ for symbol in current_universe:
     }
 
 locked_today: Dict[str, str] = {}
-sold_today_locks: Dict[str, Dict[str, Any]] = {}
 custom_symbols: Dict[str, bool] = {}
 last_universe_refresh_ts = 0
 
@@ -381,12 +375,10 @@ def safe_save_json(path: str, data):
 
 
 def load_persistent_state():
-    global trade_history, stock_memory, temp_blacklist, sold_today_locks
+    global trade_history, stock_memory, temp_blacklist
     trade_history = safe_load_json(TRADE_HISTORY_FILE, [])
     stock_memory = safe_load_json(STOCK_MEMORY_FILE, {})
     temp_blacklist = safe_load_json(TEMP_BLACKLIST_FILE, {})
-    sold_today_locks = safe_load_json(SOLD_TODAY_LOCK_FILE, {})
-    cleanup_sold_today_locks()
 
 
 def save_trade_history():
@@ -399,10 +391,6 @@ def save_stock_memory():
 
 def save_temp_blacklist():
     safe_save_json(TEMP_BLACKLIST_FILE, temp_blacklist)
-
-
-def save_sold_today_locks():
-    safe_save_json(SOLD_TODAY_LOCK_FILE, sold_today_locks)
 
 
 def cleanup_temp_blacklist():
@@ -536,8 +524,6 @@ def reset_daily_flags_if_needed():
         if day != today:
             del locked_today[symbol]
 
-    cleanup_sold_today_locks()
-
     for symbol, day in list(partial_profit_taken.items()):
         if day != today:
             del partial_profit_taken[symbol]
@@ -555,51 +541,13 @@ def reset_daily_flags_if_needed():
             pass
 
 
-def cleanup_sold_today_locks():
-    if not SOLD_TODAY_LOCK_ENABLED:
-        return
-
-    today = today_str()
-    changed = False
-    for symbol, data in list(sold_today_locks.items()):
-        try:
-            if data.get("day") != today:
-                del sold_today_locks[symbol]
-                changed = True
-        except Exception:
-            del sold_today_locks[symbol]
-            changed = True
-
-    if changed:
-        save_sold_today_locks()
-
-
-def lock_symbol_until_tomorrow(symbol: str, reason: str = "sold today"):
-    symbol = symbol.upper()
+def lock_symbol_until_tomorrow(symbol: str):
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY:
         locked_today[symbol] = today_str()
 
-    if SOLD_TODAY_LOCK_ENABLED:
-        sold_today_locks[symbol] = {
-            "day": today_str(),
-            "time": now_time(),
-            "reason": reason,
-        }
-        save_sold_today_locks()
-        print(f"SOLD TODAY LOCK | {symbol} | {reason}")
-
-
-def is_sold_today_locked(symbol: str):
-    if not SOLD_TODAY_LOCK_ENABLED:
-        return False
-
-    cleanup_sold_today_locks()
-    data = sold_today_locks.get(symbol.upper())
-    return bool(data and data.get("day") == today_str())
-
 
 def is_locked_today(symbol: str):
-    return locked_today.get(symbol) == today_str() or is_sold_today_locked(symbol)
+    return locked_today.get(symbol) == today_str()
 
 
 def floor_qty(qty: float, decimals: int = 6):
@@ -1142,8 +1090,6 @@ def confidence_notional(scan):
 
 
 def can_buy_symbol(symbol: str):
-    if is_sold_today_locked(symbol):
-        return False, f"{symbol} sold today - re-buy locked until tomorrow"
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and is_locked_today(symbol):
         return False, f"{symbol} locked until tomorrow"
     if has_open_order(symbol):
@@ -1263,7 +1209,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     trade_events.append(event)
     add_trade_history_event(event)
     update_stock_memory_from_sell(symbol, pnl, pnl_pct)
-    lock_symbol_until_tomorrow(symbol, reason=reason)
+    lock_symbol_until_tomorrow(symbol)
     notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
 
 
@@ -3135,8 +3081,6 @@ def build_status_payload(bot_name, scans):
         "todayBuyCount": today_buy_count(),
         "maxNewBuysPerDayPdtAware": MAX_NEW_BUYS_PER_DAY_PDT_AWARE,
         "lockedSymbolsToday": locked_symbols,
-        "soldTodayLockedSymbols": sorted([s for s, d in sold_today_locks.items() if d.get("day") == today_str()]),
-        "soldTodayLockEnabled": SOLD_TODAY_LOCK_ENABLED,
         "customSymbols": sorted(list(custom_symbols.keys())),
         "maxPositions": MAX_POSITIONS,
         "newPositionNotional": calculate_new_position_notional(),
@@ -3213,7 +3157,6 @@ def build_status_payload(bot_name, scans):
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f}",
             f"POSITIONS | {len(positions)}",
             f"LOCKOUT | locked_today={', '.join(locked_symbols) if locked_symbols else 'none'}",
-            f"SOLD LOCK | enabled={SOLD_TODAY_LOCK_ENABLED} | symbols={', '.join(sorted([s for s, d in sold_today_locks.items() if d.get('day') == today_str()])) or 'none'}",
         ],
         "trades": trade_events[-50:],
         "tradeTimeline": trades_from_db(1000),
@@ -3294,18 +3237,6 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True, "bot": BOT_NAME, "paperMode": PAPER}
-
-
-@app.get("/sold-today-locks")
-def sold_today_locks_public():
-    cleanup_sold_today_locks()
-    return {
-        "ok": True,
-        "enabled": SOLD_TODAY_LOCK_ENABLED,
-        "day": today_str(),
-        "symbols": sorted([s for s, d in sold_today_locks.items() if d.get("day") == today_str()]),
-        "locks": sold_today_locks,
-    }
 
 
 @app.get("/market-status")
@@ -3532,3 +3463,137 @@ def startup_event():
         return
     bot_thread_started = True
     threading.Thread(target=run_bot_loop, daemon=True).start()
+
+
+
+# =========================
+# WEEKLY / MANUAL UNIVERSE REFRESH
+# =========================
+
+WEEKLY_UNIVERSE_REFRESH_STATE_FILE = os.path.join("backend", "state", "weekly_universe_refresh.json")
+
+def _weekly_refresh_state_load() -> Dict[str, Any]:
+    try:
+        if os.path.exists(WEEKLY_UNIVERSE_REFRESH_STATE_FILE):
+            with open(WEEKLY_UNIVERSE_REFRESH_STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"WEEKLY REFRESH STATE LOAD ERROR: {e}")
+    return {"lastRefreshDate": None, "lastRefreshAt": None, "lastRefreshReason": None, "lastRefreshCount": 0}
+
+def _weekly_refresh_state_save(reason: str, count: int) -> None:
+    try:
+        os.makedirs(os.path.dirname(WEEKLY_UNIVERSE_REFRESH_STATE_FILE), exist_ok=True)
+        now = datetime.now(UTC)
+        data = {
+            "lastRefreshDate": now.date().isoformat(),
+            "lastRefreshAt": now.isoformat(),
+            "lastRefreshReason": reason,
+            "lastRefreshCount": int(count or 0),
+        }
+        with open(WEEKLY_UNIVERSE_REFRESH_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"WEEKLY REFRESH STATE SAVE ERROR: {e}")
+
+def get_weekly_refresh_status() -> Dict[str, Any]:
+    data = _weekly_refresh_state_load()
+    today = datetime.now(UTC).date()
+    last_date = data.get("lastRefreshDate")
+    needs_weekly_refresh = False
+
+    # Monday auto-refresh once per Monday.
+    if today.weekday() == 0 and last_date != today.isoformat():
+        needs_weekly_refresh = True
+
+    data["needsWeeklyRefresh"] = needs_weekly_refresh
+    data["today"] = today.isoformat()
+    return data
+
+def perform_universe_refresh(reason: str = "manual") -> Dict[str, Any]:
+    """
+    Refreshes the stock universe without breaking old bot versions.
+    It tries known refresh functions first, then falls back to clearing cached
+    universe timestamps so your existing loop rebuilds the universe.
+    """
+    global current_universe, universe_last_refreshed, universe_last_refresh, last_universe_refresh
+    refreshed = False
+    count = 0
+
+    # Try common explicit refresh functions if present.
+    for fn_name in [
+        "refresh_universe",
+        "refresh_stock_universe",
+        "build_dynamic_universe",
+        "build_auto_universe",
+        "get_dynamic_universe",
+        "get_auto_universe",
+    ]:
+        fn = globals().get(fn_name)
+        if callable(fn):
+            try:
+                result = fn()
+                if isinstance(result, list):
+                    current_universe = result
+                    count = len(result)
+                elif isinstance(globals().get("current_universe"), list):
+                    count = len(globals().get("current_universe"))
+                refreshed = True
+                print(f"UNIVERSE REFRESH via {fn_name} | reason={reason} | count={count}")
+                break
+            except TypeError:
+                # Function may require args; ignore and try fallback.
+                pass
+            except Exception as e:
+                print(f"UNIVERSE REFRESH {fn_name} ERROR: {e}")
+
+    # Fallback: clear/rebuild common cached universe globals.
+    if not refreshed:
+        try:
+            if "SAFE_UNIVERSE" in globals():
+                current_universe = list(globals().get("SAFE_UNIVERSE") or [])
+            elif "TECH_UNIVERSE" in globals():
+                current_universe = list(globals().get("TECH_UNIVERSE") or [])
+            elif "UNIVERSE" in globals():
+                current_universe = list(globals().get("UNIVERSE") or [])
+            elif "current_universe" in globals() and isinstance(globals().get("current_universe"), list):
+                current_universe = list(globals().get("current_universe") or [])
+
+            # Force existing bot loop to rebuild on next scan if it uses timestamps.
+            for name in ["universe_last_refreshed", "universe_last_refresh", "last_universe_refresh"]:
+                if name in globals():
+                    globals()[name] = 0
+
+            count = len(globals().get("current_universe") or [])
+            refreshed = True
+            print(f"UNIVERSE REFRESH fallback | reason={reason} | count={count}")
+        except Exception as e:
+            print(f"UNIVERSE REFRESH FALLBACK ERROR: {e}")
+            refreshed = False
+
+    _weekly_refresh_state_save(reason, count)
+    return {
+        "ok": bool(refreshed),
+        "reason": reason,
+        "count": count,
+        "weeklyRefresh": get_weekly_refresh_status(),
+        "universe": globals().get("current_universe", [])[:200] if isinstance(globals().get("current_universe"), list) else [],
+    }
+
+def maybe_auto_weekly_universe_refresh() -> None:
+    try:
+        status = get_weekly_refresh_status()
+        if status.get("needsWeeklyRefresh"):
+            perform_universe_refresh("auto-weekly-monday")
+    except Exception as e:
+        print(f"AUTO WEEKLY UNIVERSE REFRESH ERROR: {e}")
+
+@app.post("/refresh-universe")
+def api_refresh_universe(request: Request):
+    require_dashboard_key(request)
+    return perform_universe_refresh("manual-button")
+
+@app.get("/weekly-refresh-status")
+def api_weekly_refresh_status():
+    return get_weekly_refresh_status()
+
