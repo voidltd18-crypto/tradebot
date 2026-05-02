@@ -1,24 +1,23 @@
-Full Pro Version
+Since Upgrade Tracker update
 
-Replace these in your repo:
+Replace:
 backend/main.py
-frontend/package.json
-frontend/index.html
-frontend/src/main.tsx
 frontend/src/App.tsx
 frontend/src/styles.css
 
-Then:
-- Push to GitHub
-- Redeploy Render backend
-- Redeploy Vercel frontend
+Then redeploy:
+- Render backend
+- Vercel frontend
 
-Includes:
-- GBP-first dashboard
-- Weekly Stock Refresh button
-- Custom Buy panel
-- Risk tab: PDT warnings, Alpaca rejections, sold/locked today
-- Auto-universe score panel
-- Reports: deposited, earned/lost, equity history chart, daily PnL bars, closed trade table
-- Scanner price history
-- Admin saved dashboard password
+Adds:
+- Since Upgrade stat on top dashboard
+- Since Upgrade tracker in Reports
+- Reset Upgrade Baseline button
+- GET /since-upgrade
+- POST /reset-upgrade-baseline
+
+How to use:
+1. Deploy.
+2. Open Reports.
+3. Press Reset Upgrade Baseline once.
+4. From then on, the dashboard shows performance from that point separately from old historical loss.

@@ -61,6 +61,7 @@ export default function App() {
   const pdtWarnings = pro?.pdtWarnings || data?.pdtWarningEvents || [];
   const alpacaRejections = pro?.alpacaRejections || data?.alpacaRejections || [];
   const autoUniverse = data?.autoUniverse || pro?.autoUniverse || {};
+  const sinceUpgrade = pro?.sinceUpgrade || reports?.sinceUpgrade || data?.sinceUpgrade || {};
   const equityHistory = Array.isArray(reports?.equityHistory) ? reports.equityHistory : trades;
 
   async function fetchJson(path: string) {
@@ -175,6 +176,7 @@ export default function App() {
         <Stat label="Buying Power" value={gbp(Number(account.buyingPower || 0) * rate)} sub={usd(account.buyingPower)} />
         <Stat label="Day PnL" value={gbp(Number(account.pnlDay || 0) * rate)} sub={usd(account.pnlDay)} className={tone(account.pnlDay)} />
         <Stat label="Total Gain/Loss" value={gbp(totalGainLoss * rate)} sub={`${usd(totalGainLoss)} · Deposited ${gbp(totalDeposited * rate)}`} className={tone(totalGainLoss)} />
+        <Stat label="Since Upgrade" value={gbp(Number(sinceUpgrade.sinceUpgradePnl || 0) * rate)} sub={`${usd(sinceUpgrade.sinceUpgradePnl)} · ${pct(sinceUpgrade.sinceUpgradePnlPct)}`} className={tone(sinceUpgrade.sinceUpgradePnl)} />
       </section>
 
       <nav className="tabs">
@@ -235,7 +237,22 @@ export default function App() {
             <Stat label="Earned Since Deposit" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)} />
             <Stat label="Lost Since Deposit" value={gbp(lost * rate)} sub={usd(lost)} className="loss" />
             <Stat label="Current Equity" value={gbp(Number((reports.currentEquity ?? account.equity) || 0) * rate)} sub={usd(reports.currentEquity ?? account.equity)} />
+            <Stat label="Since Upgrade" value={gbp(Number(sinceUpgrade.sinceUpgradePnl || 0) * rate)} sub={`${usd(sinceUpgrade.sinceUpgradePnl)} · ${pct(sinceUpgrade.sinceUpgradePnlPct)}`} className={tone(sinceUpgrade.sinceUpgradePnl)} />
           </section>
+
+          <Card title="Since Upgrade Tracker">
+            <div className="summary">
+              <div><span>Baseline set</span><b>{sinceUpgrade.baselineSet ? "Yes" : "Not yet"}</b></div>
+              <div><span>Baseline date</span><b>{sinceUpgrade.baselineAt || "Press reset to start from now"}</b></div>
+              <div><span>Baseline equity</span><b>{gbp(Number(sinceUpgrade.baselineEquity || 0) * rate)} / {usd(sinceUpgrade.baselineEquity)}</b></div>
+              <div><span>Current equity</span><b>{gbp(Number(sinceUpgrade.currentEquity || account.equity || 0) * rate)} / {usd(sinceUpgrade.currentEquity || account.equity)}</b></div>
+              <div><span>Since-upgrade PnL</span><b className={tone(sinceUpgrade.sinceUpgradePnl)}>{gbp(Number(sinceUpgrade.sinceUpgradePnl || 0) * rate)} / {usd(sinceUpgrade.sinceUpgradePnl)} / {pct(sinceUpgrade.sinceUpgradePnlPct)}</b></div>
+            </div>
+            <div className="actions tracker-actions">
+              <button className="purple" onClick={() => post("/reset-upgrade-baseline")}>Reset Upgrade Baseline</button>
+            </div>
+            <p className="muted">Use this after a major bot update. It separates old historical losses from new bot performance.</p>
+          </Card>
 
           <Card title="Price / Equity History">
             <div className="chart-controls">
@@ -355,7 +372,7 @@ export default function App() {
         <Card title="Admin">
           <label className="field"><span>Dashboard password</span><input type="password" value={apiKey} onChange={e => setApiKey(e.target.value)} /></label>
           <div className="actions"><button onClick={saveKey}>Save</button><button className="ghost" onClick={() => { localStorage.removeItem("dashboard_api_key"); setApiKey(""); }}>Clear</button></div>
-          <pre>{JSON.stringify({ api: API_URL, botEnabled: data?.botEnabled, market: data?.market, autoUniverse, lockedToday, proKeys: Object.keys(pro || {}) }, null, 2)}</pre>
+          <pre>{JSON.stringify({ api: API_URL, botEnabled: data?.botEnabled, market: data?.market, autoUniverse, lockedToday, sinceUpgrade, proKeys: Object.keys(pro || {}) }, null, 2)}</pre>
         </Card>
       )}
     </div>

@@ -3507,3 +3507,92 @@ async def custom_buy_json(request: Request):
         return {"ok": True, "message": f"Custom buy requested for {symbol}", "result": str(result)}
     except Exception as e:
         return {"ok": False, "message": f"Custom buy failed for {symbol}: {e}"}
+
+
+
+
+# =========================
+# SINCE-UPGRADE PERFORMANCE TRACKER
+# =========================
+
+UPGRADE_BASELINE_FILE = os.path.join("backend", "state", "upgrade_baseline.json")
+
+def _upgrade_tracker_account_equity() -> float:
+    try:
+        acct = trading_client.get_account()
+        return float(acct.equity)
+    except Exception:
+        try:
+            if isinstance(latest_status, dict):
+                return float((latest_status.get("account") or {}).get("equity") or 0)
+        except Exception:
+            pass
+    return 0.0
+
+def load_upgrade_baseline() -> Dict[str, Any]:
+    try:
+        if os.path.exists(UPGRADE_BASELINE_FILE):
+            with open(UPGRADE_BASELINE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"UPGRADE BASELINE LOAD ERROR: {e}")
+    return {}
+
+def save_upgrade_baseline(reason: str = "manual") -> Dict[str, Any]:
+    try:
+        os.makedirs(os.path.dirname(UPGRADE_BASELINE_FILE), exist_ok=True)
+        equity = _upgrade_tracker_account_equity()
+        now = datetime.now(UTC).isoformat()
+        payload = {
+            "baselineEquity": equity,
+            "baselineEquityGbp": equity * float(get_fx_rate() if "get_fx_rate" in globals() else globals().get("FX_FALLBACK_USD_TO_GBP", 0.78)),
+            "baselineAt": now,
+            "reason": reason,
+        }
+        with open(UPGRADE_BASELINE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return payload
+    except Exception as e:
+        print(f"UPGRADE BASELINE SAVE ERROR: {e}")
+        return {"error": str(e)}
+
+def get_since_upgrade_performance() -> Dict[str, Any]:
+    baseline = load_upgrade_baseline()
+    equity = _upgrade_tracker_account_equity()
+    fx = float(get_fx_rate() if "get_fx_rate" in globals() else globals().get("FX_FALLBACK_USD_TO_GBP", 0.78))
+
+    if not baseline:
+        # No baseline yet: show current equity as baseline until user presses reset.
+        baseline = {
+            "baselineEquity": equity,
+            "baselineEquityGbp": equity * fx,
+            "baselineAt": None,
+            "reason": "not-set",
+        }
+
+    base = float(baseline.get("baselineEquity") or 0)
+    pnl = equity - base
+    pnl_pct = (pnl / base * 100.0) if base > 0 else 0.0
+
+    return {
+        "baselineSet": bool(baseline.get("baselineAt")),
+        "baselineAt": baseline.get("baselineAt"),
+        "baselineReason": baseline.get("reason"),
+        "baselineEquity": base,
+        "baselineEquityGbp": base * fx,
+        "currentEquity": equity,
+        "currentEquityGbp": equity * fx,
+        "sinceUpgradePnl": pnl,
+        "sinceUpgradePnlGbp": pnl * fx,
+        "sinceUpgradePnlPct": pnl_pct,
+    }
+
+@app.get("/since-upgrade")
+def api_since_upgrade():
+    return {"ok": True, "sinceUpgrade": get_since_upgrade_performance()}
+
+@app.post("/reset-upgrade-baseline")
+def api_reset_upgrade_baseline(request: Request):
+    verify_api_key(request)
+    baseline = save_upgrade_baseline("manual-reset")
+    return {"ok": True, "message": "Since-upgrade baseline reset to current equity", "baseline": baseline}
