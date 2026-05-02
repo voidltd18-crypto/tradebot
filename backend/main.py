@@ -56,6 +56,13 @@ FX_QUOTE = "GBP"
 FX_FALLBACK_USD_TO_GBP = 0.78
 FX_REFRESH_SECONDS = 60 * 30
 
+# Reports / money tracking
+# Set this in Render to the total amount you have deposited into Alpaca.
+# Example: TOTAL_DEPOSITED_USD=500
+TOTAL_DEPOSITED_USD = float(os.getenv("TOTAL_DEPOSITED_USD", "0") or 0)
+TOTAL_WITHDRAWN_USD = float(os.getenv("TOTAL_WITHDRAWN_USD", "0") or 0)
+
+
 
 if not API_KEY or not API_SECRET:
     raise RuntimeError("Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY")
@@ -2067,6 +2074,92 @@ def closed_trade_summary_payload():
     }
 
 
+def money_report_payload():
+    """High-level deposit / gain / loss report for the dashboard.
+
+    Deposit figures come from Render environment variables because Alpaca's
+    standard trading account payload does not reliably expose lifetime deposits.
+    Set TOTAL_DEPOSITED_USD and optionally TOTAL_WITHDRAWN_USD in Render.
+    """
+    try:
+        account = get_account()
+        equity = float(account.equity)
+        cash = float(account.cash)
+        buying_power = float(account.buying_power)
+    except Exception:
+        equity = 0.0
+        cash = 0.0
+        buying_power = 0.0
+
+    positions = get_all_positions()
+    closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
+
+    realised_gains = sum(max(0.0, float(t.get("pnl") or 0.0)) for t in closed)
+    realised_losses = abs(sum(min(0.0, float(t.get("pnl") or 0.0)) for t in closed))
+    realised_net = realised_gains - realised_losses
+
+    open_pnl = sum(float(p.get("pnl") or 0.0) for p in positions)
+    open_gains = sum(max(0.0, float(p.get("pnl") or 0.0)) for p in positions)
+    open_losses = abs(sum(min(0.0, float(p.get("pnl") or 0.0)) for p in positions))
+
+    deposited = float(TOTAL_DEPOSITED_USD or 0.0)
+    withdrawn = float(TOTAL_WITHDRAWN_USD or 0.0)
+    net_deposited = deposited - withdrawn
+
+    # True account-level gain/loss if the deposit amount has been configured.
+    if net_deposited > 0:
+        total_gain_loss = equity - net_deposited
+    else:
+        # Fallback if deposit is not configured yet.
+        total_gain_loss = realised_net + open_pnl
+
+    total_earned_gross = realised_gains + open_gains
+    total_lost_gross = realised_losses + open_losses
+    return_pct = (total_gain_loss / net_deposited * 100.0) if net_deposited > 0 else 0.0
+
+    return {
+        "depositConfigured": net_deposited > 0,
+        "totalDeposited": deposited,
+        "totalDepositedGbp": money_gbp(deposited),
+        "totalWithdrawn": withdrawn,
+        "totalWithdrawnGbp": money_gbp(withdrawn),
+        "netDeposited": net_deposited,
+        "netDepositedGbp": money_gbp(net_deposited),
+        "currentEquity": equity,
+        "currentEquityGbp": money_gbp(equity),
+        "cash": cash,
+        "cashGbp": money_gbp(cash),
+        "buyingPower": buying_power,
+        "buyingPowerGbp": money_gbp(buying_power),
+        "totalGainLoss": total_gain_loss,
+        "totalGainLossGbp": money_gbp(total_gain_loss),
+        "returnPct": return_pct,
+        "earnedSinceDeposit": max(total_gain_loss, 0.0),
+        "earnedSinceDepositGbp": money_gbp(max(total_gain_loss, 0.0)),
+        "lostSinceDeposit": max(-total_gain_loss, 0.0),
+        "lostSinceDepositGbp": money_gbp(max(-total_gain_loss, 0.0)),
+        "totalEarnedGross": total_earned_gross,
+        "totalEarnedGrossGbp": money_gbp(total_earned_gross),
+        "totalLostGross": total_lost_gross,
+        "totalLostGrossGbp": money_gbp(total_lost_gross),
+        "realisedNet": realised_net,
+        "realisedNetGbp": money_gbp(realised_net),
+        "realisedGains": realised_gains,
+        "realisedGainsGbp": money_gbp(realised_gains),
+        "realisedLosses": realised_losses,
+        "realisedLossesGbp": money_gbp(realised_losses),
+        "openPnl": open_pnl,
+        "openPnlGbp": money_gbp(open_pnl),
+        "openGains": open_gains,
+        "openGainsGbp": money_gbp(open_gains),
+        "openLosses": open_losses,
+        "openLossesGbp": money_gbp(open_losses),
+        "closedTrades": len(closed),
+        "openPositions": len(positions),
+        "updatedAt": datetime.now(UTC).isoformat(),
+    }
+
+
 def stock_memory_from_closed_trades():
     closed = closed_trades_from_db(10000)
     memory: Dict[str, Dict[str, Any]] = {}
@@ -2607,7 +2700,6 @@ def optimiser_payload():
         "enabled": PROFIT_OPTIMIZER_ENABLED,
         "autoImproveEnabled": AUTO_IMPROVE_ENABLED,
         "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
-        "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
         "buyBlocked": blocked,
         "blockReason": reason,
         "dailyProfitTarget": DAILY_PROFIT_TARGET,
@@ -2949,6 +3041,7 @@ def build_status_payload(bot_name, scans):
         "mode": "SNIPER_CONFIDENCE_MEMORY_TIMELINE_GBP",
         "market": market_status,
         "fx": fx_payload(),
+        "moneyReport": money_report_payload(),
         "autoUniverse": auto_universe_payload(),
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
@@ -2963,7 +3056,6 @@ def build_status_payload(bot_name, scans):
         "profitOptimizerEnabled": PROFIT_OPTIMIZER_ENABLED,
         "analyticsEnabled": ANALYTICS_ENABLED,
         "autoImproveEnabled": AUTO_IMPROVE_ENABLED,
-        "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
         "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
         "fastExitModeEnabled": FAST_EXIT_MODE_ENABLED,
         "partialProfitEnabled": PARTIAL_PROFIT_ENABLED,
@@ -3110,6 +3202,11 @@ def root():
 @app.get("/status")
 def get_status():
     return latest_status
+
+
+@app.get("/reports")
+def reports():
+    return money_report_payload()
 
 
 @app.post("/pause")
@@ -3307,105 +3404,106 @@ def startup_event():
 
 
 # =========================
-# REPORTS API
+# PRO DASHBOARD HELPERS
 # =========================
 
-def _num(v, default=0.0):
+def _safe_list(v):
+    return v if isinstance(v, list) else []
+
+def _safe_dict(v):
+    return v if isinstance(v, dict) else {}
+
+def _pro_status_value(name: str, default=None):
     try:
-        return float(v or default)
+        if isinstance(latest_status, dict) and name in latest_status:
+            return latest_status.get(name, default)
     except Exception:
-        return float(default)
+        pass
+    return globals().get(name, default)
 
-def build_reports_payload() -> Dict[str, Any]:
-    status = latest_status if isinstance(latest_status, dict) else {}
-    account = status.get("account") or {}
-    db = status.get("dbSummary") or {}
+@app.get("/pro-dashboard")
+def pro_dashboard():
+    """
+    Extra dashboard payload used by the frontend.
+    It only reads existing bot state, so it is safe.
+    """
+    s = latest_status if isinstance(latest_status, dict) else {}
 
-    trade_timeline = status.get("tradeTimeline") or []
-    closed_trades = status.get("closedTrades") or []
+    locked = (
+        s.get("lockedSymbolsToday")
+        or s.get("soldTodayLocks")
+        or s.get("sold_today_locks")
+        or globals().get("locked_symbols_today", [])
+        or globals().get("sold_today_locks", [])
+        or []
+    )
 
-    equity = _num(account.get("equity"))
-    equity_gbp = _num(account.get("equityGbp"))
-    open_pnl = _num(account.get("openPnl") or account.get("pnlOpen"))
-    day_pnl = _num(account.get("pnlDay"))
+    pdt_events = (
+        s.get("pdtWarningEvents")
+        or s.get("pdtWarnings")
+        or globals().get("pdt_warning_events", [])
+        or []
+    )
 
-    total_deposited = _num(globals().get("TOTAL_DEPOSITED_USD", 0))
-    total_withdrawn = _num(globals().get("TOTAL_WITHDRAWN_USD", 0))
+    alpaca_rejections = (
+        s.get("alpacaRejections")
+        or s.get("rejections")
+        or globals().get("alpaca_rejections", [])
+        or []
+    )
 
-    # If env deposit is not set, use current equity as a safe baseline so report doesn't show nonsense.
-    deposit_source = "env"
-    if total_deposited <= 0:
-        total_deposited = equity
-        deposit_source = "equity-baseline"
+    auto_universe = (
+        s.get("autoUniverse")
+        or globals().get("auto_universe_status", {})
+        or {}
+    )
 
-    realised_net = _num(db.get("totalPnl"))
-    gross_wins = 0.0
-    gross_losses = 0.0
-
-    for t in closed_trades if isinstance(closed_trades, list) else []:
-        pnl = _num(t.get("pnl"))
-        if pnl >= 0:
-            gross_wins += pnl
-        else:
-            gross_losses += abs(pnl)
-
-    total_gain_loss = equity + total_withdrawn - total_deposited
-    earned_since_deposit = max(total_gain_loss, 0.0)
-    lost_since_deposit = abs(min(total_gain_loss, 0.0))
-
-    # Price/equity history for reports page.
-    equity_history = []
-    for i, e in enumerate(trade_timeline if isinstance(trade_timeline, list) else []):
-        equity_history.append({
-            "idx": i,
-            "time": e.get("time") or e.get("timestamp") or "",
-            "symbol": e.get("symbol") or "",
-            "side": e.get("side") or "",
-            "equity": _num(e.get("equity")),
-            "equityGbp": _num(e.get("equityGbp")),
-            "pnl": _num(e.get("pnl")),
-            "pnlGbp": _num(e.get("pnlGbp")),
-            "pnlPct": _num(e.get("pnlPct")),
-            "reason": e.get("reason") or "",
-        })
-
-    closed_trade_history = []
-    for i, t in enumerate(closed_trades if isinstance(closed_trades, list) else []):
-        closed_trade_history.append({
-            "idx": i,
-            "time": t.get("time") or "",
-            "symbol": t.get("symbol") or "",
-            "entryPrice": _num(t.get("entryPrice")),
-            "exitPrice": _num(t.get("exitPrice")),
-            "qty": _num(t.get("qty")),
-            "pnl": _num(t.get("pnl")),
-            "pnlGbp": _num(t.get("pnlGbp")),
-            "pnlPct": _num(t.get("pnlPct")),
-        })
+    pdt_tracker = (
+        s.get("pdtTracker")
+        or globals().get("pdt_tracker", {})
+        or {}
+    )
 
     return {
         "ok": True,
-        "depositSource": deposit_source,
-        "totalDeposited": total_deposited,
-        "totalWithdrawn": total_withdrawn,
-        "currentEquity": equity,
-        "currentEquityGbp": equity_gbp,
-        "totalGainLoss": total_gain_loss,
-        "earnedSinceDeposit": earned_since_deposit,
-        "lostSinceDeposit": lost_since_deposit,
-        "dayPnl": day_pnl,
-        "openPnl": open_pnl,
-        "realisedNet": realised_net,
-        "grossWins": gross_wins,
-        "grossLosses": gross_losses,
-        "closedTrades": closed_trade_history[-200:],
-        "equityHistory": equity_history[-500:],
-        "winRate": _num(db.get("winRate")) * 100.0,
-        "totalTrades": int(_num(db.get("totalTrades"))),
-        "matchedClosedTrades": int(_num(db.get("closedTrades"))),
+        "lockedToday": locked,
+        "pdtWarnings": pdt_events[-100:] if isinstance(pdt_events, list) else [],
+        "alpacaRejections": alpaca_rejections[-100:] if isinstance(alpaca_rejections, list) else [],
+        "autoUniverse": auto_universe,
+        "pdtTracker": pdt_tracker,
+        "latestStatusKeys": list(s.keys())[:200],
     }
 
-@app.get("/reports")
-def reports():
-    return build_reports_payload()
 
+
+
+@app.post("/custom-buy-json")
+async def custom_buy_json(request: Request):
+    verify_api_key(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    symbol = str(body.get("symbol") or "").upper().strip()
+    amount = body.get("amount") or body.get("notional") or body.get("usd") or None
+    if not symbol:
+        return {"ok": False, "message": "Missing symbol"}
+
+    try:
+        # Prefer existing custom_buy helpers if present.
+        if "custom_buy_symbol" in globals() and callable(globals()["custom_buy_symbol"]):
+            result = globals()["custom_buy_symbol"](symbol, amount)
+        elif "manual_custom_buy" in globals() and callable(globals()["manual_custom_buy"]):
+            result = globals()["manual_custom_buy"](symbol, amount)
+        elif "market_buy_notional" in globals() and callable(globals()["market_buy_notional"]):
+            notional = float(amount or globals().get("NEW_POSITION_NOTIONAL", 25))
+            result = globals()["market_buy_notional"](symbol, notional, reason="CUSTOM BUY")
+        else:
+            return {"ok": False, "message": "No compatible custom buy function found in backend"}
+        try:
+            update_status(BOT_NAME, latest_scans)
+        except Exception:
+            pass
+        return {"ok": True, "message": f"Custom buy requested for {symbol}", "result": str(result)}
+    except Exception as e:
+        return {"ok": False, "message": f"Custom buy failed for {symbol}: {e}"}

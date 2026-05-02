@@ -1,14 +1,24 @@
-Charts update package
+Full Pro Version
 
-Replace:
+Replace these in your repo:
+backend/main.py
+frontend/package.json
+frontend/index.html
+frontend/src/main.tsx
 frontend/src/App.tsx
 frontend/src/styles.css
 
-This keeps your repo structure and backend untouched.
+Then:
+- Push to GitHub
+- Redeploy Render backend
+- Redeploy Vercel frontend
 
-Changes:
-- Price / Equity History x-axis now uses real time/date labels, not 0/1/2 index numbers.
-- Added Daily PnL bar chart on Reports page.
-- Kept Weekly Stock Refresh button.
-
-Push to GitHub and redeploy Vercel only.
+Includes:
+- GBP-first dashboard
+- Weekly Stock Refresh button
+- Custom Buy panel
+- Risk tab: PDT warnings, Alpaca rejections, sold/locked today
+- Auto-universe score panel
+- Reports: deposited, earned/lost, equity history chart, daily PnL bars, closed trade table
+- Scanner price history
+- Admin saved dashboard password
