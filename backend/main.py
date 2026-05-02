@@ -119,13 +119,6 @@ ROTATION_COOLDOWN_SECONDS = 60 * 20
 PDT_AWARE_MODE_ENABLED = True
 AVOID_SAME_DAY_PROFIT_SELLS = True
 AVOID_SAME_DAY_ROTATION_SELLS = True
-
-# SWING MODE / PDT-SAFE MODE
-# When enabled, the bot may BUY today but will not SELL anything bought today.
-# This avoids Alpaca pattern-day-trading protection on accounts under $25k.
-SWING_MODE_ENABLED = True
-NO_SAME_DAY_SELLS = True
-
 MIN_HOLD_MINUTES_BEFORE_PROFIT_SELL = 45
 MIN_HOLD_MINUTES_BEFORE_ROTATION = 60
 HARD_STOP_LOSS_PCT = -3.50
@@ -137,7 +130,7 @@ PARTIAL_PROFIT_ENABLED = True
 PARTIAL_PROFIT_TRIGGER_PCT = 1.00
 PARTIAL_PROFIT_SELL_PCT = 0.50
 POST_PARTIAL_TRAIL_GIVEBACK = 0.996
-FAST_STOP_LOSS_PCT = -1.20
+FAST_STOP_LOSS_PCT = -1.0
 STALL_EXIT_ENABLED = True
 STALL_EXIT_AFTER_MINUTES = 90
 STALL_EXIT_MIN_PNL_PCT = 0.30
@@ -200,6 +193,11 @@ LOSER_BLACKLIST_LOSS_STREAK = 2
 LOSER_BLACKLIST_MIN_TRADES = 3
 LOSER_BLACKLIST_HOURS = 24
 TEMP_BLACKLIST_FILE = "temp_blacklist.json"
+
+# Same-day re-buy lockout after a successful sell.
+# This prevents the bot from selling a stock and then buying that same symbol again later the same day.
+SOLD_TODAY_LOCK_ENABLED = True
+SOLD_TODAY_LOCK_FILE = "sold_today_locks.json"
 
 LOW_CONFIDENCE_SIZE_MULTIPLIER = 0.65
 MEDIUM_CONFIDENCE_SIZE_MULTIPLIER = 1.00
@@ -282,6 +280,7 @@ for symbol in current_universe:
     }
 
 locked_today: Dict[str, str] = {}
+sold_today_locks: Dict[str, Dict[str, Any]] = {}
 custom_symbols: Dict[str, bool] = {}
 last_universe_refresh_ts = 0
 
@@ -382,10 +381,12 @@ def safe_save_json(path: str, data):
 
 
 def load_persistent_state():
-    global trade_history, stock_memory, temp_blacklist
+    global trade_history, stock_memory, temp_blacklist, sold_today_locks
     trade_history = safe_load_json(TRADE_HISTORY_FILE, [])
     stock_memory = safe_load_json(STOCK_MEMORY_FILE, {})
     temp_blacklist = safe_load_json(TEMP_BLACKLIST_FILE, {})
+    sold_today_locks = safe_load_json(SOLD_TODAY_LOCK_FILE, {})
+    cleanup_sold_today_locks()
 
 
 def save_trade_history():
@@ -398,6 +399,10 @@ def save_stock_memory():
 
 def save_temp_blacklist():
     safe_save_json(TEMP_BLACKLIST_FILE, temp_blacklist)
+
+
+def save_sold_today_locks():
+    safe_save_json(SOLD_TODAY_LOCK_FILE, sold_today_locks)
 
 
 def cleanup_temp_blacklist():
@@ -531,6 +536,8 @@ def reset_daily_flags_if_needed():
         if day != today:
             del locked_today[symbol]
 
+    cleanup_sold_today_locks()
+
     for symbol, day in list(partial_profit_taken.items()):
         if day != today:
             del partial_profit_taken[symbol]
@@ -548,13 +555,51 @@ def reset_daily_flags_if_needed():
             pass
 
 
-def lock_symbol_until_tomorrow(symbol: str):
+def cleanup_sold_today_locks():
+    if not SOLD_TODAY_LOCK_ENABLED:
+        return
+
+    today = today_str()
+    changed = False
+    for symbol, data in list(sold_today_locks.items()):
+        try:
+            if data.get("day") != today:
+                del sold_today_locks[symbol]
+                changed = True
+        except Exception:
+            del sold_today_locks[symbol]
+            changed = True
+
+    if changed:
+        save_sold_today_locks()
+
+
+def lock_symbol_until_tomorrow(symbol: str, reason: str = "sold today"):
+    symbol = symbol.upper()
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY:
         locked_today[symbol] = today_str()
 
+    if SOLD_TODAY_LOCK_ENABLED:
+        sold_today_locks[symbol] = {
+            "day": today_str(),
+            "time": now_time(),
+            "reason": reason,
+        }
+        save_sold_today_locks()
+        print(f"SOLD TODAY LOCK | {symbol} | {reason}")
+
+
+def is_sold_today_locked(symbol: str):
+    if not SOLD_TODAY_LOCK_ENABLED:
+        return False
+
+    cleanup_sold_today_locks()
+    data = sold_today_locks.get(symbol.upper())
+    return bool(data and data.get("day") == today_str())
+
 
 def is_locked_today(symbol: str):
-    return locked_today.get(symbol) == today_str()
+    return locked_today.get(symbol) == today_str() or is_sold_today_locked(symbol)
 
 
 def floor_qty(qty: float, decimals: int = 6):
@@ -1097,6 +1142,8 @@ def confidence_notional(scan):
 
 
 def can_buy_symbol(symbol: str):
+    if is_sold_today_locked(symbol):
+        return False, f"{symbol} sold today - re-buy locked until tomorrow"
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and is_locked_today(symbol):
         return False, f"{symbol} locked until tomorrow"
     if has_open_order(symbol):
@@ -1147,18 +1194,6 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
         return True
     if ("TRAILING" in reason.upper() or "PROFIT" in reason.upper()) and AVOID_SAME_DAY_PROFIT_SELLS:
         add_pdt_warning(symbol, f"profit sell skipped because bought today; hold until next day reset")
-        return True
-    return False
-
-
-def swing_mode_should_hold_today(symbol: str, reason: str = "SELL"):
-    """Return True when same-day selling must be skipped for PDT-safe swing mode."""
-    if not globals().get("SWING_MODE_ENABLED", False):
-        return False
-    if not globals().get("NO_SAME_DAY_SELLS", False):
-        return False
-    if was_bought_today(symbol):
-        add_pdt_warning(symbol, f"SWING MODE: {reason} skipped because {symbol} was bought today; earliest sell is next market day")
         return True
     return False
 
@@ -1228,7 +1263,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     trade_events.append(event)
     add_trade_history_event(event)
     update_stock_memory_from_sell(symbol, pnl, pnl_pct)
-    lock_symbol_until_tomorrow(symbol)
+    lock_symbol_until_tomorrow(symbol, reason=reason)
     notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
 
 
@@ -1326,11 +1361,14 @@ def should_fast_stop(position: Dict[str, Any]):
     if not FAST_EXIT_MODE_ENABLED:
         return False, "fast exit disabled"
 
-    price = float(position.get("price") or 0.0)
-    entry = float(position.get("entry") or 0.0)
-    if price > 0 and entry > 0:
-        pnl_pct = ((price - entry) / entry) * 100.0
-    else:
+    try:
+        price = float(position.get("price") or 0.0)
+        entry = float(position.get("entry") or 0.0)
+        if entry > 0 and price > 0:
+            pnl_pct = ((price / entry) - 1.0) * 100.0
+        else:
+            pnl_pct = float(position.get("pnlPct") or 0.0)
+    except Exception:
         pnl_pct = float(position.get("pnlPct") or 0.0)
 
     if pnl_pct <= FAST_STOP_LOSS_PCT:
@@ -1457,9 +1495,6 @@ def maybe_rotate_weakest_into_best(scans):
     if notional < MIN_ORDER_NOTIONAL:
         return "ROTATION SKIP | replacement notional too small / no buying power"
 
-    if swing_mode_should_hold_today(weakest["symbol"], f"rotation out for {best['symbol']}"):
-        return f"ROTATION SKIP | swing/PDT-safe hold for {weakest['symbol']}"
-
     if pdt_aware_should_avoid_sell(weakest["symbol"], f"PROFIT MODE ROTATE OUT FOR {best['symbol']}", weakest["pnlPct"]):
         return f"ROTATION SKIP | PDT-aware hold for {weakest['symbol']}"
 
@@ -1475,14 +1510,24 @@ def maybe_rotate_weakest_into_best(scans):
         return f"ROTATION ERROR | {e}"
 
 def manage_money_mode_positions():
+    """Manage open positions with a guaranteed hard stop first.
+
+    Important: the stop-loss check uses live price and entry directly, not a
+    cached pnlPct field. This prevents losers sitting open because of stale or
+    missing PnL values.
+    """
     for p in get_all_positions():
+        symbol = str(p.get("symbol", "")).upper()
+
         try:
-            symbol = p["symbol"]
+            if not symbol:
+                continue
 
             if not MANAGE_OUTSIDE_UNIVERSE_POSITIONS and symbol not in current_universe:
                 continue
 
             if has_open_order(symbol):
+                print(f"POSITION SKIP {symbol} | existing open order")
                 continue
 
             price = float(p.get("price") or 0.0)
@@ -1492,17 +1537,13 @@ def manage_money_mode_positions():
             if price <= 0 or entry <= 0 or qty <= DUST_THRESHOLD:
                 continue
 
-            # Always calculate live PnL from actual price/entry.
-            pnl_pct = ((price - entry) / entry) * 100.0
+            # Always calculate PnL from live price and entry.
+            pnl_pct = ((price / entry) - 1.0) * 100.0
+            p["pnlPct"] = pnl_pct
 
-            print(f"SWING CHECK {symbol} | pnl={pnl_pct:.2f}% | boughtToday={was_bought_today(symbol)} | price={price:.2f} | entry={entry:.2f}")
+            print(f"POSITION CHECK {symbol} | pnl={pnl_pct:.2f}% | stop={FAST_STOP_LOSS_PCT:.2f}%")
 
-            # PDT-safe swing protection: no same-day sells at all.
-            # This MUST be before hard stop, trailing, partial, stall and rotation exits.
-            if swing_mode_should_hold_today(symbol, "position exit"):
-                continue
-
-            # 🚨 HARD STOP LOSS FIRST, but only after same-day-sell protection.
+            # 🚨 HARD STOP LOSS FIRST — do not let PDT/stall/trailing checks block this.
             if pnl_pct <= FAST_STOP_LOSS_PCT:
                 try:
                     market_sell_qty(
@@ -1510,20 +1551,21 @@ def manage_money_mode_positions():
                         qty,
                         entry=entry,
                         price=price,
-                        reason="SWING HARD STOP LOSS"
+                        reason="HARD FAST STOP LOSS"
                     )
                     state[symbol]["highest_since_entry"] = None
-                    print(f"SWING HARD STOP LOSS SELL {symbol} {pnl_pct:.2f}%")
+                    print(f"HARD FAST STOP LOSS SELL {symbol} {pnl_pct:.2f}%")
                 except Exception as e:
-                    print(f"SWING HARD STOP LOSS ERROR {symbol}: {e}")
+                    print(f"HARD FAST STOP LOSS ERROR {symbol}: {e}")
                 continue
 
+            # Secondary fast-stop helper kept for compatibility.
             fast_stop, fast_stop_reason = should_fast_stop(p)
             if fast_stop:
                 try:
-                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="SWING FAST EXIT STOP LOSS")
+                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="FAST EXIT STOP LOSS")
                     state[symbol]["highest_since_entry"] = None
-                    print(f"SWING FAST EXIT STOP LOSS SELL {qty:.6f} {symbol}")
+                    print(f"FAST EXIT STOP LOSS SELL {qty:.6f} {symbol} | {fast_stop_reason}")
                 except Exception as e:
                     print(f"SELL ERROR {symbol}: {e}")
                 continue
@@ -1531,8 +1573,9 @@ def manage_money_mode_positions():
             stop_price = entry * STOP_LOSS
             if price <= stop_price:
                 try:
-                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="SWING STOP LOSS")
+                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
                     state[symbol]["highest_since_entry"] = None
+                    print(f"MONEY MODE STOP LOSS SELL {symbol} {pnl_pct:.2f}%")
                 except Exception as e:
                     print(f"SELL ERROR {symbol}: {e}")
                 continue
@@ -1540,10 +1583,13 @@ def manage_money_mode_positions():
             partial_ok, partial_reason = should_partial_profit(p)
             if partial_ok:
                 try:
+                    if pdt_aware_should_avoid_sell(symbol, "PARTIAL PROFIT TAKE", pnl_pct, allow_hard_stop=False):
+                        continue
+
                     sell_qty = partial_profit_qty(p)
-                    market_sell_qty(symbol, sell_qty, entry=entry, price=price, reason="SWING PARTIAL PROFIT TAKE")
+                    market_sell_qty(symbol, sell_qty, entry=entry, price=price, reason="PARTIAL PROFIT TAKE")
                     mark_partial_profit_taken(symbol)
-                    print(f"SWING PARTIAL PROFIT SELL {sell_qty:.6f} {symbol}")
+                    print(f"PARTIAL PROFIT SELL {sell_qty:.6f} {symbol}")
                 except Exception as e:
                     print(f"PARTIAL SELL ERROR {symbol}: {e}")
                 continue
@@ -1551,9 +1597,12 @@ def manage_money_mode_positions():
             stall_ok, stall_reason = should_stall_exit(p)
             if stall_ok:
                 try:
-                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="SWING STALL EXIT")
+                    if pdt_aware_should_avoid_sell(symbol, "STALL EXIT", pnl_pct, allow_hard_stop=False):
+                        continue
+
+                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="STALL EXIT")
                     state[symbol]["highest_since_entry"] = None
-                    print(f"SWING STALL EXIT SELL {qty:.6f} {symbol} | {stall_reason}")
+                    print(f"STALL EXIT SELL {qty:.6f} {symbol} | {stall_reason}")
                 except Exception as e:
                     print(f"STALL SELL ERROR {symbol}: {e}")
                 continue
@@ -1567,16 +1616,18 @@ def manage_money_mode_positions():
 
                 if price <= trail_floor:
                     try:
-                        market_sell_qty(symbol, qty, entry=entry, price=price, reason="SWING TRAILING PROFIT")
+                        if pdt_aware_should_avoid_sell(symbol, "MONEY MODE TRAILING PROFIT", pnl_pct):
+                            continue
+
+                        market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
                         state[symbol]["highest_since_entry"] = None
+                        print(f"TRAILING PROFIT SELL {symbol} pnl={pnl_pct:.2f}%")
                     except Exception as e:
                         print(f"SELL ERROR {symbol}: {e}")
                     continue
+
         except Exception as e:
-            try:
-                print(f"POSITION LOOP ERROR {p.get('symbol', 'UNKNOWN')}: {e}")
-            except Exception:
-                print(f"POSITION LOOP ERROR: {e}")
+            print(f"POSITION LOOP ERROR {symbol or 'UNKNOWN'}: {e}")
             continue
 
 def money_mode_buy(scans, manual=False):
@@ -3063,8 +3114,6 @@ def build_status_payload(bot_name, scans):
         "profitModeEnabled": PROFIT_MODE_ENABLED,
         "rotationModeEnabled": ROTATION_MODE_ENABLED,
         "pdtAwareModeEnabled": PDT_AWARE_MODE_ENABLED,
-        "swingModeEnabled": SWING_MODE_ENABLED,
-        "noSameDaySells": NO_SAME_DAY_SELLS,
         "sniperModeEnabled": SNIPER_MODE_ENABLED,
         "confidenceSizingEnabled": CONFIDENCE_SIZING_ENABLED,
         "stockMemoryEnabled": STOCK_MEMORY_ENABLED,
@@ -3086,6 +3135,8 @@ def build_status_payload(bot_name, scans):
         "todayBuyCount": today_buy_count(),
         "maxNewBuysPerDayPdtAware": MAX_NEW_BUYS_PER_DAY_PDT_AWARE,
         "lockedSymbolsToday": locked_symbols,
+        "soldTodayLockedSymbols": sorted([s for s, d in sold_today_locks.items() if d.get("day") == today_str()]),
+        "soldTodayLockEnabled": SOLD_TODAY_LOCK_ENABLED,
         "customSymbols": sorted(list(custom_symbols.keys())),
         "maxPositions": MAX_POSITIONS,
         "newPositionNotional": calculate_new_position_notional(),
@@ -3093,8 +3144,6 @@ def build_status_payload(bot_name, scans):
         "universe": list(current_universe),
         "config": {
             "checkInterval": CHECK_INTERVAL,
-            "swingModeEnabled": SWING_MODE_ENABLED,
-            "noSameDaySells": NO_SAME_DAY_SELLS,
             "maxPositions": MAX_POSITIONS,
             "targetPositionValuePct": TARGET_POSITION_VALUE_PCT,
             "maxPositionValuePct": MAX_POSITION_VALUE_PCT,
@@ -3159,12 +3208,12 @@ def build_status_payload(bot_name, scans):
             f"ANALYTICS | profit_factor={analytics_payload().get('profitFactor', 0):.2f} | avg_win={analytics_payload().get('averageWin', 0):.2f} | avg_loss={analytics_payload().get('averageLoss', 0):.2f}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
-            f"SWING MODE | enabled={SWING_MODE_ENABLED} | no_same_day_sells={NO_SAME_DAY_SELLS}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f}",
             f"POSITIONS | {len(positions)}",
             f"LOCKOUT | locked_today={', '.join(locked_symbols) if locked_symbols else 'none'}",
+            f"SOLD LOCK | enabled={SOLD_TODAY_LOCK_ENABLED} | symbols={', '.join(sorted([s for s, d in sold_today_locks.items() if d.get('day') == today_str()])) or 'none'}",
         ],
         "trades": trade_events[-50:],
         "tradeTimeline": trades_from_db(1000),
@@ -3245,6 +3294,18 @@ def root():
 @app.get("/health")
 def health():
     return {"ok": True, "bot": BOT_NAME, "paperMode": PAPER}
+
+
+@app.get("/sold-today-locks")
+def sold_today_locks_public():
+    cleanup_sold_today_locks()
+    return {
+        "ok": True,
+        "enabled": SOLD_TODAY_LOCK_ENABLED,
+        "day": today_str(),
+        "symbols": sorted([s for s, d in sold_today_locks.items() if d.get("day") == today_str()]),
+        "locks": sold_today_locks,
+    }
 
 
 @app.get("/market-status")
