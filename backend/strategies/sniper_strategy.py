@@ -1,43 +1,61 @@
-from __future__ import annotations
+from dataclasses import dataclass
 from typing import Dict, Any, Tuple
 
-class SniperStrategy:
-    def __init__(self, fast_stop_loss_pct=-1.0, trail_start_pct=1.2, trail_giveback_pct=0.7):
-        self.fast_stop_loss_pct = float(fast_stop_loss_pct)
-        self.trail_start_pct = float(trail_start_pct)
-        self.trail_giveback_pct = float(trail_giveback_pct)
+@dataclass
+class StrategyConfig:
+    max_spread: float = 0.006
+    prefer_spread_under: float = 0.0025
+    min_pullback: float = 0.001
+    max_pullback: float = 0.035
+    min_momentum: float = -0.004
+    min_confidence: float = 0.58
+    min_quality: float = 0.012
+    fast_stop_loss_pct: float = -1.0
+    trail_start_pct: float = 1.2
+    trail_giveback_pct: float = 0.7
 
-    def confidence(self, spread_pct: float, pullback_pct: float, momentum_pct: float) -> float:
-        score = 0.0
-        score += max(0.0, min(0.35, pullback_pct / 4.0))
-        score += 0.25 if spread_pct <= 0.15 else 0.15 if spread_pct <= 0.40 else 0.0
-        score += 0.25 if momentum_pct >= 0 else 0.10 if momentum_pct >= -0.25 else 0.0
-        score += 0.15 if 0.10 <= pullback_pct <= 3.5 else 0.0
-        return round(max(0.0, min(1.0, score)), 4)
 
-    def should_buy(self, scan: Dict[str, Any]) -> Tuple[bool, str]:
-        if scan.get('held'):
-            return False, 'already holding'
-        if scan.get('spreadPct', 999) > scan.get('maxSpreadPct', 0.60):
-            return False, 'spread too wide'
-        if scan.get('pullbackPct', 0) < 0.10:
-            return False, 'not enough pullback'
-        if scan.get('momentumPct', 0) < -0.25:
-            return False, 'momentum too weak'
-        if scan.get('confidence', 0) < scan.get('minConfidence', 0.55):
-            return False, 'confidence too low'
-        return True, 'sniper buy pass'
+def confidence(scan: Dict[str, Any], cfg: StrategyConfig) -> Tuple[float, str]:
+    spread = float(scan.get("spread", 1.0))
+    pullback = float(scan.get("pullback", 0.0))
+    momentum = float(scan.get("momentum", 0.0))
+    quality = float(scan.get("quality", 0.0))
+    c = 0.0
+    c += min(0.35, quality * 10.0)
+    c += 0.25 if spread <= cfg.prefer_spread_under else 0.12 if spread <= cfg.max_spread else 0.0
+    c += 0.20 if momentum >= 0 else 0.08 if momentum >= cfg.min_momentum else 0.0
+    c += 0.20 if cfg.min_pullback <= pullback <= cfg.max_pullback else 0.0
+    c = max(0.0, min(1.0, c))
+    label = "HIGH" if c >= 0.75 else "MEDIUM" if c >= cfg.min_confidence else "LOW"
+    return c, label
 
-    def exit_decision(self, position: Dict[str, Any]) -> Tuple[str, str]:
-        pnl_pct = float(position.get('pnlPct') or 0.0)
-        price = float(position.get('price') or 0.0)
-        entry = float(position.get('entry') or 0.0)
-        highest = float(position.get('highest') or price)
-        if pnl_pct <= self.fast_stop_loss_pct:
-            return 'SELL', f'hard stop {pnl_pct:.2f}%'
-        if entry > 0 and price > 0:
-            trail_start_price = entry * (1 + self.trail_start_pct / 100)
-            trail_floor = highest * (1 - self.trail_giveback_pct / 100)
-            if price >= trail_start_price and price <= trail_floor:
-                return 'SELL', f'trailing stop floor hit {pnl_pct:.2f}%'
-        return 'HOLD', 'no exit'
+
+def should_buy(scan: Dict[str, Any], cfg: StrategyConfig):
+    c, label = confidence(scan, cfg)
+    scan["confidence"] = c
+    scan["confidenceLabel"] = label
+    if c < cfg.min_confidence:
+        return False, f"confidence too low {c:.2f}"
+    if float(scan.get("quality", 0.0)) < cfg.min_quality:
+        return False, "quality too low"
+    if float(scan.get("spread", 1.0)) > cfg.max_spread:
+        return False, "spread too wide"
+    if not (cfg.min_pullback <= float(scan.get("pullback", 0.0)) <= cfg.max_pullback):
+        return False, "pullback outside range"
+    if float(scan.get("momentum", 0.0)) < cfg.min_momentum:
+        return False, "momentum too weak"
+    return bool(scan.get("ready", False)), "buy ready" if scan.get("ready", False) else "not ready"
+
+
+def exit_reason(position: Dict[str, Any], cfg: StrategyConfig):
+    pnl_pct = float(position.get("pnlPct", 0.0))
+    if pnl_pct <= cfg.fast_stop_loss_pct:
+        return True, "HARD FAST STOP LOSS"
+    price = float(position.get("price", 0.0))
+    entry = float(position.get("entry", 0.0))
+    highest = float(position.get("highest", price))
+    if entry > 0 and price >= entry * (1 + cfg.trail_start_pct / 100):
+        floor = highest * (1 - cfg.trail_giveback_pct / 100)
+        if price <= floor:
+            return True, "TRAILING PROFIT"
+    return False, "HOLD"

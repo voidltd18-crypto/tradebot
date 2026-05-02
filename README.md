@@ -1,22 +1,16 @@
-# Merged Tradebot Platform
+# Merged TradeBot Platform — Kraken Crypto + Alpaca Stocks
 
-One backend/site for both bots:
+This package replaces the Binance crypto layer with Kraken, because Binance UK onboarding is currently unavailable for you.
 
-- **Stocks engine**: Alpaca, PDT-safe swing mode by default.
-- **Crypto engine**: Binance Spot via CCXT, testnet/dry-run by default.
-- **Shared strategy**: sniper-style entries, hard stop, trailing exit.
+## Render backend
 
-## Safe defaults
+Build command:
 
-```env
-DRY_RUN=true
-BINANCE_TESTNET=true
-STOCK_NO_SAME_DAY_SELLS=true
+```bash
+pip install -r backend/requirements.txt
 ```
 
-This means no real orders are sent unless you deliberately change those values.
-
-## Render start command
+Start command:
 
 ```bash
 uvicorn backend.main:app --host 0.0.0.0 --port $PORT
@@ -25,39 +19,37 @@ uvicorn backend.main:app --host 0.0.0.0 --port $PORT
 ## Environment variables
 
 ```env
-DASHBOARD_API_KEY=your_dashboard_password
+# Optional dashboard protection
+DASHBOARD_API_KEY=choose_a_password
+
+# Kraken crypto
+KRAKEN_API_KEY=your_kraken_api_key
+KRAKEN_SECRET_KEY=your_kraken_private_key
 
 # Alpaca stocks
-STOCK_ENABLED=true
-APCA_API_KEY_ID=your_alpaca_key
-APCA_API_SECRET_KEY=your_alpaca_secret
-PAPER=true
+ALPACA_API_KEY=your_alpaca_key
+ALPACA_SECRET_KEY=your_alpaca_secret
+
+# Safe defaults
+DRY_RUN=true
 STOCK_NO_SAME_DAY_SELLS=true
 
-# Binance crypto
-CRYPTO_ENABLED=true
-BINANCE_API_KEY=your_binance_key
-BINANCE_SECRET_KEY=your_binance_secret
-BINANCE_TESTNET=true
-
-# Global safety
-DRY_RUN=true
-CHECK_INTERVAL=10
-FAST_STOP_LOSS_PCT=-1.0
-TRAIL_START_PCT=1.2
-TRAIL_GIVEBACK_PCT=0.7
+# Crypto settings
+CRYPTO_PAIRS=BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT,ADA/USDT,LINK/USDT,DOGE/USDT,LTC/USDT
+CRYPTO_POSITION_USDT=25
+CRYPTO_MAX_POSITIONS=4
+CRYPTO_CHECK_INTERVAL=15
 ```
 
 ## Endpoints
 
-```text
-GET  /status
-POST /engines/stocks/start
-POST /engines/stocks/pause
-POST /engines/crypto/start
-POST /engines/crypto/pause
-POST /start-all
-POST /pause-all
-```
+- `GET /status`
+- `POST /start-crypto`
+- `POST /stop-crypto`
+- `POST /start-stock`
+- `POST /stop-stock`
+- `POST /stop-all`
 
-Use the `x-api-key` header if `DASHBOARD_API_KEY` is configured.
+## Safety
+
+`DRY_RUN=true` means no real Kraken trades are sent. Keep this on first.
