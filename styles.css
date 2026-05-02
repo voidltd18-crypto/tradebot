@@ -1,0 +1,12 @@
+
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+
+app = FastAPI()
+
+@app.get("/status")
+def status():
+    return {"ok": True}
+
+# 👇 UI mount already included
+app.mount("/", StaticFiles(directory="backend/static", html=True), name="static")
