@@ -56,6 +56,13 @@ FX_QUOTE = "GBP"
 FX_FALLBACK_USD_TO_GBP = 0.78
 FX_REFRESH_SECONDS = 60 * 30
 
+# Reports / money tracking
+# Set this in Render to the total amount you have deposited into Alpaca.
+# Example: TOTAL_DEPOSITED_USD=500
+TOTAL_DEPOSITED_USD = float(os.getenv("TOTAL_DEPOSITED_USD", "0") or 0)
+TOTAL_WITHDRAWN_USD = float(os.getenv("TOTAL_WITHDRAWN_USD", "0") or 0)
+
+
 
 if not API_KEY or not API_SECRET:
     raise RuntimeError("Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY")
@@ -71,13 +78,13 @@ SAFE_UNIVERSE = [
     "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "AMD", "XOM"
 ]
 
-CHECK_INTERVAL = 10
+CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
-MAX_POSITIONS = 25
+MAX_POSITIONS = 12
 MAX_NEW_BUYS_PER_LOOP = 1
-MAX_POSITION_VALUE_PCT = 0.15
-TARGET_POSITION_VALUE_PCT = 0.10
+MAX_POSITION_VALUE_PCT = 0.12
+TARGET_POSITION_VALUE_PCT = 0.08
 MIN_ORDER_NOTIONAL = 1.00
 CASH_BUFFER = 0.50
 
@@ -130,7 +137,7 @@ PARTIAL_PROFIT_ENABLED = True
 PARTIAL_PROFIT_TRIGGER_PCT = 1.00
 PARTIAL_PROFIT_SELL_PCT = 0.50
 POST_PARTIAL_TRAIL_GIVEBACK = 0.996
-FAST_STOP_LOSS_PCT = -1.0
+FAST_STOP_LOSS_PCT = -1.20
 STALL_EXIT_ENABLED = True
 STALL_EXIT_AFTER_MINUTES = 90
 STALL_EXIT_MIN_PNL_PCT = 0.30
@@ -194,11 +201,6 @@ LOSER_BLACKLIST_MIN_TRADES = 3
 LOSER_BLACKLIST_HOURS = 24
 TEMP_BLACKLIST_FILE = "temp_blacklist.json"
 
-# Same-day re-buy lockout after a successful sell.
-# This prevents the bot from selling a stock and then buying that same symbol again later the same day.
-SOLD_TODAY_LOCK_ENABLED = True
-SOLD_TODAY_LOCK_FILE = "sold_today_locks.json"
-
 LOW_CONFIDENCE_SIZE_MULTIPLIER = 0.65
 MEDIUM_CONFIDENCE_SIZE_MULTIPLIER = 1.00
 HIGH_CONFIDENCE_SIZE_MULTIPLIER = 1.35
@@ -232,31 +234,20 @@ if PROFIT_OPTIMIZER_ENABLED:
     PARTIAL_PROFIT_SELL_PCT = OPTIMIZED_PARTIAL_PROFIT_SELL_PCT
 
 
-# Monthly Auto Universe Rotation
-# Keeps the bot focused on liquid, tight-spread tech stocks, while still giving
-# extra score to stocks that your own trade history proves are working.
+# Weekly Auto Universe Rotation
 AUTO_UNIVERSE_ENABLED = True
-AUTO_UNIVERSE_MODE = "MONTHLY_TECH"
-AUTO_UNIVERSE_SIZE = 20
-AUTO_UNIVERSE_REFRESH_DAY = 0  # kept for backwards compatibility
-AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 24
+AUTO_UNIVERSE_SIZE = 12
+AUTO_UNIVERSE_REFRESH_DAY = 0
+AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 12
 AUTO_UNIVERSE_KEEP_WINNERS = True
 AUTO_UNIVERSE_KEEP_WINNER_MIN_PNL = 0.50
 AUTO_UNIVERSE_KEEP_WINNER_MIN_WINRATE = 0.55
 AUTO_UNIVERSE_REMOVE_LOSER_MAX_WINRATE = 0.35
 AUTO_UNIVERSE_REMOVE_LOSER_MAX_PNL = -1.00
 AUTO_UNIVERSE_MIN_PRICE = 1.00
-AUTO_UNIVERSE_MAX_PRICE = 900.00
+AUTO_UNIVERSE_MAX_PRICE = 800.00
 AUTO_UNIVERSE_MAX_SPREAD = 0.020
-AUTO_UNIVERSE_TECH_BIAS_BONUS = 5.0
-AUTO_UNIVERSE_HELD_POSITION_BONUS = 12.0
-AUTO_UNIVERSE_CANDIDATE_POOL = [
-    "NVDA", "MSFT", "AAPL", "AMZN", "META", "GOOGL", "AVGO", "AMD", "TSLA", "RDDT",
-    "ARM", "MU", "INTC", "ORCL", "CRM", "NOW", "ADBE", "SNOW", "SHOP", "UBER",
-    "PANW", "CRWD", "NET", "DDOG", "MDB", "TEAM", "WDAY", "ANET", "SMCI", "DELL",
-    "QCOM", "TXN", "AMAT", "LRCX", "KLAC", "ASML", "TSM", "MRVL", "SNPS", "CDNS",
-    "COIN", "HOOD", "SQ", "PYPL", "RBLX", "ROKU", "TTWO"
-]
+AUTO_UNIVERSE_CANDIDATE_POOL = ["SOFI","PLTR","F","RIVN","LCID","AAL","NIO","PLUG","OPEN","PFE","T","NVDA","MSFT","AAPL","GOOGL","AMZN","META","AVGO","AMD","XOM","TSLA","MARA","RIOT","COIN","HOOD","SHOP","SQ","PYPL","UBER","ABNB","DKNG","RBLX","SNAP","ROKU","BABA","INTC","MU","BAC","C","WFC","GM","CCL","DAL","UAL","DIS","NKE","WMT","CVS","KO","JPM"]
 
 # =========================
 # CLIENTS
@@ -280,7 +271,6 @@ for symbol in current_universe:
     }
 
 locked_today: Dict[str, str] = {}
-sold_today_locks: Dict[str, Dict[str, Any]] = {}
 custom_symbols: Dict[str, bool] = {}
 last_universe_refresh_ts = 0
 
@@ -381,12 +371,10 @@ def safe_save_json(path: str, data):
 
 
 def load_persistent_state():
-    global trade_history, stock_memory, temp_blacklist, sold_today_locks
+    global trade_history, stock_memory, temp_blacklist
     trade_history = safe_load_json(TRADE_HISTORY_FILE, [])
     stock_memory = safe_load_json(STOCK_MEMORY_FILE, {})
     temp_blacklist = safe_load_json(TEMP_BLACKLIST_FILE, {})
-    sold_today_locks = safe_load_json(SOLD_TODAY_LOCK_FILE, {})
-    cleanup_sold_today_locks()
 
 
 def save_trade_history():
@@ -399,10 +387,6 @@ def save_stock_memory():
 
 def save_temp_blacklist():
     safe_save_json(TEMP_BLACKLIST_FILE, temp_blacklist)
-
-
-def save_sold_today_locks():
-    safe_save_json(SOLD_TODAY_LOCK_FILE, sold_today_locks)
 
 
 def cleanup_temp_blacklist():
@@ -536,8 +520,6 @@ def reset_daily_flags_if_needed():
         if day != today:
             del locked_today[symbol]
 
-    cleanup_sold_today_locks()
-
     for symbol, day in list(partial_profit_taken.items()):
         if day != today:
             del partial_profit_taken[symbol]
@@ -555,51 +537,13 @@ def reset_daily_flags_if_needed():
             pass
 
 
-def cleanup_sold_today_locks():
-    if not SOLD_TODAY_LOCK_ENABLED:
-        return
-
-    today = today_str()
-    changed = False
-    for symbol, data in list(sold_today_locks.items()):
-        try:
-            if data.get("day") != today:
-                del sold_today_locks[symbol]
-                changed = True
-        except Exception:
-            del sold_today_locks[symbol]
-            changed = True
-
-    if changed:
-        save_sold_today_locks()
-
-
-def lock_symbol_until_tomorrow(symbol: str, reason: str = "sold today"):
-    symbol = symbol.upper()
+def lock_symbol_until_tomorrow(symbol: str):
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY:
         locked_today[symbol] = today_str()
 
-    if SOLD_TODAY_LOCK_ENABLED:
-        sold_today_locks[symbol] = {
-            "day": today_str(),
-            "time": now_time(),
-            "reason": reason,
-        }
-        save_sold_today_locks()
-        print(f"SOLD TODAY LOCK | {symbol} | {reason}")
-
-
-def is_sold_today_locked(symbol: str):
-    if not SOLD_TODAY_LOCK_ENABLED:
-        return False
-
-    cleanup_sold_today_locks()
-    data = sold_today_locks.get(symbol.upper())
-    return bool(data and data.get("day") == today_str())
-
 
 def is_locked_today(symbol: str):
-    return locked_today.get(symbol) == today_str() or is_sold_today_locked(symbol)
+    return locked_today.get(symbol) == today_str()
 
 
 def floor_qty(qty: float, decimals: int = 6):
@@ -1142,8 +1086,6 @@ def confidence_notional(scan):
 
 
 def can_buy_symbol(symbol: str):
-    if is_sold_today_locked(symbol):
-        return False, f"{symbol} sold today - re-buy locked until tomorrow"
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and is_locked_today(symbol):
         return False, f"{symbol} locked until tomorrow"
     if has_open_order(symbol):
@@ -1180,14 +1122,9 @@ def add_pdt_warning(symbol: str, reason: str):
 def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_hard_stop=False):
     if not PDT_AWARE_MODE_ENABLED or not was_bought_today(symbol):
         return False
-
-    # Critical safety fix:
-    # FAST STOP / hard-stop exits must not be blocked by PDT-aware profit/rotation holds.
-    # This keeps losers capped at FAST_STOP_LOSS_PCT instead of waiting for HARD_STOP_LOSS_PCT.
-    if allow_hard_stop:
+    if allow_hard_stop and pnl_pct <= HARD_STOP_LOSS_PCT:
         add_pdt_warning(symbol, f"hard stop override: attempting sell despite same-day buy, pnl={pnl_pct:.2f}%")
         return False
-
     mins = minutes_since_today_buy(symbol)
     if "ROTATE" in reason.upper() and AVOID_SAME_DAY_ROTATION_SELLS:
         add_pdt_warning(symbol, f"rotation skipped because bought today; hold until next day reset")
@@ -1263,7 +1200,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     trade_events.append(event)
     add_trade_history_event(event)
     update_stock_memory_from_sell(symbol, pnl, pnl_pct)
-    lock_symbol_until_tomorrow(symbol, reason=reason)
+    lock_symbol_until_tomorrow(symbol)
     notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
 
 
@@ -1361,20 +1298,8 @@ def should_fast_stop(position: Dict[str, Any]):
     if not FAST_EXIT_MODE_ENABLED:
         return False, "fast exit disabled"
 
-    try:
-        price = float(position.get("price") or 0.0)
-        entry = float(position.get("entry") or 0.0)
-        if entry > 0 and price > 0:
-            pnl_pct = ((price / entry) - 1.0) * 100.0
-        else:
-            pnl_pct = float(position.get("pnlPct") or 0.0)
-    except Exception:
-        pnl_pct = float(position.get("pnlPct") or 0.0)
-
-    if pnl_pct <= FAST_STOP_LOSS_PCT:
-        return True, f"fast stop hit {pnl_pct:.2f}%"
-
-    return False, "no fast stop"
+    pnl_pct = float(position.get("pnlPct") or 0.0)
+    return pnl_pct <= FAST_STOP_LOSS_PCT, f"fast stop pnl={pnl_pct:.2f}%"
 
 
 def should_stall_exit(position: Dict[str, Any]):
@@ -1460,175 +1385,119 @@ def get_weakest_position_for_rotation():
 
 
 def maybe_rotate_weakest_into_best(scans):
-    """Rotate only when the replacement is already validated.
-
-    Safer than the old version: it checks the new buy, notional and edge BEFORE
-    selling anything, so the bot does not dump a position then fail to rebuy.
-    """
     global last_rotation_ts
     if not PROFIT_MODE_ENABLED or not ROTATION_MODE_ENABLED or manual_override or emergency_stop:
         return ""
     if time.time() - last_rotation_ts < ROTATION_COOLDOWN_SECONDS:
         return "ROTATION SKIP | cooldown"
-
     best = get_best_profit_candidate(scans)
     weakest = get_weakest_position_for_rotation()
-
     if not best or not weakest or best["symbol"] == weakest["symbol"]:
         return "ROTATION SKIP | no useful rotation"
-
-    if float(weakest.get("pnlPct") or 0.0) > ROTATE_ONLY_IF_WEAKEST_PNL_BELOW:
+    if weakest["pnlPct"] > ROTATE_ONLY_IF_WEAKEST_PNL_BELOW:
         return f"ROTATION SKIP | weakest {weakest['symbol']} still okay"
-
-    best_quality = float(best.get("quality_score") or 0.0)
-    best_confidence = float(best.get("confidence") or 0.0)
-    if best_quality < ROTATION_MIN_QUALITY_EDGE:
-        return f"ROTATION SKIP | {best['symbol']} quality edge too small {best_quality:.4f}"
-    if best_confidence < SNIPER_MIN_CONFIDENCE:
-        return f"ROTATION SKIP | {best['symbol']} confidence too low {best_confidence:.2f}"
-
-    can_buy, buy_block_reason = can_buy_symbol(best["symbol"])
-    if not can_buy:
-        return f"ROTATION SKIP | replacement buy blocked: {buy_block_reason}"
-
-    notional = confidence_notional(best)
-    if notional < MIN_ORDER_NOTIONAL:
-        return "ROTATION SKIP | replacement notional too small / no buying power"
-
     if pdt_aware_should_avoid_sell(weakest["symbol"], f"PROFIT MODE ROTATE OUT FOR {best['symbol']}", weakest["pnlPct"]):
         return f"ROTATION SKIP | PDT-aware hold for {weakest['symbol']}"
-
     try:
         sell_result = close_position(weakest, reason=f"PROFIT MODE ROTATE OUT FOR {best['symbol']}")
         if not sell_result.get("ok"):
             return f"ROTATION SELL BLOCKED | {sell_result.get('message')}"
         time.sleep(2)
+        notional = confidence_notional(best)
+        if notional < MIN_ORDER_NOTIONAL:
+            return "ROTATION BUY SKIP | no buying power"
         market_buy_notional(best["symbol"], notional, reason=f"PROFIT MODE ROTATE INTO FROM {weakest['symbol']}")
         last_rotation_ts = time.time()
-        return f"ROTATION DONE | sold {weakest['symbol']} -> bought {best['symbol']} ${notional:.2f} confidence={best_confidence:.2f}"
+        return f"ROTATION DONE | sold {weakest['symbol']} -> bought {best['symbol']} ${notional:.2f}"
     except Exception as e:
         return f"ROTATION ERROR | {e}"
 
+
 def manage_money_mode_positions():
-    """Manage open positions with a guaranteed hard stop first.
-
-    Important: the stop-loss check uses live price and entry directly, not a
-    cached pnlPct field. This prevents losers sitting open because of stale or
-    missing PnL values.
-    """
     for p in get_all_positions():
-        symbol = str(p.get("symbol", "")).upper()
+        symbol = p["symbol"]
 
-        try:
-            if not symbol:
-                continue
+        if not MANAGE_OUTSIDE_UNIVERSE_POSITIONS and symbol not in current_universe:
+            continue
 
-            if not MANAGE_OUTSIDE_UNIVERSE_POSITIONS and symbol not in current_universe:
-                continue
+        if has_open_order(symbol):
+            continue
 
-            if has_open_order(symbol):
-                print(f"POSITION SKIP {symbol} | existing open order")
-                continue
+        price = float(p["price"])
+        entry = float(p["entry"])
+        qty = float(p["qty"])
+        highest = p["highest"]
 
-            price = float(p.get("price") or 0.0)
-            entry = float(p.get("entry") or 0.0)
-            qty = float(p.get("qty") or 0.0)
+        if price <= 0 or entry <= 0 or qty <= DUST_THRESHOLD:
+            continue
 
-            if price <= 0 or entry <= 0 or qty <= DUST_THRESHOLD:
-                continue
-
-            # Always calculate PnL from live price and entry.
-            pnl_pct = ((price / entry) - 1.0) * 100.0
-            p["pnlPct"] = pnl_pct
-
-            print(f"POSITION CHECK {symbol} | pnl={pnl_pct:.2f}% | stop={FAST_STOP_LOSS_PCT:.2f}%")
-
-            # 🚨 HARD STOP LOSS FIRST — do not let PDT/stall/trailing checks block this.
-            if pnl_pct <= FAST_STOP_LOSS_PCT:
-                try:
-                    market_sell_qty(
-                        symbol,
-                        qty,
-                        entry=entry,
-                        price=price,
-                        reason="HARD FAST STOP LOSS"
-                    )
-                    state[symbol]["highest_since_entry"] = None
-                    print(f"HARD FAST STOP LOSS SELL {symbol} {pnl_pct:.2f}%")
-                except Exception as e:
-                    print(f"HARD FAST STOP LOSS ERROR {symbol}: {e}")
-                continue
-
-            # Secondary fast-stop helper kept for compatibility.
-            fast_stop, fast_stop_reason = should_fast_stop(p)
-            if fast_stop:
-                try:
-                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="FAST EXIT STOP LOSS")
-                    state[symbol]["highest_since_entry"] = None
-                    print(f"FAST EXIT STOP LOSS SELL {qty:.6f} {symbol} | {fast_stop_reason}")
-                except Exception as e:
-                    print(f"SELL ERROR {symbol}: {e}")
-                continue
-
-            stop_price = entry * STOP_LOSS
-            if price <= stop_price:
-                try:
-                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
-                    state[symbol]["highest_since_entry"] = None
-                    print(f"MONEY MODE STOP LOSS SELL {symbol} {pnl_pct:.2f}%")
-                except Exception as e:
-                    print(f"SELL ERROR {symbol}: {e}")
-                continue
-
-            partial_ok, partial_reason = should_partial_profit(p)
-            if partial_ok:
-                try:
-                    if pdt_aware_should_avoid_sell(symbol, "PARTIAL PROFIT TAKE", pnl_pct, allow_hard_stop=False):
-                        continue
-
-                    sell_qty = partial_profit_qty(p)
-                    market_sell_qty(symbol, sell_qty, entry=entry, price=price, reason="PARTIAL PROFIT TAKE")
-                    mark_partial_profit_taken(symbol)
-                    print(f"PARTIAL PROFIT SELL {sell_qty:.6f} {symbol}")
-                except Exception as e:
-                    print(f"PARTIAL SELL ERROR {symbol}: {e}")
-                continue
-
-            stall_ok, stall_reason = should_stall_exit(p)
-            if stall_ok:
-                try:
-                    if pdt_aware_should_avoid_sell(symbol, "STALL EXIT", pnl_pct, allow_hard_stop=False):
-                        continue
-
-                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="STALL EXIT")
-                    state[symbol]["highest_since_entry"] = None
-                    print(f"STALL EXIT SELL {qty:.6f} {symbol} | {stall_reason}")
-                except Exception as e:
-                    print(f"STALL SELL ERROR {symbol}: {e}")
-                continue
-
-            trail_start_price = entry * TRAIL_START
-            highest = state[symbol].get("highest_since_entry")
-
-            if price >= trail_start_price and highest is not None:
-                giveback = POST_PARTIAL_TRAIL_GIVEBACK if has_taken_partial_profit(symbol) else TRAIL_GIVEBACK
-                trail_floor = highest * giveback
-
-                if price <= trail_floor:
-                    try:
-                        if pdt_aware_should_avoid_sell(symbol, "MONEY MODE TRAILING PROFIT", pnl_pct):
-                            continue
-
-                        market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
-                        state[symbol]["highest_since_entry"] = None
-                        print(f"TRAILING PROFIT SELL {symbol} pnl={pnl_pct:.2f}%")
-                    except Exception as e:
-                        print(f"SELL ERROR {symbol}: {e}")
+        fast_stop, fast_stop_reason = should_fast_stop(p)
+        if fast_stop:
+            try:
+                if pdt_aware_should_avoid_sell(symbol, "FAST EXIT STOP LOSS", p["pnlPct"], allow_hard_stop=True):
                     continue
 
-        except Exception as e:
-            print(f"POSITION LOOP ERROR {symbol or 'UNKNOWN'}: {e}")
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason="FAST EXIT STOP LOSS")
+                state[symbol]["highest_since_entry"] = None
+                print(f"FAST EXIT STOP LOSS SELL {qty:.6f} {symbol}")
+            except Exception as e:
+                print(f"SELL ERROR {symbol}: {e}")
             continue
+
+        stop_price = entry * STOP_LOSS
+        if price <= stop_price:
+            try:
+                if pdt_aware_should_avoid_sell(symbol, "MONEY MODE STOP LOSS", p["pnlPct"], allow_hard_stop=True):
+                    continue
+
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
+                state[symbol]["highest_since_entry"] = None
+            except Exception as e:
+                print(f"SELL ERROR {symbol}: {e}")
+            continue
+
+        partial_ok, partial_reason = should_partial_profit(p)
+        if partial_ok:
+            try:
+                if pdt_aware_should_avoid_sell(symbol, "PARTIAL PROFIT TAKE", p["pnlPct"], allow_hard_stop=False):
+                    continue
+
+                sell_qty = partial_profit_qty(p)
+                market_sell_qty(symbol, sell_qty, entry=entry, price=price, reason="PARTIAL PROFIT TAKE")
+                mark_partial_profit_taken(symbol)
+                print(f"PARTIAL PROFIT SELL {sell_qty:.6f} {symbol}")
+            except Exception as e:
+                print(f"PARTIAL SELL ERROR {symbol}: {e}")
+            continue
+
+        stall_ok, stall_reason = should_stall_exit(p)
+        if stall_ok:
+            try:
+                if pdt_aware_should_avoid_sell(symbol, "STALL EXIT", p["pnlPct"], allow_hard_stop=False):
+                    continue
+
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason="STALL EXIT")
+                state[symbol]["highest_since_entry"] = None
+                print(f"STALL EXIT SELL {qty:.6f} {symbol} | {stall_reason}")
+            except Exception as e:
+                print(f"STALL SELL ERROR {symbol}: {e}")
+            continue
+
+        trail_start_price = entry * TRAIL_START
+        if price >= trail_start_price and highest is not None:
+            giveback = POST_PARTIAL_TRAIL_GIVEBACK if has_taken_partial_profit(symbol) else TRAIL_GIVEBACK
+            trail_floor = highest * giveback
+
+            if price <= trail_floor:
+                try:
+                    if pdt_aware_should_avoid_sell(symbol, "MONEY MODE TRAILING PROFIT", p["pnlPct"]):
+                        continue
+
+                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
+                    state[symbol]["highest_since_entry"] = None
+                except Exception as e:
+                    print(f"SELL ERROR {symbol}: {e}")
+                continue
 
 def money_mode_buy(scans, manual=False):
     if emergency_stop:
@@ -2205,6 +2074,92 @@ def closed_trade_summary_payload():
     }
 
 
+def money_report_payload():
+    """High-level deposit / gain / loss report for the dashboard.
+
+    Deposit figures come from Render environment variables because Alpaca's
+    standard trading account payload does not reliably expose lifetime deposits.
+    Set TOTAL_DEPOSITED_USD and optionally TOTAL_WITHDRAWN_USD in Render.
+    """
+    try:
+        account = get_account()
+        equity = float(account.equity)
+        cash = float(account.cash)
+        buying_power = float(account.buying_power)
+    except Exception:
+        equity = 0.0
+        cash = 0.0
+        buying_power = 0.0
+
+    positions = get_all_positions()
+    closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
+
+    realised_gains = sum(max(0.0, float(t.get("pnl") or 0.0)) for t in closed)
+    realised_losses = abs(sum(min(0.0, float(t.get("pnl") or 0.0)) for t in closed))
+    realised_net = realised_gains - realised_losses
+
+    open_pnl = sum(float(p.get("pnl") or 0.0) for p in positions)
+    open_gains = sum(max(0.0, float(p.get("pnl") or 0.0)) for p in positions)
+    open_losses = abs(sum(min(0.0, float(p.get("pnl") or 0.0)) for p in positions))
+
+    deposited = float(TOTAL_DEPOSITED_USD or 0.0)
+    withdrawn = float(TOTAL_WITHDRAWN_USD or 0.0)
+    net_deposited = deposited - withdrawn
+
+    # True account-level gain/loss if the deposit amount has been configured.
+    if net_deposited > 0:
+        total_gain_loss = equity - net_deposited
+    else:
+        # Fallback if deposit is not configured yet.
+        total_gain_loss = realised_net + open_pnl
+
+    total_earned_gross = realised_gains + open_gains
+    total_lost_gross = realised_losses + open_losses
+    return_pct = (total_gain_loss / net_deposited * 100.0) if net_deposited > 0 else 0.0
+
+    return {
+        "depositConfigured": net_deposited > 0,
+        "totalDeposited": deposited,
+        "totalDepositedGbp": money_gbp(deposited),
+        "totalWithdrawn": withdrawn,
+        "totalWithdrawnGbp": money_gbp(withdrawn),
+        "netDeposited": net_deposited,
+        "netDepositedGbp": money_gbp(net_deposited),
+        "currentEquity": equity,
+        "currentEquityGbp": money_gbp(equity),
+        "cash": cash,
+        "cashGbp": money_gbp(cash),
+        "buyingPower": buying_power,
+        "buyingPowerGbp": money_gbp(buying_power),
+        "totalGainLoss": total_gain_loss,
+        "totalGainLossGbp": money_gbp(total_gain_loss),
+        "returnPct": return_pct,
+        "earnedSinceDeposit": max(total_gain_loss, 0.0),
+        "earnedSinceDepositGbp": money_gbp(max(total_gain_loss, 0.0)),
+        "lostSinceDeposit": max(-total_gain_loss, 0.0),
+        "lostSinceDepositGbp": money_gbp(max(-total_gain_loss, 0.0)),
+        "totalEarnedGross": total_earned_gross,
+        "totalEarnedGrossGbp": money_gbp(total_earned_gross),
+        "totalLostGross": total_lost_gross,
+        "totalLostGrossGbp": money_gbp(total_lost_gross),
+        "realisedNet": realised_net,
+        "realisedNetGbp": money_gbp(realised_net),
+        "realisedGains": realised_gains,
+        "realisedGainsGbp": money_gbp(realised_gains),
+        "realisedLosses": realised_losses,
+        "realisedLossesGbp": money_gbp(realised_losses),
+        "openPnl": open_pnl,
+        "openPnlGbp": money_gbp(open_pnl),
+        "openGains": open_gains,
+        "openGainsGbp": money_gbp(open_gains),
+        "openLosses": open_losses,
+        "openLossesGbp": money_gbp(open_losses),
+        "closedTrades": len(closed),
+        "openPositions": len(positions),
+        "updatedAt": datetime.now(UTC).isoformat(),
+    }
+
+
 def stock_memory_from_closed_trades():
     closed = closed_trades_from_db(10000)
     memory: Dict[str, Dict[str, Any]] = {}
@@ -2769,11 +2724,6 @@ def week_start_str(dt=None):
     return monday.strftime("%Y-%m-%d")
 
 
-def month_start_str(dt=None):
-    dt = dt or datetime.now(UTC)
-    return dt.strftime("%Y-%m-01")
-
-
 def get_last_universe_refresh():
     if not SQLITE_ENABLED:
         return None
@@ -2843,10 +2793,6 @@ def save_weekly_universe(rows, reason="weekly refresh"):
 
 
 def should_refresh_weekly_universe(force=False):
-    """
-    Backwards-compatible name, but now refreshes the auto universe monthly.
-    Force refresh still works from the dashboard/manual endpoint.
-    """
     if force:
         return True
     if not AUTO_UNIVERSE_ENABLED:
@@ -2863,9 +2809,10 @@ def should_refresh_weekly_universe(force=False):
         hours = (datetime.now(UTC) - last_dt).total_seconds() / 3600
         if hours < AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH:
             return False
-        return month_start_str(last_dt) != month_start_str()
     except Exception:
-        return True
+        pass
+
+    return datetime.now(UTC).weekday() == AUTO_UNIVERSE_REFRESH_DAY
 
 
 def universe_rows_from_stock_memory():
@@ -2926,34 +2873,29 @@ def universe_rows_from_stock_memory():
 
 def score_candidate_symbol(symbol):
     """
-    Monthly tech-universe scoring for new candidates.
-    Rewards liquid, tight-spread stocks that are suitable for sniper entries.
+    Fallback/new-candidate scoring for symbols not yet in stock memory.
     """
     symbol = symbol.upper()
     score = 1.0
-    reasons = ["monthly tech candidate"]
-
-    if symbol in AUTO_UNIVERSE_CANDIDATE_POOL:
-        score += AUTO_UNIVERSE_TECH_BIAS_BONUS
-        reasons.append("tech bias")
+    reasons = ["candidate pool"]
 
     try:
         q = get_quote(symbol)
         price = float(q["mid"])
         spread = float(q["spread"])
 
-        if AUTO_UNIVERSE_MIN_PRICE <= price <= AUTO_UNIVERSE_MAX_PRICE:
+        if 1 <= price <= 800:
             score += 2.0
             reasons.append(f"price ok ${price:.2f}")
         else:
             score -= 10.0
             reasons.append(f"price out of range ${price:.2f}")
 
-        if spread <= AUTO_UNIVERSE_MAX_SPREAD:
-            score += max(0.0, 6.0 - spread * 250)
+        if spread <= 0.02:
+            score += max(0.0, 4.0 - spread * 200)
             reasons.append(f"spread ok {spread:.4f}")
         else:
-            score -= 6.0
+            score -= 5.0
             reasons.append(f"spread wide {spread:.4f}")
     except Exception:
         score -= 2.0
@@ -2962,7 +2904,7 @@ def score_candidate_symbol(symbol):
     try:
         qty, _ = get_position(symbol)
         if qty > DUST_THRESHOLD:
-            score += AUTO_UNIVERSE_HELD_POSITION_BONUS
+            score += 8.0
             reasons.append("currently held")
     except Exception:
         pass
@@ -2982,7 +2924,7 @@ def build_weekly_universe(force=False):
             current_universe = [r["symbol"] for r in active]
             for s in current_universe:
                 ensure_symbol_state(s, custom=s in custom_symbols)
-            return {"ok": True, "message": f"{AUTO_UNIVERSE_MODE} universe already fresh", "symbols": current_universe, "rows": active}
+            return {"ok": True, "message": "Weekly universe already fresh", "symbols": current_universe, "rows": active}
 
     rows = universe_rows_from_stock_memory()
 
@@ -3035,7 +2977,7 @@ def build_weekly_universe(force=False):
 
     return {
         "ok": True,
-        "message": f"{AUTO_UNIVERSE_MODE} universe updated with {len(current_universe)} symbols",
+        "message": f"Weekly universe updated with {len(current_universe)} symbols",
         "symbols": current_universe,
         "rows": chosen,
     }
@@ -3051,10 +2993,8 @@ def auto_universe_payload():
 
     return {
         "enabled": AUTO_UNIVERSE_ENABLED,
-        "mode": AUTO_UNIVERSE_MODE,
         "size": AUTO_UNIVERSE_SIZE,
         "weekStart": week_start_str(),
-        "monthStart": month_start_str(),
         "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe),
         "rows": active,
         "lastRefresh": get_last_universe_refresh(),
@@ -3065,11 +3005,6 @@ def auto_universe_payload():
 
 @app.get("/weekly-universe")
 def weekly_universe_public():
-    return auto_universe_payload()
-
-
-@app.get("/monthly-universe")
-def monthly_universe_public():
     return auto_universe_payload()
 
 # =========================
@@ -3106,6 +3041,7 @@ def build_status_payload(bot_name, scans):
         "mode": "SNIPER_CONFIDENCE_MEMORY_TIMELINE_GBP",
         "market": market_status,
         "fx": fx_payload(),
+        "moneyReport": money_report_payload(),
         "autoUniverse": auto_universe_payload(),
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
@@ -3135,8 +3071,6 @@ def build_status_payload(bot_name, scans):
         "todayBuyCount": today_buy_count(),
         "maxNewBuysPerDayPdtAware": MAX_NEW_BUYS_PER_DAY_PDT_AWARE,
         "lockedSymbolsToday": locked_symbols,
-        "soldTodayLockedSymbols": sorted([s for s, d in sold_today_locks.items() if d.get("day") == today_str()]),
-        "soldTodayLockEnabled": SOLD_TODAY_LOCK_ENABLED,
         "customSymbols": sorted(list(custom_symbols.keys())),
         "maxPositions": MAX_POSITIONS,
         "newPositionNotional": calculate_new_position_notional(),
@@ -3213,7 +3147,6 @@ def build_status_payload(bot_name, scans):
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f}",
             f"POSITIONS | {len(positions)}",
             f"LOCKOUT | locked_today={', '.join(locked_symbols) if locked_symbols else 'none'}",
-            f"SOLD LOCK | enabled={SOLD_TODAY_LOCK_ENABLED} | symbols={', '.join(sorted([s for s, d in sold_today_locks.items() if d.get('day') == today_str()])) or 'none'}",
         ],
         "trades": trade_events[-50:],
         "tradeTimeline": trades_from_db(1000),
@@ -3234,31 +3167,6 @@ def update_status(bot_name, scans):
 # =========================
 # ROUTES
 # =========================
-
-
-def touch_quick_status(**updates):
-    """Update lightweight cached status fields without rebuilding the expensive full payload."""
-    latest_status.update(updates)
-    latest_status["quickUpdatedAt"] = datetime.now(UTC).isoformat()
-
-
-@app.get("/quick-status")
-def quick_status():
-    return {
-        "ok": True,
-        "botEnabled": bot_enabled,
-        "manualOverride": manual_override,
-        "emergencyStop": emergency_stop,
-        "riskBlocked": latest_status.get("riskBlocked", False),
-        "riskReason": latest_status.get("riskReason", ""),
-        "market": latest_status.get("market", {}),
-        "positionsCount": len(latest_status.get("positions", [])),
-        "todayBuyCount": today_buy_count(),
-        "universeSize": len(current_universe),
-        "autoUniverseMode": AUTO_UNIVERSE_MODE if "AUTO_UNIVERSE_MODE" in globals() else "AUTO",
-        "updatedAt": datetime.now(UTC).isoformat(),
-    }
-
 
 @app.get("/debug-orders")
 def debug_orders():
@@ -3291,46 +3199,14 @@ def root():
     return {"message": "Rebuilt Sniper Profit Bot running", "status": "/status", "paperMode": PAPER}
 
 
-@app.get("/health")
-def health():
-    return {"ok": True, "bot": BOT_NAME, "paperMode": PAPER}
-
-
-@app.get("/sold-today-locks")
-def sold_today_locks_public():
-    cleanup_sold_today_locks()
-    return {
-        "ok": True,
-        "enabled": SOLD_TODAY_LOCK_ENABLED,
-        "day": today_str(),
-        "symbols": sorted([s for s, d in sold_today_locks.items() if d.get("day") == today_str()]),
-        "locks": sold_today_locks,
-    }
-
-
-@app.get("/market-status")
-def market_status():
-    return get_market_status_payload()
-
-
-@app.get("/realtime-status")
-def realtime_status():
-    return {
-        "ok": True,
-        "botEnabled": bot_enabled,
-        "manualOverride": manual_override,
-        "emergencyStop": emergency_stop,
-        "threadStarted": bot_thread_started,
-        "scanCount": len(latest_scans),
-        "universeSize": len(current_universe),
-        "lastStatusReady": bool(latest_status),
-        "market": get_market_status_payload(),
-    }
-
-
 @app.get("/status")
 def get_status():
     return latest_status
+
+
+@app.get("/reports")
+def reports():
+    return money_report_payload()
 
 
 @app.post("/pause")
@@ -3338,7 +3214,7 @@ def pause_bot(request: Request):
     verify_api_key(request)
     global bot_enabled
     bot_enabled = False
-    touch_quick_status(botEnabled=False)
+    update_status(BOT_NAME, latest_scans)
     return {"ok": True, "message": "Bot paused"}
 
 
@@ -3348,7 +3224,7 @@ def resume_bot(request: Request):
     global bot_enabled, emergency_stop
     bot_enabled = True
     emergency_stop = False
-    touch_quick_status(botEnabled=True, emergencyStop=False)
+    update_status(BOT_NAME, latest_scans)
     return {"ok": True, "message": "Bot resumed"}
 
 
@@ -3357,7 +3233,7 @@ def manual_override_on(request: Request):
     verify_api_key(request)
     global manual_override
     manual_override = True
-    touch_quick_status(manualOverride=True)
+    update_status(BOT_NAME, latest_scans)
     return {"ok": True, "message": "Manual override ON. Auto-buy paused."}
 
 
@@ -3366,7 +3242,7 @@ def manual_override_off(request: Request):
     verify_api_key(request)
     global manual_override
     manual_override = False
-    touch_quick_status(manualOverride=False)
+    update_status(BOT_NAME, latest_scans)
     return {"ok": True, "message": "Manual override OFF. Auto-buy active."}
 
 
@@ -3377,7 +3253,7 @@ def manual_buy(request: Request):
         if not trading_client.get_clock().is_open:
             return {"ok": False, "message": "Market closed"}
         result = money_mode_buy(latest_scans, manual=True)
-        touch_quick_status(lastAction=result, lastActionAt=datetime.now(UTC).isoformat())
+        update_status(BOT_NAME, latest_scans)
         return {"ok": True, "message": result}
 
 
@@ -3386,7 +3262,7 @@ def custom_buy(symbol: str, request: Request):
     verify_api_key(request)
     with bot_lock:
         result = buy_custom_symbol(symbol)
-        touch_quick_status(lastAction=result.get("message", "custom buy"), lastActionAt=datetime.now(UTC).isoformat())
+        update_status(BOT_NAME, latest_scans)
         return result
 
 
@@ -3395,7 +3271,7 @@ def manual_sell(request: Request):
     verify_api_key(request)
     with bot_lock:
         result = close_worst_or_largest_position(reason="MANUAL SELL")
-        touch_quick_status(lastAction=result.get("message", "manual sell"), lastActionAt=datetime.now(UTC).isoformat())
+        update_status(BOT_NAME, latest_scans)
         return result
 
 
@@ -3404,7 +3280,7 @@ def sell_symbol(symbol: str, request: Request):
     verify_api_key(request)
     with bot_lock:
         result = close_position_by_symbol(symbol.upper(), reason="MANUAL SYMBOL SELL")
-        touch_quick_status(lastAction=result.get("message", "symbol sell"), lastActionAt=datetime.now(UTC).isoformat())
+        update_status(BOT_NAME, latest_scans)
         return result
 
 
@@ -3416,7 +3292,7 @@ def emergency_sell(request: Request):
         emergency_stop = True
         bot_enabled = False
         result = close_all_positions(reason="EMERGENCY SELL")
-        touch_quick_status(emergencyStop=True, botEnabled=False, lastAction=result.get("message", "emergency sell"), lastActionAt=datetime.now(UTC).isoformat())
+        update_status(BOT_NAME, latest_scans)
         return {**result, "emergencyStop": True, "botEnabled": False}
 
 
@@ -3444,15 +3320,6 @@ def backfill_trades_limited(request: Request):
 
 @app.post("/refresh-universe")
 def refresh_universe(request: Request):
-    verify_api_key(request)
-    with bot_lock:
-        result = build_weekly_universe(force=True)
-        update_status(BOT_NAME, latest_scans)
-        return result
-
-
-@app.post("/refresh-monthly-universe")
-def refresh_monthly_universe(request: Request):
     verify_api_key(request)
     with bot_lock:
         result = build_weekly_universe(force=True)
