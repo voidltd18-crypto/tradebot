@@ -239,7 +239,7 @@ if PROFIT_OPTIMIZER_ENABLED:
 # extra score to stocks that your own trade history proves are working.
 AUTO_UNIVERSE_ENABLED = True
 AUTO_UNIVERSE_MODE = "MONTHLY_TECH"
-AUTO_UNIVERSE_SIZE = 20
+AUTO_UNIVERSE_SIZE = 25
 AUTO_UNIVERSE_REFRESH_DAY = 0  # kept for backwards compatibility
 AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 24
 AUTO_UNIVERSE_KEEP_WINNERS = True
@@ -257,7 +257,7 @@ AUTO_UNIVERSE_CANDIDATE_POOL = [
     "ARM", "MU", "INTC", "ORCL", "CRM", "NOW", "ADBE", "SNOW", "SHOP", "UBER",
     "PANW", "CRWD", "NET", "DDOG", "MDB", "TEAM", "WDAY", "ANET", "SMCI", "DELL",
     "QCOM", "TXN", "AMAT", "LRCX", "KLAC", "ASML", "TSM", "MRVL", "SNPS", "CDNS",
-    "COIN", "HOOD", "SQ", "PYPL", "RBLX", "ROKU", "TTWO"
+    "COIN", "HOOD", "SQ", "PYPL", "RBLX", "ROKU",
 ]
 
 # =========================
