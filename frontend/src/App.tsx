@@ -230,7 +230,7 @@ export default function App() {
             <Stat label="Deposited" value={gbp(Number(totalDeposited || 0) * rate)} sub={`${usd(totalDeposited)} · ${reports.depositSource ? `Source: ${reports.depositSource}` : ""}`} />
             <Stat label="Earned Since Deposit" value={gbp(Number(earned || 0) * rate)} sub={usd(earned)} className={tone(earned)} />
             <Stat label="Lost Since Deposit" value={gbp(Number(lost || 0) * rate)} sub={usd(lost)} className="loss" />
-            <Stat label="Current Equity" value={gbp(Number(reports.currentEquity ?? data?.account?.equity || 0) * rate)} sub={usd(reports.currentEquity ?? data?.account?.equity)} />
+            <Stat label="Current Equity" value={gbp(Number((reports.currentEquity ?? data?.account?.equity) || 0) * rate)} sub={usd(reports.currentEquity ?? data?.account?.equity)} />
           </section>
 
           <Card title="Price / Equity History">
