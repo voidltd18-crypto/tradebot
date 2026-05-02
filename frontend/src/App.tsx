@@ -71,7 +71,7 @@ export default function App() {
 
   useEffect(() => {
     fetchData();
-    const i = setInterval(fetchData, 900000);
+    const i = setInterval(fetchData, 8000);
     return () => clearInterval(i);
   }, []);
 

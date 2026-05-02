@@ -3507,6 +3507,7 @@ def _stock_name_guess(symbol: str) -> str:
         "MU": "Micron",
         "LAC": "Lithium Americas",
         "LCID": "Lucid",
+        "TTWO": "Take-Two Interactive",
     }
     return names.get(symbol.upper(), symbol.upper())
 
@@ -3527,7 +3528,7 @@ def _stock_search_universe() -> List[str]:
         "AAPL","MSFT","NVDA","AMD","AMZN","META","GOOGL","GOOG","TSLA","INTC",
         "NFLX","CRM","ORCL","ADBE","PYPL","UBER","PLTR","SHOP","SNOW","NET",
         "MDB","MU","LAC","LCID","AVGO","QCOM","TXN","NOW","DDOG","CRWD",
-        "PANW","ZS","TEAM","SQ","COIN","HOOD","RBLX","ROKU","DIS","BABA"
+        "PANW","ZS","TEAM","SQ","COIN","HOOD","RBLX","ROKU","DIS","TTWO","EA","RBLX","U","BABA"
     ])
     seen = []
     for s in symbols:
@@ -3595,6 +3596,8 @@ def search_stocks(q: str = ""):
         return {"ok": True, "query": q, "results": []}
 
     matches = []
+
+    # 1) Search known universe/default list by symbol or company name.
     for sym in _stock_search_universe():
         name = _stock_name_guess(sym).upper()
         if query in sym or query in name:
@@ -3602,7 +3605,24 @@ def search_stocks(q: str = ""):
         if len(matches) >= 8:
             break
 
-    results = [_latest_quote_for_symbol(sym) for sym in matches]
+    # 2) If user typed an exact-looking ticker, always try it directly via Alpaca,
+    # even if it is not already in our universe list. This fixes symbols like TTWO.
+    if re.fullmatch(r"[A-Z]{1,5}", query) and query not in matches:
+        matches.insert(0, query)
+
+    # De-dupe while preserving order.
+    deduped = []
+    for sym in matches:
+        if sym not in deduped:
+            deduped.append(sym)
+
+    results = []
+    for sym in deduped[:8]:
+        qd = _latest_quote_for_symbol(sym)
+        # Keep direct ticker result even if market is closed/quote is temporarily 0.
+        if qd.get("price", 0) > 0 or sym == query:
+            results.append(qd)
+
     return {"ok": True, "query": q, "results": results}
 
 @app.get("/stock-preview/{symbol}")
