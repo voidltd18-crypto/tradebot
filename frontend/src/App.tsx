@@ -12,45 +12,9 @@ import {
 
 const API_URL = "https://tradebot-0myo.onrender.com";
 
-type Position = {
-  symbol: string;
-  qty: number;
-  entry: number;
-  price: number;
-  marketValue: number;
-  marketValueGbp?: number;
-  pnl: number;
-  pnlGbp?: number;
-  pnlPct: number;
-  trailStartPrice?: number;
-  trailFloor?: number;
-  trailingActive?: boolean;
-  boughtToday?: boolean;
-  minutesSinceBuy?: number;
-  lockedToday?: boolean;
-};
-
-type Scan = {
-  symbol: string;
-  price: number;
-  trigger?: number;
-  spread?: number;
-  pullback?: number;
-  shortMomentum?: number;
-  qualityScore?: number;
-  readyToBuy?: boolean;
-  confidence?: number;
-  confidenceLabel?: string;
-  sniperPass?: boolean;
-  sniperReason?: string;
-  aPlusPass?: boolean;
-  aPlusReason?: string;
-  priceCurve?: { t: string; value: number }[];
-};
-
 type Trade = {
   time?: string;
-  side?: string;
+  side?: "BUY" | "SELL";
   symbol?: string;
   amount?: number;
   amountGbp?: number;
@@ -61,122 +25,202 @@ type Trade = {
   reason?: string;
 };
 
-const tabs = [
-  ["overview", "Overview"],
-  ["money", "Reports"],
-  ["positions", "Positions"],
-  ["scanner", "Scanner"],
-  ["activity", "Activity"],
-  ["admin", "Admin"],
-] as const;
+type Position = {
+  symbol: string;
+  qty: number;
+  entry: number;
+  price: number;
+  marketValue: number;
+  marketValueGbp?: number;
+  pnl: number;
+  pnlGbp?: number;
+  pnlPct: number;
+  trailStartPrice: number;
+  trailFloor: number;
+  trailingActive: boolean;
+  custom?: boolean;
+  lockedToday?: boolean;
+  boughtToday?: boolean;
+  minutesSinceBuy?: number;
+  partialProfitTaken?: boolean;
+  partialProfitTriggerPct?: number;
+  fastStopLossPct?: number;
+  stallExitAfterMinutes?: number;
+};
 
-function usd(n: any) {
+type Scan = {
+  symbol: string;
+  price: number;
+  trigger: number;
+  spread: number;
+  pullback?: number;
+  shortMomentum?: number;
+  qualityScore?: number;
+  readyToBuy?: boolean;
+  lockedToday?: boolean;
+  confidence?: number;
+  confidenceLabel?: string;
+  sniperPass?: boolean;
+  sniperReason?: string;
+  aPlusPass?: boolean;
+  aPlusReason?: string;
+  priceCurve?: { t: string; value: number }[];
+};
+
+const panel: React.CSSProperties = {
+  background: "#0f172a",
+  border: "1px solid rgba(255,255,255,0.1)",
+  borderRadius: 18,
+  padding: 16,
+};
+
+const btn = (color: string): React.CSSProperties => ({
+  padding: "10px 14px",
+  borderRadius: 999,
+  background: color,
+  color: "white",
+  border: "none",
+  cursor: "pointer",
+  fontWeight: 700,
+  margin: 4,
+});
+
+function usd(n: number | undefined | null) {
   return `$${Number(n || 0).toFixed(2)}`;
 }
-function gbp(n: any) {
+
+function gbpFromUsd(n: number | undefined | null, rate: number) {
+  return `£${(Number(n || 0) * Number(rate || 0.78)).toFixed(2)}`;
+}
+
+function gbpValue(n: number | undefined | null) {
   return `£${Number(n || 0).toFixed(2)}`;
 }
-function pct(n: any) {
+
+function pct(n: number | undefined | null) {
   return `${Number(n || 0).toFixed(2)}%`;
 }
-function colour(n: any) {
-  return Number(n || 0) >= 0 ? "#22c55e" : "#f87171";
+
+function daysAgo(days: number) {
+  return Date.now() - days * 24 * 60 * 60 * 1000;
 }
-function moneyPair(usdValue: any, gbpValue: any, rate: number) {
-  const u = Number(usdValue || 0);
-  const g = gbpValue !== undefined && gbpValue !== null ? Number(gbpValue || 0) : u * rate;
+
+function timelineFilterMs(filter: string) {
+  if (filter === "day") return daysAgo(1);
+  if (filter === "week") return daysAgo(7);
+  if (filter === "month") return daysAgo(30);
+  return 0;
+}
+
+function DualMoney({
+  usdValue,
+  gbpValue: gbpDirect,
+  rate,
+}: {
+  usdValue: number;
+  gbpValue?: number;
+  rate: number;
+}) {
   return (
     <>
-      <b>{usd(u)}</b>
-      <small>{gbp(g)}</small>
+      <b>{usd(usdValue)}</b>
+      <br />
+      <span style={{ color: "#94a3b8" }}>
+        {gbpDirect !== undefined ? gbpValue(gbpDirect) : gbpFromUsd(usdValue, rate)}
+      </span>
     </>
   );
 }
 
-function Card({ title, children, tone }: { title: string; children: React.ReactNode; tone?: string }) {
+
+function CollapsibleSection({ title, defaultOpen = false, children }: { title: string; defaultOpen?: boolean; children: React.ReactNode }) {
+  const [open, setOpen] = useState(defaultOpen);
   return (
-    <div className="card" style={{ borderColor: tone || "rgba(255,255,255,.1)" }}>
-      <span className="card-label">{title}</span>
-      <div className="card-value">{children}</div>
+    <div style={{ ...panel, marginBottom: 12 }}>
+      <button onClick={() => setOpen(!open)} style={{ width: "100%", textAlign: "left", padding: "12px 14px", borderRadius: 14, border: "1px solid rgba(255,255,255,0.12)", background: "#020617", color: "white", cursor: "pointer", fontWeight: 800, fontSize: 16 }}>
+        {open ? "▼" : "▶"} {title}
+      </button>
+      {open && <div style={{ marginTop: 12 }}>{children}</div>}
     </div>
   );
 }
 
-function Pill({ children, good }: { children: React.ReactNode; good?: boolean }) {
-  return <span className={good ? "pill good" : "pill"}>{children}</span>;
-}
-
 export default function App() {
-  const [activeTab, setActiveTab] = useState<(typeof tabs)[number][0]>("overview");
   const [data, setData] = useState<any>(null);
-  const [reports, setReports] = useState<any>(null);
-  const [status, setStatus] = useState("Connecting…");
+  const [status, setStatus] = useState("Connecting...");
   const [message, setMessage] = useState("");
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("dashboard_api_key") || "");
   const [customTicker, setCustomTicker] = useState("");
   const [selectedSymbol, setSelectedSymbol] = useState("");
+  const [timelineRange, setTimelineRange] = useState("day");
   const [chartCurrency, setChartCurrency] = useState<"USD" | "GBP">("GBP");
 
-  const positions: Position[] = Array.isArray(data?.positions) ? data.positions : [];
   const scans: Scan[] = Array.isArray(data?.scans) ? data.scans : [];
+  const positions: Position[] = Array.isArray(data?.positions) ? data.positions : [];
   const trades: Trade[] = Array.isArray(data?.trades) ? data.trades : [];
-  const closedTrades: any[] = Array.isArray(data?.closedTrades) ? data.closedTrades : [];
+  const tradeTimeline: any[] = Array.isArray(data?.tradeTimeline) ? data.tradeTimeline : [];
   const stockMemory: any[] = Array.isArray(data?.stockMemory) ? data.stockMemory : [];
   const logs: string[] = Array.isArray(data?.logs) ? data.logs : [];
-  const warnings = [
-    ...(Array.isArray(data?.alpacaRejectionEvents) ? data.alpacaRejectionEvents : []),
-    ...(Array.isArray(data?.pdtWarningEvents) ? data.pdtWarningEvents : []),
-  ];
+  const alpacaRejectionEvents: any[] = Array.isArray(data?.alpacaRejectionEvents) ? data.alpacaRejectionEvents : [];
+  const pdtWarningEvents: any[] = Array.isArray(data?.pdtWarningEvents) ? data.pdtWarningEvents : [];
   const rate = Number(data?.fx?.usdToGbp || 0.78);
 
   const fetchData = async () => {
     try {
-      const [statusRes, reportsRes] = await Promise.allSettled([
-        fetch(`${API_URL}/status`),
-        fetch(`${API_URL}/reports`),
-      ]);
-
-      if (statusRes.status === "fulfilled") {
-        const json = await statusRes.value.json();
-        setData(json);
-        const nextScans = Array.isArray(json?.scans) ? json.scans : [];
-        if (!selectedSymbol && nextScans.length) setSelectedSymbol(nextScans[0].symbol);
-      }
-
-      if (reportsRes.status === "fulfilled" && reportsRes.value.ok) {
-        setReports(await reportsRes.value.json());
-      }
-
+      const res = await fetch(`${API_URL}/status`);
+      const json = await res.json();
+      setData(json);
       setStatus("Connected");
-    } catch (e) {
-      console.error(e);
+
+      const nextScans = Array.isArray(json?.scans) ? json.scans : [];
+      if (!selectedSymbol && nextScans.length) {
+        setSelectedSymbol(nextScans[0].symbol);
+      }
+    } catch (err) {
+      console.error("Fetch failed:", err);
       setStatus("Connection failed");
     }
   };
 
   useEffect(() => {
     fetchData();
-    const id = setInterval(fetchData, 5000);
-    return () => clearInterval(id);
+    const i = setInterval(fetchData, 5000);
+    return () => clearInterval(i);
   }, []);
 
   const saveApiKey = () => {
     localStorage.setItem("dashboard_api_key", apiKey);
-    setMessage("Dashboard key saved");
+    setMessage("Dashboard key saved on this device");
+  };
+
+  const clearApiKey = () => {
+    localStorage.removeItem("dashboard_api_key");
+    setApiKey("");
+    setMessage("Dashboard key cleared");
   };
 
   const action = async (endpoint: string) => {
-    if (!apiKey.trim()) return setMessage("Enter dashboard password first");
+    if (!apiKey.trim()) {
+      setMessage("Enter your dashboard password first");
+      return;
+    }
+
     try {
       const res = await fetch(`${API_URL}${endpoint}`, {
         method: "POST",
         headers: { "x-api-key": apiKey.trim() },
       });
       const json = await res.json();
-      setMessage(json.message || json.detail || "Action sent");
+
+      if (!res.ok) {
+        setMessage(json.detail || json.message || "Action blocked");
+        return;
+      }
+
+      setMessage(json.message || "Action sent");
       fetchData();
-    } catch (e) {
-      console.error(e);
+    } catch (err) {
+      console.error("Action failed:", err);
       setMessage("Action failed");
     }
   };
@@ -184,243 +228,350 @@ export default function App() {
   const customBuy = async () => {
     const symbol = customTicker.trim().toUpperCase();
     if (!symbol) return setMessage("Enter a ticker first");
-    if (!confirm(`Buy ${symbol}?`)) return;
+    if (!confirm(`Custom buy ${symbol}?`)) return;
     await action(`/custom-buy/${symbol}`);
     setCustomTicker("");
   };
 
-  const selectedScan = useMemo(() => {
+
+  const timelineSource = useMemo(() => {
+    const raw = Array.isArray(data?.tradeTimeline) && data.tradeTimeline.length
+      ? data.tradeTimeline
+      : Array.isArray(data?.closedTrades)
+        ? data.closedTrades
+        : [];
+
+    return raw;
+  }, [data]);
+
+  const selectedScan: Scan | undefined = useMemo(() => {
     if (!scans.length) return undefined;
     return scans.find((s) => s.symbol === selectedSymbol) || scans[0];
   }, [scans, selectedSymbol]);
 
-  const equityChart = useMemo(() => {
-    const rows = Array.isArray(data?.tradeTimeline) ? data.tradeTimeline : [];
-    return rows.slice(-80).map((e: any, idx: number) => ({
-      idx,
-      equity: chartCurrency === "GBP" ? Number(e.equityGbp || e.equity * rate || 0) : Number(e.equity || 0),
+  const timeline = useMemo(() => {
+    const start = timelineFilterMs(timelineRange);
+    return tradeTimeline
+      .filter((e: any) => {
+        if (!start) return true;
+        const t = new Date(e?.timestamp || 0).getTime();
+        return Number.isFinite(t) && t >= start;
+      })
+      .map((e: any, i: number) => ({ ...e, idx: i }));
+  }, [tradeTimeline, timelineRange]);
+
+  const timelineChart = useMemo(() => {
+    return timeline.map((e: any, i: number) => ({
+      idx: i,
+      equity: chartCurrency === "GBP" ? (e.equityGbp ?? Number(e.equity || 0) * rate) : Number(e.equity || 0),
       symbol: e.symbol || "",
       side: e.side || "",
+      time: e.time || "",
+      reason: e.reason || "",
+      pnl: chartCurrency === "GBP" ? (e.pnlGbp ?? Number(e.pnl || 0) * rate) : Number(e.pnl || 0),
+      pnlPct: e.pnlPct || 0,
     }));
-  }, [data, chartCurrency, rate]);
+  }, [timeline, chartCurrency, rate]);
 
-  const report = reports || {};
-  const totalGainLoss = Number(report.totalGainLoss ?? (data?.dbSummary?.totalPnl || 0));
-  const marketOpen = data?.market?.label === "OPEN";
+  const scannerChartData = selectedScan?.priceCurve || [];
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="logo">£</div>
-          <div>
-            <h1>TradeBot</h1>
-            <p>{status}</p>
-          </div>
+    <div style={{ minHeight: "100vh", background: "#020617", color: "white", padding: 14, fontFamily: "Arial" }}>
+      <div style={{ maxWidth: 1350, margin: "0 auto" }}>
+        <h1 style={{ textAlign: "center", fontSize: "clamp(28px, 6vw, 48px)" }}>
+          🇬🇧 GBP Profit Trading Bot
+        </h1>
+
+        <div style={{ textAlign: "center", color: status === "Connected" ? "#22c55e" : "#f87171", fontWeight: 700 }}>
+          {status}
         </div>
 
-        <div className="status-box">
-          <Pill good={!!data?.botEnabled}>Bot {data?.botEnabled ? "ON" : "OFF"}</Pill>
-          <Pill good={marketOpen}>Market {data?.market?.label || "UNKNOWN"}</Pill>
-          <Pill>{data?.paperMode ? "PAPER" : "LIVE"}</Pill>
+        {data && (
+          <div style={{ textAlign: "center", color: "#94a3b8", marginBottom: 12 }}>
+            {data.name || "Trading Bot"} · {data.paperMode ? "PAPER" : "LIVE"} · Bot {data.botEnabled ? "ON" : "OFF"} · Market{" "}
+            {data.market?.label || "UNKNOWN"} · USD/GBP {Number(rate).toFixed(4)}
+          </div>
+        )}
+
+        <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(56,189,248,0.45)" }}>
+          <h3>Security</h3>
+          <input
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder="Dashboard password"
+            style={{ padding: 11, borderRadius: 12, background: "#020617", color: "white", border: "1px solid rgba(255,255,255,0.18)", minWidth: 220 }}
+          />
+          <button style={btn("#2563eb")} onClick={saveApiKey}>Save Key</button>
+          <button style={btn("#4b5563")} onClick={clearApiKey}>Clear</button>
+          {message && <span style={{ color: "#facc15", marginLeft: 8 }}>{message}</span>}
         </div>
 
-        <nav>
-          {tabs.map(([id, label]) => (
-            <button key={id} className={activeTab === id ? "nav active" : "nav"} onClick={() => setActiveTab(id)}>
-              {label}
-            </button>
-          ))}
-        </nav>
-
-        <div className="key-box">
-          <label>Dashboard password</label>
-          <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="x-api-key" />
-          <div className="mini-row">
-            <button onClick={saveApiKey}>Save</button>
-            <button className="secondary" onClick={() => { localStorage.removeItem("dashboard_api_key"); setApiKey(""); }}>Clear</button>
-          </div>
-          {message && <p className="message">{message}</p>}
-        </div>
-      </aside>
-
-      <main className="main">
-        <header className="topbar">
-          <div>
-            <h2>{tabs.find(([id]) => id === activeTab)?.[1]}</h2>
-            <p>{data?.name || "GBP Profit Trading Bot"} · USD/GBP {Number(rate).toFixed(4)}</p>
-          </div>
-          <div className="actions compact-actions">
-            <button onClick={fetchData}>Refresh</button>
-            <button className="buy" onClick={() => action("/manual-buy")}>Money Buy</button>
-            <button className="danger" onClick={() => action("/manual-sell")}>Sell Worst</button>
-          </div>
-        </header>
-
-        {!data && <div className="empty">Loading bot status…</div>}
-
-        {data && activeTab === "overview" && (
+        {data && (
           <>
-            <section className="cards compact-grid">
-              <Card title="Equity">{moneyPair(data.account?.equity, data.account?.equityGbp, rate)}</Card>
-              <Card title="Buying Power">{moneyPair(data.account?.buyingPower, data.account?.buyingPowerGbp, rate)}</Card>
-              <Card title="Day PnL" tone={colour(data.account?.pnlDay)}><b style={{ color: colour(data.account?.pnlDay) }}>{usd(data.account?.pnlDay)}</b><small style={{ color: colour(data.account?.pnlDay) }}>{gbp(data.account?.pnlDayGbp ?? data.account?.pnlDay * rate)}</small></Card>
-              <Card title="Total Gain/Loss" tone={colour(totalGainLoss)}><b style={{ color: colour(totalGainLoss) }}>{usd(totalGainLoss)}</b><small style={{ color: colour(totalGainLoss) }}>{gbp(report.totalGainLossGbp ?? totalGainLoss * rate)} · {pct(report.returnPct)}</small></Card>
-              <Card title="Positions"><b>{positions.length}/{data.maxPositions || 0}</b><small>Next buy {usd(data.newPositionNotional)}</small></Card>
-              <Card title="PDT / Buys"><b>{data.todayBuyCount || 0}/{data.maxNewBuysPerDayPdtAware || "—"}</b><small>{(data.lockedSymbolsToday || []).length} locked today</small></Card>
-            </section>
+            <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(34,197,94,0.45)" }}>
+              <h3>GBP Conversion</h3>
+              <p style={{ color: "#22c55e", fontWeight: 700 }}>
+                1 USD = £{Number(rate).toFixed(4)} GBP
+              </p>
+              <p style={{ color: "#94a3b8" }}>
+                Equity, PnL, position value and trade history show both USD and GBP.
+              </p>
+            </div>
 
-            <section className="split">
-              <div className="panel grow">
-                <div className="panel-head">
-                  <h3>Equity Timeline</h3>
-                  <div className="toggle">
-                    <button className={chartCurrency === "USD" ? "active" : ""} onClick={() => setChartCurrency("USD")}>USD</button>
-                    <button className={chartCurrency === "GBP" ? "active" : ""} onClick={() => setChartCurrency("GBP")}>GBP</button>
-                  </div>
-                </div>
-                <div className="chart-box">
-                  {equityChart.length ? (
-                    <ResponsiveContainer width="100%" height="100%">
-                      <LineChart data={equityChart}>
-                        <CartesianGrid stroke="rgba(255,255,255,.08)" />
-                        <XAxis dataKey="idx" />
-                        <YAxis />
-                        <Tooltip formatter={(v: any) => chartCurrency === "GBP" ? gbp(v) : usd(v)} />
-                        <Line dataKey="equity" stroke="#22c55e" strokeWidth={2} dot={false} />
-                        {equityChart.map((e: any) => (
-                          <ReferenceDot key={`${e.idx}-${e.side}-${e.symbol}`} x={e.idx} y={e.equity} r={4} fill={e.side === "BUY" ? "#22c55e" : "#ef4444"} />
-                        ))}
-                      </LineChart>
-                    </ResponsiveContainer>
-                  ) : <div className="empty small">Timeline appears after trades/backfill.</div>}
-                </div>
-              </div>
+            
+            <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(20,184,166,0.45)" }}>
+              <h3>Persistent Trade Database</h3>
+              <p style={{ color: "#2dd4bf", fontWeight: 700 }}>
+                SQLite {data.dbSummary?.enabled ? "ON" : "OFF"} · Raw Orders {data.dbSummary?.totalTrades || 0} · Closed Trades {data.dbSummary?.closedTrades || 0} · Win rate {pct((data.dbSummary?.winRate || 0) * 100)}
+              </p>
+              <p style={{ color: Number(data.dbSummary?.totalPnl || 0) >= 0 ? "#22c55e" : "#f87171" }}>
+                Total Realised PnL: {usd(data.dbSummary?.totalPnl || 0)} / {gbpValue(data.dbSummary?.totalPnlGbp || 0)}
+              </p>
+              <p style={{ color: "#94a3b8" }}>
+                Use “Full Backfill ALL Alpaca Orders” to import old orders, then “Rebuild PnL Matching” to pair BUY → SELL and calculate realised PnL.
+              </p>
+            </div>
 
-              <div className="panel side-panel">
-                <h3>Live Summary</h3>
-                <div className="mini-list">
-                  <span>Sniper</span><b>{data.sniperModeEnabled ? "ON" : "OFF"}</b>
-                  <span>A+ Gate</span><b>{data.aPlusGateEnabled ? "ON" : "OFF"}</b>
-                  <span>Auto Universe</span><b>{data.autoUniverseEnabled ? "ON" : "OFF"}</b>
-                  <span>PDT-aware</span><b>{data.pdtAwareModeEnabled ? "ON" : "OFF"}</b>
-                  <span>Closed trades</span><b>{data.dbSummary?.closedTrades || 0}</b>
-                  <span>Win rate</span><b>{pct((data.dbSummary?.winRate || 0) * 100)}</b>
+
+        {data && (
+          <div style={{ ...panel, marginBottom: 12, borderColor: "rgba(14,165,233,0.55)" }}>
+            <h3>Weekly Auto Universe</h3>
+            <p style={{ color: "#38bdf8", fontWeight: 700 }}>
+              {data.autoUniverse?.enabled ? "ON" : "OFF"} · Week {data.autoUniverse?.weekStart || "—"} · Active {data.autoUniverse?.activeSymbols?.length || 0}/{data.autoUniverse?.size || 12}
+            </p>
+            <p style={{ color: "#94a3b8" }}>
+              These are the stocks the bot is prioritising this week. It keeps winners, removes weak performers, and refreshes weekly or when you press Refresh Weekly Universe.
+            </p>
+            {(data.autoUniverse?.rows || []).length === 0 && (
+              <p style={{ color: "#facc15" }}>No weekly universe yet. Open Data & Maintenance Tools, then press Refresh Weekly Universe.</p>
+            )}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 8 }}>
+              {(data.autoUniverse?.rows || []).slice(0, 25).map((r: any) => (
+                <div key={r.symbol} style={{ background: "#020617", borderRadius: 12, padding: 10, border: "1px solid rgba(255,255,255,0.08)" }}>
+                  <b style={{ fontSize: 18 }}>{r.symbol}</b>
+                  <div style={{ color: "#38bdf8", fontWeight: 700 }}>Score {Number(r.score || 0).toFixed(2)}</div>
+                  <div style={{ color: "#94a3b8", fontSize: 12 }}>{r.reason}</div>
                 </div>
-              </div>
-            </section>
+              ))}
+            </div>
+          </div>
+        )}
+
+<div style={{ ...panel, marginBottom: 12, borderColor: "rgba(250,204,21,0.45)" }}>
+              <h3>Strategy Modes</h3>
+              <p style={{ color: "#facc15", fontWeight: 700 }}>
+                Sniper {data.sniperModeEnabled ? "ON" : "OFF"} · A+ Gate {data.aPlusGateEnabled ? "ON" : "OFF"} · Optimiser {data.profitOptimizerEnabled ? "ON" : "OFF"} · Analytics {data.analyticsEnabled ? "ON" : "OFF"} · Auto-Improve {data.autoImproveEnabled ? "ON" : "OFF"} · Auto Universe {data.autoUniverseEnabled ? "ON" : "OFF"} · PDT-Aware {data.pdtAwareModeEnabled ? "ON" : "OFF"}
+              </p>
+            </div>
           </>
         )}
 
-        {data && activeTab === "money" && (
-          <>
-            <section className="cards compact-grid">
-              <Card title="Total Deposited">{moneyPair(report.totalDeposited, report.totalDepositedGbp, rate)}</Card>
-              <Card title="Current Value">{moneyPair(report.currentEquity ?? data.account?.equity, report.currentEquityGbp ?? data.account?.equityGbp, rate)}</Card>
-              <Card title="Total Gain/Loss" tone={colour(totalGainLoss)}><b style={{ color: colour(totalGainLoss) }}>{usd(totalGainLoss)}</b><small style={{ color: colour(totalGainLoss) }}>{gbp(report.totalGainLossGbp ?? totalGainLoss * rate)} · {pct(report.returnPct)}</small></Card>
-              <Card title="Earned Since Deposit" tone="#22c55e">{moneyPair(report.earnedSinceDeposit, report.earnedSinceDepositGbp, rate)}</Card>
-              <Card title="Lost Since Deposit" tone="#f87171">{moneyPair(report.lostSinceDeposit, report.lostSinceDepositGbp, rate)}</Card>
-              <Card title="Open PnL" tone={colour(report.openPnl)}><b style={{ color: colour(report.openPnl) }}>{usd(report.openPnl)}</b><small>{gbp(report.openPnlGbp)}</small></Card>
-            </section>
-            <section className="panel">
-              <div className="panel-head"><h3>Report Details</h3><Pill>{report.depositSource || "status/db fallback"}</Pill></div>
-              <div className="report-grid">
-                <div><span>Withdrawn</span><b>{usd(report.totalWithdrawn)} / {gbp(report.totalWithdrawnGbp)}</b></div>
-                <div><span>Net deposited</span><b>{usd(report.netDeposited)} / {gbp(report.netDepositedGbp)}</b></div>
-                <div><span>Realised net</span><b style={{ color: colour(report.realisedNet) }}>{usd(report.realisedNet)} / {gbp(report.realisedNetGbp)}</b></div>
-                <div><span>Gross wins</span><b style={{ color: "#22c55e" }}>{usd(report.realisedGains)} / {gbp(report.realisedGainsGbp)}</b></div>
-                <div><span>Gross losses</span><b style={{ color: "#f87171" }}>{usd(report.realisedLosses)} / {gbp(report.realisedLossesGbp)}</b></div>
-                <div><span>Activity count</span><b>{report.depositActivityCount ?? 0}</b></div>
-              </div>
-              {report.depositErrors?.length ? <p className="warning">Deposit activity warning: {report.depositErrors.join(" | ")}</p> : null}
-            </section>
-          </>
-        )}
+        <CollapsibleSection title="Main Controls" defaultOpen={true}>
+          <button style={btn("#2563eb")} onClick={fetchData}>Refresh Data</button>
+          <button style={btn("#16a34a")} onClick={() => action("/manual-buy")}>Money Buy</button>
+          <div style={{ marginTop: 12 }}>
+            <input value={customTicker} onChange={(e) => setCustomTicker(e.target.value.toUpperCase())} placeholder="Ticker e.g. AMD" style={{ padding: 11, borderRadius: 12, background: "#020617", color: "white", border: "1px solid rgba(255,255,255,0.18)", minWidth: 160 }} />
+            <button style={btn("#22c55e")} onClick={customBuy}>Buy Custom</button>
+          </div>
+        </CollapsibleSection>
 
-        {data && activeTab === "positions" && (
-          <section className="panel">
-            <div className="panel-head"><h3>Open Positions</h3><span>{positions.length} open</span></div>
-            <div className="table-wrap">
-              <table>
-                <thead><tr><th>Symbol</th><th>Value</th><th>Entry</th><th>Price</th><th>PnL</th><th>Trail</th><th></th></tr></thead>
-                <tbody>
-                  {positions.map((p) => (
-                    <tr key={p.symbol}>
-                      <td><b>{p.symbol}</b>{p.boughtToday ? <small className="yellow"> bought today</small> : null}</td>
-                      <td>{usd(p.marketValue)}<small>{gbp(p.marketValueGbp ?? p.marketValue * rate)}</small></td>
-                      <td>{usd(p.entry)}</td>
-                      <td>{usd(p.price)}</td>
-                      <td style={{ color: colour(p.pnlPct) }}>{usd(p.pnl)}<small>{pct(p.pnlPct)}</small></td>
-                      <td>{p.trailingActive ? <span className="green">Floor {usd(p.trailFloor)}</span> : <span className="yellow">Starts {usd(p.trailStartPrice)}</span>}</td>
-                      <td><button className="danger" onClick={() => action(`/sell/${p.symbol}`)}>Sell</button></td>
-                    </tr>
+        <CollapsibleSection title="Safety Controls">
+          <button style={btn("#dc2626")} onClick={() => action("/manual-sell")}>Sell Worst</button>
+          <button style={btn("#7f1d1d")} onClick={() => action("/emergency-sell")}>EMERGENCY SELL ALL</button>
+          <button style={btn("#9333ea")} onClick={() => action("/pause")}>Pause Bot</button>
+          <button style={btn("#0891b2")} onClick={() => action("/resume")}>Resume Bot</button>
+          <button style={btn("#f59e0b")} onClick={() => action("/manual-override/on")}>Manual Override ON</button>
+          <button style={btn("#4b5563")} onClick={() => action("/manual-override/off")}>Manual Override OFF</button>
+        </CollapsibleSection>
+
+        <CollapsibleSection title="Data & Maintenance Tools">
+          <button style={btn("#0f766e")} onClick={() => action("/backfill-trades")}>Full Backfill ALL Alpaca Orders</button>
+          <button style={btn("#0d9488")} onClick={() => action("/rebuild-closed-trades")}>Rebuild PnL Matching</button>
+          <button style={btn("#0ea5e9")} onClick={() => action("/refresh-universe")}>Refresh Weekly Universe</button>
+          <p style={{ color: "#94a3b8", marginTop: 8 }}>Use these when importing order history, rebuilding analytics, or forcing the weekly stock list to refresh.</p>
+        </CollapsibleSection>
+
+        {!data && <p>Loading...</p>}
+
+        {data && (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12, marginBottom: 12 }}>
+              <div style={panel}>Equity<br /><DualMoney usdValue={data.account?.equity || 0} gbpValue={data.account?.equityGbp} rate={rate} /></div>
+              <div style={panel}>Buying Power<br /><DualMoney usdValue={data.account?.buyingPower || 0} gbpValue={data.account?.buyingPowerGbp} rate={rate} /></div>
+              <div style={panel}>Cash<br /><DualMoney usdValue={data.account?.cash || 0} gbpValue={data.account?.cashGbp} rate={rate} /></div>
+              <div style={panel}>Day PnL<br /><b style={{ color: Number(data.account?.pnlDay || 0) >= 0 ? "#22c55e" : "#f87171" }}>{usd(data.account?.pnlDay)}</b><br /><span style={{ color: Number(data.account?.pnlDay || 0) >= 0 ? "#22c55e" : "#f87171" }}>{gbpValue(data.account?.pnlDayGbp ?? Number(data.account?.pnlDay || 0) * rate)}</span></div>
+              <div style={panel}>Positions<br /><b>{positions.length}/{data.maxPositions || 0}</b></div>
+              <div style={panel}>Next Buy Size<br /><DualMoney usdValue={data.newPositionNotional || 0} rate={rate} /></div>
+            </div>
+
+            <div style={{ ...panel, marginBottom: 12 }}>
+              <h3>Trade Timeline</h3>
+              <div>
+                {["day", "week", "month", "total"].map((r) => (
+                  <button key={r} style={btn(timelineRange === r ? "#2563eb" : "#334155")} onClick={() => setTimelineRange(r)}>
+                    {r.toUpperCase()}
+                  </button>
+                ))}
+                <button style={btn(chartCurrency === "USD" ? "#16a34a" : "#334155")} onClick={() => setChartCurrency("USD")}>USD Chart</button>
+                <button style={btn(chartCurrency === "GBP" ? "#16a34a" : "#334155")} onClick={() => setChartCurrency("GBP")}>GBP Chart</button>
+              </div>
+
+              {timelineChart.length > 0 ? (
+                <div style={{ height: 320 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={timelineChart}>
+                      <CartesianGrid stroke="rgba(255,255,255,0.1)" />
+                      <XAxis dataKey="idx" />
+                      <YAxis />
+                      <Tooltip formatter={(value: any) => chartCurrency === "GBP" ? gbpValue(Number(value)) : usd(Number(value))} />
+                      <Line type="monotone" dataKey="equity" stroke="#22c55e" strokeWidth={2} dot={false} />
+                      {timelineChart.map((e: any) => (
+                        <ReferenceDot
+                          key={`${e.idx}-${e.symbol}-${e.side}`}
+                          x={e.idx}
+                          y={e.equity}
+                          r={5}
+                          fill={e.side === "BUY" ? "#22c55e" : "#ef4444"}
+                          stroke="white"
+                          label={{ value: e.symbol, position: "top", fill: "white", fontSize: 11 }}
+                        />
+                      ))}
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              ) : (
+                <div style={{ height: 180, display: "flex", alignItems: "center", justifyContent: "center", color: "#94a3b8", border: "1px dashed rgba(255,255,255,0.15)", borderRadius: 14, marginTop: 12 }}>
+                  No trades yet — timeline will appear after first buy/sell.
+                </div>
+              )}
+            </div>
+
+            <div style={{ ...panel, marginBottom: 12 }}>
+              <h3>All Positions</h3>
+              {positions.length === 0 && <p>No open positions.</p>}
+              {positions.map((p: Position) => (
+                <div key={p.symbol} style={{ background: "#020617", borderRadius: 14, padding: 12, marginBottom: 8 }}>
+                  <b>{p.symbol}</b>
+                  {p.boughtToday ? <span style={{ color: "#facc15" }}> · BOUGHT TODAY · {p.minutesSinceBuy}m held</span> : null}
+                  {p.partialProfitTaken ? <span style={{ color: "#22c55e" }}> · PARTIAL PROFIT TAKEN</span> : null}
+                  {" · "}Qty {Number(p.qty).toFixed(4)} · Entry {usd(p.entry)} · Price {usd(p.price)}
+                  <br />
+                  Value: <b>{usd(p.marketValue)}</b> / <span style={{ color: "#94a3b8" }}>{gbpValue(p.marketValueGbp ?? p.marketValue * rate)}</span>
+                  <br />
+                  <span style={{ color: p.pnlPct >= 0 ? "#22c55e" : "#f87171" }}>
+                    PnL {usd(p.pnl)} / {gbpValue(p.pnlGbp ?? p.pnl * rate)} / {pct(p.pnlPct)}
+                  </span>
+                  {" · "}
+                  <span style={{ color: p.trailingActive ? "#22c55e" : "#facc15" }}>
+                    {p.trailingActive ? `Trailing floor ${usd(p.trailFloor)}` : `Trail starts ${usd(p.trailStartPrice)}`}
+                  </span>
+                  <button style={btn("#dc2626")} onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ ...panel, marginBottom: 12 }}>
+              <h3>Scanner</h3>
+
+              {scans.length > 0 ? (
+                <>
+                  <select value={selectedScan?.symbol || ""} onChange={(e) => setSelectedSymbol(e.target.value)} style={{ padding: 10, borderRadius: 10, marginBottom: 10 }}>
+                    {scans.map((s: Scan) => <option key={s.symbol} value={s.symbol}>{s.symbol}</option>)}
+                  </select>
+
+                  {scannerChartData.length > 0 ? (
+                    <div style={{ height: 220, marginBottom: 12 }}>
+                      <ResponsiveContainer width="100%" height="100%">
+                        <LineChart data={scannerChartData}>
+                          <CartesianGrid stroke="rgba(255,255,255,0.1)" />
+                          <XAxis dataKey="t" />
+                          <YAxis />
+                          <Tooltip />
+                          <Line type="monotone" dataKey="value" stroke="#38bdf8" strokeWidth={2} dot={false} />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    </div>
+                  ) : (
+                    <p style={{ color: "#94a3b8" }}>No scanner chart data yet.</p>
+                  )}
+
+                  {scans.map((s: Scan) => (
+                    <div key={s.symbol} style={{ background: s.aPlusPass || s.sniperPass ? "rgba(22,163,74,0.18)" : "#020617", borderRadius: 14, padding: 12, marginBottom: 8 }}>
+                      <b>{s.symbol}</b> | {usd(s.price)} / {gbpFromUsd(s.price, rate)} | trigger {usd(s.trigger)} | spread {(Number(s.spread || 0) * 100).toFixed(2)}%
+                      <br />
+                      quality {(s.qualityScore || 0).toFixed(4)} | confidence {(s.confidence || 0).toFixed(2)} {s.confidenceLabel} | {(s as any).optimiserDecision?.action || "NORMAL"} | {(s.aPlusPass || s.sniperPass) ? "PASS" : `WAIT: ${s.aPlusReason || s.sniperReason || "not ready"}`}
+                    </div>
                   ))}
-                  {!positions.length && <tr><td colSpan={7}>No open positions.</td></tr>}
-                </tbody>
-              </table>
+                </>
+              ) : (
+                <div style={{ color: "#94a3b8", padding: 20, border: "1px dashed rgba(255,255,255,0.15)", borderRadius: 14 }}>
+                  No scan data yet. This is normal while the market is closed.
+                </div>
+              )}
             </div>
-          </section>
-        )}
 
-        {data && activeTab === "scanner" && (
-          <section className="split">
-            <div className="panel grow">
-              <div className="panel-head"><h3>Scanner Chart</h3><select value={selectedScan?.symbol || ""} onChange={(e) => setSelectedSymbol(e.target.value)}>{scans.map((s) => <option key={s.symbol}>{s.symbol}</option>)}</select></div>
-              <div className="chart-box scanner">
-                {selectedScan?.priceCurve?.length ? (
-                  <ResponsiveContainer width="100%" height="100%"><LineChart data={selectedScan.priceCurve}><CartesianGrid stroke="rgba(255,255,255,.08)" /><XAxis dataKey="t" /><YAxis /><Tooltip /><Line dataKey="value" stroke="#38bdf8" strokeWidth={2} dot={false} /></LineChart></ResponsiveContainer>
-                ) : <div className="empty small">No chart data yet.</div>}
-              </div>
+            <div style={{ ...panel, marginBottom: 12 }}>
+              <h3>Trades</h3>
+              {trades.length === 0 && <p>No trades yet.</p>}
+              {trades.map((t: Trade, i: number) => (
+                <div key={i} style={{ color: t.side === "BUY" ? "#22c55e" : "#f87171", marginBottom: 6 }}>
+                  {t.time || "—"} | {t.side || "—"} | {t.symbol || "—"}
+                  {t.amount ? ` | ${usd(t.amount)} / ${gbpValue(t.amountGbp ?? t.amount * rate)}` : ""}
+                  {t.qty ? ` | ${t.qty} shares` : ""}
+                  {t.reason ? ` | ${t.reason}` : ""}
+                  {t.pnl !== undefined ? ` | PnL ${usd(t.pnl)} / ${gbpValue(t.pnlGbp ?? t.pnl * rate)} (${pct(t.pnlPct || 0)})` : ""}
+                </div>
+              ))}
             </div>
-            <div className="panel grow">
-              <div className="panel-head"><h3>Scan List</h3><span>{scans.length} symbols</span></div>
-              <div className="scan-grid">
-                {scans.map((s) => <div key={s.symbol} className={(s.aPlusPass || s.sniperPass) ? "scan pass" : "scan"} onClick={() => setSelectedSymbol(s.symbol)}><b>{s.symbol}</b><span>{usd(s.price)} · conf {(s.confidence || 0).toFixed(2)}</span><small>{s.aPlusPass || s.sniperPass ? "PASS" : s.aPlusReason || s.sniperReason || "waiting"}</small></div>)}
-                {!scans.length && <div className="empty small">No scan data yet. Normal while market is closed.</div>}
-              </div>
-            </div>
-          </section>
-        )}
 
-        {data && activeTab === "activity" && (
-          <section className="split">
-            <div className="panel grow">
-              <h3>Recent Trades</h3>
-              <div className="activity-list">{trades.slice().reverse().map((t, i) => <div key={i} className={t.side === "BUY" ? "activity buy" : "activity sell"}><b>{t.side || "—"} {t.symbol || "—"}</b><span>{t.time || "—"} · {t.amount ? `${usd(t.amount)} / ${gbp(t.amountGbp ?? t.amount * rate)}` : ""} {t.pnl !== undefined ? ` · PnL ${usd(t.pnl)} (${pct(t.pnlPct)})` : ""}</span><small>{t.reason}</small></div>)}{!trades.length && <p>No trades yet.</p>}</div>
-            </div>
-            <div className="panel grow">
-              <h3>Closed Trades / Memory</h3>
-              <div className="activity-list">{closedTrades.slice(-30).reverse().map((t, i) => <div key={i} className={Number(t.pnl || 0) >= 0 ? "activity buy" : "activity sell"}><b>{t.symbol} {pct(t.pnlPct)}</b><span>{usd(t.pnl)} / {gbp(t.pnlGbp)}</span><small>Entry {usd(t.entryPrice)} → Exit {usd(t.exitPrice)}</small></div>)}{!closedTrades.length && <p>No matched closed trades yet.</p>}</div>
-            </div>
-          </section>
-        )}
 
-        {data && activeTab === "admin" && (
-          <section className="split">
-            <div className="panel grow">
-              <h3>Controls</h3>
-              <div className="actions">
-                <button onClick={() => action("/resume")}>Resume</button>
-                <button className="warn" onClick={() => action("/pause")}>Pause</button>
-                <button onClick={() => action("/manual-override/on")}>Override ON</button>
-                <button className="secondary" onClick={() => action("/manual-override/off")}>Override OFF</button>
-                <button className="danger" onClick={() => action("/emergency-sell")}>Emergency Sell All</button>
-              </div>
-              <div className="custom-buy"><input value={customTicker} onChange={(e) => setCustomTicker(e.target.value.toUpperCase())} placeholder="Ticker e.g. AMD" /><button className="buy" onClick={customBuy}>Buy Custom</button></div>
-              <h3>Maintenance</h3>
-              <div className="actions"><button onClick={() => action("/backfill-trades")}>Backfill Orders</button><button onClick={() => action("/rebuild-closed-trades")}>Rebuild PnL</button><button onClick={() => action("/refresh-universe")}>Refresh Universe</button></div>
+            <div style={{ ...panel, marginBottom: 12 }}>
+              <h3>Matched Closed Trades</h3>
+              {(!Array.isArray(data.closedTrades) || data.closedTrades.length === 0) && (
+                <p style={{ color: "#94a3b8" }}>No matched closed trades yet. Click Backfill, then Rebuild PnL Matching.</p>
+              )}
+              {(Array.isArray(data.closedTrades) ? data.closedTrades : []).slice(-50).reverse().map((t: any, i: number) => (
+                <div key={i} style={{ color: Number(t.pnl || 0) >= 0 ? "#22c55e" : "#f87171", marginBottom: 6 }}>
+                  {t.time || "—"} | {t.symbol} | Qty {Number(t.qty || 0).toFixed(4)}
+                  {" | "}Entry {usd(t.entryPrice || 0)} → Exit {usd(t.exitPrice || 0)}
+                  {" | "}PnL {usd(t.pnl || 0)} / {gbpValue(t.pnlGbp || 0)} ({pct(t.pnlPct || 0)})
+                </div>
+              ))}
             </div>
-            <div className="panel grow">
-              <h3>Warnings & Logs</h3>
-              <div className="log-box">
-                {warnings.map((w: any, i: number) => <div key={`w-${i}`} className="log warning-line">{w.time || "—"} | {w.message || w.reason || w.error}</div>)}
-                {logs.map((l, i) => <div key={`l-${i}`} className="log">{l}</div>)}
-                {!warnings.length && !logs.length && <p>No logs yet.</p>}
-              </div>
+
+            <div style={{ ...panel, marginBottom: 12 }}>
+              <h3>Stock Memory</h3>
+              {stockMemory.length === 0 && <p style={{ color: "#94a3b8" }}>No completed sell history yet.</p>}
+              {stockMemory.slice(0, 20).map((m: any) => (
+                <div key={m.symbol} style={{ background: "#020617", borderRadius: 12, padding: 10, marginBottom: 6 }}>
+                  <b>{m.symbol}</b> · Trust {m.trust} · Trades {m.trades} · Win rate {pct((m.winRate || 0) * 100)} · Avg PnL {usd(m.avgPnl || 0)} / {gbpFromUsd(m.avgPnl || 0, rate)}
+                </div>
+              ))}
             </div>
-          </section>
+
+            <div style={{ ...panel, marginBottom: 12 }}>
+              <h3>Alpaca Rejections / PDT Warnings</h3>
+              {alpacaRejectionEvents.length === 0 && pdtWarningEvents.length === 0 && <p style={{ color: "#94a3b8" }}>No warnings yet.</p>}
+              {alpacaRejectionEvents.map((e: any, i: number) => (
+                <div key={`a-${i}`} style={{ color: "#f87171", marginBottom: 6 }}>{e.time} | {e.message} | {e.error}</div>
+              ))}
+              {pdtWarningEvents.map((e: any, i: number) => (
+                <div key={`p-${i}`} style={{ color: "#facc15", marginBottom: 6 }}>{e.time} | {e.message}</div>
+              ))}
+            </div>
+
+            <div style={{ ...panel, marginBottom: 12 }}>
+              <h3>Logs</h3>
+              {logs.map((l: string, i: number) => (
+                <div key={i} style={{ color: l.includes("FX") ? "#22c55e" : l.includes("SNIPER") ? "#38bdf8" : l.includes("PDT") ? "#facc15" : l.includes("PROFIT") ? "#22c55e" : "#94a3b8", fontSize: 12 }}>
+                  {l}
+                </div>
+              ))}
+            </div>
+          </>
         )}
-      </main>
+      </div>
     </div>
   );
 }
