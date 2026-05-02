@@ -1,6 +1,5 @@
-alpaca-py
 fastapi
 uvicorn
-pydantic
 requests
-pytz
+alpaca-py
+ccxt
