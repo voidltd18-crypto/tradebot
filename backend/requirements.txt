@@ -3,3 +3,4 @@ uvicorn==0.46.0
 pydantic==2.13.3
 requests
 python-dotenv
+ccxt
