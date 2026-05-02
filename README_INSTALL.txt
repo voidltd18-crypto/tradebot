@@ -1,23 +1,14 @@
-Since Upgrade Tracker update
+Charts update package
 
 Replace:
-backend/main.py
 frontend/src/App.tsx
 frontend/src/styles.css
 
-Then redeploy:
-- Render backend
-- Vercel frontend
+This keeps your repo structure and backend untouched.
 
-Adds:
-- Since Upgrade stat on top dashboard
-- Since Upgrade tracker in Reports
-- Reset Upgrade Baseline button
-- GET /since-upgrade
-- POST /reset-upgrade-baseline
+Changes:
+- Price / Equity History x-axis now uses real time/date labels, not 0/1/2 index numbers.
+- Added Daily PnL bar chart on Reports page.
+- Kept Weekly Stock Refresh button.
 
-How to use:
-1. Deploy.
-2. Open Reports.
-3. Press Reset Upgrade Baseline once.
-4. From then on, the dashboard shows performance from that point separately from old historical loss.
+Push to GitHub and redeploy Vercel only.
