@@ -212,7 +212,7 @@ export default function App() {
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={reportChart}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#263450" />
-                    <XAxis dataKey="idx" stroke="#94a3b8" />
+                    <XAxis dataKey="label" stroke="#94a3b8" />
                     <YAxis stroke="#94a3b8" />
                     <Tooltip formatter={(v: any) => chartCurrency === "GBP" ? gbp(v) : usd(v)} />
                     <Area type="monotone" dataKey="equity" stroke="#38bdf8" fill="#38bdf833" />
