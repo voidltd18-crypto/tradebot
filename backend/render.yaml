@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: rebuilt-sniper-profit-bot
+    runtime: python
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: APCA_API_KEY_ID
+        sync: false
+      - key: APCA_API_SECRET_KEY
+        sync: false
+      - key: DASHBOARD_API_KEY
+        sync: false
+      - key: PAPER
+        value: "false"
