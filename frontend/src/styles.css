@@ -47,3 +47,34 @@ h2{margin:0 0 14px;font-size:20px}.muted,small{color:var(--muted)}
 .mini-chart{height:95px;background:#020617;border:1px solid #1e293b;border-radius:14px;padding:8px}
 .search-actions{display:flex;gap:10px;flex-wrap:wrap}
 @media(max-width:700px){.search-row{flex-direction:column}.search-results{grid-template-columns:1fr}}
+.universe-counts {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin: 14px 0;
+}
+
+.universe-counts div {
+  background: #050817;
+  border: 1px solid #1e293b;
+  border-radius: 16px;
+  padding: 14px;
+}
+
+.universe-counts span {
+  display: block;
+  color: #94a3b8;
+  font-size: 14px;
+}
+
+.universe-counts b {
+  display: block;
+  font-size: 28px;
+  margin-top: 6px;
+}
+
+@media(max-width:700px){
+  .universe-counts {
+    grid-template-columns: 1fr;
+  }
+}
