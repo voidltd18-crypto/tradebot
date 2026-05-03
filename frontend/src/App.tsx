@@ -51,34 +51,38 @@ export default function App() {
   const equityHistory = Array.isArray(reports?.equityHistory) ? reports.equityHistory : (Array.isArray(data?.tradeTimeline) ? data.tradeTimeline : []);
 
   async function fetchData() {
-    try {
-      const [statusRes, reportRes] = await Promise.allSettled([
-        fetch(`${API_URL}/status`).then(r => r.json()),
-        fetch(`${API_URL}/reports`).then(r => r.json()),
-      ]);
-      if (statusRes.status === "fulfilled") {
-  const json = statusRes.value;
+  try {
+    const [statusRes, reportRes] = await Promise.allSettled([
+      fetch(`${API_URL}/status`).then(r => r.json()),
+      fetch(`${API_URL}/reports`).then(r => r.json()),
+    ]);
 
-  if (json?.account?.equity !== undefined) {
-    setData(prev => ({
-      ...prev,
-      ...json
-    }));
-  }
+    if (statusRes.status === "fulfilled") {
+      const json = statusRes.value;
 
-  const nextScans = Array.isArray(json?.scans) ? json.scans : [];
-  if (!selectedSymbol && nextScans.length) {
-    setSelectedSymbol(nextScans[0].symbol);
+      if (json?.account?.equity !== undefined) {
+        setData(prev => ({
+          ...prev,
+          ...json
+        }));
+      }
+
+      const nextScans = Array.isArray(json?.scans) ? json.scans : [];
+      if (!selectedSymbol && nextScans.length) {
+        setSelectedSymbol(nextScans[0].symbol);
+      }
+    }
+
+    if (reportRes.status === "fulfilled") {
+      setReports(reportRes.value || {});
+    }
+
+    setStatus("Connected");
+  } catch (e) {
+    console.error(e);
+    setStatus("Connection failed");
   }
 }
-      }
-      if (reportRes.status === "fulfilled") setReports(reportRes.value || {});
-      setStatus("Connected");
-    } catch (e) {
-      console.error(e);
-      setStatus("Connection failed");
-    }
-  }
 
   useEffect(() => {
     fetchData();
