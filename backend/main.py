@@ -81,7 +81,7 @@ SAFE_UNIVERSE = [
 CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
-MAX_POSITIONS = 25
+MAX_POSITIONS = 12
 MAX_NEW_BUYS_PER_LOOP = 1
 MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
@@ -236,7 +236,7 @@ if PROFIT_OPTIMIZER_ENABLED:
 
 # Weekly Auto Universe Rotation
 AUTO_UNIVERSE_ENABLED = True
-AUTO_UNIVERSE_SIZE = 25
+AUTO_UNIVERSE_SIZE = 12
 AUTO_UNIVERSE_REFRESH_DAY = 0
 AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 12
 AUTO_UNIVERSE_KEEP_WINNERS = True
@@ -3201,8 +3201,6 @@ def root():
 
 @app.get("/status")
 def get_status():
-    if "merge_manual_picks_into_auto_universe" in globals():
-        return merge_manual_picks_into_auto_universe(latest_status)
     return latest_status
 
 
@@ -3404,281 +3402,35 @@ def startup_event():
 
 
 
-
 # =========================
-# STOCK SEARCH / PREVIEW API
+# REPORT BASELINE RESET
 # =========================
+BASELINE_FILE = os.path.join("backend", "state", "equity_baseline.json")
 
-SEARCH_PREVIEW_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
-
-def _stock_name_guess(symbol: str) -> str:
-    names = {
-        "AAPL": "Apple",
-        "MSFT": "Microsoft",
-        "NVDA": "NVIDIA",
-        "AMD": "Advanced Micro Devices",
-        "AMZN": "Amazon",
-        "META": "Meta Platforms",
-        "GOOGL": "Alphabet",
-        "GOOG": "Alphabet",
-        "TSLA": "Tesla",
-        "INTC": "Intel",
-        "NFLX": "Netflix",
-        "CRM": "Salesforce",
-        "ORCL": "Oracle",
-        "ADBE": "Adobe",
-        "PYPL": "PayPal",
-        "UBER": "Uber",
-        "PLTR": "Palantir",
-        "SHOP": "Shopify",
-        "SNOW": "Snowflake",
-        "NET": "Cloudflare",
-        "MDB": "MongoDB",
-        "MU": "Micron",
-        "LAC": "Lithium Americas",
-        "LCID": "Lucid",
-        "TTWO": "Take-Two Interactive",
-        "EA": "Electronic Arts",
-        "RBLX": "Roblox",
-        "U": "Unity Software",
-    }
-    return names.get(symbol.upper(), symbol.upper())
-
-def _stock_search_universe() -> List[str]:
-    symbols = []
-    for name in [
-        "current_universe",
-        "SAFE_UNIVERSE",
-        "TECH_UNIVERSE",
-        "AUTO_UNIVERSE",
-        "UNIVERSE",
-    ]:
-        val = globals().get(name)
-        if isinstance(val, list):
-            symbols.extend([str(x).upper() for x in val])
-
+def load_equity_baseline() -> float:
     try:
-        if "load_manual_universe_picks" in globals():
-            symbols.extend(load_manual_universe_picks())
-    except Exception:
-        pass
-
-    symbols.extend([
-        "AAPL","MSFT","NVDA","AMD","AMZN","META","GOOGL","GOOG","TSLA","INTC",
-        "NFLX","CRM","ORCL","ADBE","PYPL","UBER","PLTR","SHOP","SNOW","NET",
-        "MDB","MU","LAC","LCID","AVGO","QCOM","TXN","NOW","DDOG","CRWD",
-        "PANW","ZS","TEAM","SQ","COIN","HOOD","RBLX","ROKU","DIS","TTWO","EA","U"
-    ])
-
-    seen = []
-    for s in symbols:
-        s = str(s).upper().strip()
-        if s and s not in seen:
-            seen.append(s)
-    return seen
-
-def _usd_to_gbp_for_search() -> float:
-    try:
-        if "get_usd_to_gbp" in globals() and callable(globals()["get_usd_to_gbp"]):
-            return float(get_usd_to_gbp())
-    except Exception:
-        pass
-    try:
-        return float(globals().get("usd_to_gbp", 0.78) or 0.78)
-    except Exception:
-        return 0.78
-
-def _latest_quote_for_symbol(symbol: str) -> Dict[str, Any]:
-    symbol = symbol.upper().strip()
-    quote_price = 0.0
-    bid = 0.0
-    ask = 0.0
-    spread = 0.0
-
-    try:
-        req = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
-        q = data_client.get_stock_latest_quote(req)
-        quote = q.get(symbol) if isinstance(q, dict) else None
-        if quote:
-            bid = float(getattr(quote, "bid_price", 0) or 0)
-            ask = float(getattr(quote, "ask_price", 0) or 0)
-            quote_price = round((bid + ask) / 2, 4) if bid and ask else round(float(ask or bid or 0), 4)
-            spread = round(ask - bid, 4) if ask and bid else 0.0
+        if os.path.exists(BASELINE_FILE):
+            with open(BASELINE_FILE, "r", encoding="utf-8") as f:
+                return float(json.load(f).get("baseline", 0) or 0)
     except Exception as e:
-        print(f"SEARCH QUOTE ERROR {symbol}: {e}")
+        print(f"BASELINE LOAD ERROR: {e}")
+    return 0.0
 
-    if quote_price <= 0:
-        try:
-            for s in latest_scans:
-                if str(s.get("symbol", "")).upper() == symbol:
-                    quote_price = float(s.get("price") or 0)
-                    break
-        except Exception:
-            pass
+def save_equity_baseline(value: float) -> None:
+    os.makedirs(os.path.dirname(BASELINE_FILE), exist_ok=True)
+    with open(BASELINE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"baseline": float(value or 0), "resetAt": datetime.now(UTC).isoformat()}, f, indent=2)
 
-    now = datetime.now(UTC).isoformat()
-    hist = SEARCH_PREVIEW_HISTORY.setdefault(symbol, [])
-    if quote_price > 0:
-        hist.append({"t": now, "value": quote_price})
-        del hist[:-80]
-
-    prev = hist[0]["value"] if hist else quote_price
-    change = quote_price - prev if quote_price and prev else 0.0
-    change_pct = (change / prev * 100.0) if prev else 0.0
-    fx = _usd_to_gbp_for_search()
-
-    return {
-        "symbol": symbol,
-        "name": _stock_name_guess(symbol),
-        "price": quote_price,
-        "priceGbp": round(quote_price * fx, 4),
-        "bid": bid,
-        "ask": ask,
-        "spread": spread,
-        "change": round(change, 4),
-        "changePct": round(change_pct, 4),
-        "history": hist,
-        "inUniverse": symbol in [x.upper() for x in _stock_search_universe()],
-    }
-
-@app.get("/search-stocks")
-def search_stocks(q: str = ""):
-    query = (q or "").strip().upper()
-    if not query:
-        return {"ok": True, "query": q, "results": []}
-
-    matches = []
-    for sym in _stock_search_universe():
-        name = _stock_name_guess(sym).upper()
-        if query in sym or query in name:
-            matches.append(sym)
-        if len(matches) >= 8:
-            break
-
-    # Always try direct exact ticker, even if not in universe.
-    if re.fullmatch(r"[A-Z]{1,5}", query) and query not in matches:
-        matches.insert(0, query)
-
-    deduped = []
-    for sym in matches:
-        if sym not in deduped:
-            deduped.append(sym)
-
-    results = []
-    for sym in deduped[:8]:
-        qd = _latest_quote_for_symbol(sym)
-        if qd.get("price", 0) > 0 or sym == query:
-            results.append(qd)
-
-    return {"ok": True, "query": q, "results": results}
-
-@app.get("/stock-preview/{symbol}")
-def stock_preview(symbol: str):
-    return {"ok": True, "stock": _latest_quote_for_symbol(symbol)}
-
-
-
-
-
-# =========================
-# MANUAL UNIVERSE PICKS
-# =========================
-
-MANUAL_UNIVERSE_FILE = os.path.join("backend", "state", "manual_universe_picks.json")
-
-def load_manual_universe_picks() -> List[str]:
-    try:
-        if os.path.exists(MANUAL_UNIVERSE_FILE):
-            with open(MANUAL_UNIVERSE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return sorted({str(x).upper().strip() for x in data if str(x).strip()})
-    except Exception as e:
-        print(f"MANUAL UNIVERSE LOAD ERROR: {e}")
-    return []
-
-def save_manual_universe_picks(symbols: List[str]) -> None:
-    try:
-        os.makedirs(os.path.dirname(MANUAL_UNIVERSE_FILE), exist_ok=True)
-        clean = sorted({str(x).upper().strip() for x in symbols if str(x).strip()})
-        with open(MANUAL_UNIVERSE_FILE, "w", encoding="utf-8") as f:
-            json.dump(clean, f, indent=2)
-    except Exception as e:
-        print(f"MANUAL UNIVERSE SAVE ERROR: {e}")
-
-def add_manual_universe_pick(symbol: str) -> List[str]:
-    sym = symbol.upper().strip()
-    picks = load_manual_universe_picks()
-    if sym and sym not in picks:
-        picks.append(sym)
-    save_manual_universe_picks(picks)
-    return load_manual_universe_picks()
-
-def manual_pick_row(symbol: str) -> Dict[str, Any]:
-    return {
-        "symbol": symbol.upper(),
-        "score": 99.0,
-        "reason": "manual pick | pinned to universe",
-        "manualPick": True,
-    }
-
-def merge_manual_picks_into_auto_universe(status_obj: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        picks = load_manual_universe_picks()
-        status_obj["manualUniversePicks"] = picks
-        au = status_obj.setdefault("autoUniverse", {})
-        rows = au.setdefault("rows", [])
-        active = au.setdefault("activeSymbols", [])
-
-        existing_rows = {str(r.get("symbol", "")).upper() for r in rows if isinstance(r, dict)}
-        existing_active = {str(x).upper() for x in active}
-
-        for sym in reversed(picks):
-            if sym not in existing_rows:
-                rows.insert(0, manual_pick_row(sym))
-            if sym not in existing_active:
-                active.insert(0, sym)
-
-        au["rows"] = rows
-        au["activeSymbols"] = active
-        au["size"] = max(int(au.get("size") or 0), len(active))
-        au["manualPickCount"] = len(picks)
-    except Exception as e:
-        print(f"MERGE MANUAL PICKS ERROR: {e}")
-    return status_obj
-
-@app.get("/manual-universe")
-def api_manual_universe():
-    return {"ok": True, "symbols": load_manual_universe_picks()}
-
-
-@app.post("/add-to-universe/{symbol}")
-def add_to_universe(symbol: str, request: Request):
+@app.post("/reset-baseline")
+def reset_baseline(request: Request):
     verify_api_key(request)
-    sym = symbol.upper().strip()
     try:
-        picks = add_manual_universe_pick(sym)
-
-        if "current_universe" in globals() and isinstance(globals().get("current_universe"), list):
-            if sym not in current_universe:
-                current_universe.insert(0, sym)
-
-        if "SAFE_UNIVERSE" in globals() and isinstance(globals().get("SAFE_UNIVERSE"), list):
-            if sym not in SAFE_UNIVERSE:
-                SAFE_UNIVERSE.insert(0, sym)
-
-        latest_status.setdefault("autoUniverse", {})
-        latest_status["autoUniverse"].setdefault("rows", [])
-        latest_status["autoUniverse"].setdefault("activeSymbols", [])
-        merge_manual_picks_into_auto_universe(latest_status)
-
-        update_status(BOT_NAME, latest_scans)
-        merge_manual_picks_into_auto_universe(latest_status)
-
-        return {
-            "ok": True,
-            "message": f"{sym} added and pinned to universe",
-            "symbols": picks,
-            "manualPick": True,
-        }
+        equity = float(latest_status.get("account", {}).get("equity", 0) or 0)
+        save_equity_baseline(equity)
+        return {"ok": True, "message": f"Baseline reset to ${equity:.2f}", "baseline": equity}
     except Exception as e:
-        return {"ok": False, "message": f"Could not add {sym}: {e}"}
+        return {"ok": False, "message": str(e)}
+
+@app.get("/baseline")
+def get_baseline():
+    return {"ok": True, "baseline": load_equity_baseline()}

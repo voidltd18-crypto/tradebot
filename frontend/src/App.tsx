@@ -1,88 +1,70 @@
 
 import React, { useEffect, useMemo, useState } from "react";
-import {
-  Area, AreaChart, Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis
-} from "recharts";
+import { Area, AreaChart, Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 const API_URL = import.meta.env.VITE_API_BASE || "https://tradebot-0myo.onrender.com";
-
 type AnyObj = Record<string, any>;
+type Tab = "overview" | "reports" | "positions" | "scanner" | "search" | "activity" | "admin";
 
-function usd(n: any) {
-  return `$${Number(n || 0).toFixed(2)}`;
-}
-function gbp(n: any) {
-  return `£${Number(n || 0).toFixed(2)}`;
-}
-function pct(n: any) {
-  return `${Number(n || 0).toFixed(2)}%`;
-}
-function tone(n: any) {
-  return Number(n || 0) >= 0 ? "gain" : "loss";
-}
+const usd = (n:any) => `$${Number(n || 0).toFixed(2)}`;
+const gbp = (n:any) => `£${Number(n || 0).toFixed(2)}`;
+const pct = (n:any) => `${Number(n || 0).toFixed(2)}%`;
+const tone = (n:any) => Number(n || 0) >= 0 ? "gain" : "loss";
 
-function Card({ title, children, wide = false }: { title?: string; children: React.ReactNode; wide?: boolean }) {
+function Card({ title, children, wide=false }: {title?: string; children: React.ReactNode; wide?: boolean}) {
   return <section className={`card ${wide ? "wide" : ""}`}>{title && <h2>{title}</h2>}{children}</section>;
 }
-
-function Stat({ label, value, sub, className = "" }: { label: string; value: React.ReactNode; sub?: React.ReactNode; className?: string }) {
+function Stat({ label, value, sub, className="" }: {label:string; value:React.ReactNode; sub?:React.ReactNode; className?:string}) {
   return <section className="card stat"><span>{label}</span><strong className={className}>{value}</strong>{sub && <small>{sub}</small>}</section>;
 }
 
 export default function App() {
-  const [tab, setTab] = useState("overview");
+  const [tab, setTab] = useState<Tab>("overview");
   const [data, setData] = useState<AnyObj>({});
   const [reports, setReports] = useState<AnyObj>({});
   const [status, setStatus] = useState("Connecting...");
-  const [message, setMessage] = useState("");
+  const [message, setMessage] = useState("Ready.");
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("dashboard_api_key") || "");
   const [selectedSymbol, setSelectedSymbol] = useState("");
+  const [chartCurrency, setChartCurrency] = useState<"GBP"|"USD">("GBP");
   const [stockQuery, setStockQuery] = useState("");
   const [stockResults, setStockResults] = useState<any[]>([]);
   const [stockSearchLoading, setStockSearchLoading] = useState(false);
-  const [chartCurrency, setChartCurrency] = useState<"USD" | "GBP">("GBP");
 
-  const rate = Number(data?.fx?.usdToGbp || 0.78);
+  const rate = Number(data?.fx?.usdToGbp || 0.7403);
   const scans = Array.isArray(data?.scans) ? data.scans : [];
   const positions = Array.isArray(data?.positions) ? data.positions : [];
   const trades = Array.isArray(data?.trades) ? data.trades : [];
   const logs = Array.isArray(data?.logs) ? data.logs : [];
-  const closedTrades = Array.isArray(reports?.closedTrades) ? reports.closedTrades : (Array.isArray(data?.closedTrades) ? data.closedTrades : []);
+  const closedTrades = Array.isArray(reports?.closedTrades) ? reports.closedTrades : [];
   const equityHistory = Array.isArray(reports?.equityHistory) ? reports.equityHistory : (Array.isArray(data?.tradeTimeline) ? data.tradeTimeline : []);
 
   async function fetchData() {
-  try {
-    const [statusRes, reportRes] = await Promise.allSettled([
-      fetch(`${API_URL}/status`).then(r => r.json()),
-      fetch(`${API_URL}/reports`).then(r => r.json()),
-    ]);
+    try {
+      const [statusRes, reportRes] = await Promise.allSettled([
+        fetch(`${API_URL}/status`).then(r => r.json()),
+        fetch(`${API_URL}/reports`).then(r => r.json()),
+      ]);
 
-    if (statusRes.status === "fulfilled") {
-      const json = statusRes.value;
-
-      if (json?.account?.equity !== undefined) {
-        setData(prev => ({
-          ...prev,
-          ...json
-        }));
+      if (statusRes.status === "fulfilled") {
+        const json = statusRes.value;
+        if (json?.account?.equity !== undefined) {
+          setData(prev => ({ ...prev, ...json }));
+        }
+        const nextScans = Array.isArray(json?.scans) ? json.scans : [];
+        if (!selectedSymbol && nextScans.length) setSelectedSymbol(nextScans[0].symbol);
       }
 
-      const nextScans = Array.isArray(json?.scans) ? json.scans : [];
-      if (!selectedSymbol && nextScans.length) {
-        setSelectedSymbol(nextScans[0].symbol);
+      if (reportRes.status === "fulfilled" && reportRes.value) {
+        setReports(prev => ({ ...prev, ...reportRes.value }));
       }
-    }
 
-    if (reportRes.status === "fulfilled") {
-      setReports(reportRes.value || {});
+      setStatus("Connected");
+    } catch (e) {
+      console.error(e);
+      setStatus("Connection failed");
     }
-
-    setStatus("Connected");
-  } catch (e) {
-    console.error(e);
-    setStatus("Connection failed");
   }
-}
 
   useEffect(() => {
     fetchData();
@@ -95,399 +77,145 @@ export default function App() {
     setMessage("Dashboard password saved.");
   }
 
-  async function action(endpoint: string) {
+  async function action(endpoint:string) {
     if (!apiKey.trim()) {
       setMessage("Enter your dashboard password first.");
       return;
     }
     try {
-      const res = await fetch(`${API_URL}${endpoint}`, {
-        method: "POST",
-        headers: { "x-api-key": apiKey.trim() },
-      });
+      const res = await fetch(`${API_URL}${endpoint}`, { method:"POST", headers:{ "x-api-key": apiKey.trim() }});
       const json = await res.json();
       setMessage(json.message || json.detail || JSON.stringify(json));
-      fetchData();
-    } catch (e) {
+      await fetchData();
+    } catch {
       setMessage("Action failed.");
     }
   }
 
   async function searchStocks(queryOverride?: string) {
     const query = (queryOverride ?? stockQuery).trim();
-    if (!query) {
-      setStockResults([]);
-      return;
-    }
+    if (!query) { setStockResults([]); return; }
     setStockSearchLoading(true);
     try {
       const res = await fetch(`${API_URL}/search-stocks?q=${encodeURIComponent(query)}`);
       const json = await res.json();
       setStockResults(Array.isArray(json.results) ? json.results : []);
-    } catch (e) {
+    } catch {
       setMessage("Stock search failed.");
     } finally {
       setStockSearchLoading(false);
     }
   }
 
-  async function addToUniverse(symbol: string) {
-    await action(`/add-to-universe/${symbol}`);
+  async function resetBaseline() {
+    if (!confirm("Reset PnL baseline to current equity? This only resets reporting.")) return;
+    await action("/reset-baseline");
   }
 
-  async function refreshUniverse() {
-    await action("/refresh-universe");
+  function chartLabel(raw:any, i:number) {
+    const d = new Date(raw || "");
+    if (Number.isNaN(d.getTime())) return raw ? String(raw).slice(0,16) : `#${i+1}`;
+    return d.toLocaleString(undefined, { month:"short", day:"2-digit", hour:"2-digit", minute:"2-digit" });
+  }
+  function chartDay(raw:any, i:number) {
+    const d = new Date(raw || "");
+    if (Number.isNaN(d.getTime())) return raw ? String(raw).slice(0,10) : `Session ${i+1}`;
+    return d.toLocaleDateString(undefined, { month:"short", day:"2-digit" });
   }
 
-  const selectedScan = useMemo(() => {
-    if (!scans.length) return undefined;
-    return scans.find((s: AnyObj) => s.symbol === selectedSymbol) || scans[0];
-  }, [scans, selectedSymbol]);
-
-  function formatChartLabel(raw: any, fallback: number) {
-    if (!raw) return `#${fallback + 1}`;
-    const d = new Date(raw);
-    if (Number.isNaN(d.getTime())) return String(raw).slice(0, 16);
-    return d.toLocaleString(undefined, {
-      month: "short",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  }
-
-  function formatChartDay(raw: any, fallback: number) {
-    if (!raw) return `Session ${fallback + 1}`;
-    const d = new Date(raw);
-    if (Number.isNaN(d.getTime())) return String(raw).slice(0, 10);
-    return d.toLocaleDateString(undefined, { month: "short", day: "2-digit" });
-  }
-
-  const reportChart = useMemo(() => {
-    return equityHistory.map((e: AnyObj, i: number) => {
-      const rawTime = e.time || e.timestamp || e.t || e.label || "";
-      return {
-        idx: i,
-        label: formatChartLabel(rawTime, i),
-        day: formatChartDay(rawTime, i),
-        equity: chartCurrency === "GBP"
-          ? Number(e.equityGbp ?? e.valueGbp ?? Number(e.equity || e.value || 0) * rate)
-          : Number(e.equity ?? e.value ?? 0),
-        pnl: chartCurrency === "GBP"
-          ? Number(e.pnlGbp ?? Number(e.pnl || 0) * rate)
-          : Number(e.pnl || 0),
-        symbol: e.symbol || "",
-        side: e.side || "",
-      };
-    });
-  }, [equityHistory, chartCurrency, rate]);
+  const reportChart = useMemo(() => equityHistory.map((e:AnyObj, i:number) => {
+    const raw = e.time || e.timestamp || e.t || e.label || "";
+    return {
+      idx:i,
+      label:chartLabel(raw,i),
+      day:chartDay(raw,i),
+      equity: chartCurrency === "GBP" ? Number(e.equityGbp ?? e.valueGbp ?? Number(e.equity || e.value || 0) * rate) : Number(e.equity ?? e.value ?? 0),
+      pnl: chartCurrency === "GBP" ? Number(e.pnlGbp ?? Number(e.pnl || 0) * rate) : Number(e.pnl || 0)
+    };
+  }), [equityHistory, chartCurrency, rate]);
 
   const dailyPnlChart = useMemo(() => {
     const grouped: Record<string, number> = {};
-    for (const p of reportChart) {
-      grouped[p.day] = (grouped[p.day] || 0) + Number(p.pnl || 0);
-    }
-    return Object.entries(grouped).map(([day, pnl]) => ({ day, pnl }));
+    for (const p of reportChart) grouped[p.day] = (grouped[p.day] || 0) + Number(p.pnl || 0);
+    return Object.entries(grouped).map(([day,pnl]) => ({ day, pnl }));
   }, [reportChart]);
 
+  const selectedScan = scans.find((s:AnyObj) => s.symbol === selectedSymbol) || scans[0];
   const scannerChart = selectedScan?.priceCurve || [];
+  const totalDeposited = Number(reports.totalDeposited ?? 0);
+  const earned = Number(reports.earnedSinceDeposit ?? 0);
+  const totalGainLoss = Number(reports.totalGainLoss ?? 0);
+  const lost = Number(reports.lostSinceDeposit ?? 0);
+  const tabs: Tab[] = ["overview","reports","positions","scanner","search","activity","admin"];
 
-  const totalDeposited = reports.totalDeposited ?? 0;
-  const earned = reports.earnedSinceDeposit ?? 0;
-  const totalGainLoss = reports.totalGainLoss ?? 0;
-  const lost = reports.lostSinceDeposit ?? 0;
+  return <div className="app">
+    <header className="topbar">
+      <div><p className="eyebrow">Rebuilt Sniper Profit Bot</p><h1>TradeBot</h1></div>
+      <div className="pills">
+        <span className="pill ok">{status}</span>
+        <span className={`pill ${data?.market?.isOpen ? "ok" : "warn"}`}>Market {data?.market?.label || "UNKNOWN"}</span>
+        <span className={`pill ${data?.botEnabled ? "ok" : "bad"}`}>Bot {data?.botEnabled ? "ON" : "OFF"}</span>
+        <span className="pill">{data?.paperMode ? "PAPER" : "LIVE"}</span>
+      </div>
+    </header>
 
-  return (
-    <div className="app">
-      <header className="topbar">
-        <div>
-          <p className="eyebrow">Rebuilt Sniper Profit Bot</p>
-          <h1>TradeBot</h1>
+    <section className="stats">
+      <Stat label="Equity" value={gbp(Number(data?.account?.equity || 0) * rate)} sub={usd(data?.account?.equity)} />
+      <Stat label="Buying Power" value={gbp(Number(data?.account?.buyingPower || 0) * rate)} sub={usd(data?.account?.buyingPower)} />
+      <Stat label="Day PnL" value={gbp(Number(data?.account?.pnlDay || 0) * rate)} sub={usd(data?.account?.pnlDay)} className={tone(data?.account?.pnlDay)} />
+      <Stat label="Total Gain/Loss" value={gbp(totalGainLoss * rate)} sub={`Deposited ${gbp(totalDeposited * rate)} / ${usd(totalDeposited)}`} className={tone(totalGainLoss)} />
+    </section>
+
+    <nav className="tabs">{tabs.map(t => <button key={t} className={tab===t ? "active":""} onClick={() => setTab(t)}>{t.toUpperCase()}</button>)}</nav>
+
+    {tab==="overview" && <main className="grid two">
+      <Card title="Controls"><div className="actions">
+        <button onClick={fetchData}>Refresh Data</button>
+        <button onClick={() => action("/manual-buy")}>Money Buy</button>
+        <button className="danger" onClick={() => action("/manual-sell")}>Sell Worst</button>
+        <button className="purple" onClick={() => action("/refresh-universe")}>↻ Weekly Stock Refresh</button>
+        <button className="ghost" onClick={() => action("/pause")}>Pause</button>
+        <button onClick={() => action("/resume")}>Resume</button>
+      </div><p className="notice">{message}</p></Card>
+      <Card title="Live Summary"><div className="summary">
+        <div><span>Positions</span><b>{positions.length}/{data?.maxPositions || 0}</b></div>
+        <div><span>Next buy</span><b>{usd(data?.newPositionNotional)}</b></div>
+        <div><span>Win rate</span><b>{pct((data?.dbSummary?.winRate || 0) * 100)}</b></div>
+        <div><span>Weekly universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
+        <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
+      </div></Card>
+      <Card title="Weekly Auto Universe" wide>
+        <p className="muted">Use the button to rebuild the stock list immediately. Manual picks stay pinned.</p>
+        <div className="universe-counts">
+          <div><span>Total in universe</span><b>{data?.autoUniverse?.rows?.length || 0}</b></div>
+          <div><span>Active symbols</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}</b></div>
+          <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
         </div>
-        <div className="pills">
-          <span className="pill ok">{status}</span>
-          <span className={`pill ${data?.market?.isOpen ? "ok" : "warn"}`}>Market {data?.market?.label || "UNKNOWN"}</span>
-          <span className={`pill ${data?.botEnabled ? "ok" : "bad"}`}>Bot {data?.botEnabled ? "ON" : "OFF"}</span>
-          <span className="pill">{data?.paperMode ? "PAPER" : "LIVE"}</span>
-        </div>
-      </header>
+        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "weekly candidate"}</p></article>)}</div>
+      </Card>
+    </main>}
 
+    {tab==="reports" && <main>
+      <div className="actions report-actions"><button onClick={fetchData}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button></div>
       <section className="stats">
-        <Stat label="Equity" value={gbp(Number(data?.account?.equity || 0) * rate)} sub={usd(data?.account?.equity)} />
-        <Stat label="Buying Power" value={gbp(Number(data?.account?.buyingPower || 0) * rate)} sub={usd(data?.account?.buyingPower)} />
-        <Stat label="Day PnL" value={gbp(Number(data?.account?.pnlDay || 0) * rate)} sub={usd(data?.account?.pnlDay)} className={tone(data?.account?.pnlDay)} />
-        <Stat label="Total Gain/Loss" value={gbp(Number(totalGainLoss || 0) * rate)} sub={`Deposited ${gbp(Number(totalDeposited || 0) * rate)} / ${usd(totalDeposited)}`} className={tone(totalGainLoss)} />
+        <Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={`${usd(totalDeposited)} · ${reports.depositSource ? `Source: ${reports.depositSource}` : ""}`} />
+        <Stat label="Earned Since Deposit" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)} />
+        <Stat label="Lost Since Deposit" value={gbp(lost * rate)} sub={usd(lost)} className="loss" />
+        <Stat label="Current Equity" value={gbp(Number((reports.currentEquity ?? data?.account?.equity) || 0) * rate)} sub={usd(reports.currentEquity ?? data?.account?.equity)} />
       </section>
+      <Card title="Price / Equity History"><div className="chart-controls"><button className={chartCurrency==="GBP" ? "active":""} onClick={() => setChartCurrency("GBP")}>GBP</button><button className={chartCurrency==="USD" ? "active":""} onClick={() => setChartCurrency("USD")}>USD</button></div><div className="chart">{reportChart.length ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={reportChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="label" stroke="#94a3b8" minTickGap={28}/><YAxis stroke="#94a3b8"/><Tooltip formatter={(v:any) => chartCurrency==="GBP" ? gbp(v) : usd(v)}/><Area type="monotone" dataKey="equity" stroke="#38bdf8" fill="#38bdf833"/></AreaChart></ResponsiveContainer> : <p className="muted">No price/equity history yet.</p>}</div></Card>
+      <Card title="Daily PnL"><div className="chart small-chart">{dailyPnlChart.length ? <ResponsiveContainer width="100%" height="100%"><BarChart data={dailyPnlChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="day" stroke="#94a3b8"/><YAxis stroke="#94a3b8"/><Tooltip formatter={(v:any) => chartCurrency==="GBP" ? gbp(v) : usd(v)}/><Bar dataKey="pnl" fill="#38bdf8"/></BarChart></ResponsiveContainer> : <p className="muted">Daily PnL bars will appear as trades are recorded.</p>}</div></Card>
+      <Card title="Closed Trade History"><div className="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th></tr></thead><tbody>{closedTrades.slice(-80).reverse().map((t:AnyObj,i:number)=><tr key={i}><td>{t.time || "—"}</td><td>{t.symbol}</td><td>{usd(t.entryPrice)}</td><td>{usd(t.exitPrice)}</td><td>{Number(t.qty || 0).toFixed(4)}</td><td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td><td className={tone(t.pnl)}>{pct(t.pnlPct)}</td></tr>)}{!closedTrades.length && <tr><td colSpan={7}>No matched closed trades yet.</td></tr>}</tbody></table></div></Card>
+    </main>}
 
-      <nav className="tabs">
-        {["overview","reports","positions","scanner","search","activity","admin"].map(t => (
-          <button key={t} className={tab === t ? "active" : ""} onClick={() => setTab(t)}>{t.toUpperCase()}</button>
-        ))}
-      </nav>
+    {tab==="positions" && <Card title="All Positions"><div className="position-list">{positions.map((p:AnyObj)=><article className="position" key={p.symbol}><div><h3>{p.symbol}</h3><p>Qty {Number(p.qty || 0).toFixed(4)} · Entry {usd(p.entry)} · Price {usd(p.price)}</p><p>Value <b>{gbp(p.marketValueGbp ?? p.marketValue * rate)}</b> / {usd(p.marketValue)}</p></div><div className="position-side"><b className={tone(p.pnl)}>PnL {gbp(p.pnlGbp ?? p.pnl * rate)} / {usd(p.pnl)} / {pct(p.pnlPct)}</b><span>{p.trailingActive ? `Trailing floor ${usd(p.trailFloor)}` : `Trail starts ${usd(p.trailStartPrice)}`}</span><button className="danger" onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button></div></article>)}{!positions.length && <p className="muted">No open positions.</p>}</div></Card>}
 
-      {tab === "overview" && (
-        <main className="grid two">
-          <Card title="Controls">
-            <div className="actions">
-              <button onClick={fetchData}>Refresh Data</button>
-              <button onClick={() => action("/manual-buy")}>Money Buy</button>
-              <button className="danger" onClick={() => action("/manual-sell")}>Sell Worst</button>
-              <button className="purple" onClick={refreshUniverse}>🔄 Weekly Stock Refresh</button>
-              <button className="ghost" onClick={() => action("/pause")}>Pause</button>
-              <button onClick={() => action("/resume")}>Resume</button>
-            </div>
-            <p className="notice">{message || "Ready."}</p>
-          </Card>
+    {tab==="scanner" && <main><Card title="Scanner Price History">{scans.length>0 && <select value={selectedSymbol} onChange={e=>setSelectedSymbol(e.target.value)}>{scans.map((s:AnyObj)=><option key={s.symbol}>{s.symbol}</option>)}</select>}<div className="chart">{scannerChart.length ? <ResponsiveContainer width="100%" height="100%"><LineChart data={scannerChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="t" stroke="#94a3b8"/><YAxis stroke="#94a3b8"/><Tooltip/><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false}/></LineChart></ResponsiveContainer> : <p className="muted">No scanner price history yet.</p>}</div></Card></main>}
 
-          <Card title="Live Summary">
-            <div className="summary">
-              <div><span>Positions</span><b>{positions.length}/{data?.maxPositions || 0}</b></div>
-              <div><span>Next buy</span><b>{usd(data?.newPositionNotional)}</b></div>
-              <div><span>Win rate</span><b>{pct((data?.dbSummary?.winRate || 0) * 100)}</b></div>
-              <div><span>Weekly universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
-              <div><span>Week start</span><b>{data?.autoUniverse?.weekStart || "—"}</b></div>
-            </div>
-          </Card>
+    {tab==="search" && <main><Card title="Stock Search / Preview"><div className="search-row"><input value={stockQuery} onChange={e=>{setStockQuery(e.target.value); if(e.target.value.trim().length>=2) searchStocks(e.target.value); if(!e.target.value.trim()) setStockResults([])}} onKeyDown={e=>{if(e.key==="Enter") searchStocks()}} placeholder="Search ticker or company, e.g. AMD"/><button onClick={()=>searchStocks()}>{stockSearchLoading ? "Searching..." : "Search"}</button></div><div className="search-results">{stockResults.map((s:AnyObj)=><article className="search-card" key={s.symbol}><div className="search-main"><div className="logo-circle">{s.symbol.slice(0,2)}</div><div><h3>{s.name}</h3><p>{s.symbol} · NASDAQ/NYSE</p></div></div><div className="search-price"><strong>{usd(s.price)}</strong><span className={tone(s.changePct)}>{Number(s.changePct || 0)>=0 ? "↗":"↘"} {pct(s.changePct)}</span><small>{gbp(s.priceGbp)}</small></div><div className="mini-chart">{Array.isArray(s.history) && s.history.length>1 ? <ResponsiveContainer width="100%" height="100%"><LineChart data={s.history.map((p:AnyObj,i:number)=>({...p,i}))}><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false} strokeWidth={2}/><Tooltip formatter={(v:any)=>usd(v)}/></LineChart></ResponsiveContainer> : <p className="muted">Preview builds while you search.</p>}</div><div className="search-actions"><button onClick={()=>action(`/custom-buy/${s.symbol}`)}>Buy</button><button className="ghost" onClick={()=>action(`/add-to-universe/${s.symbol}`)}>Add to Universe</button></div></article>)}{!stockResults.length && <p className="muted">Type a symbol to preview price, daily movement and mini chart.</p>}</div></Card></main>}
 
-          <Card title="Weekly Auto Universe" wide>
-            <div className="universe-counts">
-  <div>
-    <span>Total in universe</span>
-    <b>{data?.autoUniverse?.rows?.length || 0}</b>
-  </div>
-  <div>
-    <span>Active symbols</span>
-    <b>{data?.autoUniverse?.activeSymbols?.length || 0}</b>
-  </div>
-  <div>
-    <span>Universe size</span>
-    <b>{data?.autoUniverse?.size || 0}</b>
-  </div>
-</div>
-            <p className="muted">Use the button to rebuild the stock list immediately. The backend also supports automatic weekly refresh.</p>
-            <div className="scan-grid">
-              {(data?.autoUniverse?.rows || []).slice(0, 100).map((r: AnyObj) => (
-                <article className="scan" key={r.symbol}>
-                  <div><b>{r.symbol}</b><strong>Score {Number(r.score || 0).toFixed(2)}</strong></div>
-                  <p>{r.reason || "weekly candidate"}</p>
-                </article>
-              ))}
-              {!(data?.autoUniverse?.rows || []).length && <p className="muted">No weekly universe yet. Press Weekly Stock Refresh.</p>}
-            </div>
-          </Card>
-        </main>
-      )}
+    {tab==="activity" && <main className="grid two"><Card title="Recent Trades"><div className="log-list">{trades.slice(-50).reverse().map((t:AnyObj,i:number)=><div key={i}>{t.time || "—"} · <b>{t.side} {t.symbol}</b> · {t.reason || ""}</div>)}{!trades.length && <p className="muted">No trades yet.</p>}</div></Card><Card title="Logs"><div className="log-list">{logs.map((l:string,i:number)=><div key={i}>{l}</div>)}</div></Card></main>}
 
-      {tab === "reports" && (
-        <main>
-          <section className="stats">
-            <Stat label="Deposited" value={gbp(Number(totalDeposited || 0) * rate)} sub={`${usd(totalDeposited)} · ${reports.depositSource ? `Source: ${reports.depositSource}` : ""}`} />
-            <Stat label="Earned Since Deposit" value={gbp(Number(earned || 0) * rate)} sub={usd(earned)} className={tone(earned)} />
-            <Stat label="Lost Since Deposit" value={gbp(Number(lost || 0) * rate)} sub={usd(lost)} className="loss" />
-            <Stat label="Current Equity" value={gbp(Number((reports.currentEquity ?? data?.account?.equity) || 0) * rate)} sub={usd(reports.currentEquity ?? data?.account?.equity)} />
-          </section>
-
-          <Card title="Price / Equity History">
-            <div className="chart-controls">
-              <button className={chartCurrency === "GBP" ? "active" : ""} onClick={() => setChartCurrency("GBP")}>GBP</button>
-              <button className={chartCurrency === "USD" ? "active" : ""} onClick={() => setChartCurrency("USD")}>USD</button>
-            </div>
-            <div className="chart">
-              {reportChart.length ? (
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={reportChart}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#263450" />
-                    <XAxis dataKey="label" stroke="#94a3b8" minTickGap={28} />
-                    <YAxis stroke="#94a3b8" />
-                    <Tooltip formatter={(v: any) => chartCurrency === "GBP" ? gbp(v) : usd(v)} />
-                    <Area type="monotone" dataKey="equity" stroke="#38bdf8" fill="#38bdf833" />
-                  </AreaChart>
-                </ResponsiveContainer>
-              ) : <p className="muted">No price/equity history yet. It will build as trades are recorded.</p>}
-            </div>
-          </Card>
-
-          <Card title="Daily PnL">
-            <div className="chart small-chart">
-              {dailyPnlChart.length ? (
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={dailyPnlChart}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#263450" />
-                    <XAxis dataKey="day" stroke="#94a3b8" />
-                    <YAxis stroke="#94a3b8" />
-                    <Tooltip formatter={(v: any) => chartCurrency === "GBP" ? gbp(v) : usd(v)} />
-                    <Bar dataKey="pnl" fill="#38bdf8" />
-                  </BarChart>
-                </ResponsiveContainer>
-              ) : <p className="muted">Daily PnL bars will appear as trades are recorded.</p>}
-            </div>
-          </Card>
-
-          <Card title="Closed Trade History">
-            <div className="table-wrap">
-              <table>
-                <thead><tr><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th></tr></thead>
-                <tbody>
-                  {closedTrades.slice(-80).reverse().map((t: AnyObj, i: number) => (
-                    <tr key={i}>
-                      <td>{t.time || "—"}</td>
-                      <td>{t.symbol}</td>
-                      <td>{usd(t.entryPrice)}</td>
-                      <td>{usd(t.exitPrice)}</td>
-                      <td>{Number(t.qty || 0).toFixed(4)}</td>
-                      <td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td>
-                      <td className={tone(t.pnl)}>{pct(t.pnlPct)}</td>
-                    </tr>
-                  ))}
-                  {!closedTrades.length && <tr><td colSpan={7}>No matched closed trades yet.</td></tr>}
-                </tbody>
-              </table>
-            </div>
-          </Card>
-        </main>
-      )}
-
-      {tab === "positions" && (
-        <Card title="All Positions">
-          <div className="position-list">
-            {positions.map((p: AnyObj) => (
-              <article className="position" key={p.symbol}>
-                <div>
-                  <h3>{p.symbol}</h3>
-                  <p>Qty {Number(p.qty || 0).toFixed(4)} · Entry {usd(p.entry)} · Price {usd(p.price)}</p>
-                  <p>Value <b>{gbp(p.marketValueGbp ?? p.marketValue * rate)}</b> / {usd(p.marketValue)}</p>
-                </div>
-                <div className="position-side">
-                  <b className={tone(p.pnl)}>PnL {gbp(p.pnlGbp ?? p.pnl * rate)} / {usd(p.pnl)} / {pct(p.pnlPct)}</b>
-                  <span>{p.trailingActive ? `Trailing floor ${usd(p.trailFloor)}` : `Trail starts ${usd(p.trailStartPrice)}`}</span>
-                  <button className="danger" onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button>
-                </div>
-              </article>
-            ))}
-            {!positions.length && <p className="muted">No open positions.</p>}
-          </div>
-        </Card>
-      )}
-
-      {tab === "scanner" && (
-        <main>
-          <Card title="Scanner Price History">
-            {scans.length > 0 && (
-              <select value={selectedSymbol} onChange={(e) => setSelectedSymbol(e.target.value)}>
-                {scans.map((s: AnyObj) => <option key={s.symbol}>{s.symbol}</option>)}
-              </select>
-            )}
-            <div className="chart">
-              {scannerChart.length ? (
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={scannerChart}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#263450" />
-                    <XAxis dataKey="t" stroke="#94a3b8" />
-                    <YAxis stroke="#94a3b8" />
-                    <Tooltip />
-                    <Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
-              ) : <p className="muted">No scanner price history yet.</p>}
-            </div>
-          </Card>
-          <Card title="Scan Cards">
-            <div className="scan-grid">
-              {scans.map((s: AnyObj) => (
-                <article className="scan" key={s.symbol}>
-                  <div><b>{s.symbol}</b><strong>{usd(s.price)}</strong></div>
-                  <p>Confidence {Number(s.confidence || 0).toFixed(2)} · Quality {Number(s.qualityScore || 0).toFixed(4)}</p>
-                  <span className={s.readyToBuy ? "ready" : ""}>{s.readyToBuy ? "Ready" : (s.aPlusReason || s.sniperReason || "Watching")}</span>
-                </article>
-              ))}
-            </div>
-          </Card>
-        </main>
-      )}
-
-      {tab === "search" && (
-        <main>
-          <Card title="Stock Search / Preview">
-            <div className="search-row">
-              <input
-                value={stockQuery}
-                onChange={(e) => {
-                  setStockQuery(e.target.value);
-                  if (e.target.value.trim().length >= 2) searchStocks(e.target.value);
-                  if (!e.target.value.trim()) setStockResults([]);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") searchStocks();
-                }}
-                placeholder="Search ticker or company, e.g. AMD"
-              />
-              <button onClick={() => searchStocks()}>{stockSearchLoading ? "Searching..." : "Search"}</button>
-            </div>
-            <div className="search-results">
-              {stockResults.map((s: AnyObj) => (
-                <article className="search-card" key={s.symbol}>
-                  <div className="search-main">
-                    <div className="logo-circle">{s.symbol.slice(0, 2)}</div>
-                    <div>
-                      <h3>{s.name}</h3>
-                      <p>{s.symbol} · NASDAQ/NYSE</p>
-                    </div>
-                  </div>
-                  <div className="search-price">
-                    <strong>{usd(s.price)}</strong>
-                    <span className={tone(s.changePct)}>{Number(s.changePct || 0) >= 0 ? "↗" : "↘"} {pct(s.changePct)}</span>
-                    <small>{gbp(s.priceGbp)}</small>
-                  </div>
-                  <div className="mini-chart">
-                    {Array.isArray(s.history) && s.history.length > 1 ? (
-                      <ResponsiveContainer width="100%" height="100%">
-                        <LineChart data={s.history.map((p: AnyObj, i: number) => ({ ...p, i }))}>
-                          <Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false} strokeWidth={2} />
-                          <Tooltip formatter={(v: any) => usd(v)} />
-                        </LineChart>
-                      </ResponsiveContainer>
-                    ) : (
-                      <p className="muted">Preview builds while you search.</p>
-                    )}
-                  </div>
-                  <div className="search-actions">
-                    <button onClick={() => action(`/custom-buy/${s.symbol}`)}>Buy</button>
-                    <button className="ghost" onClick={() => addToUniverse(s.symbol)}>Add to Universe</button>
-                  </div>
-                </article>
-              ))}
-              {!stockResults.length && <p className="muted">Type a symbol to preview price, daily movement and mini chart.</p>}
-            </div>
-          </Card>
-        </main>
-      )}
-
-      {tab === "activity" && (
-        <main className="grid two">
-          <Card title="Recent Trades">
-            <div className="log-list">
-              {trades.slice(-50).reverse().map((t: AnyObj, i: number) => (
-                <div key={i}>{t.time || "—"} · <b>{t.side} {t.symbol}</b> · {t.reason || ""}</div>
-              ))}
-              {!trades.length && <p className="muted">No trades yet.</p>}
-            </div>
-          </Card>
-          <Card title="Logs">
-            <div className="log-list">{logs.map((l: string, i: number) => <div key={i}>{l}</div>)}</div>
-          </Card>
-        </main>
-      )}
-
-      {tab === "admin" && (
-        <Card title="Admin">
-          <label className="field"><span>Dashboard password</span><input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} /></label>
-          <div className="actions">
-            <button onClick={saveApiKey}>Save</button>
-            <button className="ghost" onClick={() => { localStorage.removeItem("dashboard_api_key"); setApiKey(""); }}>Clear</button>
-          </div>
-          <pre>{JSON.stringify({ api: API_URL, botEnabled: data?.botEnabled, market: data?.market, autoUniverse: data?.autoUniverse }, null, 2)}</pre>
-        </Card>
-      )}
-    </div>
-  );
+    {tab==="admin" && <Card title="Admin"><label className="field"><span>Dashboard password</span><input type="password" value={apiKey} onChange={e=>setApiKey(e.target.value)}/></label><div className="actions"><button onClick={saveApiKey}>Save</button><button className="ghost" onClick={()=>{localStorage.removeItem("dashboard_api_key"); setApiKey("")}}>Clear</button></div><pre>{JSON.stringify({ api:API_URL, botEnabled:data?.botEnabled, market:data?.market, manualPicks:data?.manualUniversePicks }, null, 2)}</pre></Card>}
+  </div>;
 }
