@@ -250,6 +250,20 @@ export default function App() {
           </Card>
 
           <Card title="Weekly Auto Universe" wide>
+            <div className="universe-counts">
+  <div>
+    <span>Total in universe</span>
+    <b>{data?.autoUniverse?.rows?.length || 0}</b>
+  </div>
+  <div>
+    <span>Active symbols</span>
+    <b>{data?.autoUniverse?.activeSymbols?.length || 0}</b>
+  </div>
+  <div>
+    <span>Universe size</span>
+    <b>{data?.autoUniverse?.size || 0}</b>
+  </div>
+</div>
             <p className="muted">Use the button to rebuild the stock list immediately. The backend also supports automatic weekly refresh.</p>
             <div className="scan-grid">
               {(data?.autoUniverse?.rows || []).slice(0, 100).map((r: AnyObj) => (
