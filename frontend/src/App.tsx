@@ -252,7 +252,7 @@ export default function App() {
           <Card title="Weekly Auto Universe" wide>
             <p className="muted">Use the button to rebuild the stock list immediately. The backend also supports automatic weekly refresh.</p>
             <div className="scan-grid">
-              {(data?.autoUniverse?.rows || []).slice(0, 25).map((r: AnyObj) => (
+              {(data?.autoUniverse?.rows || []).slice(0, 100).map((r: AnyObj) => (
                 <article className="scan" key={r.symbol}>
                   <div><b>{r.symbol}</b><strong>Score {Number(r.score || 0).toFixed(2)}</strong></div>
                   <p>{r.reason || "weekly candidate"}</p>
