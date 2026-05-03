@@ -57,9 +57,20 @@ export default function App() {
         fetch(`${API_URL}/reports`).then(r => r.json()),
       ]);
       if (statusRes.status === "fulfilled") {
-        setData(statusRes.value);
-        const nextScans = Array.isArray(statusRes.value?.scans) ? statusRes.value.scans : [];
-        if (!selectedSymbol && nextScans.length) setSelectedSymbol(nextScans[0].symbol);
+  const json = statusRes.value;
+
+  if (json?.account?.equity !== undefined) {
+    setData(prev => ({
+      ...prev,
+      ...json
+    }));
+  }
+
+  const nextScans = Array.isArray(json?.scans) ? json.scans : [];
+  if (!selectedSymbol && nextScans.length) {
+    setSelectedSymbol(nextScans[0].symbol);
+  }
+}
       }
       if (reportRes.status === "fulfilled") setReports(reportRes.value || {});
       setStatus("Connected");
