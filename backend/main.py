@@ -56,13 +56,6 @@ FX_QUOTE = "GBP"
 FX_FALLBACK_USD_TO_GBP = 0.78
 FX_REFRESH_SECONDS = 60 * 30
 
-# Reports / money tracking
-# Set this in Render to the total amount you have deposited into Alpaca.
-# Example: TOTAL_DEPOSITED_USD=500
-TOTAL_DEPOSITED_USD = float(os.getenv("TOTAL_DEPOSITED_USD", "0") or 0)
-TOTAL_WITHDRAWN_USD = float(os.getenv("TOTAL_WITHDRAWN_USD", "0") or 0)
-
-
 
 if not API_KEY or not API_SECRET:
     raise RuntimeError("Missing APCA_API_KEY_ID or APCA_API_SECRET_KEY")
@@ -2074,92 +2067,6 @@ def closed_trade_summary_payload():
     }
 
 
-def money_report_payload():
-    """High-level deposit / gain / loss report for the dashboard.
-
-    Deposit figures come from Render environment variables because Alpaca's
-    standard trading account payload does not reliably expose lifetime deposits.
-    Set TOTAL_DEPOSITED_USD and optionally TOTAL_WITHDRAWN_USD in Render.
-    """
-    try:
-        account = get_account()
-        equity = float(account.equity)
-        cash = float(account.cash)
-        buying_power = float(account.buying_power)
-    except Exception:
-        equity = 0.0
-        cash = 0.0
-        buying_power = 0.0
-
-    positions = get_all_positions()
-    closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
-
-    realised_gains = sum(max(0.0, float(t.get("pnl") or 0.0)) for t in closed)
-    realised_losses = abs(sum(min(0.0, float(t.get("pnl") or 0.0)) for t in closed))
-    realised_net = realised_gains - realised_losses
-
-    open_pnl = sum(float(p.get("pnl") or 0.0) for p in positions)
-    open_gains = sum(max(0.0, float(p.get("pnl") or 0.0)) for p in positions)
-    open_losses = abs(sum(min(0.0, float(p.get("pnl") or 0.0)) for p in positions))
-
-    deposited = float(TOTAL_DEPOSITED_USD or 0.0)
-    withdrawn = float(TOTAL_WITHDRAWN_USD or 0.0)
-    net_deposited = deposited - withdrawn
-
-    # True account-level gain/loss if the deposit amount has been configured.
-    if net_deposited > 0:
-        total_gain_loss = equity - net_deposited
-    else:
-        # Fallback if deposit is not configured yet.
-        total_gain_loss = realised_net + open_pnl
-
-    total_earned_gross = realised_gains + open_gains
-    total_lost_gross = realised_losses + open_losses
-    return_pct = (total_gain_loss / net_deposited * 100.0) if net_deposited > 0 else 0.0
-
-    return {
-        "depositConfigured": net_deposited > 0,
-        "totalDeposited": deposited,
-        "totalDepositedGbp": money_gbp(deposited),
-        "totalWithdrawn": withdrawn,
-        "totalWithdrawnGbp": money_gbp(withdrawn),
-        "netDeposited": net_deposited,
-        "netDepositedGbp": money_gbp(net_deposited),
-        "currentEquity": equity,
-        "currentEquityGbp": money_gbp(equity),
-        "cash": cash,
-        "cashGbp": money_gbp(cash),
-        "buyingPower": buying_power,
-        "buyingPowerGbp": money_gbp(buying_power),
-        "totalGainLoss": total_gain_loss,
-        "totalGainLossGbp": money_gbp(total_gain_loss),
-        "returnPct": return_pct,
-        "earnedSinceDeposit": max(total_gain_loss, 0.0),
-        "earnedSinceDepositGbp": money_gbp(max(total_gain_loss, 0.0)),
-        "lostSinceDeposit": max(-total_gain_loss, 0.0),
-        "lostSinceDepositGbp": money_gbp(max(-total_gain_loss, 0.0)),
-        "totalEarnedGross": total_earned_gross,
-        "totalEarnedGrossGbp": money_gbp(total_earned_gross),
-        "totalLostGross": total_lost_gross,
-        "totalLostGrossGbp": money_gbp(total_lost_gross),
-        "realisedNet": realised_net,
-        "realisedNetGbp": money_gbp(realised_net),
-        "realisedGains": realised_gains,
-        "realisedGainsGbp": money_gbp(realised_gains),
-        "realisedLosses": realised_losses,
-        "realisedLossesGbp": money_gbp(realised_losses),
-        "openPnl": open_pnl,
-        "openPnlGbp": money_gbp(open_pnl),
-        "openGains": open_gains,
-        "openGainsGbp": money_gbp(open_gains),
-        "openLosses": open_losses,
-        "openLossesGbp": money_gbp(open_losses),
-        "closedTrades": len(closed),
-        "openPositions": len(positions),
-        "updatedAt": datetime.now(UTC).isoformat(),
-    }
-
-
 def stock_memory_from_closed_trades():
     closed = closed_trades_from_db(10000)
     memory: Dict[str, Dict[str, Any]] = {}
@@ -2700,6 +2607,7 @@ def optimiser_payload():
         "enabled": PROFIT_OPTIMIZER_ENABLED,
         "autoImproveEnabled": AUTO_IMPROVE_ENABLED,
         "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
+        "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
         "buyBlocked": blocked,
         "blockReason": reason,
         "dailyProfitTarget": DAILY_PROFIT_TARGET,
@@ -3041,7 +2949,6 @@ def build_status_payload(bot_name, scans):
         "mode": "SNIPER_CONFIDENCE_MEMORY_TIMELINE_GBP",
         "market": market_status,
         "fx": fx_payload(),
-        "moneyReport": money_report_payload(),
         "autoUniverse": auto_universe_payload(),
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
@@ -3056,6 +2963,7 @@ def build_status_payload(bot_name, scans):
         "profitOptimizerEnabled": PROFIT_OPTIMIZER_ENABLED,
         "analyticsEnabled": ANALYTICS_ENABLED,
         "autoImproveEnabled": AUTO_IMPROVE_ENABLED,
+        "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
         "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
         "fastExitModeEnabled": FAST_EXIT_MODE_ENABLED,
         "partialProfitEnabled": PARTIAL_PROFIT_ENABLED,
@@ -3202,12 +3110,12 @@ def root():
 @app.get("/status")
 def get_status():
     latest_status["botVersion"] = "v1.0-production-stable"
+    try:
+        if "merge_manual_picks_into_auto_universe" in globals():
+            return merge_manual_picks_into_auto_universe(latest_status)
+    except Exception as e:
+        print(f"STATUS MANUAL PICK MERGE ERROR: {e}")
     return latest_status
-
-
-@app.get("/reports")
-def reports():
-    return money_report_payload()
 
 
 @app.post("/pause")
@@ -3404,7 +3312,7 @@ def startup_event():
 
 
 # =========================
-# BOT VERSION
+# V1.0 PRODUCTION STABLE ADDONS
 # =========================
 
 BOT_VERSION = "v1.0-production-stable"
@@ -3422,3 +3330,308 @@ BOT_VERSION_NOTES = {
 @app.get("/version")
 def version():
     return BOT_VERSION_NOTES
+
+# ---------- baseline reporting ----------
+BASELINE_FILE = os.path.join("backend", "state", "equity_baseline.json")
+
+def _safe_num(v, default=0.0):
+    try:
+        return float(v or default)
+    except Exception:
+        return float(default)
+
+def load_equity_baseline() -> float:
+    try:
+        if os.path.exists(BASELINE_FILE):
+            with open(BASELINE_FILE, "r", encoding="utf-8") as f:
+                return float(json.load(f).get("baseline", 0) or 0)
+    except Exception as e:
+        print(f"BASELINE LOAD ERROR: {e}")
+    return 0.0
+
+def save_equity_baseline(value: float) -> None:
+    try:
+        os.makedirs(os.path.dirname(BASELINE_FILE), exist_ok=True)
+        with open(BASELINE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"baseline": float(value or 0), "resetAt": datetime.now(UTC).isoformat()}, f, indent=2)
+    except Exception as e:
+        print(f"BASELINE SAVE ERROR: {e}")
+
+@app.post("/reset-baseline")
+def reset_baseline(request: Request):
+    verify_api_key(request)
+    try:
+        equity = _safe_num(latest_status.get("account", {}).get("equity", 0))
+        save_equity_baseline(equity)
+        return {"ok": True, "message": f"Baseline reset to ${equity:.2f}", "baseline": equity}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+@app.get("/baseline")
+def get_baseline():
+    return {"ok": True, "baseline": load_equity_baseline()}
+
+@app.get("/reports")
+def reports():
+    status = latest_status if isinstance(latest_status, dict) else {}
+    account = status.get("account") or {}
+    db = status.get("dbSummary") or {}
+    equity = _safe_num(account.get("equity"))
+    equity_gbp = _safe_num(account.get("equityGbp"))
+    total_withdrawn = _safe_num(globals().get("TOTAL_WITHDRAWN_USD", 0))
+    baseline = load_equity_baseline()
+    total_deposited = baseline if baseline > 0 else _safe_num(globals().get("TOTAL_DEPOSITED_USD", 0))
+    deposit_source = "reset-baseline" if baseline > 0 else "env"
+    if total_deposited <= 0:
+        total_deposited = equity
+        deposit_source = "equity-baseline"
+    total_gain_loss = equity + total_withdrawn - total_deposited
+    closed = status.get("closedTrades") or []
+    timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
+    equity_history = []
+    for i, e in enumerate(timeline if isinstance(timeline, list) else []):
+        if not isinstance(e, dict):
+            continue
+        equity_history.append({
+            "idx": i,
+            "time": e.get("time") or e.get("timestamp") or e.get("t") or "",
+            "symbol": e.get("symbol") or "",
+            "side": e.get("side") or "",
+            "equity": _safe_num(e.get("equity") or e.get("value")),
+            "equityGbp": _safe_num(e.get("equityGbp") or e.get("valueGbp")),
+            "pnl": _safe_num(e.get("pnl")),
+            "pnlGbp": _safe_num(e.get("pnlGbp")),
+            "pnlPct": _safe_num(e.get("pnlPct")),
+            "reason": e.get("reason") or "",
+        })
+    return {
+        "ok": True,
+        "depositSource": deposit_source,
+        "totalDeposited": total_deposited,
+        "totalWithdrawn": total_withdrawn,
+        "currentEquity": equity,
+        "currentEquityGbp": equity_gbp,
+        "totalGainLoss": total_gain_loss,
+        "earnedSinceDeposit": max(total_gain_loss, 0.0),
+        "lostSinceDeposit": abs(min(total_gain_loss, 0.0)),
+        "dayPnl": _safe_num(account.get("pnlDay")),
+        "realisedNet": _safe_num(db.get("totalPnl")),
+        "closedTrades": closed[-200:] if isinstance(closed, list) else [],
+        "equityHistory": equity_history[-500:],
+        "winRate": _safe_num(db.get("winRate")) * 100.0,
+        "totalTrades": int(_safe_num(db.get("totalTrades"))),
+    }
+
+# ---------- manual universe pins ----------
+MANUAL_UNIVERSE_FILE = os.path.join("backend", "state", "manual_universe_picks.json")
+
+def load_manual_universe_picks() -> List[str]:
+    try:
+        if os.path.exists(MANUAL_UNIVERSE_FILE):
+            with open(MANUAL_UNIVERSE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return sorted({str(x).upper().strip() for x in data if str(x).strip()})
+    except Exception as e:
+        print(f"MANUAL UNIVERSE LOAD ERROR: {e}")
+    return []
+
+def save_manual_universe_picks(symbols: List[str]) -> None:
+    try:
+        os.makedirs(os.path.dirname(MANUAL_UNIVERSE_FILE), exist_ok=True)
+        clean = sorted({str(x).upper().strip() for x in symbols if str(x).strip()})
+        with open(MANUAL_UNIVERSE_FILE, "w", encoding="utf-8") as f:
+            json.dump(clean, f, indent=2)
+    except Exception as e:
+        print(f"MANUAL UNIVERSE SAVE ERROR: {e}")
+
+def add_manual_universe_pick(symbol: str) -> List[str]:
+    sym = symbol.upper().strip()
+    picks = load_manual_universe_picks()
+    if sym and sym not in picks:
+        picks.append(sym)
+    save_manual_universe_picks(picks)
+    return load_manual_universe_picks()
+
+def remove_manual_universe_pick(symbol: str) -> List[str]:
+    sym = symbol.upper().strip()
+    picks = [x for x in load_manual_universe_picks() if x != sym]
+    save_manual_universe_picks(picks)
+    return picks
+
+def manual_pick_row(symbol: str) -> Dict[str, Any]:
+    return {"symbol": symbol.upper(), "score": 99.0, "reason": "manual pick | pinned to universe", "manualPick": True, "status": "active"}
+
+def apply_manual_picks_to_current_universe() -> None:
+    try:
+        for sym in load_manual_universe_picks():
+            add_symbol_to_universe(sym, custom=True)
+    except Exception as e:
+        print(f"APPLY MANUAL PICKS ERROR: {e}")
+
+def merge_manual_picks_into_auto_universe(status_obj: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        picks = load_manual_universe_picks()
+        apply_manual_picks_to_current_universe()
+        status_obj["manualUniversePicks"] = picks
+        au = status_obj.setdefault("autoUniverse", {})
+        rows = au.setdefault("rows", [])
+        active = au.setdefault("activeSymbols", [])
+        existing_rows = {str(r.get("symbol", "")).upper() for r in rows if isinstance(r, dict)}
+        existing_active = {str(x).upper() for x in active}
+        for sym in reversed(picks):
+            if sym not in existing_rows:
+                rows.insert(0, manual_pick_row(sym))
+            if sym not in existing_active:
+                active.insert(0, sym)
+        au["rows"] = rows
+        au["activeSymbols"] = active
+        au["size"] = max(int(au.get("size") or 0), len(active))
+        au["manualPickCount"] = len(picks)
+    except Exception as e:
+        print(f"MERGE MANUAL PICKS ERROR: {e}")
+    return status_obj
+
+@app.get("/manual-universe")
+def api_manual_universe():
+    return {"ok": True, "symbols": load_manual_universe_picks()}
+
+@app.post("/add-to-universe/{symbol}")
+def add_to_universe(symbol: str, request: Request):
+    verify_api_key(request)
+    sym = symbol.upper().strip()
+    try:
+        picks = add_manual_universe_pick(sym)
+        add_symbol_to_universe(sym, custom=True)
+        latest_status.setdefault("autoUniverse", {})
+        latest_status["autoUniverse"].setdefault("rows", [])
+        latest_status["autoUniverse"].setdefault("activeSymbols", [])
+        merge_manual_picks_into_auto_universe(latest_status)
+        touch_quick_status(lastAction=f"{sym} added and pinned to universe", lastActionAt=datetime.now(UTC).isoformat())
+        return {"ok": True, "message": f"{sym} added and pinned to universe", "symbols": picks, "manualPick": True}
+    except Exception as e:
+        return {"ok": False, "message": f"Could not add {sym}: {e}"}
+
+@app.post("/remove-from-universe/{symbol}")
+def api_remove_from_universe(symbol: str, request: Request):
+    verify_api_key(request)
+    picks = remove_manual_universe_pick(symbol)
+    try:
+        sym = symbol.upper().strip()
+        if sym in current_universe:
+            current_universe.remove(sym)
+        custom_symbols.pop(sym, None)
+    except Exception:
+        pass
+    update_status(BOT_NAME, latest_scans)
+    merge_manual_picks_into_auto_universe(latest_status)
+    return {"ok": True, "message": f"{symbol.upper()} removed from manual picks", "symbols": picks}
+
+# Wrap weekly universe builder so pinned picks survive refreshes and are tradable.
+_ORIGINAL_BUILD_WEEKLY_UNIVERSE = build_weekly_universe
+
+def build_weekly_universe(force=False):
+    result = _ORIGINAL_BUILD_WEEKLY_UNIVERSE(force=force)
+    apply_manual_picks_to_current_universe()
+    try:
+        picks = load_manual_universe_picks()
+        rows = result.setdefault("rows", []) if isinstance(result, dict) else []
+        symbols = result.setdefault("symbols", []) if isinstance(result, dict) else []
+        existing = {str(r.get("symbol", "")).upper() for r in rows if isinstance(r, dict)}
+        for sym in reversed(picks):
+            if sym not in existing:
+                rows.insert(0, manual_pick_row(sym))
+            if sym not in symbols:
+                symbols.insert(0, sym)
+    except Exception as e:
+        print(f"BUILD WEEKLY MANUAL MERGE ERROR: {e}")
+    return result
+
+# ---------- search preview ----------
+SEARCH_PREVIEW_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
+
+def _stock_name_guess(symbol: str) -> str:
+    names = {"AAPL":"Apple","MSFT":"Microsoft","NVDA":"NVIDIA","AMD":"Advanced Micro Devices","AMZN":"Amazon","META":"Meta Platforms","GOOGL":"Alphabet","GOOG":"Alphabet","TSLA":"Tesla","INTC":"Intel","NFLX":"Netflix","CRM":"Salesforce","ORCL":"Oracle","ADBE":"Adobe","PYPL":"PayPal","UBER":"Uber","PLTR":"Palantir","SHOP":"Shopify","SNOW":"Snowflake","NET":"Cloudflare","MDB":"MongoDB","MU":"Micron","LAC":"Lithium Americas","LCID":"Lucid","TTWO":"Take-Two Interactive","EA":"Electronic Arts","RBLX":"Roblox","U":"Unity Software"}
+    return names.get(symbol.upper(), symbol.upper())
+
+def _stock_search_universe() -> List[str]:
+    symbols = []
+    for name in ["current_universe", "SAFE_UNIVERSE", "TECH_UNIVERSE", "AUTO_UNIVERSE", "UNIVERSE"]:
+        val = globals().get(name)
+        if isinstance(val, list):
+            symbols.extend([str(x).upper() for x in val])
+    symbols.extend(load_manual_universe_picks())
+    symbols.extend(["AAPL","MSFT","NVDA","AMD","AMZN","META","GOOGL","GOOG","TSLA","INTC","NFLX","CRM","ORCL","ADBE","PYPL","UBER","PLTR","SHOP","SNOW","NET","MDB","MU","LAC","LCID","AVGO","QCOM","TXN","NOW","DDOG","CRWD","PANW","ZS","TEAM","SQ","COIN","HOOD","RBLX","ROKU","DIS","TTWO","EA","U"])
+    seen = []
+    for s in symbols:
+        s = str(s).upper().strip()
+        if s and s not in seen:
+            seen.append(s)
+    return seen
+
+def _search_fx_rate() -> float:
+    try:
+        return float(get_usd_to_gbp_rate())
+    except Exception:
+        return 0.7403
+
+def _latest_quote_for_symbol(symbol: str) -> Dict[str, Any]:
+    symbol = symbol.upper().strip()
+    quote_price = bid = ask = spread = 0.0
+    try:
+        req = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
+        q = data_client.get_stock_latest_quote(req)
+        quote = q.get(symbol) if isinstance(q, dict) else None
+        if quote:
+            bid = float(getattr(quote, "bid_price", 0) or 0)
+            ask = float(getattr(quote, "ask_price", 0) or 0)
+            quote_price = round((bid + ask) / 2, 4) if bid and ask else round(float(ask or bid or 0), 4)
+            spread = round(ask - bid, 4) if ask and bid else 0.0
+    except Exception as e:
+        print(f"SEARCH QUOTE ERROR {symbol}: {e}")
+    if quote_price <= 0:
+        try:
+            for s in latest_scans:
+                if str(s.get("symbol", "")).upper() == symbol:
+                    quote_price = float(s.get("price") or 0)
+                    break
+        except Exception:
+            pass
+    now = datetime.now(UTC).isoformat()
+    hist = SEARCH_PREVIEW_HISTORY.setdefault(symbol, [])
+    if quote_price > 0:
+        hist.append({"t": now, "value": quote_price})
+        del hist[:-80]
+    prev = hist[0]["value"] if hist else quote_price
+    change = quote_price - prev if quote_price and prev else 0.0
+    change_pct = (change / prev * 100.0) if prev else 0.0
+    fx = _search_fx_rate()
+    return {"symbol": symbol, "name": _stock_name_guess(symbol), "price": quote_price, "priceGbp": round(quote_price * fx, 4), "bid": bid, "ask": ask, "spread": spread, "change": round(change, 4), "changePct": round(change_pct, 4), "history": hist, "inUniverse": symbol in [x.upper() for x in _stock_search_universe()]}
+
+@app.get("/search-stocks")
+def search_stocks(q: str = ""):
+    query = (q or "").strip().upper()
+    if not query:
+        return {"ok": True, "query": q, "results": []}
+    matches = []
+    for sym in _stock_search_universe():
+        name = _stock_name_guess(sym).upper()
+        if query in sym or query in name:
+            matches.append(sym)
+        if len(matches) >= 8:
+            break
+    if re.fullmatch(r"[A-Z]{1,5}", query) and query not in matches:
+        matches.insert(0, query)
+    deduped = []
+    for sym in matches:
+        if sym not in deduped:
+            deduped.append(sym)
+    results = []
+    for sym in deduped[:8]:
+        qd = _latest_quote_for_symbol(sym)
+        if qd.get("price", 0) > 0 or sym == query:
+            results.append(qd)
+    return {"ok": True, "query": q, "results": results}
+
+@app.get("/stock-preview/{symbol}")
+def stock_preview(symbol: str):
+    return {"ok": True, "stock": _latest_quote_for_symbol(symbol)}
