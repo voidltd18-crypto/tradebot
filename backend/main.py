@@ -3201,6 +3201,7 @@ def root():
 
 @app.get("/status")
 def get_status():
+    latest_status["botVersion"] = "v1.0-production-stable"
     return latest_status
 
 
@@ -3403,34 +3404,21 @@ def startup_event():
 
 
 # =========================
-# REPORT BASELINE RESET
+# BOT VERSION
 # =========================
-BASELINE_FILE = os.path.join("backend", "state", "equity_baseline.json")
 
-def load_equity_baseline() -> float:
-    try:
-        if os.path.exists(BASELINE_FILE):
-            with open(BASELINE_FILE, "r", encoding="utf-8") as f:
-                return float(json.load(f).get("baseline", 0) or 0)
-    except Exception as e:
-        print(f"BASELINE LOAD ERROR: {e}")
-    return 0.0
+BOT_VERSION = "v1.0-production-stable"
+BOT_VERSION_NOTES = {
+    "version": BOT_VERSION,
+    "name": "TradeBot v1.0 Production Stable",
+    "sameDayTrading": True,
+    "sellThenLockUntilNextDay": True,
+    "manualUniversePins": True,
+    "weeklyUniverseRefresh": True,
+    "gbpFirstReports": True,
+    "pdtAware": True,
+}
 
-def save_equity_baseline(value: float) -> None:
-    os.makedirs(os.path.dirname(BASELINE_FILE), exist_ok=True)
-    with open(BASELINE_FILE, "w", encoding="utf-8") as f:
-        json.dump({"baseline": float(value or 0), "resetAt": datetime.now(UTC).isoformat()}, f, indent=2)
-
-@app.post("/reset-baseline")
-def reset_baseline(request: Request):
-    verify_api_key(request)
-    try:
-        equity = float(latest_status.get("account", {}).get("equity", 0) or 0)
-        save_equity_baseline(equity)
-        return {"ok": True, "message": f"Baseline reset to ${equity:.2f}", "baseline": equity}
-    except Exception as e:
-        return {"ok": False, "message": str(e)}
-
-@app.get("/baseline")
-def get_baseline():
-    return {"ok": True, "baseline": load_equity_baseline()}
+@app.get("/version")
+def version():
+    return BOT_VERSION_NOTES
