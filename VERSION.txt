@@ -1,0 +1,11 @@
+TradeBot v1.0-production-stable
+
+Confirmed intended behaviour:
+- Can buy and sell same day.
+- After a ticker is sold, it should be locked and not bought again until the next trading day.
+- Manual universe picks are pinned.
+- Weekly universe refresh is enabled.
+- Reports are GBP-first.
+- UI refresh is slowed to 15 minutes and should not flicker to zero.
+- Search preview endpoint should be available at /search-stocks?q=AMD.
+- Version endpoint available at /version.

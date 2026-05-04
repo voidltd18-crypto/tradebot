@@ -1,0 +1,30 @@
+Pre-market checklist
+
+1. Render backend:
+   - Deploy successful
+   - /status works
+   - /version works
+   - /search-stocks?q=AMD works
+   - Bot ON
+
+2. Vercel frontend:
+   - VITE_API_BASE points to Render URL
+   - UI shows v1.0-production-stable
+   - Reports page opens
+   - Search tab returns preview cards
+
+3. Trading safety:
+   - Confirm DRY_RUN setting:
+     DRY_RUN=true for safe paper/test
+     DRY_RUN=false for live money
+
+4. Behaviour expected:
+   - Buy same day allowed
+   - Sell same day allowed
+   - Sold ticker locked until next day
+   - Bot moves on to other universe stocks
+
+5. First hour:
+   - Watch positions
+   - Watch PDT/log warnings
+   - Do not change code during active market unless needed
