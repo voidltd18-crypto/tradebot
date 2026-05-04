@@ -3,6 +3,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
 const API_URL = import.meta.env.VITE_API_BASE || "https://tradebot-0myo.onrender.com";
+const BOT_VERSION = "v1.0-production-stable";
 type AnyObj = Record<string, any>;
 type Tab = "overview" | "reports" | "positions" | "scanner" | "search" | "activity" | "admin";
 
@@ -156,6 +157,7 @@ export default function App() {
         <span className={`pill ${data?.market?.isOpen ? "ok" : "warn"}`}>Market {data?.market?.label || "UNKNOWN"}</span>
         <span className={`pill ${data?.botEnabled ? "ok" : "bad"}`}>Bot {data?.botEnabled ? "ON" : "OFF"}</span>
         <span className="pill">{data?.paperMode ? "PAPER" : "LIVE"}</span>
+        <span className="pill">{BOT_VERSION}</span>
       </div>
     </header>
 
