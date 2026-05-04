@@ -157,7 +157,6 @@ export default function App() {
         <span className={`pill ${data?.market?.isOpen ? "ok" : "warn"}`}>Market {data?.market?.label || "UNKNOWN"}</span>
         <span className={`pill ${data?.botEnabled ? "ok" : "bad"}`}>Bot {data?.botEnabled ? "ON" : "OFF"}</span>
         <span className="pill">{data?.paperMode ? "PAPER" : "LIVE"}</span>
-        <span className="pill">{BOT_VERSION}</span>
       </div>
     </header>
 
