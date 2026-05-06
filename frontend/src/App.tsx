@@ -5,7 +5,7 @@ import { Area, AreaChart, Bar, BarChart, CartesianGrid, Line, LineChart, Respons
 const API_URL = import.meta.env.VITE_API_BASE || "https://tradebot-0myo.onrender.com";
 const BOT_VERSION = "v1.0-production-stable";
 type AnyObj = Record<string, any>;
-type Tab = "overview" | "reports" | "positions" | "scanner" | "search" | "activity" | "admin";
+type Tab = "overview" | "reports" | "positions" | "scanner" | "search" | "activity" | "terminal" | "admin";
 
 const usd = (n:any) => `$${Number(n || 0).toFixed(2)}`;
 const gbp = (n:any) => `£${Number(n || 0).toFixed(2)}`;
@@ -147,7 +147,31 @@ export default function App() {
   const earned = Number(reports.earnedSinceDeposit ?? 0);
   const totalGainLoss = Number(reports.totalGainLoss ?? 0);
   const lost = Number(reports.lostSinceDeposit ?? 0);
-  const tabs: Tab[] = ["overview","reports","positions","scanner","search","activity","admin"];
+  const tabs: Tab[] = ["overview","reports","positions","scanner","search","activity","terminal","admin"];
+
+
+  function terminalTone(line: string) {
+    const s = String(line || "").toLowerCase();
+    if (s.includes("pdt") || s.includes("block") || s.includes("warning") || s.includes("locked")) return "warn";
+    if (s.includes("sell") || s.includes("stop") || s.includes("error") || s.includes("rejected")) return "sell";
+    if (s.includes("buy") || s.includes("bought") || s.includes("trail active")) return "buy";
+    if (s.includes("universe") || s.includes("scan") || s.includes("market")) return "info";
+    return "";
+  }
+
+  const terminalLines = [
+    ...(Array.isArray(data?.pdtWarnings) ? data.pdtWarnings : []),
+    ...(Array.isArray(data?.pdtWarningEvents) ? data.pdtWarningEvents : []),
+    ...(Array.isArray(data?.logs) ? data.logs : []),
+    ...(Array.isArray(data?.activity) ? data.activity : []),
+    ...(Array.isArray(data?.events) ? data.events : []),
+    ...(Array.isArray(data?.trades) ? data.trades.map((t: AnyObj) => `${t.time || ""} ${t.side || "TRADE"} ${t.symbol || ""} ${t.reason || ""}`) : []),
+  ]
+    .map((x: any) => typeof x === "string" ? x : JSON.stringify(x))
+    .filter(Boolean)
+    .slice(-200)
+    .reverse();
+
 
   return <div className="app">
     <header className="topbar">
@@ -216,6 +240,36 @@ export default function App() {
     {tab==="search" && <main><Card title="Stock Search / Preview"><div className="search-row"><input value={stockQuery} onChange={e=>{setStockQuery(e.target.value); if(e.target.value.trim().length>=2) searchStocks(e.target.value); if(!e.target.value.trim()) setStockResults([])}} onKeyDown={e=>{if(e.key==="Enter") searchStocks()}} placeholder="Search ticker or company, e.g. AMD"/><button onClick={()=>searchStocks()}>{stockSearchLoading ? "Searching..." : "Search"}</button></div><div className="search-results">{stockResults.map((s:AnyObj)=><article className="search-card" key={s.symbol}><div className="search-main"><div className="logo-circle">{s.symbol.slice(0,2)}</div><div><h3>{s.name}</h3><p>{s.symbol} · NASDAQ/NYSE</p></div></div><div className="search-price"><strong>{usd(s.price)}</strong><span className={tone(s.changePct)}>{Number(s.changePct || 0)>=0 ? "↗":"↘"} {pct(s.changePct)}</span><small>{gbp(s.priceGbp)}</small></div><div className="mini-chart">{Array.isArray(s.history) && s.history.length>1 ? <ResponsiveContainer width="100%" height="100%"><LineChart data={s.history.map((p:AnyObj,i:number)=>({...p,i}))}><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false} strokeWidth={2}/><Tooltip formatter={(v:any)=>usd(v)}/></LineChart></ResponsiveContainer> : <p className="muted">Preview builds while you search.</p>}</div><div className="search-actions"><button onClick={()=>action(`/custom-buy/${s.symbol}`)}>Buy</button><button className="ghost" onClick={()=>action(`/add-to-universe/${s.symbol}`)}>Add to Universe</button></div></article>)}{!stockResults.length && <p className="muted">Type a symbol to preview price, daily movement and mini chart.</p>}</div></Card></main>}
 
     {tab==="activity" && <main className="grid two"><Card title="Recent Trades"><div className="log-list">{trades.slice(-50).reverse().map((t:AnyObj,i:number)=><div key={i}>{t.time || "—"} · <b>{t.side} {t.symbol}</b> · {t.reason || ""}</div>)}{!trades.length && <p className="muted">No trades yet.</p>}</div></Card><Card title="Logs"><div className="log-list">{logs.map((l:string,i:number)=><div key={i}>{l}</div>)}</div></Card></main>}
+
+
+    {tab==="terminal" && <main>
+      <Card title="Live Trading Terminal">
+        <div className="terminal-toolbar">
+          <button onClick={fetchData}>Refresh Terminal</button>
+          <span>{terminalLines.length} log lines</span>
+        </div>
+        <div className="terminal">
+          {terminalLines.length ? terminalLines.map((line: string, i: number) => (
+            <div key={i} className={`terminal-line ${terminalTone(line)}`}>
+              <span className="terminal-time">{new Date().toLocaleTimeString()}</span>
+              <code>{line}</code>
+            </div>
+          )) : (
+            <p className="muted">No logs yet. Buys, sells, PDT blocks, sold-today locks, errors, scanner and universe messages should appear here if the backend exposes them in /status.</p>
+          )}
+        </div>
+      </Card>
+
+      <Card title="What to watch for">
+        <div className="summary">
+          <div><span>Buy events</span><b>Green lines</b></div>
+          <div><span>Sell / rejected</span><b>Red lines</b></div>
+          <div><span>PDT / sold-today lock</span><b>Yellow lines</b></div>
+          <div><span>Scanner / universe</span><b>Blue lines</b></div>
+        </div>
+      </Card>
+    </main>}
+
 
     {tab==="admin" && <Card title="Admin"><label className="field"><span>Dashboard password</span><input type="password" value={apiKey} onChange={e=>setApiKey(e.target.value)}/></label><div className="actions"><button onClick={saveApiKey}>Save</button><button className="ghost" onClick={()=>{localStorage.removeItem("dashboard_api_key"); setApiKey("")}}>Clear</button></div><pre>{JSON.stringify({ api:API_URL, botEnabled:data?.botEnabled, market:data?.market, manualPicks:data?.manualUniversePicks }, null, 2)}</pre></Card>}
   </div>;
