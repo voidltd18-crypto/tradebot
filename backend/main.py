@@ -66,7 +66,10 @@ if not API_KEY or not API_SECRET:
 # =========================
 BOT_NAME = "Rebuilt Sniper Profit Bot"
 
-SAFE_UNIVERSE = ["NVDA","AMD","MSFT","AAPL","META","AMZN","GOOGL","GOOG","AVGO","NFLX","TSLA","PLTR","UBER","QQQ","SMH"]
+SAFE_UNIVERSE = [
+    "SOFI", "PLTR", "F", "RIVN", "LCID", "AAL", "NIO", "PLUG", "OPEN", "PFE", "T",
+    "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "AMD", "XOM"
+]
 
 CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
@@ -237,7 +240,7 @@ AUTO_UNIVERSE_REMOVE_LOSER_MAX_PNL = -1.00
 AUTO_UNIVERSE_MIN_PRICE = 1.00
 AUTO_UNIVERSE_MAX_PRICE = 800.00
 AUTO_UNIVERSE_MAX_SPREAD = 0.020
-AUTO_UNIVERSE_CANDIDATE_POOL = ["NVDA","AMD","MSFT","AAPL","META","AMZN","GOOGL","GOOG","AVGO","NFLX","TSLA","PLTR","UBER","QQQ","SMH"]
+AUTO_UNIVERSE_CANDIDATE_POOL = ["SOFI","PLTR","F","RIVN","LCID","AAL","NIO","PLUG","OPEN","PFE","T","NVDA","MSFT","AAPL","GOOGL","AMZN","META","AVGO","AMD","XOM","TSLA","MARA","RIOT","COIN","HOOD","SHOP","SQ","PYPL","UBER","ABNB","DKNG","RBLX","SNAP","ROKU","BABA","INTC","MU","BAC","C","WFC","GM","CCL","DAL","UAL","DIS","NKE","WMT","CVS","KO","JPM"]
 
 # =========================
 # CLIENTS
@@ -2891,40 +2894,22 @@ def build_weekly_universe(force=False):
 def auto_universe_payload():
     active = get_weekly_universe_from_db()
 
-    # If DB has not been populated or SQLite is disabled, show the live in-memory universe.
-    # This makes the Weekly Stock Refresh button visibly update the UI every time.
+    # If DB has not been populated yet but stock memory exists, show live preview.
     if not active:
-        active = []
-        try:
-            for sym in current_universe:
-                active.append({
-                    "symbol": str(sym).upper(),
-                    "score": 0,
-                    "reason": "active quality momentum universe",
-                    "status": "active",
-                })
-        except Exception:
-            active = []
-
-    # Last fallback: use quality candidate pool.
-    if not active:
-        active = [
-            {"symbol": s, "score": 0, "reason": "quality momentum fallback", "status": "active"}
-            for s in AUTO_UNIVERSE_CANDIDATE_POOL[:AUTO_UNIVERSE_SIZE]
-        ]
+        preview = universe_rows_from_stock_memory()[:AUTO_UNIVERSE_SIZE]
+        active = preview
 
     return {
         "enabled": AUTO_UNIVERSE_ENABLED,
-        "mode": AUTO_UNIVERSE_MODE,
         "size": AUTO_UNIVERSE_SIZE,
         "weekStart": week_start_str(),
-        "monthStart": month_start_str(),
-        "activeSymbols": [r["symbol"] for r in active],
+        "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe),
         "rows": active,
         "lastRefresh": get_last_universe_refresh(),
         "candidatePoolSize": len(AUTO_UNIVERSE_CANDIDATE_POOL),
         "keepWinners": True,
     }
+
 
 @app.get("/weekly-universe")
 def weekly_universe_public():
@@ -3132,24 +3117,6 @@ def get_status():
         print(f"STATUS MANUAL PICK MERGE ERROR: {e}")
     return latest_status
 
-
-@app.post("/pause")
-def pause_bot(request: Request):
-    verify_api_key(request)
-    global bot_enabled
-    bot_enabled = False
-    update_status(BOT_NAME, latest_scans)
-    return {"ok": True, "message": "Bot paused"}
-
-
-@app.post("/resume")
-def resume_bot(request: Request):
-    verify_api_key(request)
-    global bot_enabled, emergency_stop
-    bot_enabled = True
-    emergency_stop = False
-    update_status(BOT_NAME, latest_scans)
-    return {"ok": True, "message": "Bot resumed"}
 
 
 @app.post("/manual-override/on")
@@ -3768,11 +3735,89 @@ def api_clear_loser_cooldown(request: Request):
     return {"ok": True, "message": "Loser cooldown cleared"}
 
 
-@app.get("/refresh-universe-preview")
-def refresh_universe_preview():
-    return {
-        "ok": True,
-        "currentUniverse": current_universe,
-        "autoUniverse": auto_universe_payload(),
-        "candidatePool": AUTO_UNIVERSE_CANDIDATE_POOL,
-    }
+
+
+# =========================
+# BOT CONTROL SAFETY PATCH
+# =========================
+
+BOT_CONTROL_FILE = os.path.join("backend", "state", "bot_control.json")
+
+def _load_bot_control() -> Dict[str, Any]:
+    try:
+        if os.path.exists(BOT_CONTROL_FILE):
+            with open(BOT_CONTROL_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"BOT CONTROL LOAD ERROR: {e}")
+    return {}
+
+def _save_bot_control(enabled: bool) -> None:
+    try:
+        os.makedirs(os.path.dirname(BOT_CONTROL_FILE), exist_ok=True)
+        with open(BOT_CONTROL_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "botEnabled": bool(enabled),
+                "updatedAt": datetime.now(UTC).isoformat(),
+            }, f, indent=2)
+    except Exception as e:
+        print(f"BOT CONTROL SAVE ERROR: {e}")
+
+def get_bot_enabled() -> bool:
+    try:
+        saved = _load_bot_control()
+        if "botEnabled" in saved:
+            return bool(saved["botEnabled"])
+    except Exception:
+        pass
+    try:
+        return os.getenv("BOT_ENABLED", "true").lower() == "true"
+    except Exception:
+        return True
+
+def set_bot_enabled(value: bool) -> bool:
+    global bot_enabled
+    try:
+        bot_enabled = bool(value)
+    except Exception:
+        pass
+    _save_bot_control(bool(value))
+    try:
+        latest_status["botEnabled"] = bool(value)
+        latest_status["lastAction"] = "Bot resumed" if value else "Bot paused"
+        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
+    except Exception:
+        pass
+    return bool(value)
+
+try:
+    bot_enabled = get_bot_enabled()
+except Exception:
+    bot_enabled = True
+
+@app.post("/resume")
+def resume_bot(request: Request):
+    verify_api_key(request)
+    enabled = set_bot_enabled(True)
+    try:
+        update_status(BOT_NAME, latest_scans)
+        latest_status["botEnabled"] = enabled
+    except Exception as e:
+        print(f"RESUME UPDATE_STATUS ERROR: {e}")
+    return {"ok": True, "message": "Bot resumed", "botEnabled": enabled}
+
+@app.post("/pause")
+def pause_bot(request: Request):
+    verify_api_key(request)
+    enabled = set_bot_enabled(False)
+    try:
+        update_status(BOT_NAME, latest_scans)
+        latest_status["botEnabled"] = enabled
+    except Exception as e:
+        print(f"PAUSE UPDATE_STATUS ERROR: {e}")
+    return {"ok": True, "message": "Bot paused", "botEnabled": enabled}
+
+
+@app.get("/bot-control")
+def bot_control_status():
+    return {"ok": True, "botEnabled": get_bot_enabled()}
