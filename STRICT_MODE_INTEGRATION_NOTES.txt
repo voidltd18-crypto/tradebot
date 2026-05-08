@@ -1,0 +1,31 @@
+Strict Profit Mode v1.1
+
+Adds:
+- /strict-mode
+- /clear-loser-cooldown
+- strict_position_should_sell()
+- strict_can_buy_symbol()
+
+Settings:
+STRICT_PROFIT_MODE=true
+STRICT_STOP_LOSS_PCT=-2.25
+STRICT_TAKE_PROFIT_PCT=1.25
+STRICT_TRAIL_START_PCT=1.00
+STRICT_TRAIL_DROP_PCT=0.45
+STRICT_MAX_POSITIONS=6
+LOSER_COOLDOWN_DAYS=3
+
+Important:
+If your current buy/sell loop does not call these helpers, add:
+
+Before buying:
+buy_check = strict_can_buy_symbol(symbol)
+if not buy_check["ok"]:
+    log_event(f"STRICT BUY BLOCK | {symbol} | {buy_check['reason']}")
+    continue
+
+Before old trailing sell logic:
+decision = strict_position_should_sell(symbol, entry_price, current_price, high_price)
+if decision["sell"]:
+    sell_position(symbol, reason=decision["reason"])
+    continue

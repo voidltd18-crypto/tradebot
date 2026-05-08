@@ -74,7 +74,7 @@ SAFE_UNIVERSE = [
 CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
-MAX_POSITIONS = 12
+MAX_POSITIONS = 6
 MAX_NEW_BUYS_PER_LOOP = 1
 MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
@@ -3109,7 +3109,7 @@ def root():
 
 @app.get("/status")
 def get_status():
-    latest_status["botVersion"] = "v1.0-production-stable"
+    latest_status["botVersion"] = "v1.1-strict-profit-mode"
     try:
         if "merge_manual_picks_into_auto_universe" in globals():
             return merge_manual_picks_into_auto_universe(latest_status)
@@ -3315,7 +3315,7 @@ def startup_event():
 # V1.0 PRODUCTION STABLE ADDONS
 # =========================
 
-BOT_VERSION = "v1.0-production-stable"
+BOT_VERSION = "v1.1-strict-profit-mode"
 BOT_VERSION_NOTES = {
     "version": BOT_VERSION,
     "name": "TradeBot v1.0 Production Stable",
@@ -3635,3 +3635,119 @@ def search_stocks(q: str = ""):
 @app.get("/stock-preview/{symbol}")
 def stock_preview(symbol: str):
     return {"ok": True, "stock": _latest_quote_for_symbol(symbol)}
+
+
+
+
+# =========================
+# STRICTER PROFIT MODE v1.1
+# =========================
+
+STRICT_PROFIT_MODE = os.getenv("STRICT_PROFIT_MODE", "true").lower() == "true"
+STRICT_STOP_LOSS_PCT = float(os.getenv("STRICT_STOP_LOSS_PCT", "-2.25"))
+STRICT_TAKE_PROFIT_PCT = float(os.getenv("STRICT_TAKE_PROFIT_PCT", "1.25"))
+STRICT_TRAIL_START_PCT = float(os.getenv("STRICT_TRAIL_START_PCT", "1.00"))
+STRICT_TRAIL_DROP_PCT = float(os.getenv("STRICT_TRAIL_DROP_PCT", "0.45"))
+STRICT_MAX_POSITIONS = int(os.getenv("STRICT_MAX_POSITIONS", "6"))
+LOSER_COOLDOWN_DAYS = int(os.getenv("LOSER_COOLDOWN_DAYS", "3"))
+LOSER_COOLDOWN_FILE = os.path.join("backend", "state", "loser_cooldown.json")
+
+def _load_loser_cooldown() -> Dict[str, Any]:
+    try:
+        if os.path.exists(LOSER_COOLDOWN_FILE):
+            with open(LOSER_COOLDOWN_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"LOSER COOLDOWN LOAD ERROR: {e}")
+    return {}
+
+def _save_loser_cooldown(data: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(LOSER_COOLDOWN_FILE), exist_ok=True)
+        with open(LOSER_COOLDOWN_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"LOSER COOLDOWN SAVE ERROR: {e}")
+
+def add_loser_cooldown(symbol: str, pnl_pct: float = 0.0, reason: str = "loss") -> None:
+    try:
+        sym = symbol.upper().strip()
+        until = (datetime.now(UTC) + timedelta(days=LOSER_COOLDOWN_DAYS)).date().isoformat()
+        data = _load_loser_cooldown()
+        data[sym] = {"until": until, "pnlPct": float(pnl_pct or 0), "reason": reason, "createdAt": datetime.now(UTC).isoformat()}
+        _save_loser_cooldown(data)
+        print(f"LOSER COOLDOWN | {sym} blocked until {until} | pnlPct={pnl_pct}")
+    except Exception as e:
+        print(f"ADD LOSER COOLDOWN ERROR: {e}")
+
+def is_loser_cooldown(symbol: str) -> bool:
+    try:
+        sym = symbol.upper().strip()
+        data = _load_loser_cooldown()
+        row = data.get(sym)
+        if not row:
+            return False
+        until = datetime.fromisoformat(row.get("until")).date()
+        if datetime.now(UTC).date() <= until:
+            return True
+        data.pop(sym, None)
+        _save_loser_cooldown(data)
+    except Exception:
+        return False
+    return False
+
+def strict_position_should_sell(symbol: str, entry_price: float, current_price: float, high_price: float = 0.0) -> Dict[str, Any]:
+    try:
+        if not STRICT_PROFIT_MODE:
+            return {"sell": False, "reason": ""}
+        entry = float(entry_price or 0)
+        price = float(current_price or 0)
+        high = float(high_price or price or 0)
+        if entry <= 0 or price <= 0:
+            return {"sell": False, "reason": ""}
+
+        pnl_pct = ((price - entry) / entry) * 100.0
+        high_pct = ((high - entry) / entry) * 100.0
+        drop_from_high_pct = ((price - high) / high) * 100.0 if high > 0 else 0.0
+
+        if pnl_pct <= STRICT_STOP_LOSS_PCT:
+            add_loser_cooldown(symbol, pnl_pct, "strict-stop-loss")
+            return {"sell": True, "reason": f"STRICT STOP LOSS {pnl_pct:.2f}%", "pnlPct": pnl_pct}
+
+        if pnl_pct >= STRICT_TAKE_PROFIT_PCT:
+            return {"sell": True, "reason": f"STRICT TAKE PROFIT {pnl_pct:.2f}%", "pnlPct": pnl_pct}
+
+        if high_pct >= STRICT_TRAIL_START_PCT and drop_from_high_pct <= -abs(STRICT_TRAIL_DROP_PCT):
+            return {"sell": True, "reason": f"STRICT TRAIL DROP {drop_from_high_pct:.2f}%", "pnlPct": pnl_pct}
+    except Exception as e:
+        print(f"STRICT SELL DECISION ERROR {symbol}: {e}")
+    return {"sell": False, "reason": ""}
+
+def strict_can_buy_symbol(symbol: str) -> Dict[str, Any]:
+    try:
+        if STRICT_PROFIT_MODE and is_loser_cooldown(symbol):
+            return {"ok": False, "reason": f"{symbol.upper()} in loser cooldown"}
+    except Exception as e:
+        print(f"STRICT CAN BUY ERROR {symbol}: {e}")
+    return {"ok": True, "reason": ""}
+
+@app.get("/strict-mode")
+def api_strict_mode():
+    return {
+        "ok": True,
+        "version": "v1.1-strict-profit-mode",
+        "strictProfitMode": STRICT_PROFIT_MODE,
+        "stopLossPct": STRICT_STOP_LOSS_PCT,
+        "takeProfitPct": STRICT_TAKE_PROFIT_PCT,
+        "trailStartPct": STRICT_TRAIL_START_PCT,
+        "trailDropPct": STRICT_TRAIL_DROP_PCT,
+        "maxPositions": STRICT_MAX_POSITIONS,
+        "loserCooldownDays": LOSER_COOLDOWN_DAYS,
+        "loserCooldown": _load_loser_cooldown(),
+    }
+
+@app.post("/clear-loser-cooldown")
+def api_clear_loser_cooldown(request: Request):
+    verify_api_key(request)
+    _save_loser_cooldown({})
+    return {"ok": True, "message": "Loser cooldown cleared"}
