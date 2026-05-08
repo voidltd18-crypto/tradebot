@@ -66,10 +66,7 @@ if not API_KEY or not API_SECRET:
 # =========================
 BOT_NAME = "Rebuilt Sniper Profit Bot"
 
-SAFE_UNIVERSE = [
-    "SOFI", "PLTR", "F", "RIVN", "LCID", "AAL", "NIO", "PLUG", "OPEN", "PFE", "T",
-    "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "AMD", "XOM"
-]
+SAFE_UNIVERSE = ["NVDA","AMD","MSFT","AAPL","META","AMZN","GOOGL","GOOG","AVGO","NFLX","TSLA","PLTR","UBER","QQQ","SMH"]
 
 CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
@@ -240,7 +237,7 @@ AUTO_UNIVERSE_REMOVE_LOSER_MAX_PNL = -1.00
 AUTO_UNIVERSE_MIN_PRICE = 1.00
 AUTO_UNIVERSE_MAX_PRICE = 800.00
 AUTO_UNIVERSE_MAX_SPREAD = 0.020
-AUTO_UNIVERSE_CANDIDATE_POOL = ["SOFI","PLTR","F","RIVN","LCID","AAL","NIO","PLUG","OPEN","PFE","T","NVDA","MSFT","AAPL","GOOGL","AMZN","META","AVGO","AMD","XOM","TSLA","MARA","RIOT","COIN","HOOD","SHOP","SQ","PYPL","UBER","ABNB","DKNG","RBLX","SNAP","ROKU","BABA","INTC","MU","BAC","C","WFC","GM","CCL","DAL","UAL","DIS","NKE","WMT","CVS","KO","JPM"]
+AUTO_UNIVERSE_CANDIDATE_POOL = ["NVDA","AMD","MSFT","AAPL","META","AMZN","GOOGL","GOOG","AVGO","NFLX","TSLA","PLTR","UBER","QQQ","SMH"]
 
 # =========================
 # CLIENTS
@@ -2894,22 +2891,40 @@ def build_weekly_universe(force=False):
 def auto_universe_payload():
     active = get_weekly_universe_from_db()
 
-    # If DB has not been populated yet but stock memory exists, show live preview.
+    # If DB has not been populated or SQLite is disabled, show the live in-memory universe.
+    # This makes the Weekly Stock Refresh button visibly update the UI every time.
     if not active:
-        preview = universe_rows_from_stock_memory()[:AUTO_UNIVERSE_SIZE]
-        active = preview
+        active = []
+        try:
+            for sym in current_universe:
+                active.append({
+                    "symbol": str(sym).upper(),
+                    "score": 0,
+                    "reason": "active quality momentum universe",
+                    "status": "active",
+                })
+        except Exception:
+            active = []
+
+    # Last fallback: use quality candidate pool.
+    if not active:
+        active = [
+            {"symbol": s, "score": 0, "reason": "quality momentum fallback", "status": "active"}
+            for s in AUTO_UNIVERSE_CANDIDATE_POOL[:AUTO_UNIVERSE_SIZE]
+        ]
 
     return {
         "enabled": AUTO_UNIVERSE_ENABLED,
+        "mode": AUTO_UNIVERSE_MODE,
         "size": AUTO_UNIVERSE_SIZE,
         "weekStart": week_start_str(),
-        "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe),
+        "monthStart": month_start_str(),
+        "activeSymbols": [r["symbol"] for r in active],
         "rows": active,
         "lastRefresh": get_last_universe_refresh(),
         "candidatePoolSize": len(AUTO_UNIVERSE_CANDIDATE_POOL),
         "keepWinners": True,
     }
-
 
 @app.get("/weekly-universe")
 def weekly_universe_public():
@@ -3753,143 +3768,11 @@ def api_clear_loser_cooldown(request: Request):
     return {"ok": True, "message": "Loser cooldown cleared"}
 
 
-
-
-# =========================
-# STOCK SEARCH / PREVIEW API
-# =========================
-
-SEARCH_PREVIEW_HISTORY = {}
-
-def _stock_name_guess(symbol: str) -> str:
-    names = {
-        "AAPL": "Apple", "MSFT": "Microsoft", "NVDA": "NVIDIA",
-        "AMD": "Advanced Micro Devices", "AMZN": "Amazon",
-        "META": "Meta Platforms", "GOOGL": "Alphabet", "GOOG": "Alphabet",
-        "TSLA": "Tesla", "INTC": "Intel", "NFLX": "Netflix",
-        "CRM": "Salesforce", "ORCL": "Oracle", "ADBE": "Adobe",
-        "PYPL": "PayPal", "UBER": "Uber", "PLTR": "Palantir",
-        "SHOP": "Shopify", "SNOW": "Snowflake", "NET": "Cloudflare",
-        "MDB": "MongoDB", "MU": "Micron", "AVGO": "Broadcom",
-        "QCOM": "Qualcomm", "QQQ": "Invesco QQQ Trust",
-        "SMH": "VanEck Semiconductor ETF", "TTWO": "Take-Two Interactive",
-        "EA": "Electronic Arts", "RBLX": "Roblox", "U": "Unity Software",
-    }
-    return names.get(symbol.upper(), symbol.upper())
-
-def _stock_search_universe():
-    symbols = []
-    for name in ["UNIVERSE", "current_universe", "SAFE_UNIVERSE", "TECH_UNIVERSE", "AUTO_UNIVERSE"]:
-        val = globals().get(name)
-        if isinstance(val, list):
-            symbols.extend([str(x).upper().strip() for x in val])
-    try:
-        if "load_manual_universe_picks" in globals() and callable(globals()["load_manual_universe_picks"]):
-            symbols.extend(load_manual_universe_picks())
-    except Exception:
-        pass
-    symbols.extend(["NVDA","AMD","MSFT","AAPL","META","AMZN","GOOGL","GOOG","AVGO","NFLX","TSLA","PLTR","UBER","QQQ","SMH","TTWO","EA","RBLX","U"])
-    seen = []
-    for s in symbols:
-        if s and s not in seen:
-            seen.append(s)
-    return seen
-
-def _search_fx_rate() -> float:
-    try:
-        if "get_usd_to_gbp" in globals() and callable(globals()["get_usd_to_gbp"]):
-            return float(get_usd_to_gbp())
-    except Exception:
-        pass
-    try:
-        return float(globals().get("usd_to_gbp", 0.7403) or 0.7403)
-    except Exception:
-        return 0.7403
-
-def _latest_quote_for_symbol(symbol: str):
-    symbol = symbol.upper().strip()
-    quote_price = 0.0
-    bid = 0.0
-    ask = 0.0
-    spread = 0.0
-
-    try:
-        req = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
-        q = data_client.get_stock_latest_quote(req)
-        quote = q.get(symbol) if isinstance(q, dict) else None
-        if quote:
-            bid = float(getattr(quote, "bid_price", 0) or 0)
-            ask = float(getattr(quote, "ask_price", 0) or 0)
-            quote_price = round((bid + ask) / 2, 4) if bid and ask else round(float(ask or bid or 0), 4)
-            spread = round(ask - bid, 4) if ask and bid else 0.0
-    except Exception as e:
-        print(f"SEARCH QUOTE ERROR {symbol}: {e}")
-
-    if quote_price <= 0:
-        try:
-            for s in latest_scans:
-                if str(s.get("symbol", "")).upper() == symbol:
-                    quote_price = float(s.get("price") or 0)
-                    break
-        except Exception:
-            pass
-
-    now = datetime.now(UTC).isoformat()
-    hist = SEARCH_PREVIEW_HISTORY.setdefault(symbol, [])
-    if quote_price > 0:
-        hist.append({"t": now, "value": quote_price})
-        del hist[:-80]
-
-    prev = hist[0]["value"] if hist else quote_price
-    change = quote_price - prev if quote_price and prev else 0.0
-    change_pct = (change / prev * 100.0) if prev else 0.0
-    fx = _search_fx_rate()
-
+@app.get("/refresh-universe-preview")
+def refresh_universe_preview():
     return {
-        "symbol": symbol,
-        "name": _stock_name_guess(symbol),
-        "price": quote_price,
-        "priceGbp": round(quote_price * fx, 4),
-        "bid": bid,
-        "ask": ask,
-        "spread": spread,
-        "change": round(change, 4),
-        "changePct": round(change_pct, 4),
-        "history": hist,
-        "inUniverse": symbol in [x.upper() for x in _stock_search_universe()],
+        "ok": True,
+        "currentUniverse": current_universe,
+        "autoUniverse": auto_universe_payload(),
+        "candidatePool": AUTO_UNIVERSE_CANDIDATE_POOL,
     }
-
-@app.get("/search-stocks")
-def search_stocks(q: str = ""):
-    query = (q or "").strip().upper()
-    if not query:
-        return {"ok": True, "query": q, "results": []}
-
-    matches = []
-    for sym in _stock_search_universe():
-        name = _stock_name_guess(sym).upper()
-        if query in sym or query in name:
-            matches.append(sym)
-        if len(matches) >= 8:
-            break
-
-    if re.fullmatch(r"[A-Z]{1,5}", query) and query not in matches:
-        matches.insert(0, query)
-
-    deduped = []
-    for sym in matches:
-        if sym not in deduped:
-            deduped.append(sym)
-
-    results = []
-    for sym in deduped[:8]:
-        qd = _latest_quote_for_symbol(sym)
-        if qd.get("price", 0) > 0 or sym == query:
-            results.append(qd)
-
-    return {"ok": True, "query": q, "results": results}
-
-@app.get("/stock-preview/{symbol}")
-def stock_preview(symbol: str):
-    return {"ok": True, "stock": _latest_quote_for_symbol(symbol)}
-
