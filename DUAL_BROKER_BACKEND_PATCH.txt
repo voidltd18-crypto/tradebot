@@ -1,0 +1,13 @@
+Add near the top of backend/main.py after imports/load_dotenv:
+
+BOT_ID = os.getenv("BOT_ID", os.getenv("BROKER", "alpaca")).lower().strip()
+STATE_DIR = os.getenv("STATE_DIR", os.path.join("backend", "state", BOT_ID))
+LOG_DIR = os.getenv("LOG_DIR", os.path.join("backend", "logs", BOT_ID))
+os.makedirs(STATE_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+Then make state files broker-specific:
+manual_universe_picks.json -> os.path.join(STATE_DIR, "manual_universe_picks.json")
+loser_cooldown.json       -> os.path.join(STATE_DIR, "loser_cooldown.json")
+bot_control.json          -> os.path.join(STATE_DIR, "bot_control.json")
+equity_baseline.json      -> os.path.join(STATE_DIR, "equity_baseline.json")

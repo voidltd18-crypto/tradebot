@@ -1,3 +1,9 @@
+BOT_ID = os.getenv("BOT_ID", os.getenv("BROKER", "alpaca")).lower().strip()
+STATE_DIR = os.getenv("STATE_DIR", os.path.join("backend", "state", BOT_ID))
+LOG_DIR = os.getenv("LOG_DIR", os.path.join("backend", "logs", BOT_ID))
+os.makedirs(STATE_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
 
 import os
 import sqlite3
@@ -3337,7 +3343,7 @@ def version():
     return BOT_VERSION_NOTES
 
 # ---------- baseline reporting ----------
-BASELINE_FILE = os.path.join("backend", "state", "equity_baseline.json")
+BASELINE_FILE = os.path.join(STATE_DIR, "equity_baseline.json")
 
 def _safe_num(v, default=0.0):
     try:
@@ -3428,7 +3434,7 @@ def reports():
     }
 
 # ---------- manual universe pins ----------
-MANUAL_UNIVERSE_FILE = os.path.join("backend", "state", "manual_universe_picks.json")
+MANUAL_UNIVERSE_FILE = os.path.join(STATE_DIR, "manual_universe_picks.json")
 
 def load_manual_universe_picks() -> List[str]:
     try:
@@ -3655,7 +3661,7 @@ STRICT_TRAIL_START_PCT = float(os.getenv("STRICT_TRAIL_START_PCT", "1.00"))
 STRICT_TRAIL_DROP_PCT = float(os.getenv("STRICT_TRAIL_DROP_PCT", "0.45"))
 STRICT_MAX_POSITIONS = int(os.getenv("STRICT_MAX_POSITIONS", "6"))
 LOSER_COOLDOWN_DAYS = int(os.getenv("LOSER_COOLDOWN_DAYS", "3"))
-LOSER_COOLDOWN_FILE = os.path.join("backend", "state", "loser_cooldown.json")
+LOSER_COOLDOWN_FILE = os.path.join(STATE_DIR, "loser_cooldown.json")
 
 def _load_loser_cooldown() -> Dict[str, Any]:
     try:
@@ -3896,167 +3902,4 @@ def api_apply_quality_universe(request: Request):
         "message": "Quality-only universe applied",
         "activeSymbols": symbols,
         "blockedWeakTickers": sorted(list(BLOCKED_WEAK_TICKERS)),
-    }
-
-
-
-
-# =========================
-# IBKR BROKER SUPPORT v1.4
-# =========================
-
-BROKER = os.getenv("BROKER", "alpaca").lower().strip()
-
-IBKR_HOST = os.getenv("IBKR_HOST", "127.0.0.1")
-IBKR_PORT = int(os.getenv("IBKR_PORT", "7497"))
-IBKR_CLIENT_ID = int(os.getenv("IBKR_CLIENT_ID", "1"))
-IBKR_ACCOUNT = os.getenv("IBKR_ACCOUNT", "")
-
-ibkr_ib = None
-
-def ibkr_enabled() -> bool:
-    return BROKER == "ibkr"
-
-def ibkr_connect():
-    global ibkr_ib
-
-    if not ibkr_enabled():
-        return None
-
-    try:
-        from ib_insync import IB
-
-        if ibkr_ib and ibkr_ib.isConnected():
-            return ibkr_ib
-
-        ibkr_ib = IB()
-        ibkr_ib.connect(
-            IBKR_HOST,
-            IBKR_PORT,
-            clientId=IBKR_CLIENT_ID,
-            readonly=False,
-        )
-
-        print(f"IBKR CONNECTED | host={IBKR_HOST} port={IBKR_PORT}")
-        return ibkr_ib
-
-    except Exception as e:
-        print(f"IBKR CONNECT ERROR: {e}")
-        return None
-
-def ibkr_account_summary():
-    try:
-        ib = ibkr_connect()
-        if not ib:
-            return None
-
-        values = ib.accountSummary()
-        data = {}
-
-        for row in values:
-            try:
-                data[row.tag] = row.value
-            except Exception:
-                pass
-
-        return data
-
-    except Exception as e:
-        print(f"IBKR ACCOUNT SUMMARY ERROR: {e}")
-        return None
-
-def ibkr_positions():
-    try:
-        ib = ibkr_connect()
-        if not ib:
-            return []
-
-        rows = []
-        for p in ib.positions():
-            try:
-                rows.append({
-                    "symbol": p.contract.symbol,
-                    "qty": float(p.position),
-                    "marketValue": float(getattr(p, "marketValue", 0) or 0),
-                    "avgEntryPrice": float(p.avgCost or 0),
-                })
-            except Exception:
-                pass
-
-        return rows
-
-    except Exception as e:
-        print(f"IBKR POSITIONS ERROR: {e}")
-        return []
-
-def ibkr_place_market_buy(symbol: str, qty: float):
-    try:
-        from ib_insync import Stock, MarketOrder
-
-        ib = ibkr_connect()
-        if not ib:
-            return {"ok": False, "error": "IBKR not connected"}
-
-        contract = Stock(symbol.upper(), "SMART", "USD")
-        order = MarketOrder("BUY", float(qty))
-
-        trade = ib.placeOrder(contract, order)
-
-        return {
-            "ok": True,
-            "symbol": symbol.upper(),
-            "side": "BUY",
-            "qty": qty,
-            "status": str(getattr(trade.orderStatus, "status", "submitted")),
-        }
-
-    except Exception as e:
-        print(f"IBKR BUY ERROR {symbol}: {e}")
-        return {"ok": False, "error": str(e)}
-
-def ibkr_place_market_sell(symbol: str, qty: float):
-    try:
-        from ib_insync import Stock, MarketOrder
-
-        ib = ibkr_connect()
-        if not ib:
-            return {"ok": False, "error": "IBKR not connected"}
-
-        contract = Stock(symbol.upper(), "SMART", "USD")
-        order = MarketOrder("SELL", float(qty))
-
-        trade = ib.placeOrder(contract, order)
-
-        return {
-            "ok": True,
-            "symbol": symbol.upper(),
-            "side": "SELL",
-            "qty": qty,
-            "status": str(getattr(trade.orderStatus, "status", "submitted")),
-        }
-
-    except Exception as e:
-        print(f"IBKR SELL ERROR {symbol}: {e}")
-        return {"ok": False, "error": str(e)}
-
-@app.get("/broker-status")
-def broker_status():
-    connected = False
-
-    if ibkr_enabled():
-        try:
-            ib = ibkr_connect()
-            connected = bool(ib and ib.isConnected())
-        except Exception:
-            connected = False
-
-    return {
-        "ok": True,
-        "broker": BROKER,
-        "ibkrEnabled": ibkr_enabled(),
-        "ibkrConnected": connected,
-        "host": IBKR_HOST,
-        "port": IBKR_PORT,
-        "clientId": IBKR_CLIENT_ID,
-        "account": IBKR_ACCOUNT,
     }
