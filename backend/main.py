@@ -1,3 +1,4 @@
+import os
 BOT_ID = os.getenv("BOT_ID", os.getenv("BROKER", "alpaca")).lower().strip()
 STATE_DIR = os.getenv("STATE_DIR", os.path.join("backend", "state", BOT_ID))
 LOG_DIR = os.getenv("LOG_DIR", os.path.join("backend", "logs", BOT_ID))
