@@ -1,13 +1,15 @@
-Restore Search Preview + Pinned Universe
+Force Quality Universe UI Fix
 
 Replace:
 backend/main.py
 
-This restores:
-- /search-stocks
-- /stock-preview/{symbol}
-- pinned manual Add to Universe
-- /manual-universe
+Fixes stale Weekly Auto Universe panel by forcing these endpoints to return the quality-only list:
+- GET /weekly-universe
+- POST /refresh-universe
+- GET /refresh-universe-preview
 
-Redeploy Render after replacing backend/main.py.
-No Vercel redeploy required unless you change UI files.
+After Render deploy:
+1. Open /weekly-universe
+2. Open /refresh-universe-preview
+3. Click Weekly Stock Refresh
+4. Click Refresh Data / hard refresh browser
