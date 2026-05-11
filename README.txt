@@ -1,11 +1,14 @@
-Frontend Weekly Universe Direct Fix
+Quality Build Weekly Final Fix
 
 Replace:
-frontend/src/App.tsx
+backend/main.py
 
-What this fixes:
-- Weekly Auto Universe panel now reads directly from /weekly-universe
-- It no longer depends only on stale /status.autoUniverse
-- Weekly Stock Refresh button immediately refetches /weekly-universe after refresh
+Fix:
+- build_weekly_universe() no longer uses stock-memory scoring.
+- Weekly refresh now forces quality-only list:
+  NVDA, AMD, MSFT, AAPL, META, AMZN, GOOGL, GOOG, AVGO, NFLX, TSLA, PLTR, UBER, QQQ, SMH
 
-Redeploy Vercel after replacing App.tsx.
+After deploy:
+1. Open /weekly-universe
+2. Click Weekly Stock Refresh
+3. Check /status autoUniverse only shows quality names.
