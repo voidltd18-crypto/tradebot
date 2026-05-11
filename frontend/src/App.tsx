@@ -23,6 +23,7 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
   const [data, setData] = useState<AnyObj>({});
   const [reports, setReports] = useState<AnyObj>({});
+  const [weeklyUniverse, setWeeklyUniverse] = useState<AnyObj | null>(null);
   const [status, setStatus] = useState("Connecting...");
   const [message, setMessage] = useState("Ready.");
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("dashboard_api_key") || "");
@@ -39,12 +40,14 @@ export default function App() {
   const logs = Array.isArray(data?.logs) ? data.logs : [];
   const closedTrades = Array.isArray(reports?.closedTrades) ? reports.closedTrades : [];
   const equityHistory = Array.isArray(reports?.equityHistory) ? reports.equityHistory : (Array.isArray(data?.tradeTimeline) ? data.tradeTimeline : []);
+  const autoUniverse = weeklyUniverse || data?.autoUniverse || {};
 
   async function fetchData() {
     try {
-      const [statusRes, reportRes] = await Promise.allSettled([
+      const [statusRes, reportRes, weeklyRes] = await Promise.allSettled([
         fetch(`${API_URL}/status`).then(r => r.json()),
         fetch(`${API_URL}/reports`).then(r => r.json()),
+        fetch(`${API_URL}/weekly-universe`).then(r => r.json()),
       ]);
 
       if (statusRes.status === "fulfilled") {

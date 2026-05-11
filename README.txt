@@ -1,15 +1,11 @@
-Force Quality Universe UI Fix
+Frontend Weekly Universe Direct Fix
 
 Replace:
-backend/main.py
+frontend/src/App.tsx
 
-Fixes stale Weekly Auto Universe panel by forcing these endpoints to return the quality-only list:
-- GET /weekly-universe
-- POST /refresh-universe
-- GET /refresh-universe-preview
+What this fixes:
+- Weekly Auto Universe panel now reads directly from /weekly-universe
+- It no longer depends only on stale /status.autoUniverse
+- Weekly Stock Refresh button immediately refetches /weekly-universe after refresh
 
-After Render deploy:
-1. Open /weekly-universe
-2. Open /refresh-universe-preview
-3. Click Weekly Stock Refresh
-4. Click Refresh Data / hard refresh browser
+Redeploy Vercel after replacing App.tsx.
