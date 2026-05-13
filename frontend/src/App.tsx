@@ -23,7 +23,7 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
   const [data, setData] = useState<AnyObj>({});
   const [reports, setReports] = useState<AnyObj>({});
-  const [weeklyUniverse, setWeeklyUniverse] = useState<AnyObj | null>(null);
+  const [banking, setBanking] = useState<AnyObj>({});
   const [status, setStatus] = useState("Connecting...");
   const [message, setMessage] = useState("Ready.");
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("dashboard_api_key") || "");
@@ -40,14 +40,18 @@ export default function App() {
   const logs = Array.isArray(data?.logs) ? data.logs : [];
   const closedTrades = Array.isArray(reports?.closedTrades) ? reports.closedTrades : [];
   const equityHistory = Array.isArray(reports?.equityHistory) ? reports.equityHistory : (Array.isArray(data?.tradeTimeline) ? data.tradeTimeline : []);
-  const autoUniverse = weeklyUniverse || data?.autoUniverse || {};
+  const bankingEnabled = Boolean(banking?.enabled || data?.banking?.enabled);
+  const bankingCap = Number(banking?.maxTradingCapital ?? data?.banking?.maxTradingCapital ?? 0);
+  const bankingEquity = Number(banking?.accountEquity ?? data?.banking?.accountEquity ?? data?.account?.equity ?? 0);
+  const bankingEffective = Number(banking?.effectiveTradingEquity ?? data?.banking?.effectiveTradingEquity ?? 0);
+  const bankingBuffer = Number(banking?.bankedProfitCashBuffer ?? data?.banking?.bankedProfitCashBuffer ?? 0);
 
   async function fetchData() {
     try {
-      const [statusRes, reportRes, weeklyRes] = await Promise.allSettled([
+      const [statusRes, reportRes, bankingRes] = await Promise.allSettled([
         fetch(`${API_URL}/status`).then(r => r.json()),
         fetch(`${API_URL}/reports`).then(r => r.json()),
-        fetch(`${API_URL}/weekly-universe`).then(r => r.json()),
+        fetch(`${API_URL}/banking-status`).then(r => r.json()),
       ]);
 
       if (statusRes.status === "fulfilled") {
@@ -61,6 +65,10 @@ export default function App() {
 
       if (reportRes.status === "fulfilled" && reportRes.value) {
         setReports(prev => ({ ...prev, ...reportRes.value }));
+      }
+
+      if (bankingRes?.status === "fulfilled" && bankingRes.value) {
+        setBanking(bankingRes.value || {});
       }
 
       setStatus("Connected");
@@ -188,6 +196,16 @@ export default function App() {
         <div><span>Weekly universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
         <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
       </div></Card>
+
+      <Card title="Profit Banking">
+        <div className="summary">
+          <div><span>Status</span><b className={bankingEnabled ? "gain" : ""}>{bankingEnabled ? "ON" : "OFF"}</b></div>
+          <div><span>Trading cap</span><b>{usd(bankingCap)} · {gbp(bankingCap * rate)}</b></div>
+          <div><span>Used for sizing</span><b>{usd(bankingEffective)} · {gbp(bankingEffective * rate)}</b></div>
+          <div><span>Banked buffer</span><b className="gain">{usd(bankingBuffer)} · {gbp(bankingBuffer * rate)}</b></div>
+        </div>
+        <p className="muted">Profits above the cap stay as cash buffer instead of increasing future trade size.</p>
+      </Card>
       <Card title="Weekly Auto Universe" wide>
         <p className="muted">Use the button to rebuild the stock list immediately. Manual picks stay pinned.</p>
         <div className="universe-counts">
