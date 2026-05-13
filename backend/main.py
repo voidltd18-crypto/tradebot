@@ -1,4 +1,3 @@
-import os
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "260") or 260)
 
 import os
@@ -2918,6 +2917,29 @@ def auto_universe_payload():
     }
 
 
+
+
+# ============================================================
+# SECURITY: API KEY PROTECTION
+# ============================================================
+
+API_ACCESS_KEY = os.getenv("API_ACCESS_KEY", os.getenv("ADMIN_PASSWORD", ""))
+
+def require_access_key(request: Request):
+    if not API_ACCESS_KEY:
+        raise HTTPException(status_code=503, detail="API access key not configured")
+
+    supplied = (
+        request.headers.get("X-API-Key")
+        or request.query_params.get("api_key")
+        or ""
+    )
+
+    if supplied != API_ACCESS_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    return True
+
 @app.get("/weekly-universe")
 def weekly_universe_public():
     return auto_universe_payload()
@@ -3127,6 +3149,7 @@ def get_status():
 
 @app.post("/pause")
 def pause_bot(request: Request):
+    require_access_key(request)
     verify_api_key(request)
     global bot_enabled
     bot_enabled = False
@@ -3136,6 +3159,7 @@ def pause_bot(request: Request):
 
 @app.post("/resume")
 def resume_bot(request: Request):
+    require_access_key(request)
     verify_api_key(request)
     global bot_enabled, emergency_stop
     bot_enabled = True
@@ -3164,6 +3188,7 @@ def manual_override_off(request: Request):
 
 @app.post("/manual-buy")
 def manual_buy(request: Request):
+    require_access_key(request)
     verify_api_key(request)
     with bot_lock:
         if not trading_client.get_clock().is_open:
@@ -3184,6 +3209,7 @@ def custom_buy(symbol: str, request: Request):
 
 @app.post("/manual-sell")
 def manual_sell(request: Request):
+    require_access_key(request)
     verify_api_key(request)
     with bot_lock:
         result = close_worst_or_largest_position(reason="MANUAL SELL")
@@ -3193,6 +3219,7 @@ def manual_sell(request: Request):
 
 @app.post("/sell/{symbol}")
 def sell_symbol(symbol: str, request: Request):
+    require_access_key(request)
     verify_api_key(request)
     with bot_lock:
         result = close_position_by_symbol(symbol.upper(), reason="MANUAL SYMBOL SELL")
@@ -3236,6 +3263,7 @@ def backfill_trades_limited(request: Request):
 
 @app.post("/refresh-universe")
 def refresh_universe(request: Request):
+    require_access_key(request)
     verify_api_key(request)
     with bot_lock:
         result = build_weekly_universe(force=True)
@@ -3245,6 +3273,7 @@ def refresh_universe(request: Request):
 
 @app.post("/backfill-trades")
 def backfill_trades(request: Request):
+    require_access_key(request)
     verify_api_key(request)
     with bot_lock:
         result = backfill_trades_from_alpaca_full()
@@ -3504,6 +3533,7 @@ def api_manual_universe():
 
 @app.post("/add-to-universe/{symbol}")
 def add_to_universe(symbol: str, request: Request):
+    require_access_key(request)
     verify_api_key(request)
     sym = symbol.upper().strip()
     try:
@@ -4069,51 +4099,8 @@ def banking_payload():
 def api_banking_status():
     return banking_payload()
 
-@app.get("/debug/positions")
-def debug_positions():
-    try:
-        positions = trading_client.get_all_positions()
 
-        rows = []
-        total_market_value = 0.0
-
-        for p in positions:
-            try:
-                mv = float(getattr(p, "market_value", 0) or 0)
-            except Exception:
-                mv = 0.0
-
-            total_market_value += mv
-
-            rows.append({
-                "symbol": str(getattr(p, "symbol", "")),
-                "qty": str(getattr(p, "qty", "")),
-                "avg_entry_price": str(getattr(p, "avg_entry_price", "")),
-                "current_price": str(getattr(p, "current_price", "")),
-                "market_value": str(getattr(p, "market_value", "")),
-                "unrealized_pl": str(getattr(p, "unrealized_pl", "")),
-                "unrealized_plpc": str(getattr(p, "unrealized_plpc", "")),
-                "side": str(getattr(p, "side", "")),
-            })
-
-        try:
-            account = get_account()
-            account_payload = {
-                "equity": str(getattr(account, "equity", "")),
-                "cash": str(getattr(account, "cash", "")),
-                "buying_power": str(getattr(account, "buying_power", "")),
-                "portfolio_value": str(getattr(account, "portfolio_value", "")),
-            }
-        except Exception as e:
-            account_payload = {"error": str(e)}
-
-        return {
-            "ok": True,
-            "count": len(rows),
-            "totalMarketValue": total_market_value,
-            "account": account_payload,
-            "positions": rows,
-        }
-
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+@app.get("/auth-check")
+def auth_check(request: Request):
+    require_access_key(request)
+    return {"ok": True, "authenticated": True}
