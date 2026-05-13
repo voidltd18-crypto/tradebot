@@ -1,4 +1,8 @@
 
+# Profit banking / fixed trading capital
+MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "0") or 0)
+
+
 import os
 import sqlite3
 import json
@@ -2932,6 +2936,21 @@ def update_equity_curve(account):
         equity_curve.pop(0)
 
 
+
+
+def effective_trading_equity(account_equity: float) -> float:
+    try:
+        equity = float(account_equity or 0)
+    except Exception:
+        equity = 0.0
+    try:
+        cap = float(MAX_TRADING_CAPITAL or 0)
+    except Exception:
+        cap = 0.0
+    if cap > 0:
+        return max(0.0, min(equity, cap))
+    return max(0.0, equity)
+
 def build_status_payload(bot_name, scans):
     account = get_account()
     update_equity_curve(account)
@@ -4021,3 +4040,33 @@ def refresh_universe_final(request: Request):
         "autoUniverse": payload,
         "activeSymbols": payload["activeSymbols"],
     }
+
+
+
+# ============================================================
+# PROFIT BANKING FINAL OVERRIDE
+# ============================================================
+
+def banking_payload():
+    try:
+        account = get_account()
+        equity = float(account.equity)
+    except Exception:
+        equity = 0.0
+
+    cap = float(MAX_TRADING_CAPITAL or 0)
+    effective = effective_trading_equity(equity)
+    banked = max(0.0, equity - effective) if cap > 0 else 0.0
+
+    return {
+        "enabled": cap > 0,
+        "maxTradingCapital": cap,
+        "accountEquity": equity,
+        "effectiveTradingEquity": effective,
+        "bankedProfitCashBuffer": banked,
+        "message": "Profit banking active" if cap > 0 else "Profit banking disabled",
+    }
+
+@app.get("/banking-status")
+def api_banking_status():
+    return {"ok": True, **banking_payload()}
