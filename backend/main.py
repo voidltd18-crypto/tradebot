@@ -1,4 +1,4 @@
-
+import os
 # Profit banking / fixed trading capital
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "0") or 0)
 
