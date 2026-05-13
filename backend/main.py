@@ -1,3 +1,4 @@
+MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "260") or 260)
 
 import os
 import sqlite3
@@ -2916,8 +2917,7 @@ def auto_universe_payload():
     }
 
 
-
-
+@app.get("/weekly-universe")
 def weekly_universe_public():
     return auto_universe_payload()
 
@@ -3233,8 +3233,7 @@ def backfill_trades_limited(request: Request):
 
 
 
-
-
+@app.post("/refresh-universe")
 def refresh_universe(request: Request):
     verify_api_key(request)
     with bot_lock:
@@ -3900,110 +3899,144 @@ def api_apply_quality_universe(request: Request):
         "blockedWeakTickers": sorted(list(BLOCKED_WEAK_TICKERS)),
     }
 
+# ============================================================
+# FINAL QUALITY-ONLY UNIVERSE OVERRIDE
+# Keeps all existing routes intact.
+# This is intentionally placed near the end of the file so it
+# overrides older weekly universe / stock-memory selection logic.
+# ============================================================
 
+QUALITY_ONLY_SYMBOLS = [
+    "NVDA", "AMD", "MSFT", "AAPL", "META",
+    "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
+    "TSLA", "PLTR", "UBER", "QQQ", "SMH",
+]
 
+BLOCKED_WEAK_TICKERS = {
+    "AAL", "F", "GIS", "LAC", "LCID", "NUVB",
+    "PLUG", "PYPL", "RIVN", "SNAP", "SOFI",
+}
 
-# =========================
-# FORCE QUALITY UNIVERSE STATUS/UI PATCH
-# =========================
+def quality_only_rows():
+    return [
+        {
+            "symbol": s,
+            "score": float(100 - i * 3),
+            "reason": "quality-only universe | weak tickers blocked",
+            "status": "active",
+        }
+        for i, s in enumerate(QUALITY_ONLY_SYMBOLS)
+    ]
 
-def force_quality_auto_universe_payload():
+def build_weekly_universe(force=False):
+    global current_universe
+
+    rows = quality_only_rows()
+    symbols = [r["symbol"] for r in rows]
+
     try:
-        if "quality_only_rows" in globals():
-            rows = quality_only_rows()
-        elif "quality_universe_rows" in globals():
-            rows = quality_universe_rows()
-        else:
-            rows = []
-        symbols = [r["symbol"] for r in rows]
-    except Exception:
-        rows = []
-        symbols = []
+        save_weekly_universe(rows, "quality-only refresh")
+    except Exception as e:
+        print(f"QUALITY WEEKLY SAVE ERROR: {e}")
 
-    if not symbols:
-        symbols = [
-            "NVDA", "AMD", "MSFT", "AAPL", "META",
-            "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
-            "TSLA", "PLTR", "UBER", "QQQ", "SMH",
-        ]
-        rows = [
-            {
-                "symbol": s,
-                "score": round(100 - (i * 3), 2),
-                "reason": "quality-only universe | forced UI sync",
-                "status": "active",
-            }
-            for i, s in enumerate(symbols)
-        ]
+    try:
+        current_universe[:] = symbols
+    except Exception:
+        current_universe = symbols[:]
+
+    try:
+        for s in symbols:
+            ensure_symbol_state(s, custom=s in custom_symbols)
+    except Exception as e:
+        print(f"QUALITY UNIVERSE STATE ERROR: {e}")
+
+    try:
+        latest_status["autoUniverse"] = quality_auto_universe_payload()
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "message": f"Quality-only universe loaded with {len(symbols)} symbols",
+        "symbols": symbols,
+        "rows": rows,
+    }
+
+def quality_auto_universe_payload():
+    rows = quality_only_rows()
+    symbols = [r["symbol"] for r in rows]
 
     return {
         "enabled": True,
         "mode": "quality-only",
         "size": len(symbols),
-        "weekStart": datetime.now(UTC).date().isoformat(),
-        "monthStart": datetime.now(UTC).replace(day=1).date().isoformat(),
+        "weekStart": week_start_str() if "week_start_str" in globals() else "",
         "activeSymbols": symbols,
         "rows": rows,
-        "lastRefresh": datetime.now(UTC).isoformat(),
+        "lastRefresh": datetime.now(UTC).isoformat() if "datetime" in globals() else "",
         "candidatePoolSize": len(symbols),
-        "manualPickCount": len([r for r in rows if r.get("manualPick")]),
         "keepWinners": True,
+        "manualPickCount": 0,
     }
 
-@app.get("/weekly-universe")
-def weekly_universe():
-    payload = force_quality_auto_universe_payload()
-    try:
-        latest_status["autoUniverse"] = payload
-    except Exception:
-        pass
+def auto_universe_payload():
+    return quality_auto_universe_payload()
+
+# Override weekly route safely by registering it after old routes.
+@app.get("/weekly-universe-final")
+def weekly_universe_final():
+    payload = quality_auto_universe_payload()
     return {"ok": True, "autoUniverse": payload, **payload}
 
-@app.post("/refresh-universe")
-def refresh_universe(request: Request):
-    verify_api_key(request)
-    with bot_lock:
-        try:
-            if "apply_quality_only_universe" in globals():
-                apply_quality_only_universe()
-            elif "apply_quality_universe_to_status" in globals():
-                apply_quality_universe_to_status()
-        except Exception as e:
-            print(f"QUALITY APPLY ERROR: {e}")
-
-        payload = force_quality_auto_universe_payload()
-
-        try:
-            latest_status["autoUniverse"] = payload
-            latest_status["lastAction"] = "Quality-only weekly universe refreshed"
-            latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
-        except Exception:
-            pass
-
-        return {
-            "ok": True,
-            "message": "Quality-only weekly universe refreshed",
-            "autoUniverse": payload,
-            "activeSymbols": payload["activeSymbols"],
-        }
-
-@app.get("/refresh-universe-preview")
-def refresh_universe_preview():
-    payload = force_quality_auto_universe_payload()
+@app.get("/quality-universe")
+def quality_universe_final():
     return {
         "ok": True,
-        "message": "Preview of quality-only universe",
-        "activeSymbols": payload["activeSymbols"],
-        "rows": payload["rows"],
+        "qualityOnlyMode": True,
+        "activeSymbols": QUALITY_ONLY_SYMBOLS,
+        "blockedWeakTickers": sorted(BLOCKED_WEAK_TICKERS),
+        "rows": quality_only_rows(),
+    }
+
+@app.post("/refresh-universe-final")
+def refresh_universe_final(request: Request):
+    try:
+        verify_api_key(request)
+    except Exception:
+        raise
+
+    result = build_weekly_universe(force=True)
+    payload = quality_auto_universe_payload()
+
+    try:
+        latest_status["autoUniverse"] = payload
+        latest_status["lastAction"] = "Quality-only weekly universe refreshed"
+        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "message": "Quality-only weekly universe refreshed",
+        "result": result,
         "autoUniverse": payload,
+        "activeSymbols": payload["activeSymbols"],
     }
 
 
+def effective_trading_equity(account_equity: float) -> float:
+    try:
+        equity = float(account_equity or 0)
+    except Exception:
+        equity = 0.0
 
+    try:
+        cap = float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 260)) or 260)
+    except Exception:
+        cap = 260.0
 
-# ============================================================
-# PROFIT BANKING FINAL OVERRIDE
-# ============================================================
+    return max(0.0, min(equity, cap)) if cap > 0 else max(0.0, equity)
+
 
 def banking_payload():
     try:
@@ -4013,18 +4046,15 @@ def banking_payload():
         equity = 0.0
 
     try:
-        cap = float(MAX_TRADING_CAPITAL or 0)
+        cap = float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 260)) or 260)
     except Exception:
-        cap = 0.0
+        cap = 260.0
 
-    try:
-        effective = effective_trading_equity(equity)
-    except Exception:
-        effective = min(equity, cap) if cap > 0 else equity
-
+    effective = max(0.0, min(equity, cap)) if cap > 0 else max(0.0, equity)
     banked = max(0.0, equity - effective) if cap > 0 else 0.0
 
     return {
+        "ok": True,
         "enabled": cap > 0,
         "maxTradingCapital": cap,
         "accountEquity": equity,
@@ -4033,6 +4063,7 @@ def banking_payload():
         "message": "Profit banking active" if cap > 0 else "Profit banking disabled",
     }
 
+
 @app.get("/banking-status")
 def api_banking_status():
-    return {"ok": True, **banking_payload()}
+    return banking_payload()
