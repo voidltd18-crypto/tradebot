@@ -1,4 +1,3 @@
-import os
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "260") or 260)
 
 import os
@@ -4068,3 +4067,52 @@ def banking_payload():
 @app.get("/banking-status")
 def api_banking_status():
     return banking_payload()
+
+@app.get("/debug/positions")
+def debug_positions():
+    try:
+        positions = trading_client.get_all_positions()
+
+        rows = []
+        total_market_value = 0.0
+
+        for p in positions:
+            try:
+                mv = float(getattr(p, "market_value", 0) or 0)
+            except Exception:
+                mv = 0.0
+
+            total_market_value += mv
+
+            rows.append({
+                "symbol": str(getattr(p, "symbol", "")),
+                "qty": str(getattr(p, "qty", "")),
+                "avg_entry_price": str(getattr(p, "avg_entry_price", "")),
+                "current_price": str(getattr(p, "current_price", "")),
+                "market_value": str(getattr(p, "market_value", "")),
+                "unrealized_pl": str(getattr(p, "unrealized_pl", "")),
+                "unrealized_plpc": str(getattr(p, "unrealized_plpc", "")),
+                "side": str(getattr(p, "side", "")),
+            })
+
+        try:
+            account = get_account()
+            account_payload = {
+                "equity": str(getattr(account, "equity", "")),
+                "cash": str(getattr(account, "cash", "")),
+                "buying_power": str(getattr(account, "buying_power", "")),
+                "portfolio_value": str(getattr(account, "portfolio_value", "")),
+            }
+        except Exception as e:
+            account_payload = {"error": str(e)}
+
+        return {
+            "ok": True,
+            "count": len(rows),
+            "totalMarketValue": total_market_value,
+            "account": account_payload,
+            "positions": rows,
+        }
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
