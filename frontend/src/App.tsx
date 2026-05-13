@@ -23,7 +23,11 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
   const [data, setData] = useState<AnyObj>({});
   const [reports, setReports] = useState<AnyObj>({});
-  const [banking, setBanking] = useState<AnyObj>({});
+  
+  const [accessKey, setAccessKey] = useState<string>(() => localStorage.getItem("tradebot_access_key") || "");
+  const [loginKey, setLoginKey] = useState<string>("");
+  const [authError, setAuthError] = useState<string>("");
+const [banking, setBanking] = useState<AnyObj>({});
   const [status, setStatus] = useState("Connecting...");
   const [message, setMessage] = useState("Ready.");
   const [apiKey, setApiKey] = useState(() => localStorage.getItem("dashboard_api_key") || "");
@@ -46,7 +50,29 @@ export default function App() {
   const bankingEffective = Number(banking?.effectiveTradingEquity ?? data?.banking?.effectiveTradingEquity ?? 0);
   const bankingBuffer = Number(banking?.bankedProfitCashBuffer ?? data?.banking?.bankedProfitCashBuffer ?? 0);
 
-  async function fetchData() {
+  
+  const authHeaders = accessKey ? { "X-API-Key": accessKey } : {};
+
+  async function loginWithKey() {
+    try {
+      setAuthError("");
+      const key = loginKey.trim();
+      const res = await fetch(`${API_URL}/auth-check`, { headers: { "X-API-Key": key } });
+      if (!res.ok) throw new Error("Wrong access key");
+      localStorage.setItem("tradebot_access_key", key);
+      setAccessKey(key);
+      setLoginKey("");
+    } catch (e: any) {
+      setAuthError(e?.message || "Login failed");
+    }
+  }
+
+  function logout() {
+    localStorage.removeItem("tradebot_access_key");
+    setAccessKey("");
+  }
+
+async function fetchData() {
     try {
       const [statusRes, reportRes, bankingRes] = await Promise.allSettled([
         fetch(`${API_URL}/status`).then(r => r.json()),
@@ -81,7 +107,38 @@ export default function App() {
   useEffect(() => {
     fetchData();
     const i = setInterval(fetchData, 900000);
-    return () => clearInterval(i);
+    
+  if (!accessKey) {
+    return (
+      <div className="app">
+        <h1>TradeBot</h1>
+        <div className="card" style={{ maxWidth: 520, margin: "40px auto" }}>
+          <h2>Secure Login</h2>
+          <p className="muted">Enter your private access key to open the dashboard.</p>
+          <input
+            type="password"
+            value={loginKey}
+            onChange={(e) => setLoginKey(e.target.value)}
+            placeholder="Access key"
+            style={{
+              width: "100%",
+              padding: "16px",
+              borderRadius: "14px",
+              border: "1px solid #26324a",
+              background: "#070b18",
+              color: "white",
+              fontSize: "18px",
+              marginBottom: "14px",
+            }}
+          />
+          <button onClick={loginWithKey}>Unlock Dashboard</button>
+          {authError && <p className="loss">{authError}</p>}
+        </div>
+      </div>
+    );
+  }
+
+return () => clearInterval(i);
   }, []);
 
   function saveApiKey() {
@@ -183,6 +240,7 @@ export default function App() {
     {tab==="overview" && <main className="grid two">
       <Card title="Controls"><div className="actions">
         <button onClick={fetchData}>Refresh Data</button>
+        <button onClick={logout}>Logout</button>
         <button onClick={() => action("/manual-buy")}>Money Buy</button>
         <button className="danger" onClick={() => action("/manual-sell")}>Sell Worst</button>
         <button className="purple" onClick={() => action("/refresh-universe")}>↻ Weekly Stock Refresh</button>
