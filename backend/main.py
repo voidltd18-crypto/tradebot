@@ -1,4 +1,5 @@
-import os
+import hashlib
+import secrets
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "260") or 260)
 
 import os
@@ -12,7 +13,7 @@ from datetime import datetime, UTC, timedelta
 from typing import Dict, Any, List, Optional
 
 import requests
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 
 from alpaca.trading.client import TradingClient
@@ -2921,25 +2922,60 @@ def auto_universe_payload():
 
 
 # ============================================================
-# SECURITY: API KEY PROTECTION
+# SECURE LOGIN AUTH
 # ============================================================
 
-API_ACCESS_KEY = os.getenv("API_ACCESS_KEY", os.getenv("ADMIN_PASSWORD", ""))
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", os.getenv("API_ACCESS_KEY", ""))
+AUTH_SECRET = os.getenv("AUTH_SECRET", os.getenv("API_ACCESS_KEY", ADMIN_PASSWORD))
 
-def require_access_key(request: Request):
-    if not API_ACCESS_KEY:
-        raise HTTPException(status_code=503, detail="API access key not configured")
+def _make_auth_token(username: str) -> str:
+    raw = f"{username}:{AUTH_SECRET}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
 
-    supplied = (
-        request.headers.get("X-API-Key")
+def _get_auth_from_request(request: Request) -> str:
+    return (
+        request.headers.get("X-Auth-Token")
+        or request.headers.get("X-API-Key")
+        or request.query_params.get("token")
         or request.query_params.get("api_key")
         or ""
     )
 
-    if supplied != API_ACCESS_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+def require_login(request: Request):
+    if not ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="Admin password not configured")
 
-    return True
+    supplied = _get_auth_from_request(request)
+    expected = _make_auth_token(ADMIN_USERNAME)
+    api_key = os.getenv("API_ACCESS_KEY", "")
+
+    if supplied and (secrets.compare_digest(supplied, expected) or (api_key and secrets.compare_digest(supplied, api_key))):
+        return True
+
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+@app.post("/login")
+def login(payload: dict = Body(...)):
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+
+    if not ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="Admin password not configured")
+
+    if not secrets.compare_digest(username, ADMIN_USERNAME) or not secrets.compare_digest(password, ADMIN_PASSWORD):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    return {
+        "ok": True,
+        "token": _make_auth_token(username),
+        "username": username,
+    }
+
+@app.get("/auth-check")
+def auth_check(request: Request):
+    require_login(request)
+    return {"ok": True, "authenticated": True}
 
 @app.get("/weekly-universe")
 def weekly_universe_public():
@@ -3150,7 +3186,7 @@ def get_status():
 
 @app.post("/pause")
 def pause_bot(request: Request):
-    require_access_key(request)
+    require_login(request)
     verify_api_key(request)
     global bot_enabled
     bot_enabled = False
@@ -3160,7 +3196,7 @@ def pause_bot(request: Request):
 
 @app.post("/resume")
 def resume_bot(request: Request):
-    require_access_key(request)
+    require_login(request)
     verify_api_key(request)
     global bot_enabled, emergency_stop
     bot_enabled = True
@@ -3189,7 +3225,7 @@ def manual_override_off(request: Request):
 
 @app.post("/manual-buy")
 def manual_buy(request: Request):
-    require_access_key(request)
+    require_login(request)
     verify_api_key(request)
     with bot_lock:
         if not trading_client.get_clock().is_open:
@@ -3210,7 +3246,7 @@ def custom_buy(symbol: str, request: Request):
 
 @app.post("/manual-sell")
 def manual_sell(request: Request):
-    require_access_key(request)
+    require_login(request)
     verify_api_key(request)
     with bot_lock:
         result = close_worst_or_largest_position(reason="MANUAL SELL")
@@ -3220,7 +3256,6 @@ def manual_sell(request: Request):
 
 @app.post("/sell/{symbol}")
 def sell_symbol(symbol: str, request: Request):
-    require_access_key(request)
     verify_api_key(request)
     with bot_lock:
         result = close_position_by_symbol(symbol.upper(), reason="MANUAL SYMBOL SELL")
@@ -3254,6 +3289,7 @@ def rebuild_closed_trades(request: Request):
 
 @app.post("/backfill-trades-limited")
 def backfill_trades_limited(request: Request):
+    require_login(request)
     verify_api_key(request)
     with bot_lock:
         result = backfill_trades_from_alpaca()
@@ -3264,7 +3300,7 @@ def backfill_trades_limited(request: Request):
 
 @app.post("/refresh-universe")
 def refresh_universe(request: Request):
-    require_access_key(request)
+    require_login(request)
     verify_api_key(request)
     with bot_lock:
         result = build_weekly_universe(force=True)
@@ -3274,7 +3310,7 @@ def refresh_universe(request: Request):
 
 @app.post("/backfill-trades")
 def backfill_trades(request: Request):
-    require_access_key(request)
+    require_login(request)
     verify_api_key(request)
     with bot_lock:
         result = backfill_trades_from_alpaca_full()
@@ -3396,6 +3432,7 @@ def save_equity_baseline(value: float) -> None:
 
 @app.post("/reset-baseline")
 def reset_baseline(request: Request):
+    require_login(request)
     verify_api_key(request)
     try:
         equity = _safe_num(latest_status.get("account", {}).get("equity", 0))
@@ -3534,7 +3571,7 @@ def api_manual_universe():
 
 @app.post("/add-to-universe/{symbol}")
 def add_to_universe(symbol: str, request: Request):
-    require_access_key(request)
+    require_login(request)
     verify_api_key(request)
     sym = symbol.upper().strip()
     try:
@@ -3551,6 +3588,7 @@ def add_to_universe(symbol: str, request: Request):
 
 @app.post("/remove-from-universe/{symbol}")
 def api_remove_from_universe(symbol: str, request: Request):
+    require_login(request)
     verify_api_key(request)
     picks = remove_manual_universe_pick(symbol)
     try:
@@ -4032,6 +4070,7 @@ def quality_universe_final():
 
 @app.post("/refresh-universe-final")
 def refresh_universe_final(request: Request):
+    require_login(request)
     try:
         verify_api_key(request)
     except Exception:
@@ -4099,9 +4138,3 @@ def banking_payload():
 @app.get("/banking-status")
 def api_banking_status():
     return banking_payload()
-
-
-@app.get("/auth-check")
-def auth_check(request: Request):
-    require_access_key(request)
-    return {"ok": True, "authenticated": True}
