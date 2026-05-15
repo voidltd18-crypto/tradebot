@@ -1,3 +1,4 @@
+import os
 import hashlib
 import secrets
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "260") or 260)
