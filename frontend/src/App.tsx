@@ -24,8 +24,9 @@ export default function App() {
   const [data, setData] = useState<AnyObj>({});
   const [reports, setReports] = useState<AnyObj>({});
   
-  const [accessKey, setAccessKey] = useState<string>(() => localStorage.getItem("tradebot_access_key") || "");
-  const [loginKey, setLoginKey] = useState<string>("");
+  const [authToken, setAuthToken] = useState<string>(() => localStorage.getItem("tradebot_auth_token") || "");
+  const [secureUsername, setSecureUsername] = useState<string>("");
+  const [securePassword, setSecurePassword] = useState<string>("");
   const [authError, setAuthError] = useState<string>("");
 const [banking, setBanking] = useState<AnyObj>({});
   const [status, setStatus] = useState("Connecting...");
@@ -51,25 +52,29 @@ const [banking, setBanking] = useState<AnyObj>({});
   const bankingBuffer = Number(banking?.bankedProfitCashBuffer ?? data?.banking?.bankedProfitCashBuffer ?? 0);
 
   
-  const authHeaders = accessKey ? { "X-API-Key": accessKey } : {};
+  const secureHeaders = authToken ? { "X-Auth-Token": authToken } : {};
 
-  async function loginWithKey() {
+  async function secureLogin() {
     try {
       setAuthError("");
-      const key = loginKey.trim();
-      const res = await fetch(`${API_URL}/auth-check`, { headers: { "X-API-Key": key } });
-      if (!res.ok) throw new Error("Wrong access key");
-      localStorage.setItem("tradebot_access_key", key);
-      setAccessKey(key);
-      setLoginKey("");
+      const res = await fetch(`${API_URL}/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: secureUsername.trim(), password: securePassword }),
+      });
+      const json = await res.json();
+      if (!res.ok || !json?.token) throw new Error(json?.detail || "Login failed");
+      localStorage.setItem("tradebot_auth_token", json.token);
+      setAuthToken(json.token);
+      setSecurePassword("");
     } catch (e: any) {
       setAuthError(e?.message || "Login failed");
     }
   }
 
-  function logout() {
-    localStorage.removeItem("tradebot_access_key");
-    setAccessKey("");
+  function secureLogout() {
+    localStorage.removeItem("tradebot_auth_token");
+    setAuthToken("");
   }
 
 async function fetchData() {
@@ -108,30 +113,27 @@ async function fetchData() {
     fetchData();
     const i = setInterval(fetchData, 900000);
     
-  if (!accessKey) {
+  if (!authToken) {
     return (
       <div className="app">
-        <h1>TradeBot</h1>
+        <h1>TradeBot Secure Login</h1>
         <div className="card" style={{ maxWidth: 520, margin: "40px auto" }}>
-          <h2>Secure Login</h2>
-          <p className="muted">Enter your private access key to open the dashboard.</p>
+          <h2>Login</h2>
+          <p className="muted">Enter your admin username and password.</p>
+          <input
+            value={secureUsername}
+            onChange={(e) => setSecureUsername(e.target.value)}
+            placeholder="Username"
+            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
+          />
           <input
             type="password"
-            value={loginKey}
-            onChange={(e) => setLoginKey(e.target.value)}
-            placeholder="Access key"
-            style={{
-              width: "100%",
-              padding: "16px",
-              borderRadius: "14px",
-              border: "1px solid #26324a",
-              background: "#070b18",
-              color: "white",
-              fontSize: "18px",
-              marginBottom: "14px",
-            }}
+            value={securePassword}
+            onChange={(e) => setSecurePassword(e.target.value)}
+            placeholder="Password"
+            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
           />
-          <button onClick={loginWithKey}>Unlock Dashboard</button>
+          <button onClick={secureLogin}>Login</button>
           {authError && <p className="loss">{authError}</p>}
         </div>
       </div>
@@ -152,7 +154,7 @@ return () => clearInterval(i);
       return;
     }
     try {
-      const res = await fetch(`${API_URL}${endpoint}`, { method:"POST", headers:{ "x-api-key": apiKey.trim() }});
+      const res = await fetch(`${API_URL}${endpoint}`, { method:"POST", headers: secureHeaders });
       const json = await res.json();
       setMessage(json.message || json.detail || JSON.stringify(json));
       await fetchData();
@@ -240,7 +242,7 @@ return () => clearInterval(i);
     {tab==="overview" && <main className="grid two">
       <Card title="Controls"><div className="actions">
         <button onClick={fetchData}>Refresh Data</button>
-        <button onClick={logout}>Logout</button>
+        <button onClick={secureLogout}>Logout</button>
         <button onClick={() => action("/manual-buy")}>Money Buy</button>
         <button className="danger" onClick={() => action("/manual-sell")}>Sell Worst</button>
         <button className="purple" onClick={() => action("/refresh-universe")}>↻ Weekly Stock Refresh</button>
