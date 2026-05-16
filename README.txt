@@ -1,4 +1,4 @@
-Fixed Login Package
+Guaranteed Login Fix
 
 Replace:
 backend/main.py
@@ -6,12 +6,16 @@ frontend/src/App.tsx
 
 Render backend env vars:
 ADMIN_USERNAME=yourusername
-ADMIN_PASSWORD=your-strong-password
-AUTH_SECRET=another-long-random-secret
+ADMIN_PASSWORD=yourpassword
 
-Deploy Render and Vercel.
+Optional but recommended:
+DASHBOARD_API_KEY=yourpassword
 
-Open:
-https://tradebot-sand.vercel.app/?v=login-fixed
+Deploy:
+1. Render backend
+2. Vercel frontend
 
-The login block is outside useEffect and should show first.
+Open normal URL:
+https://tradebot-sand.vercel.app/
+
+No new URL is needed.

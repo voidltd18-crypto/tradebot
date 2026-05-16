@@ -23,15 +23,14 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
   const [data, setData] = useState<AnyObj>({});
   const [reports, setReports] = useState<AnyObj>({});
-  
+  const [banking, setBanking] = useState<AnyObj>({});
+  const [status, setStatus] = useState("Connecting...");
+  const [message, setMessage] = useState("Ready.");
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem("dashboard_api_key") || "");
   const [authToken, setAuthToken] = useState<string>(() => localStorage.getItem("tradebot_auth_token") || "");
   const [secureUsername, setSecureUsername] = useState<string>("");
   const [securePassword, setSecurePassword] = useState<string>("");
   const [authError, setAuthError] = useState<string>("");
-const [banking, setBanking] = useState<AnyObj>({});
-  const [status, setStatus] = useState("Connecting...");
-  const [message, setMessage] = useState("Ready.");
-  const [apiKey, setApiKey] = useState(() => localStorage.getItem("dashboard_api_key") || "");
   const [selectedSymbol, setSelectedSymbol] = useState("");
   const [chartCurrency, setChartCurrency] = useState<"GBP"|"USD">("GBP");
   const [stockQuery, setStockQuery] = useState("");
@@ -52,7 +51,7 @@ const [banking, setBanking] = useState<AnyObj>({});
   const bankingBuffer = Number(banking?.bankedProfitCashBuffer ?? data?.banking?.bankedProfitCashBuffer ?? 0);
 
   
-  const secureHeaders = authToken ? { "X-Auth-Token": authToken } : {};
+  const secureHeaders = authToken ? { "x-api-key": authToken } : {};
 
   async function secureLogin() {
     try {
@@ -65,8 +64,11 @@ const [banking, setBanking] = useState<AnyObj>({});
       const json = await res.json();
       if (!res.ok || !json?.token) throw new Error(json?.detail || "Login failed");
       localStorage.setItem("tradebot_auth_token", json.token);
+      localStorage.setItem("dashboard_api_key", json.token);
       setAuthToken(json.token);
+      setApiKey(json.token);
       setSecurePassword("");
+      setMessage("Logged in.");
     } catch (e: any) {
       setAuthError(e?.message || "Login failed");
     }
@@ -74,7 +76,9 @@ const [banking, setBanking] = useState<AnyObj>({});
 
   function secureLogout() {
     localStorage.removeItem("tradebot_auth_token");
+    localStorage.removeItem("dashboard_api_key");
     setAuthToken("");
+    setApiKey("");
   }
 
 async function fetchData() {
@@ -110,38 +114,11 @@ async function fetchData() {
   }
 
   useEffect(() => {
+    if (!authToken) return;
     fetchData();
     const i = setInterval(fetchData, 900000);
-    
-  if (!authToken) {
-    return (
-      <div className="app">
-        <h1>TradeBot Secure Login</h1>
-        <div className="card" style={{ maxWidth: 520, margin: "40px auto" }}>
-          <h2>Login</h2>
-          <p className="muted">Enter your admin username and password.</p>
-          <input
-            value={secureUsername}
-            onChange={(e) => setSecureUsername(e.target.value)}
-            placeholder="Username"
-            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
-          />
-          <input
-            type="password"
-            value={securePassword}
-            onChange={(e) => setSecurePassword(e.target.value)}
-            placeholder="Password"
-            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
-          />
-          <button onClick={secureLogin}>Login</button>
-          {authError && <p className="loss">{authError}</p>}
-        </div>
-      </div>
-    );
-  }
-
-return () => clearInterval(i);
-  }, []);
+    return () => clearInterval(i);
+  }, [authToken]);
 
   function saveApiKey() {
     localStorage.setItem("dashboard_api_key", apiKey);
@@ -149,8 +126,8 @@ return () => clearInterval(i);
   }
 
   async function action(endpoint:string) {
-    if (!apiKey.trim()) {
-      setMessage("Enter your dashboard password first.");
+    if (!authToken) {
+      setMessage("Please login first.");
       return;
     }
     try {
@@ -219,7 +196,37 @@ return () => clearInterval(i);
   const lost = Number(reports.lostSinceDeposit ?? 0);
   const tabs: Tab[] = ["overview","reports","positions","scanner","search","activity","admin"];
 
-  return <div className="app">
+  
+  if (!authToken) {
+    return (
+      <div className="app">
+        <header className="topbar">
+          <div><p className="eyebrow">Protected Dashboard</p><h1>TradeBot Secure Login</h1></div>
+        </header>
+        <section className="card" style={{ maxWidth: 520, margin: "40px auto" }}>
+          <h2>Login</h2>
+          <p className="muted">Enter your admin username and password.</p>
+          <input
+            value={secureUsername}
+            onChange={(e) => setSecureUsername(e.target.value)}
+            placeholder="Username"
+            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
+          />
+          <input
+            type="password"
+            value={securePassword}
+            onChange={(e) => setSecurePassword(e.target.value)}
+            placeholder="Password"
+            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
+          />
+          <button onClick={secureLogin}>Login</button>
+          {authError && <p className="loss">{authError}</p>}
+        </section>
+      </div>
+    );
+  }
+
+return <div className="app">
     <header className="topbar">
       <div><p className="eyebrow">Rebuilt Sniper Profit Bot</p><h1>TradeBot</h1></div>
       <div className="pills">
