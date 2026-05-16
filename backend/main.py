@@ -1088,8 +1088,14 @@ def calculate_new_position_notional():
     account = get_account()
     equity = float(account.equity)
     buying_power = float(account.buying_power)
-    target_value = equity * TARGET_POSITION_VALUE_PCT
-    max_value = equity * MAX_POSITION_VALUE_PCT
+
+    # Profit banking cap now controls sizing. If account equity grows above
+    # the saved cap, new trade sizes are calculated from the capped amount,
+    # not full account equity.
+    sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
+
+    target_value = sizing_equity * TARGET_POSITION_VALUE_PCT
+    max_value = sizing_equity * MAX_POSITION_VALUE_PCT
     usable_cash = max(0.0, buying_power - CASH_BUFFER)
     return round(max(0.0, min(target_value, max_value, usable_cash)), 2)
 
@@ -1101,10 +1107,11 @@ def confidence_notional(scan):
     confidence, label = calculate_confidence(scan)
     mult = HIGH_CONFIDENCE_SIZE_MULTIPLIER if label == "HIGH" else MEDIUM_CONFIDENCE_SIZE_MULTIPLIER if label == "MEDIUM" else LOW_CONFIDENCE_SIZE_MULTIPLIER
     try:
-        equity = float(get_account().equity)
+        account_equity = float(get_account().equity)
+        sizing_equity = effective_trading_equity(account_equity) if "effective_trading_equity" in globals() else account_equity
     except Exception:
-        equity = 0.0
-    cap = equity * MAX_CONFIDENCE_POSITION_VALUE_PCT if equity > 0 else base
+        sizing_equity = 0.0
+    cap = sizing_equity * MAX_CONFIDENCE_POSITION_VALUE_PCT if sizing_equity > 0 else base
     return round(max(0.0, min(base * mult, cap)), 2)
 
 
@@ -1528,9 +1535,6 @@ def money_mode_buy(scans, manual=False):
     blocked, reason = risk_blocked()
     if blocked:
         return f"BUY BLOCKED | {reason}"
-    regime_ok, regime_reason, regime = market_regime_allows_new_buys()
-    if not regime_ok:
-        return f"BUY BLOCKED | {regime_reason}"
     if allowed_new_position_count() <= 0:
         return f"BUY BLOCKED | max positions reached ({MAX_POSITIONS})"
     if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
@@ -1557,12 +1561,6 @@ def money_mode_buy(scans, manual=False):
             messages.append(f"SKIP {symbol} | {reason}")
             continue
         notional = confidence_notional(c)
-        try:
-            regime_multiplier = float((regime or {}).get("sizeMultiplier", 1.0) or 1.0)
-            if regime_multiplier > 0 and regime_multiplier < 1.0:
-                notional = round(notional * regime_multiplier, 2)
-        except Exception:
-            pass
         if notional < MIN_ORDER_NOTIONAL:
             messages.append(f"SKIP {symbol} | notional too small {notional:.2f}")
             continue
@@ -2663,110 +2661,6 @@ def optimiser_payload():
 
 
 # =========================
-# MARKET REGIME FILTER
-# =========================
-MARKET_REGIME_FILTER_ENABLED = os.getenv("MARKET_REGIME_FILTER_ENABLED", "true").lower() == "true"
-MARKET_REGIME_SYMBOLS = [s.strip().upper() for s in os.getenv("MARKET_REGIME_SYMBOLS", "QQQ,SPY").split(",") if s.strip()]
-MARKET_REGIME_DEFENSIVE_PCT = float(os.getenv("MARKET_REGIME_DEFENSIVE_PCT", "-0.35"))
-MARKET_REGIME_BLOCK_PCT = float(os.getenv("MARKET_REGIME_BLOCK_PCT", "-0.75"))
-MARKET_REGIME_STRONG_PCT = float(os.getenv("MARKET_REGIME_STRONG_PCT", "0.25"))
-MARKET_REGIME_DEFENSIVE_SIZE_MULTIPLIER = float(os.getenv("MARKET_REGIME_DEFENSIVE_SIZE_MULTIPLIER", "0.50"))
-MARKET_REGIME_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
-
-
-def _regime_quote(symbol: str):
-    try:
-        q = get_quote(symbol)
-        return float(q.get("mid") or 0.0), float(q.get("spread") or 0.0)
-    except Exception as e:
-        print(f"MARKET REGIME QUOTE ERROR {symbol}: {e}")
-        return 0.0, 0.0
-
-
-def market_regime_payload():
-    """QQQ/SPY based market condition filter.
-    Uses lightweight live quotes and an in-memory intraday baseline. It is deliberately
-    simple and fast so it can run inside /status without slowing the dashboard.
-    """
-    if not MARKET_REGIME_FILTER_ENABLED:
-        return {
-            "enabled": False,
-            "mode": "OFF",
-            "allowNewBuys": True,
-            "sizeMultiplier": 1.0,
-            "message": "Market regime filter disabled",
-            "symbols": [],
-        }
-
-    rows = []
-    now_iso = datetime.now(UTC).isoformat()
-
-    for symbol in MARKET_REGIME_SYMBOLS or ["QQQ", "SPY"]:
-        price, spread = _regime_quote(symbol)
-        hist = MARKET_REGIME_HISTORY.setdefault(symbol, [])
-        if price > 0:
-            hist.append({"t": now_iso, "value": price})
-            del hist[:-240]
-        baseline = float(hist[0]["value"]) if hist else price
-        change_pct = ((price / baseline) - 1.0) * 100.0 if price > 0 and baseline > 0 else 0.0
-        rows.append({
-            "symbol": symbol,
-            "price": price,
-            "baseline": baseline,
-            "changePct": change_pct,
-            "spread": spread,
-            "points": hist[-80:],
-        })
-
-    valid = [r for r in rows if float(r.get("price") or 0) > 0]
-    avg_change = sum(float(r.get("changePct") or 0.0) for r in valid) / max(1, len(valid))
-
-    allow_new_buys = True
-    size_multiplier = 1.0
-    mode = "NORMAL"
-    message = "Market backdrop normal — normal buying allowed"
-
-    if avg_change <= MARKET_REGIME_BLOCK_PCT:
-        mode = "RISK-OFF"
-        allow_new_buys = False
-        size_multiplier = 0.0
-        message = f"Market weak: avg QQQ/SPY change {avg_change:.2f}% — new buys paused"
-    elif avg_change <= MARKET_REGIME_DEFENSIVE_PCT:
-        mode = "DEFENSIVE"
-        allow_new_buys = True
-        size_multiplier = MARKET_REGIME_DEFENSIVE_SIZE_MULTIPLIER
-        message = f"Market soft: avg QQQ/SPY change {avg_change:.2f}% — smaller buys only"
-    elif avg_change >= MARKET_REGIME_STRONG_PCT:
-        mode = "STRONG"
-        message = f"Market strong: avg QQQ/SPY change {avg_change:.2f}% — normal buying allowed"
-
-    return {
-        "enabled": True,
-        "mode": mode,
-        "allowNewBuys": allow_new_buys,
-        "sizeMultiplier": size_multiplier,
-        "avgChangePct": avg_change,
-        "message": message,
-        "symbols": rows,
-        "defensivePct": MARKET_REGIME_DEFENSIVE_PCT,
-        "blockPct": MARKET_REGIME_BLOCK_PCT,
-        "strongPct": MARKET_REGIME_STRONG_PCT,
-        "updatedAt": now_iso,
-    }
-
-
-def market_regime_allows_new_buys():
-    try:
-        payload = market_regime_payload()
-        if not bool(payload.get("allowNewBuys", True)):
-            return False, payload.get("message", "Market regime blocked new buys"), payload
-        return True, payload.get("message", "Market regime OK"), payload
-    except Exception as e:
-        return True, f"Market regime unavailable: {e}", {"enabled": True, "mode": "UNKNOWN", "allowNewBuys": True, "message": str(e)}
-
-
-
-# =========================
 # WEEKLY AUTO UNIVERSE ROTATION
 # =========================
 def week_start_str(dt=None):
@@ -3092,7 +2986,6 @@ def build_status_payload(bot_name, scans):
         "riskReason": risk_reason,
         "mode": "SNIPER_CONFIDENCE_MEMORY_TIMELINE_GBP",
         "market": market_status,
-        "marketRegime": market_regime_payload(),
         "fx": fx_payload(),
         "autoUniverse": auto_universe_payload(),
         "analytics": analytics_payload(),
@@ -3185,8 +3078,6 @@ def build_status_payload(bot_name, scans):
                 "optimiserDecision": auto_improve_decision(s["symbol"]),
             } for s in scans
         ],
-        "tradeSafety": [trade_safety_panel_row(s) for s in scans],
-        "bestSetupToday": best_setup_today_payload(scans),
         "banking": banking_payload(),
         "logs": [
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
@@ -3200,7 +3091,6 @@ def build_status_payload(bot_name, scans):
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
-            f"REGIME | {market_regime_payload().get('mode', 'UNKNOWN')} | {market_regime_payload().get('message', '')}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f}",
             f"POSITIONS | {len(positions)}",
             f"LOCKOUT | locked_today={', '.join(locked_symbols) if locked_symbols else 'none'}",
@@ -3222,215 +3112,8 @@ def update_status(bot_name, scans):
 
 
 # =========================
-# TRADE SAFETY PANEL HELPERS
-# =========================
-def trade_safety_panel_row(scan: Dict[str, Any]):
-    """Explain clearly why the bot can/cannot buy each scanned symbol.
-    This powers the dashboard Trade Safety Panel and does not place trades.
-    """
-    symbol = str(scan.get("symbol", "")).upper()
-    reasons: List[str] = []
-    warnings: List[str] = []
-
-    try:
-        market = get_market_status_payload()
-        market_open = bool(market.get("isOpen"))
-    except Exception:
-        market_open = False
-
-    if not bot_enabled:
-        reasons.append("Bot paused")
-    if emergency_stop:
-        reasons.append("Emergency stop active")
-    if manual_override:
-        warnings.append("Manual override is ON, auto-buy paused")
-    if not market_open:
-        reasons.append("Market closed")
-
-    try:
-        regime = market_regime_payload()
-        if regime.get("enabled") and not regime.get("allowNewBuys", True):
-            reasons.append(regime.get("message") or "Market regime blocked new buys")
-        elif regime.get("enabled") and regime.get("mode") == "DEFENSIVE":
-            warnings.append(regime.get("message") or "Market regime defensive — smaller buys")
-    except Exception as e:
-        warnings.append(f"Market regime check unavailable: {e}")
-
-    try:
-        blocked, risk_reason = risk_blocked()
-        if blocked:
-            reasons.append(risk_reason or "Risk guardrail active")
-    except Exception as e:
-        warnings.append(f"Risk check unavailable: {e}")
-
-    try:
-        can_buy, can_reason = can_buy_symbol(symbol)
-        if not can_buy:
-            reasons.append(can_reason)
-    except Exception as e:
-        warnings.append(f"Position/open-order check unavailable: {e}")
-
-    if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
-        reasons.append(f"PDT-aware daily buy limit reached ({today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE})")
-
-    try:
-        spread = float(scan.get("spread") or 0)
-        if spread > MAX_SPREAD:
-            reasons.append(f"Spread too high {spread:.4f} > max {MAX_SPREAD:.4f}")
-    except Exception:
-        pass
-
-    try:
-        confidence = float(scan.get("confidence") or 0)
-        if confidence < SNIPER_MIN_CONFIDENCE:
-            reasons.append(f"Confidence too low {confidence:.2f} < sniper {SNIPER_MIN_CONFIDENCE:.2f}")
-    except Exception:
-        pass
-
-    try:
-        quality = float(scan.get("quality_score") or 0)
-        if quality < SNIPER_MIN_QUALITY:
-            reasons.append(f"Quality too low {quality:.4f} < sniper {SNIPER_MIN_QUALITY:.4f}")
-    except Exception:
-        pass
-
-    if not bool(scan.get("ready_to_buy")):
-        reasons.append("Entry trigger not ready")
-
-    if not bool(scan.get("sniper_pass")):
-        reasons.append(str(scan.get("sniper_reason") or "Sniper filter blocked"))
-
-    if not bool(scan.get("a_plus_pass")):
-        reasons.append(str(scan.get("a_plus_reason") or "A+ quality gate blocked"))
-
-    try:
-        blacklisted, black_reason = is_temp_blacklisted(symbol)
-        if blacklisted:
-            reasons.append(f"Temporary blacklist: {black_reason}")
-    except Exception:
-        pass
-
-    # De-duplicate while keeping order.
-    clean_reasons = []
-    for r in reasons:
-        r = str(r).strip()
-        if r and r not in clean_reasons:
-            clean_reasons.append(r)
-
-    clean_warnings = []
-    for w in warnings:
-        w = str(w).strip()
-        if w and w not in clean_warnings:
-            clean_warnings.append(w)
-
-    can_trade = len(clean_reasons) == 0
-    return {
-        "symbol": symbol,
-        "canBuy": can_trade,
-        "status": "READY" if can_trade else "BLOCKED",
-        "summary": "Ready for sniper buy if selected" if can_trade else clean_reasons[0],
-        "reasons": clean_reasons,
-        "warnings": clean_warnings,
-        "confidence": float(scan.get("confidence") or 0),
-        "qualityScore": float(scan.get("quality_score") or 0),
-        "spread": float(scan.get("spread") or 0),
-        "readyToBuy": bool(scan.get("ready_to_buy")),
-        "sniperPass": bool(scan.get("sniper_pass")),
-        "aPlusPass": bool(scan.get("a_plus_pass")),
-    }
-
-
-def best_setup_today_payload(scans: List[Dict[str, Any]]):
-    """Pick the clearest best opportunity from the current scan list.
-    It ranks READY stocks first, then highest confidence, quality and tightest spread.
-    This is dashboard-only advice and does not place trades.
-    """
-    try:
-        rows = [trade_safety_panel_row(s) for s in scans]
-        if not rows:
-            return {
-                "ok": True,
-                "symbol": "—",
-                "status": "WAITING",
-                "action": "Wait for scanner data",
-                "summary": "No scan data yet. The bot will populate this after the next scan.",
-                "confidence": 0.0,
-                "qualityScore": 0.0,
-                "spread": 0.0,
-                "reasons": [],
-                "warnings": [],
-            }
-
-        scan_by_symbol = {str(s.get("symbol", "")).upper(): s for s in scans}
-
-        def rank(row):
-            symbol = str(row.get("symbol", "")).upper()
-            scan = scan_by_symbol.get(symbol, {})
-            can_buy = 1 if row.get("canBuy") else 0
-            confidence = float(row.get("confidence") or scan.get("confidence") or 0.0)
-            quality = float(row.get("qualityScore") or scan.get("quality_score") or 0.0)
-            spread = float(row.get("spread") or scan.get("spread") or 9.0)
-            ready = 1 if scan.get("ready_to_buy") else 0
-            sniper = 1 if scan.get("sniper_pass") else 0
-            aplus = 1 if scan.get("a_plus_pass") else 0
-            return (can_buy, ready + sniper + aplus, confidence, quality, -spread)
-
-        ordered = sorted(rows, key=rank, reverse=True)
-        best = ordered[0]
-        symbol = str(best.get("symbol", "—")).upper()
-        scan = scan_by_symbol.get(symbol, {})
-        can_buy = bool(best.get("canBuy"))
-
-        if can_buy:
-            action = "READY — eligible for Money Buy"
-            summary = "This is the strongest clear setup right now."
-        else:
-            action = "WAIT — buy blocked"
-            summary = best.get("summary") or "The top candidate is not clear yet."
-
-        return {
-            "ok": True,
-            "symbol": symbol,
-            "status": "READY" if can_buy else "WAIT",
-            "action": action,
-            "summary": summary,
-            "reasons": best.get("reasons", []),
-            "warnings": best.get("warnings", []),
-            "confidence": float(best.get("confidence") or scan.get("confidence") or 0.0),
-            "confidenceLabel": scan.get("confidence_label", "LOW"),
-            "qualityScore": float(best.get("qualityScore") or scan.get("quality_score") or 0.0),
-            "spread": float(best.get("spread") or scan.get("spread") or 0.0),
-            "price": float(scan.get("price") or 0.0),
-            "readyToBuy": bool(scan.get("ready_to_buy")),
-            "sniperPass": bool(scan.get("sniper_pass")),
-            "aPlusPass": bool(scan.get("a_plus_pass")),
-            "topThree": ordered[:3],
-            "updatedAt": datetime.now(UTC).isoformat(),
-        }
-    except Exception as e:
-        return {
-            "ok": False,
-            "symbol": "—",
-            "status": "ERROR",
-            "action": "Check logs",
-            "summary": f"Best setup calculation failed: {e}",
-            "reasons": [str(e)],
-            "warnings": [],
-            "confidence": 0.0,
-            "qualityScore": 0.0,
-            "spread": 0.0,
-        }
-
-
-# =========================
 # ROUTES
 # =========================
-
-
-@app.get("/market-regime")
-def api_market_regime():
-    payload = market_regime_payload()
-    return {"ok": True, "marketRegime": payload, **payload}
 
 @app.get("/debug-orders")
 def debug_orders():
@@ -3514,17 +3197,12 @@ def manual_override_off(request: Request):
 @app.post("/manual-buy")
 def manual_buy(request: Request):
     verify_api_key(request)
-    acquired = bot_lock.acquire(timeout=2)
-    if not acquired:
-        return {"ok": False, "message": "Bot is busy scanning. Money Buy was not started; try again in a few seconds."}
-    try:
+    with bot_lock:
         if not trading_client.get_clock().is_open:
             return {"ok": False, "message": "Market closed"}
         result = money_mode_buy(latest_scans, manual=True)
         update_status(BOT_NAME, latest_scans)
         return {"ok": True, "message": result}
-    finally:
-        bot_lock.release()
 
 
 @app.post("/custom-buy/{symbol}")
@@ -3539,15 +3217,10 @@ def custom_buy(symbol: str, request: Request):
 @app.post("/manual-sell")
 def manual_sell(request: Request):
     verify_api_key(request)
-    acquired = bot_lock.acquire(timeout=2)
-    if not acquired:
-        return {"ok": False, "message": "Bot is busy scanning. Sell Worst was not started; try again in a few seconds."}
-    try:
+    with bot_lock:
         result = close_worst_or_largest_position(reason="MANUAL SELL")
         update_status(BOT_NAME, latest_scans)
         return result
-    finally:
-        bot_lock.release()
 
 
 @app.post("/sell/{symbol}")
@@ -3612,16 +3285,6 @@ def backfill_trades(request: Request):
         return result
 
 
-
-@app.get("/trade-safety")
-def api_trade_safety():
-    return {"ok": True, "rows": [trade_safety_panel_row(s) for s in latest_scans]}
-
-@app.get("/best-setup-today")
-def api_best_setup_today():
-    return {"ok": True, "bestSetupToday": best_setup_today_payload(latest_scans)}
-
-
 # =========================
 # LOOP
 # =========================
@@ -3635,9 +3298,6 @@ def run_bot_loop():
 
     while True:
         try:
-            # Important: never sleep while holding bot_lock.
-            # The previous version slept inside the lock when the market was closed,
-            # which made manual-buy/manual-sell wait until Render's 30s timeout.
             with bot_lock:
                 reset_daily_flags_if_needed()
                 cleanup_temp_blacklist()
@@ -3647,30 +3307,32 @@ def run_bot_loop():
                 if not clock.is_open:
                     print("Market closed. Waiting...")
                     update_status(BOT_NAME, latest_scans)
-                else:
-                    scans = []
-                    for symbol in current_universe:
-                        try:
-                            scan = compute_scan(symbol)
-                            scans.append(scan)
-                            print(f"{symbol} | price={scan['price']:.2f} | quality={scan['quality_score']:.4f} | confidence={scan['confidence']:.2f} | sniper={scan['sniper_pass']}")
-                        except Exception as e:
-                            print(f"SCAN ERROR {symbol}: {e}")
+                    time.sleep(CHECK_INTERVAL)
+                    continue
 
-                    latest_scans.clear()
-                    latest_scans.extend(scans)
+                scans = []
+                for symbol in current_universe:
+                    try:
+                        scan = compute_scan(symbol)
+                        scans.append(scan)
+                        print(f"{symbol} | price={scan['price']:.2f} | quality={scan['quality_score']:.4f} | confidence={scan['confidence']:.2f} | sniper={scan['sniper_pass']}")
+                    except Exception as e:
+                        print(f"SCAN ERROR {symbol}: {e}")
 
-                    if bot_enabled and not emergency_stop:
-                        manage_money_mode_positions()
-                        if PROFIT_MODE_ENABLED and ROTATION_MODE_ENABLED:
-                            rr = maybe_rotate_weakest_into_best(scans)
-                            if rr:
-                                print(rr)
-                        if not manual_override:
-                            result = money_mode_buy(scans, manual=False)
-                            if result:
-                                print(result)
-                    update_status(BOT_NAME, scans)
+                latest_scans.clear()
+                latest_scans.extend(scans)
+
+                if bot_enabled and not emergency_stop:
+                    manage_money_mode_positions()
+                    if PROFIT_MODE_ENABLED and ROTATION_MODE_ENABLED:
+                        rr = maybe_rotate_weakest_into_best(scans)
+                        if rr:
+                            print(rr)
+                    if not manual_override:
+                        result = money_mode_buy(scans, manual=False)
+                        if result:
+                            print(result)
+                update_status(BOT_NAME, scans)
 
             time.sleep(CHECK_INTERVAL)
 
@@ -4413,8 +4075,102 @@ def refresh_universe_preview():
 
 
 # ============================================================
-# PROFIT BANKING FINAL OVERRIDE
+# PROFIT BANKING / PERSISTENT TRADING CAP OVERRIDE
 # ============================================================
+
+def trading_cap_file_path() -> str:
+    """Persistent cap file.
+
+    On Render, set TRADING_CAP_FILE to your disk path if your disk is not mounted
+    at /var/data. If /var/data exists, the bot will use it automatically.
+    """
+    env_path = os.getenv("TRADING_CAP_FILE", "").strip()
+    if env_path:
+        return env_path
+    if os.path.isdir("/var/data"):
+        return "/var/data/trading_cap.json"
+    base = os.getenv("RENDER_DISK_PATH", "backend/state")
+    return os.path.join(base, "trading_cap.json")
+
+
+def _default_trading_cap_usd() -> float:
+    try:
+        return float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 200)) or 200)
+    except Exception:
+        return 200.0
+
+
+def load_trading_cap_setting() -> Dict[str, Any]:
+    path = trading_cap_file_path()
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            value = float(data.get("value") or 0)
+            currency = str(data.get("currency") or "GBP").upper()
+            if value > 0 and currency in ["GBP", "USD"]:
+                return {
+                    "value": value,
+                    "currency": currency,
+                    "source": "saved",
+                    "path": path,
+                    "updatedAt": data.get("updatedAt", ""),
+                }
+    except Exception as e:
+        print(f"TRADING CAP LOAD ERROR: {e}")
+
+    # Backwards-compatible fallback: old env/code cap is USD.
+    return {
+        "value": _default_trading_cap_usd(),
+        "currency": "USD",
+        "source": "env",
+        "path": path,
+        "updatedAt": "",
+    }
+
+
+def save_trading_cap_setting(value: float, currency: str = "GBP") -> Dict[str, Any]:
+    currency = str(currency or "GBP").upper().strip()
+    if currency not in ["GBP", "USD"]:
+        currency = "GBP"
+    value = float(value or 0)
+    if value < 0:
+        value = 0.0
+
+    path = trading_cap_file_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = {
+        "value": round(value, 2),
+        "currency": currency,
+        "updatedAt": datetime.now(UTC).isoformat(),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    return load_trading_cap_setting()
+
+
+def trading_cap_usd() -> float:
+    setting = load_trading_cap_setting()
+    value = float(setting.get("value") or 0.0)
+    currency = str(setting.get("currency") or "USD").upper()
+    if value <= 0:
+        return 0.0
+    if currency == "GBP":
+        rate = get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP
+        return value / max(rate, 0.0001)
+    return value
+
+
+def trading_cap_gbp() -> float:
+    setting = load_trading_cap_setting()
+    value = float(setting.get("value") or 0.0)
+    currency = str(setting.get("currency") or "USD").upper()
+    if value <= 0:
+        return 0.0
+    if currency == "GBP":
+        return value
+    return money_gbp(value)
+
 
 def effective_trading_equity(account_equity: float) -> float:
     try:
@@ -4422,12 +4178,9 @@ def effective_trading_equity(account_equity: float) -> float:
     except Exception:
         equity = 0.0
 
-    try:
-        cap = float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 200)) or 200)
-    except Exception:
-        cap = 200.0
-
+    cap = trading_cap_usd()
     return max(0.0, min(equity, cap)) if cap > 0 else max(0.0, equity)
+
 
 def banking_payload():
     try:
@@ -4436,23 +4189,68 @@ def banking_payload():
     except Exception:
         equity = 0.0
 
-    try:
-        cap = float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 200)) or 200)
-    except Exception:
-        cap = 200.0
+    setting = load_trading_cap_setting()
+    cap_usd = trading_cap_usd()
+    cap_gbp = trading_cap_gbp()
 
-    effective = max(0.0, min(equity, cap)) if cap > 0 else max(0.0, equity)
-    banked = max(0.0, equity - effective) if cap > 0 else 0.0
+    effective = max(0.0, min(equity, cap_usd)) if cap_usd > 0 else max(0.0, equity)
+    banked = max(0.0, equity - effective) if cap_usd > 0 else 0.0
 
     return {
         "ok": True,
-        "enabled": cap > 0,
-        "maxTradingCapital": cap,
+        "enabled": cap_usd > 0,
+        "maxTradingCapital": cap_usd,
+        "maxTradingCapitalUsd": cap_usd,
+        "maxTradingCapitalGbp": cap_gbp,
+        "tradingCapValue": float(setting.get("value") or 0.0),
+        "tradingCapCurrency": setting.get("currency", "USD"),
+        "tradingCapSource": setting.get("source", "env"),
+        "tradingCapFile": setting.get("path", trading_cap_file_path()),
+        "tradingCapUpdatedAt": setting.get("updatedAt", ""),
         "accountEquity": equity,
         "effectiveTradingEquity": effective,
+        "effectiveTradingEquityGbp": money_gbp(effective),
         "bankedProfitCashBuffer": banked,
-        "message": "Profit banking active" if cap > 0 else "Profit banking disabled",
+        "bankedProfitCashBufferGbp": money_gbp(banked),
+        "message": "Profit banking active" if cap_usd > 0 else "Profit banking disabled",
     }
+
+
 @app.get("/banking-status")
 def api_banking_status():
     return {"ok": True, **banking_payload()}
+
+
+@app.get("/trading-cap")
+def api_get_trading_cap():
+    return {"ok": True, **banking_payload()}
+
+
+@app.post("/trading-cap")
+def api_set_trading_cap(request: Request, payload: dict = Body(...)):
+    verify_api_key(request)
+    try:
+        # Dashboard sends GBP by default, because that is how the user thinks
+        # about the trading cap. Backend converts it to USD internally for Alpaca.
+        value = payload.get("capGbp", payload.get("value", payload.get("cap")))
+        currency = str(payload.get("currency", "GBP")).upper()
+        value = float(value)
+        if value <= 0:
+            return {"ok": False, "message": "Trading cap must be greater than 0"}
+        setting = save_trading_cap_setting(value, currency)
+        payload_out = banking_payload()
+        try:
+            latest_status["banking"] = payload_out
+            latest_status["newPositionNotional"] = calculate_new_position_notional()
+            latest_status["lastAction"] = f"Trading cap saved: {currency} {value:.2f}"
+            latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
+        except Exception:
+            pass
+        return {
+            "ok": True,
+            "message": f"Trading cap saved at {currency} {value:.2f}",
+            "setting": setting,
+            **payload_out,
+        }
+    except Exception as e:
+        return {"ok": False, "message": f"Could not save trading cap: {e}"}
