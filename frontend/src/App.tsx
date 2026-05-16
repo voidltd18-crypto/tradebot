@@ -53,6 +53,9 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [stockSearchLoading, setStockSearchLoading] = useState(false);
   const [tradingCapInput, setTradingCapInput] = useState<string>("");
   const [tradingCapSaving, setTradingCapSaving] = useState(false);
+  const [replayCapInput, setReplayCapInput] = useState<string>("");
+  const [replayLoading, setReplayLoading] = useState(false);
+  const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
   const lastFetchAt = useRef(0);
@@ -82,6 +85,7 @@ const [banking, setBanking] = useState<AnyObj>({});
   useEffect(() => {
     const gbpCap = Number(banking?.maxTradingCapitalGbp ?? data?.banking?.maxTradingCapitalGbp ?? 0);
     if (gbpCap > 0 && !tradingCapInput) setTradingCapInput(String(Math.round(gbpCap)));
+    if (gbpCap > 0 && !replayCapInput) setReplayCapInput(String(Math.round(gbpCap)));
   }, [banking?.maxTradingCapitalGbp, data?.banking?.maxTradingCapitalGbp]);
 
   
@@ -150,6 +154,8 @@ const [banking, setBanking] = useState<AnyObj>({});
     setTab("overview");
     setStockQuery("");
     setStockResults([]);
+    setReplayResult(null);
+    setReplayLoading(false);
   }
 
 const fetchData = useCallback(async (force = false) => {
@@ -202,6 +208,40 @@ const fetchData = useCallback(async (force = false) => {
     const i = setInterval(() => fetchData(false), POLL_MS);
     return () => clearInterval(i);
   }, [authToken, fetchData]);
+
+  useEffect(() => {
+    if (!authToken) return;
+
+    let warnedForDate = "";
+
+    const scheduleMidnightLogout = () => {
+      const now = new Date();
+      const nextMidnight = new Date(now);
+      nextMidnight.setHours(24, 0, 0, 0);
+      const msUntilMidnight = Math.max(1000, nextMidnight.getTime() - now.getTime());
+      const msUntilWarning = Math.max(1000, msUntilMidnight - 60000);
+
+      const warningTimer = window.setTimeout(() => {
+        const todayKey = new Date().toISOString().slice(0, 10);
+        if (warnedForDate !== todayKey) {
+          warnedForDate = todayKey;
+          setMessage("Daily session reset soon. You will be logged out at 00:00.");
+        }
+      }, msUntilWarning);
+
+      const logoutTimer = window.setTimeout(() => {
+        setMessage("00:00 daily session reset. Logging out...");
+        secureLogout();
+      }, msUntilMidnight + 500);
+
+      return () => {
+        window.clearTimeout(warningTimer);
+        window.clearTimeout(logoutTimer);
+      };
+    };
+
+    return scheduleMidnightLogout();
+  }, [authToken]);
 
   if (!authToken) {
     return (
@@ -401,6 +441,38 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
+  async function runBacktestReplay() {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+
+    const capGbp = Number(replayCapInput || tradingCapInput || bankingCapGbp || 0);
+    if (!Number.isFinite(capGbp) || capGbp <= 0) {
+      setMessage("Enter a valid replay cap in GBP.");
+      return;
+    }
+
+    setReplayLoading(true);
+    setMessage(`Running paper replay using £${capGbp.toFixed(2)} cap...`);
+    try {
+      const res = await fetch(`${API_URL}/backtest-replay`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ capGbp }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Replay failed");
+      setReplayResult(json);
+      setMessage(json?.message || "Backtest / paper replay complete.");
+    } catch (e:any) {
+      setMessage(e?.message || "Replay failed.");
+    } finally {
+      setReplayLoading(false);
+    }
+  }
+
   async function resetBaseline() {
     if (!confirm("Reset PnL baseline to current equity? This only resets reporting.")) return;
     await action("/reset-baseline");
@@ -563,6 +635,26 @@ const fetchData = useCallback(async (force = false) => {
       </section>
       <Card title="Price / Equity History"><div className="chart-controls"><button className={chartCurrency==="GBP" ? "active":""} onClick={() => setChartCurrency("GBP")}>GBP</button><button className={chartCurrency==="USD" ? "active":""} onClick={() => setChartCurrency("USD")}>USD</button></div><div className="chart">{reportChart.length ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={reportChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="label" stroke="#94a3b8" minTickGap={28}/><YAxis stroke="#94a3b8"/><Tooltip formatter={(v:any) => chartCurrency==="GBP" ? gbp(v) : usd(v)}/><Area type="monotone" dataKey="equity" stroke="#38bdf8" fill="#38bdf833"/></AreaChart></ResponsiveContainer> : <p className="muted">No price/equity history yet.</p>}</div></Card>
       <Card title="Daily PnL"><div className="chart small-chart">{dailyPnlChart.length ? <ResponsiveContainer width="100%" height="100%"><BarChart data={dailyPnlChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="day" stroke="#94a3b8"/><YAxis stroke="#94a3b8"/><Tooltip formatter={(v:any) => chartCurrency==="GBP" ? gbp(v) : usd(v)}/><Bar dataKey="pnl" fill="#38bdf8"/></BarChart></ResponsiveContainer> : <p className="muted">Daily PnL bars will appear as trades are recorded.</p>}</div></Card>
+      <Card title="Backtest / Paper Replay" wide>
+        <p className="muted">Run a quick report using your closed trade history and a chosen trading cap. This does not place trades.</p>
+        <label className="field"><span>Replay trading cap (£)</span><input value={replayCapInput} onChange={e=>setReplayCapInput(e.target.value)} placeholder="200" inputMode="decimal" /></label>
+        <div className="actions">
+          <button className="ghost" onClick={()=>setReplayCapInput("100")}>£100</button>
+          <button className="ghost" onClick={()=>setReplayCapInput("200")}>£200</button>
+          <button className="ghost" onClick={()=>setReplayCapInput("260")}>£260</button>
+          <button onClick={runBacktestReplay} disabled={replayLoading}>{replayLoading ? "Running..." : "Run Replay Report"}</button>
+        </div>
+        {replayResult && <div className="summary">
+          <div><span>Trades tested</span><b>{replayResult?.tradesTested || 0}</b></div>
+          <div><span>Win rate</span><b>{pct(Number(replayResult?.winRate || 0) * 100)}</b></div>
+          <div><span>Replay PnL</span><b className={tone(replayResult?.replayPnlGbp)}>{gbp(replayResult?.replayPnlGbp)} · {usd(replayResult?.replayPnlUsd)}</b></div>
+          <div><span>Best symbol</span><b>{replayResult?.bestSymbol || "—"}</b></div>
+          <div><span>Worst symbol</span><b>{replayResult?.worstSymbol || "—"}</b></div>
+          <div><span>Max drawdown</span><b className="loss">{gbp(replayResult?.maxDrawdownGbp)}</b></div>
+        </div>}
+        {replayResult?.notes && <p className="notice">{replayResult.notes}</p>}
+        {Array.isArray(replayResult?.bySymbol) && replayResult.bySymbol.length > 0 && <div className="table-wrap"><table><thead><tr><th>Symbol</th><th>Trades</th><th>Win rate</th><th>PnL</th></tr></thead><tbody>{replayResult.bySymbol.slice(0,12).map((r:AnyObj)=><tr key={r.symbol}><td>{r.symbol}</td><td>{r.trades}</td><td>{pct(Number(r.winRate || 0) * 100)}</td><td className={tone(r.pnlGbp)}>{gbp(r.pnlGbp)} / {usd(r.pnlUsd)}</td></tr>)}</tbody></table></div>}
+      </Card>
       <Card title="Closed Trade History"><div className="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th></tr></thead><tbody>{closedTrades.slice(-80).reverse().map((t:AnyObj,i:number)=><tr key={i}><td>{t.time || "—"}</td><td>{t.symbol}</td><td>{usd(t.entryPrice)}</td><td>{usd(t.exitPrice)}</td><td>{Number(t.qty || 0).toFixed(4)}</td><td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td><td className={tone(t.pnl)}>{pct(t.pnlPct)}</td></tr>)}{!closedTrades.length && <tr><td colSpan={7}>No matched closed trades yet.</td></tr>}</tbody></table></div></Card>
     </main>}
 

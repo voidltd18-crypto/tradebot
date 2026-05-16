@@ -4542,3 +4542,112 @@ def api_set_trading_cap(request: Request, payload: dict = Body(...)):
         }
     except Exception as e:
         return {"ok": False, "message": f"Could not save trading cap: {e}"}
+
+
+
+# =========================
+# BACKTEST / PAPER REPLAY REPORT
+# =========================
+@app.post("/backtest-replay")
+def api_backtest_replay(payload: dict = Body(default={}), request: Request = None):
+    if request is not None:
+        verify_api_key(request)
+
+    try:
+        cap_gbp = float(payload.get("capGbp") or 0.0)
+    except Exception:
+        cap_gbp = 0.0
+
+    try:
+        rate = get_usd_to_gbp_rate()
+    except Exception:
+        rate = FX_FALLBACK_USD_TO_GBP
+
+    cap_usd = cap_gbp / max(rate, 0.0001) if cap_gbp > 0 else 0.0
+
+    try:
+        closed = closed_trades_from_db(10000)
+    except Exception:
+        closed = []
+
+    rows = []
+    equity = cap_gbp if cap_gbp > 0 else 0.0
+    peak = equity
+    max_drawdown = 0.0
+    wins = 0
+    losses = 0
+    total_pnl_gbp = 0.0
+    total_pnl_usd = 0.0
+    by_symbol: Dict[str, Dict[str, Any]] = {}
+
+    for t in closed:
+        try:
+            symbol = str(t.get("symbol", "")).upper()
+            pnl_usd = float(t.get("pnl") or 0.0)
+            pnl_gbp = float(t.get("pnlGbp") or (pnl_usd * rate))
+            if not symbol:
+                continue
+
+            wins += 1 if pnl_usd >= 0 else 0
+            losses += 1 if pnl_usd < 0 else 0
+            total_pnl_usd += pnl_usd
+            total_pnl_gbp += pnl_gbp
+            equity += pnl_gbp
+            peak = max(peak, equity)
+            max_drawdown = max(max_drawdown, peak - equity)
+
+            row = by_symbol.setdefault(symbol, {
+                "symbol": symbol,
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "pnlUsd": 0.0,
+                "pnlGbp": 0.0,
+                "winRate": 0.0,
+            })
+            row["trades"] += 1
+            row["wins"] += 1 if pnl_usd >= 0 else 0
+            row["losses"] += 1 if pnl_usd < 0 else 0
+            row["pnlUsd"] += pnl_usd
+            row["pnlGbp"] += pnl_gbp
+
+            rows.append({
+                "time": t.get("time") or t.get("timestamp") or "",
+                "symbol": symbol,
+                "pnlUsd": pnl_usd,
+                "pnlGbp": pnl_gbp,
+                "equityGbp": equity,
+            })
+        except Exception:
+            continue
+
+    symbol_rows = []
+    for row in by_symbol.values():
+        row["winRate"] = row["wins"] / max(1, row["trades"])
+        row["pnlUsd"] = round(float(row["pnlUsd"]), 4)
+        row["pnlGbp"] = round(float(row["pnlGbp"]), 4)
+        symbol_rows.append(row)
+
+    symbol_rows.sort(key=lambda r: float(r.get("pnlGbp") or 0.0), reverse=True)
+    best_symbol = symbol_rows[0]["symbol"] if symbol_rows else "—"
+    worst_symbol = symbol_rows[-1]["symbol"] if symbol_rows else "—"
+
+    return {
+        "ok": True,
+        "message": "Backtest / paper replay report complete",
+        "capGbp": cap_gbp,
+        "capUsd": cap_usd,
+        "tradesTested": len(rows),
+        "wins": wins,
+        "losses": losses,
+        "winRate": wins / max(1, wins + losses),
+        "replayPnlUsd": round(total_pnl_usd, 4),
+        "replayPnlGbp": round(total_pnl_gbp, 4),
+        "endingEquityGbp": round(equity, 4),
+        "maxDrawdownGbp": round(max_drawdown, 4),
+        "bestSymbol": best_symbol,
+        "worstSymbol": worst_symbol,
+        "bySymbol": symbol_rows,
+        "equityCurve": rows[-500:],
+        "notes": "Uses matched closed-trade history. It is a reporting replay, not a live trade signal and does not place orders.",
+    }
