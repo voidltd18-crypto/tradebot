@@ -1,21 +1,15 @@
-Guaranteed Login Fix
+Render Button Logging Patch
 
 Replace:
 backend/main.py
-frontend/src/App.tsx
 
-Render backend env vars:
-ADMIN_USERNAME=yourusername
-ADMIN_PASSWORD=yourpassword
+Added instant logs for:
+- money-buy
+- sell-worst
+- weekly-refresh
+- refresh-universe
 
-Optional but recommended:
-DASHBOARD_API_KEY=yourpassword
+You will now immediately see:
+BUTTON HIT: ...
 
-Deploy:
-1. Render backend
-2. Vercel frontend
-
-Open normal URL:
-https://tradebot-sand.vercel.app/
-
-No new URL is needed.
+in Render logs as soon as the button request reaches backend.

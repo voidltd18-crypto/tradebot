@@ -3985,6 +3985,7 @@ def weekly_universe():
 
 @app.post("/refresh-universe")
 def refresh_universe(request: Request):
+    print("BUTTON HIT: refresh-universe", flush=True)
     verify_api_key(request)
     with bot_lock:
         try:
@@ -4013,6 +4014,7 @@ def refresh_universe(request: Request):
 
 @app.get("/refresh-universe-preview")
 def refresh_universe_preview():
+    print("BUTTON HIT: refresh-universe", flush=True)
     payload = force_quality_auto_universe_payload()
     return {
         "ok": True,
