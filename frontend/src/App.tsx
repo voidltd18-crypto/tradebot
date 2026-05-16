@@ -70,6 +70,9 @@ const [banking, setBanking] = useState<AnyObj>({});
   const bankingEffectiveGbp = Number(banking?.effectiveTradingEquityGbp ?? data?.banking?.effectiveTradingEquityGbp ?? bankingEffective * rate);
   const bankingBuffer = Number(banking?.bankedProfitCashBuffer ?? data?.banking?.bankedProfitCashBuffer ?? 0);
   const bankingBufferGbp = Number(banking?.bankedProfitCashBufferGbp ?? data?.banking?.bankedProfitCashBufferGbp ?? bankingBuffer * rate);
+  const dynamicScanner = data?.dynamicMarketScanner || data?.autoUniverse?.dynamicScanner || {};
+  const dynamicRows = Array.isArray(dynamicScanner?.rows) ? dynamicScanner.rows : [];
+  const dynamicPickCount = Number(data?.autoUniverse?.dynamicPickCount || dynamicRows.length || 0);
 
   useEffect(() => {
     const gbpCap = Number(banking?.maxTradingCapitalGbp ?? data?.banking?.maxTradingCapitalGbp ?? 0);
@@ -204,7 +207,7 @@ const fetchData = useCallback(async (force = false) => {
           ...prev,
           autoUniverse,
           universe: autoUniverse.activeSymbols || prev.universe,
-          lastAction: json?.message || "Weekly universe refreshed",
+          lastAction: json?.message || "Dynamic universe refreshed",
           lastActionAt: new Date().toISOString(),
         }));
       }
@@ -228,7 +231,7 @@ const fetchData = useCallback(async (force = false) => {
     if (optimistic) setData(optimistic);
 
     const isWeeklyRefresh = endpoint === "/refresh-universe";
-    setMessage(isWeeklyRefresh ? "Weekly stock refresh sent. Updating universe..." : `Sent ${endpoint}. Updating dashboard...`);
+    setMessage(isWeeklyRefresh ? "Dynamic market refresh sent. Updating universe..." : `Sent ${endpoint}. Updating dashboard...`);
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), isWeeklyRefresh ? 12000 : 30000);
@@ -250,18 +253,18 @@ const fetchData = useCallback(async (force = false) => {
             ...prev,
             autoUniverse,
             universe: autoUniverse.activeSymbols || prev.universe,
-            lastAction: json?.message || "Weekly universe refreshed",
+            lastAction: json?.message || "Dynamic universe refreshed",
             lastActionAt: new Date().toISOString(),
           }));
         }
-        setMessage(json?.message || "Weekly universe refreshed.");
+        setMessage(json?.message || "Dynamic universe refreshed.");
         await refreshWeeklyUniverseView();
       } else {
         setMessage(json.message || json.detail || JSON.stringify(json));
       }
     } catch (e:any) {
       if (isWeeklyRefresh && e?.name === "AbortError") {
-        setMessage("Weekly refresh was sent. Checking saved universe now...");
+        setMessage("Dynamic refresh was sent. Checking saved universe now...");
         await refreshWeeklyUniverseView();
       } else {
         setMessage(e?.name === "AbortError" ? "Action is still processing on Render. Dashboard will refresh normally." : (e?.message || "Action failed."));
@@ -321,6 +324,29 @@ const fetchData = useCallback(async (force = false) => {
       setMessage(e?.message || "Could not save trading cap.");
     } finally {
       setTradingCapSaving(false);
+    }
+  }
+
+  async function refreshDynamicScanner() {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+    setMessage("Refreshing dynamic market scanner...");
+    try {
+      const res = await fetch(`${API_URL}/dynamic-market-scanner/refresh`, {
+        method: "POST",
+        headers: secureHeaders,
+        cache: "no-store",
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Dynamic scanner failed");
+      setData(prev => ({ ...prev, dynamicMarketScanner: json.dynamicMarketScanner || json }));
+      setMessage(json?.message || "Dynamic market scanner refreshed.");
+      await refreshWeeklyUniverseView();
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Dynamic scanner failed.");
     }
   }
 
@@ -391,7 +417,7 @@ const fetchData = useCallback(async (force = false) => {
         <button onClick={secureLogout}>Logout</button>
         <button onClick={() => action("/manual-buy")}>Money Buy</button>
         <button className="danger" onClick={() => action("/manual-sell")}>Sell Worst</button>
-        <button className="purple" onClick={() => action("/refresh-universe")}>↻ Weekly Stock Refresh</button>
+        <button className="purple" onClick={() => action("/refresh-universe")}>↻ Dynamic Market Refresh</button>
         <button className="ghost" onClick={() => action("/pause")}>Pause</button>
         <button onClick={() => action("/resume")}>Resume</button>
       </div><p className="notice">{message}</p></Card>
@@ -399,9 +425,22 @@ const fetchData = useCallback(async (force = false) => {
         <div><span>Positions</span><b>{positions.length}/{data?.maxPositions || 0}</b></div>
         <div><span>Next buy</span><b>{usd(data?.newPositionNotional)}</b></div>
         <div><span>Win rate</span><b>{pct((data?.dbSummary?.winRate || 0) * 100)}</b></div>
-        <div><span>Weekly universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
+        <div><span>Dynamic universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
         <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
       </div></Card>
+
+      <Card title="Dynamic Market Scanner" wide>
+        <div className="summary">
+          <div><span>Status</span><b className={dynamicScanner?.enabled === false ? "loss" : "gain"}>{dynamicScanner?.enabled === false ? "OFF" : "ON"}</b></div>
+          <div><span>Discovered picks</span><b>{dynamicPickCount}</b></div>
+          <div><span>Source</span><b>{dynamicScanner?.source || "market movers"}</b></div>
+          <div><span>Refresh</span><b>{dynamicScanner?.updatedAt ? new Date(dynamicScanner.updatedAt).toLocaleTimeString() : "Waiting"}</b></div>
+        </div>
+        <div className="actions"><button className="purple" onClick={refreshDynamicScanner}>Refresh Dynamic Scanner</button></div>
+        <p className="muted">This searches market movers/active stocks first, applies price/volume/spread filters, then merges the best candidates with your manual pinned stocks and core safety list.</p>
+        {dynamicScanner?.error && <p className="notice danger-text">Scanner warning: {dynamicScanner.error}</p>}
+        <div className="scan-grid">{dynamicRows.slice(0,12).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>Score {Number(r.score || 0).toFixed(2)}</strong></div><p>{r.reason || "dynamic candidate"}</p><small>{r.price ? `Price ${usd(r.price)} · ` : ""}{r.changePct !== undefined ? `Change ${pct(r.changePct)} · ` : ""}{r.volume ? `Volume ${Number(r.volume).toLocaleString()}` : ""}</small></article>)}</div>
+      </Card>
 
       <Card title="Profit Banking / Trading Cap">
         <div className="summary">
@@ -419,14 +458,15 @@ const fetchData = useCallback(async (force = false) => {
         </div>
         <p className="muted">Saved cap source: {bankingCapSource}. Profits above the cap stay as cash buffer instead of increasing future trade size.</p>
       </Card>
-      <Card title="Weekly Auto Universe" wide>
-        <p className="muted">Use the button to rebuild the stock list immediately. Manual picks stay pinned.</p>
+      <Card title="Dynamic Auto Universe" wide>
+        <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
         <div className="universe-counts">
           <div><span>Total in universe</span><b>{data?.autoUniverse?.rows?.length || 0}</b></div>
           <div><span>Active symbols</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}</b></div>
           <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
+          <div><span>Dynamic picks</span><b>{data?.autoUniverse?.dynamicPickCount || dynamicPickCount}</b></div>
         </div>
-        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "weekly candidate"}</p></article>)}</div>
+        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : r.dynamicPick ? "Dynamic ⚡" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "dynamic candidate"}</p></article>)}</div>
       </Card>
     </main>}
 

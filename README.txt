@@ -1,13 +1,12 @@
-Balanced Current View UI Refresh Fix
+Dynamic Market Scanner Upgrade
 
-Replace this file in your repo:
-frontend/src/App.tsx
+Replace:
+- backend/main.py
+- frontend/src/App.tsx
 
-What changed:
-- Keeps the current dashboard view/layout.
-- Keeps instant refresh after button actions.
-- Slows normal background polling to every 10 seconds.
-- Adds a guard so polling cannot overlap or spam Render.
-- Uses no-store fetches so the UI does not show stale cached data.
-
-After upload, commit to GitHub and let Vercel redeploy.
+Adds a hybrid dynamic market scanner:
+- discovers market movers/active stocks
+- filters weak/junk tickers by price, volume and spread
+- keeps manual pinned stocks
+- keeps core quality universe as a fallback
+- exposes dashboard controls and /dynamic-market-scanner endpoints
