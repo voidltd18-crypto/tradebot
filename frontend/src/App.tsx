@@ -6,6 +6,7 @@ const API_URL = import.meta.env.VITE_API_BASE || "https://tradebot-0myo.onrender
 const BOT_VERSION = "v1.1-strict-profit-mode";
 type AnyObj = Record<string, any>;
 type Tab = "overview" | "reports" | "positions" | "scanner" | "search" | "activity" | "admin";
+type ViewMode = "simple" | "advanced" | "admin";
 
 const usd = (n:any) => `$${Number(n || 0).toFixed(2)}`;
 const gbp = (n:any) => `£${Number(n || 0).toFixed(2)}`;
@@ -30,6 +31,10 @@ async function readJson(res: Response) {
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
+  const [viewMode, setViewMode] = useState<ViewMode>(() => {
+    const saved = localStorage.getItem("tradebot_view_mode") as ViewMode | null;
+    return saved === "advanced" || saved === "admin" || saved === "simple" ? saved : "simple";
+  });
   const [data, setData] = useState<AnyObj>({});
   const [reports, setReports] = useState<AnyObj>({});
   
@@ -435,7 +440,23 @@ const fetchData = useCallback(async (force = false) => {
   const earned = Number(reports.earnedSinceDeposit ?? 0);
   const totalGainLoss = Number(reports.totalGainLoss ?? 0);
   const lost = Number(reports.lostSinceDeposit ?? 0);
-  const tabs: Tab[] = ["overview","reports","positions","scanner","search","activity","admin"];
+  const tabs: Tab[] = useMemo(() => {
+    if (viewMode === "simple") return ["overview", "positions", "search"];
+    if (viewMode === "advanced") return ["overview", "reports", "positions", "scanner", "search", "activity"];
+    return ["overview", "reports", "positions", "scanner", "search", "activity", "admin"];
+  }, [viewMode]);
+  const simpleView = viewMode === "simple";
+
+  function changeViewMode(mode: ViewMode) {
+    setViewMode(mode);
+    localStorage.setItem("tradebot_view_mode", mode);
+    const allowed: Record<ViewMode, Tab[]> = {
+      simple: ["overview", "positions", "search"],
+      advanced: ["overview", "reports", "positions", "scanner", "search", "activity"],
+      admin: ["overview", "reports", "positions", "scanner", "search", "activity", "admin"],
+    };
+    if (!allowed[mode].includes(tab)) setTab("overview");
+  }
 
   return <div className="app">
     <header className="topbar">
@@ -462,9 +483,16 @@ const fetchData = useCallback(async (force = false) => {
       <Stat label="Total Gain/Loss" value={gbp(totalGainLoss * rate)} sub={`Deposited ${gbp(totalDeposited * rate)} / ${usd(totalDeposited)}`} className={tone(totalGainLoss)} />
     </section>
 
+    <nav className="tabs mode-tabs" aria-label="Dashboard mode">
+      <button className={viewMode==="simple" ? "active":""} onClick={() => changeViewMode("simple")}>SIMPLE VIEW</button>
+      <button className={viewMode==="advanced" ? "active":""} onClick={() => changeViewMode("advanced")}>ADVANCED VIEW</button>
+      <button className={viewMode==="admin" ? "active":""} onClick={() => changeViewMode("admin")}>ADMIN VIEW</button>
+    </nav>
+
     <nav className="tabs">{tabs.map(t => <button key={t} className={tab===t ? "active":""} onClick={() => setTab(t)}>{t.toUpperCase()}</button>)}</nav>
 
     {tab==="overview" && <main className="grid two">
+      {simpleView && <Card title="Simple View" wide><p className="muted">Showing only the essentials. Switch to Advanced View for scanner, universe, reports and logs, or Admin View for settings.</p></Card>}
       <Card title="Controls"><div className="actions">
         <button onClick={() => fetchData(true)}>Refresh Data</button>
         <button onClick={() => action("/manual-buy")}>Money Buy</button>
@@ -480,6 +508,8 @@ const fetchData = useCallback(async (force = false) => {
         <div><span>Dynamic universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
         <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
       </div></Card>
+
+      {!simpleView && <> 
 
       <Card title="Dynamic Market Scanner" wide>
         <div className="summary">
@@ -520,6 +550,7 @@ const fetchData = useCallback(async (force = false) => {
         </div>
         <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : r.dynamicPick ? "Dynamic ⚡" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "dynamic candidate"}</p></article>)}</div>
       </Card>
+      </>}
     </main>}
 
     {tab==="reports" && <main>
