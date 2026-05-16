@@ -1,6 +1,6 @@
 import os
 import secrets
-MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "260") or 260)
+MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "200") or 200)
 
 import sqlite3
 import json
@@ -4040,9 +4040,9 @@ def effective_trading_equity(account_equity: float) -> float:
         equity = 0.0
 
     try:
-        cap = float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 260)) or 260)
+        cap = float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 200)) or 200)
     except Exception:
-        cap = 260.0
+        cap = 200.0
 
     return max(0.0, min(equity, cap)) if cap > 0 else max(0.0, equity)
 
@@ -4054,9 +4054,9 @@ def banking_payload():
         equity = 0.0
 
     try:
-        cap = float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 260)) or 260)
+        cap = float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 200)) or 200)
     except Exception:
-        cap = 260.0
+        cap = 200.0
 
     effective = max(0.0, min(equity, cap)) if cap > 0 else max(0.0, equity)
     banked = max(0.0, equity - effective) if cap > 0 else 0.0
