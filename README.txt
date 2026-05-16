@@ -1,14 +1,17 @@
-Quality Build Weekly Final Fix
+Fixed Login Package
 
 Replace:
 backend/main.py
+frontend/src/App.tsx
 
-Fix:
-- build_weekly_universe() no longer uses stock-memory scoring.
-- Weekly refresh now forces quality-only list:
-  NVDA, AMD, MSFT, AAPL, META, AMZN, GOOGL, GOOG, AVGO, NFLX, TSLA, PLTR, UBER, QQQ, SMH
+Render backend env vars:
+ADMIN_USERNAME=yourusername
+ADMIN_PASSWORD=your-strong-password
+AUTH_SECRET=another-long-random-secret
 
-After deploy:
-1. Open /weekly-universe
-2. Click Weekly Stock Refresh
-3. Check /status autoUniverse only shows quality names.
+Deploy Render and Vercel.
+
+Open:
+https://tradebot-sand.vercel.app/?v=login-fixed
+
+The login block is outside useEffect and should show first.

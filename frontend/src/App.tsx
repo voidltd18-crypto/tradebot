@@ -242,7 +242,6 @@ return () => clearInterval(i);
     {tab==="overview" && <main className="grid two">
       <Card title="Controls"><div className="actions">
         <button onClick={fetchData}>Refresh Data</button>
-        <button onClick={secureLogout}>Logout</button>
         <button onClick={() => action("/manual-buy")}>Money Buy</button>
         <button className="danger" onClick={() => action("/manual-sell")}>Sell Worst</button>
         <button className="purple" onClick={() => action("/refresh-universe")}>↻ Weekly Stock Refresh</button>

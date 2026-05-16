@@ -1,9 +1,8 @@
 import os
-import hashlib
 import secrets
+import hashlib
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "260") or 260)
 
-import os
 import sqlite3
 import json
 import time
@@ -2967,11 +2966,7 @@ def login(payload: dict = Body(...)):
     if not secrets.compare_digest(username, ADMIN_USERNAME) or not secrets.compare_digest(password, ADMIN_PASSWORD):
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    return {
-        "ok": True,
-        "token": _make_auth_token(username),
-        "username": username,
-    }
+    return {"ok": True, "token": _make_auth_token(username), "username": username}
 
 @app.get("/auth-check")
 def auth_check(request: Request):
@@ -3187,7 +3182,6 @@ def get_status():
 
 @app.post("/pause")
 def pause_bot(request: Request):
-    require_login(request)
     verify_api_key(request)
     global bot_enabled
     bot_enabled = False
@@ -3197,7 +3191,6 @@ def pause_bot(request: Request):
 
 @app.post("/resume")
 def resume_bot(request: Request):
-    require_login(request)
     verify_api_key(request)
     global bot_enabled, emergency_stop
     bot_enabled = True
@@ -3226,7 +3219,6 @@ def manual_override_off(request: Request):
 
 @app.post("/manual-buy")
 def manual_buy(request: Request):
-    require_login(request)
     verify_api_key(request)
     with bot_lock:
         if not trading_client.get_clock().is_open:
@@ -3247,7 +3239,6 @@ def custom_buy(symbol: str, request: Request):
 
 @app.post("/manual-sell")
 def manual_sell(request: Request):
-    require_login(request)
     verify_api_key(request)
     with bot_lock:
         result = close_worst_or_largest_position(reason="MANUAL SELL")
@@ -3290,7 +3281,6 @@ def rebuild_closed_trades(request: Request):
 
 @app.post("/backfill-trades-limited")
 def backfill_trades_limited(request: Request):
-    require_login(request)
     verify_api_key(request)
     with bot_lock:
         result = backfill_trades_from_alpaca()
@@ -3301,7 +3291,6 @@ def backfill_trades_limited(request: Request):
 
 @app.post("/refresh-universe")
 def refresh_universe(request: Request):
-    require_login(request)
     verify_api_key(request)
     with bot_lock:
         result = build_weekly_universe(force=True)
@@ -3311,7 +3300,6 @@ def refresh_universe(request: Request):
 
 @app.post("/backfill-trades")
 def backfill_trades(request: Request):
-    require_login(request)
     verify_api_key(request)
     with bot_lock:
         result = backfill_trades_from_alpaca_full()
@@ -3433,7 +3421,6 @@ def save_equity_baseline(value: float) -> None:
 
 @app.post("/reset-baseline")
 def reset_baseline(request: Request):
-    require_login(request)
     verify_api_key(request)
     try:
         equity = _safe_num(latest_status.get("account", {}).get("equity", 0))
@@ -3572,7 +3559,6 @@ def api_manual_universe():
 
 @app.post("/add-to-universe/{symbol}")
 def add_to_universe(symbol: str, request: Request):
-    require_login(request)
     verify_api_key(request)
     sym = symbol.upper().strip()
     try:
@@ -3589,7 +3575,6 @@ def add_to_universe(symbol: str, request: Request):
 
 @app.post("/remove-from-universe/{symbol}")
 def api_remove_from_universe(symbol: str, request: Request):
-    require_login(request)
     verify_api_key(request)
     picks = remove_manual_universe_pick(symbol)
     try:
@@ -4071,7 +4056,6 @@ def quality_universe_final():
 
 @app.post("/refresh-universe-final")
 def refresh_universe_final(request: Request):
-    require_login(request)
     try:
         verify_api_key(request)
     except Exception:
