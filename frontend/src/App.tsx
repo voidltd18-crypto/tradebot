@@ -47,6 +47,9 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [stockResults, setStockResults] = useState<any[]>([]);
   const [stockSearchLoading, setStockSearchLoading] = useState(false);
   const fetchSeq = useRef(0);
+  const fetchInFlight = useRef(false);
+  const lastFetchAt = useRef(0);
+  const POLL_MS = 10000;
 
   const rate = Number(data?.fx?.usdToGbp || 0.7403);
   const scans = Array.isArray(data?.scans) ? data.scans : [];
@@ -92,8 +95,14 @@ const [banking, setBanking] = useState<AnyObj>({});
     setApiKey("");
   }
 
-const fetchData = useCallback(async () => {
+const fetchData = useCallback(async (force = false) => {
     if (!authToken) return;
+
+    const now = Date.now();
+    if (!force && (fetchInFlight.current || now - lastFetchAt.current < POLL_MS)) return;
+
+    fetchInFlight.current = true;
+    lastFetchAt.current = now;
     const seq = ++fetchSeq.current;
     try {
       const [statusRes, reportRes, bankingRes] = await Promise.allSettled([
@@ -125,13 +134,15 @@ const fetchData = useCallback(async () => {
     } catch (e) {
       console.error(e);
       setStatus("Connection failed");
+    } finally {
+      fetchInFlight.current = false;
     }
   }, [authToken, selectedSymbol]);
 
   useEffect(() => {
     if (!authToken) return;
-    fetchData();
-    const i = setInterval(fetchData, 5000);
+    fetchData(true);
+    const i = setInterval(() => fetchData(false), POLL_MS);
     return () => clearInterval(i);
   }, [authToken, fetchData]);
 
@@ -204,7 +215,7 @@ const fetchData = useCallback(async () => {
     } finally {
       clearTimeout(timeout);
       clearInterval(pollWhileWaiting);
-      await fetchData();
+      await fetchData(true);
     }
   }
 
@@ -286,7 +297,7 @@ const fetchData = useCallback(async () => {
 
     {tab==="overview" && <main className="grid two">
       <Card title="Controls"><div className="actions">
-        <button onClick={fetchData}>Refresh Data</button>
+        <button onClick={() => fetchData(true)}>Refresh Data</button>
         <button onClick={secureLogout}>Logout</button>
         <button onClick={() => action("/manual-buy")}>Money Buy</button>
         <button className="danger" onClick={() => action("/manual-sell")}>Sell Worst</button>
@@ -323,7 +334,7 @@ const fetchData = useCallback(async () => {
     </main>}
 
     {tab==="reports" && <main>
-      <div className="actions report-actions"><button onClick={fetchData}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button></div>
+      <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button></div>
       <section className="stats">
         <Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={`${usd(totalDeposited)} · ${reports.depositSource ? `Source: ${reports.depositSource}` : ""}`} />
         <Stat label="Earned Since Deposit" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)} />
