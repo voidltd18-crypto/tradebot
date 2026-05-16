@@ -3987,32 +3987,55 @@ def weekly_universe():
 
 @app.post("/refresh-universe")
 def refresh_universe(request: Request):
+    """
+    Fast weekly stock refresh route for the dashboard button.
+
+    Important fix:
+    - Do not wait behind the trading bot lock.
+    - Do not run slow scans/trading work here.
+    - Update current_universe + latest_status immediately so /status and /weekly-universe
+      show the refreshed list straight away.
+    """
     print("BUTTON HIT: refresh-universe", flush=True)
     verify_api_key(request)
-    with bot_lock:
-        try:
-            if "apply_quality_only_universe" in globals():
-                apply_quality_only_universe()
-            elif "apply_quality_universe_to_status" in globals():
-                apply_quality_universe_to_status()
-        except Exception as e:
-            print(f"QUALITY APPLY ERROR: {e}")
 
-        payload = force_quality_auto_universe_payload()
+    try:
+        if "apply_quality_only_universe" in globals():
+            apply_quality_only_universe()
+        elif "apply_quality_universe_to_status" in globals():
+            apply_quality_universe_to_status()
+    except Exception as e:
+        print(f"QUALITY APPLY ERROR: {e}")
 
-        try:
-            latest_status["autoUniverse"] = payload
-            latest_status["lastAction"] = "Quality-only weekly universe refreshed"
-            latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
-        except Exception:
-            pass
+    payload = force_quality_auto_universe_payload()
+    symbols = list(dict.fromkeys([str(s).upper().strip() for s in payload.get("activeSymbols", []) if str(s).strip()]))
 
-        return {
-            "ok": True,
-            "message": "Quality-only weekly universe refreshed",
-            "autoUniverse": payload,
-            "activeSymbols": payload["activeSymbols"],
-        }
+    try:
+        global current_universe, last_universe_refresh_ts
+        if symbols:
+            current_universe = symbols
+            for sym in current_universe:
+                ensure_symbol_state(sym, custom=sym in custom_symbols)
+        last_universe_refresh_ts = time.time()
+    except Exception as e:
+        print(f"REFRESH UNIVERSE STATE ERROR: {e}")
+
+    try:
+        latest_status["autoUniverse"] = payload
+        latest_status["universe"] = symbols or payload.get("activeSymbols", [])
+        latest_status["lastAction"] = "Quality-only weekly universe refreshed"
+        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
+        latest_status["autoUniverseEnabled"] = True
+    except Exception as e:
+        print(f"REFRESH UNIVERSE STATUS ERROR: {e}")
+
+    return {
+        "ok": True,
+        "message": "Quality-only weekly universe refreshed",
+        "autoUniverse": payload,
+        "activeSymbols": symbols or payload.get("activeSymbols", []),
+        "rows": payload.get("rows", []),
+    }
 
 @app.get("/refresh-universe-preview")
 def refresh_universe_preview():

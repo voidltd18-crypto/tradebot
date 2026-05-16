@@ -179,11 +179,34 @@ const fetchData = useCallback(async (force = false) => {
     setMessage("Dashboard password saved.");
   }
 
+  async function refreshWeeklyUniverseView() {
+    try {
+      const res = await fetch(`${API_URL}/weekly-universe`, {
+        cache: "no-store",
+        headers: secureHeaders,
+      });
+      const json = await readJson(res);
+      const autoUniverse = json?.autoUniverse || json;
+      if (autoUniverse?.activeSymbols || autoUniverse?.rows) {
+        setData(prev => ({
+          ...prev,
+          autoUniverse,
+          universe: autoUniverse.activeSymbols || prev.universe,
+          lastAction: json?.message || "Weekly universe refreshed",
+          lastActionAt: new Date().toISOString(),
+        }));
+      }
+    } catch (e) {
+      console.error("Weekly universe follow-up failed", e);
+    }
+  }
+
   async function action(endpoint:string) {
     if (!token) {
       setMessage("Please login first.");
       return;
     }
+
     const optimistic = endpoint === "/pause"
       ? (prev: AnyObj) => ({ ...prev, botEnabled: false })
       : endpoint === "/resume"
@@ -191,11 +214,12 @@ const fetchData = useCallback(async (force = false) => {
         : null;
 
     if (optimistic) setData(optimistic);
-    setMessage(`Sent ${endpoint}. Updating dashboard...`);
+
+    const isWeeklyRefresh = endpoint === "/refresh-universe";
+    setMessage(isWeeklyRefresh ? "Weekly stock refresh sent. Updating universe..." : `Sent ${endpoint}. Updating dashboard...`);
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000);
-    const pollWhileWaiting = setInterval(fetchData, 1500);
+    const timeout = setTimeout(() => controller.abort(), isWeeklyRefresh ? 12000 : 30000);
 
     try {
       const res = await fetch(`${API_URL}${endpoint}`, {
@@ -206,16 +230,34 @@ const fetchData = useCallback(async (force = false) => {
       });
       const json = await readJson(res);
       if (!res.ok) throw new Error(json?.detail || json?.message || `Action failed (${res.status})`);
-      setMessage(json.message || json.detail || JSON.stringify(json));
-      if (endpoint === "/refresh-universe" && json?.autoUniverse) {
-        setData(prev => ({ ...prev, autoUniverse: json.autoUniverse }));
+
+      if (isWeeklyRefresh) {
+        const autoUniverse = json?.autoUniverse;
+        if (autoUniverse?.activeSymbols || autoUniverse?.rows) {
+          setData(prev => ({
+            ...prev,
+            autoUniverse,
+            universe: autoUniverse.activeSymbols || prev.universe,
+            lastAction: json?.message || "Weekly universe refreshed",
+            lastActionAt: new Date().toISOString(),
+          }));
+        }
+        setMessage(json?.message || "Weekly universe refreshed.");
+        await refreshWeeklyUniverseView();
+      } else {
+        setMessage(json.message || json.detail || JSON.stringify(json));
       }
     } catch (e:any) {
-      setMessage(e?.name === "AbortError" ? "Action is still processing on Render. Refreshing dashboard..." : (e?.message || "Action failed."));
+      if (isWeeklyRefresh && e?.name === "AbortError") {
+        setMessage("Weekly refresh was sent. Checking saved universe now...");
+        await refreshWeeklyUniverseView();
+      } else {
+        setMessage(e?.name === "AbortError" ? "Action is still processing on Render. Dashboard will refresh normally." : (e?.message || "Action failed."));
+      }
     } finally {
       clearTimeout(timeout);
-      clearInterval(pollWhileWaiting);
       await fetchData(true);
+      if (isWeeklyRefresh) setTimeout(() => refreshWeeklyUniverseView(), 2500);
     }
   }
 
