@@ -202,6 +202,16 @@ MEDIUM_CONFIDENCE_SIZE_MULTIPLIER = 1.00
 HIGH_CONFIDENCE_SIZE_MULTIPLIER = 1.35
 MAX_CONFIDENCE_POSITION_VALUE_PCT = 0.14
 
+# Adaptive Position Sizing
+ADAPTIVE_POSITION_SIZING_ENABLED = os.getenv("ADAPTIVE_POSITION_SIZING_ENABLED", "true").lower() == "true"
+ADAPTIVE_MIN_SIZE_MULTIPLIER = float(os.getenv("ADAPTIVE_MIN_SIZE_MULTIPLIER", "0.35"))
+ADAPTIVE_MAX_SIZE_MULTIPLIER = float(os.getenv("ADAPTIVE_MAX_SIZE_MULTIPLIER", "1.25"))
+ADAPTIVE_DRAWDOWN_REDUCTION_PCT = float(os.getenv("ADAPTIVE_DRAWDOWN_REDUCTION_PCT", "-2.0"))
+ADAPTIVE_LOSS_STREAK_REDUCTION = float(os.getenv("ADAPTIVE_LOSS_STREAK_REDUCTION", "0.75"))
+ADAPTIVE_WIN_STREAK_BOOST = float(os.getenv("ADAPTIVE_WIN_STREAK_BOOST", "1.10"))
+ADAPTIVE_VOLATILITY_REDUCTION = float(os.getenv("ADAPTIVE_VOLATILITY_REDUCTION", "0.85"))
+ADAPTIVE_HIGH_VOLATILITY_PCT = float(os.getenv("ADAPTIVE_HIGH_VOLATILITY_PCT", "1.25"))
+
 MEMORY_MIN_TRADES_FOR_TRUST = 3
 MEMORY_BAD_WINRATE = 0.35
 MEMORY_GOOD_WINRATE = 0.58
@@ -1094,18 +1104,172 @@ def calculate_new_position_notional():
     return round(max(0.0, min(target_value, max_value, usable_cash)), 2)
 
 
-def confidence_notional(scan):
+def _recent_sell_streak():
+    """Return recent win/loss streak from matched closed trades or in-memory history."""
+    try:
+        rows = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
+    except Exception:
+        rows = []
+
+    if not rows:
+        rows = [t for t in trade_history[-100:] if str(t.get("side", "")).upper() == "SELL"]
+
+    streak_type = "NONE"
+    streak = 0
+    for row in reversed(rows[-100:]):
+        pnl = float(row.get("pnl") or 0.0)
+        row_type = "WIN" if pnl >= 0 else "LOSS"
+        if streak_type == "NONE":
+            streak_type = row_type
+            streak = 1
+        elif row_type == streak_type:
+            streak += 1
+        else:
+            break
+    return streak_type, streak
+
+
+def _scan_volatility_pct(scan: Dict[str, Any]):
+    try:
+        curve = scan.get("price_curve") or scan.get("priceCurve") or []
+        values = [float(p.get("value") or 0.0) for p in curve[-30:] if isinstance(p, dict) and float(p.get("value") or 0.0) > 0]
+        if len(values) < 3:
+            return 0.0
+        high = max(values)
+        low = min(values)
+        mid = values[-1] or values[0]
+        return ((high - low) / mid) * 100.0 if mid > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def adaptive_sizing_payload(scan: Optional[Dict[str, Any]] = None):
+    """Explains how the bot scales the next buy size.
+    This is also used by confidence_notional, so the UI and execution logic agree.
+    """
     base = calculate_new_position_notional()
-    if not CONFIDENCE_SIZING_ENABLED:
-        return base
-    confidence, label = calculate_confidence(scan)
-    mult = HIGH_CONFIDENCE_SIZE_MULTIPLIER if label == "HIGH" else MEDIUM_CONFIDENCE_SIZE_MULTIPLIER if label == "MEDIUM" else LOW_CONFIDENCE_SIZE_MULTIPLIER
+    reasons = []
+    warnings = []
+
+    if not scan and latest_scans:
+        try:
+            scan = best_setup_today_payload(latest_scans).get("scan")
+        except Exception:
+            scan = None
+        if not scan:
+            try:
+                scan = sorted(latest_scans, key=lambda x: (float(x.get("confidence") or 0), float(x.get("quality_score") or 0)), reverse=True)[0]
+            except Exception:
+                scan = None
+
+    symbol = str((scan or {}).get("symbol") or "—").upper()
+    confidence = 0.0
+    confidence_label = "LOW"
+    confidence_mult = 1.0
+
+    if scan and CONFIDENCE_SIZING_ENABLED:
+        confidence, confidence_label = calculate_confidence(scan)
+        confidence_mult = HIGH_CONFIDENCE_SIZE_MULTIPLIER if confidence_label == "HIGH" else MEDIUM_CONFIDENCE_SIZE_MULTIPLIER if confidence_label == "MEDIUM" else LOW_CONFIDENCE_SIZE_MULTIPLIER
+        reasons.append(f"{confidence_label} confidence multiplier {confidence_mult:.2f}x")
+    elif not CONFIDENCE_SIZING_ENABLED:
+        reasons.append("Confidence sizing disabled")
+
+    memory_mult = 1.0
+    try:
+        if symbol != "—":
+            memory_mult = memory_multiplier(symbol)
+            if memory_mult > 1.0:
+                reasons.append(f"Good symbol memory boost {memory_mult:.2f}x")
+            elif memory_mult < 1.0:
+                warnings.append(f"Weak symbol memory reduction {memory_mult:.2f}x")
+    except Exception as e:
+        warnings.append(f"Memory sizing unavailable: {e}")
+
+    performance_mult = 1.0
+    streak_type, streak = _recent_sell_streak()
+    if streak_type == "LOSS" and streak >= 2:
+        performance_mult *= ADAPTIVE_LOSS_STREAK_REDUCTION
+        warnings.append(f"Recent loss streak {streak}: reduced size")
+    elif streak_type == "WIN" and streak >= 3:
+        performance_mult *= ADAPTIVE_WIN_STREAK_BOOST
+        reasons.append(f"Recent win streak {streak}: small boost")
+
+    drawdown_mult = 1.0
+    try:
+        day_pnl = get_daily_pnl()
+        equity = float(get_account().equity)
+        day_pnl_pct = (day_pnl / max(1.0, equity)) * 100.0
+        if day_pnl_pct <= ADAPTIVE_DRAWDOWN_REDUCTION_PCT:
+            drawdown_mult = 0.50
+            warnings.append(f"Daily drawdown {day_pnl_pct:.2f}%: half size")
+    except Exception as e:
+        day_pnl_pct = 0.0
+        warnings.append(f"Drawdown sizing unavailable: {e}")
+
+    volatility_mult = 1.0
+    volatility_pct = _scan_volatility_pct(scan or {})
+    if volatility_pct >= ADAPTIVE_HIGH_VOLATILITY_PCT:
+        volatility_mult = ADAPTIVE_VOLATILITY_REDUCTION
+        warnings.append(f"High short-term volatility {volatility_pct:.2f}%: reduced size")
+
+    raw_multiplier = confidence_mult * memory_mult * performance_mult * drawdown_mult * volatility_mult
+
+    if ADAPTIVE_POSITION_SIZING_ENABLED:
+        final_multiplier = max(ADAPTIVE_MIN_SIZE_MULTIPLIER, min(ADAPTIVE_MAX_SIZE_MULTIPLIER, raw_multiplier))
+    else:
+        final_multiplier = confidence_mult if CONFIDENCE_SIZING_ENABLED else 1.0
+        reasons.append("Adaptive sizing disabled")
+
+    suggested = round(base * final_multiplier, 2)
     try:
         equity = float(get_account().equity)
     except Exception:
         equity = 0.0
     cap = equity * MAX_CONFIDENCE_POSITION_VALUE_PCT if equity > 0 else base
-    return round(max(0.0, min(base * mult, cap)), 2)
+    suggested_capped = round(max(0.0, min(suggested, cap)), 2)
+
+    return {
+        "enabled": ADAPTIVE_POSITION_SIZING_ENABLED,
+        "symbol": symbol,
+        "baseNotional": base,
+        "suggestedNotional": suggested_capped,
+        "rawSuggestedNotional": suggested,
+        "capNotional": round(cap, 2),
+        "finalMultiplier": round(final_multiplier, 4),
+        "confidenceMultiplier": round(confidence_mult, 4),
+        "memoryMultiplier": round(memory_mult, 4),
+        "performanceMultiplier": round(performance_mult, 4),
+        "drawdownMultiplier": round(drawdown_mult, 4),
+        "volatilityMultiplier": round(volatility_mult, 4),
+        "confidence": round(confidence, 4),
+        "confidenceLabel": confidence_label,
+        "recentStreakType": streak_type,
+        "recentStreak": streak,
+        "dayPnlPct": round(day_pnl_pct, 4),
+        "volatilityPct": round(volatility_pct, 4),
+        "reasons": reasons,
+        "warnings": warnings,
+        "message": f"Adaptive size for {symbol}: ${suggested_capped:.2f} ({final_multiplier:.2f}x base)",
+    }
+
+
+def confidence_notional(scan):
+    base = calculate_new_position_notional()
+    if not CONFIDENCE_SIZING_ENABLED and not ADAPTIVE_POSITION_SIZING_ENABLED:
+        return base
+    try:
+        payload = adaptive_sizing_payload(scan)
+        return round(float(payload.get("suggestedNotional") or base), 2)
+    except Exception as e:
+        print(f"ADAPTIVE SIZING ERROR: {e}")
+        confidence, label = calculate_confidence(scan)
+        mult = HIGH_CONFIDENCE_SIZE_MULTIPLIER if label == "HIGH" else MEDIUM_CONFIDENCE_SIZE_MULTIPLIER if label == "MEDIUM" else LOW_CONFIDENCE_SIZE_MULTIPLIER
+        try:
+            equity = float(get_account().equity)
+        except Exception:
+            equity = 0.0
+        cap = equity * MAX_CONFIDENCE_POSITION_VALUE_PCT if equity > 0 else base
+        return round(max(0.0, min(base * mult, cap)), 2)
 
 
 def can_buy_symbol(symbol: str):
@@ -1528,9 +1692,6 @@ def money_mode_buy(scans, manual=False):
     blocked, reason = risk_blocked()
     if blocked:
         return f"BUY BLOCKED | {reason}"
-    regime_ok, regime_reason, regime = market_regime_allows_new_buys()
-    if not regime_ok:
-        return f"BUY BLOCKED | {regime_reason}"
     if allowed_new_position_count() <= 0:
         return f"BUY BLOCKED | max positions reached ({MAX_POSITIONS})"
     if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
@@ -1557,12 +1718,6 @@ def money_mode_buy(scans, manual=False):
             messages.append(f"SKIP {symbol} | {reason}")
             continue
         notional = confidence_notional(c)
-        try:
-            regime_multiplier = float((regime or {}).get("sizeMultiplier", 1.0) or 1.0)
-            if regime_multiplier > 0 and regime_multiplier < 1.0:
-                notional = round(notional * regime_multiplier, 2)
-        except Exception:
-            pass
         if notional < MIN_ORDER_NOTIONAL:
             messages.append(f"SKIP {symbol} | notional too small {notional:.2f}")
             continue
@@ -2663,110 +2818,6 @@ def optimiser_payload():
 
 
 # =========================
-# MARKET REGIME FILTER
-# =========================
-MARKET_REGIME_FILTER_ENABLED = os.getenv("MARKET_REGIME_FILTER_ENABLED", "true").lower() == "true"
-MARKET_REGIME_SYMBOLS = [s.strip().upper() for s in os.getenv("MARKET_REGIME_SYMBOLS", "QQQ,SPY").split(",") if s.strip()]
-MARKET_REGIME_DEFENSIVE_PCT = float(os.getenv("MARKET_REGIME_DEFENSIVE_PCT", "-0.35"))
-MARKET_REGIME_BLOCK_PCT = float(os.getenv("MARKET_REGIME_BLOCK_PCT", "-0.75"))
-MARKET_REGIME_STRONG_PCT = float(os.getenv("MARKET_REGIME_STRONG_PCT", "0.25"))
-MARKET_REGIME_DEFENSIVE_SIZE_MULTIPLIER = float(os.getenv("MARKET_REGIME_DEFENSIVE_SIZE_MULTIPLIER", "0.50"))
-MARKET_REGIME_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
-
-
-def _regime_quote(symbol: str):
-    try:
-        q = get_quote(symbol)
-        return float(q.get("mid") or 0.0), float(q.get("spread") or 0.0)
-    except Exception as e:
-        print(f"MARKET REGIME QUOTE ERROR {symbol}: {e}")
-        return 0.0, 0.0
-
-
-def market_regime_payload():
-    """QQQ/SPY based market condition filter.
-    Uses lightweight live quotes and an in-memory intraday baseline. It is deliberately
-    simple and fast so it can run inside /status without slowing the dashboard.
-    """
-    if not MARKET_REGIME_FILTER_ENABLED:
-        return {
-            "enabled": False,
-            "mode": "OFF",
-            "allowNewBuys": True,
-            "sizeMultiplier": 1.0,
-            "message": "Market regime filter disabled",
-            "symbols": [],
-        }
-
-    rows = []
-    now_iso = datetime.now(UTC).isoformat()
-
-    for symbol in MARKET_REGIME_SYMBOLS or ["QQQ", "SPY"]:
-        price, spread = _regime_quote(symbol)
-        hist = MARKET_REGIME_HISTORY.setdefault(symbol, [])
-        if price > 0:
-            hist.append({"t": now_iso, "value": price})
-            del hist[:-240]
-        baseline = float(hist[0]["value"]) if hist else price
-        change_pct = ((price / baseline) - 1.0) * 100.0 if price > 0 and baseline > 0 else 0.0
-        rows.append({
-            "symbol": symbol,
-            "price": price,
-            "baseline": baseline,
-            "changePct": change_pct,
-            "spread": spread,
-            "points": hist[-80:],
-        })
-
-    valid = [r for r in rows if float(r.get("price") or 0) > 0]
-    avg_change = sum(float(r.get("changePct") or 0.0) for r in valid) / max(1, len(valid))
-
-    allow_new_buys = True
-    size_multiplier = 1.0
-    mode = "NORMAL"
-    message = "Market backdrop normal — normal buying allowed"
-
-    if avg_change <= MARKET_REGIME_BLOCK_PCT:
-        mode = "RISK-OFF"
-        allow_new_buys = False
-        size_multiplier = 0.0
-        message = f"Market weak: avg QQQ/SPY change {avg_change:.2f}% — new buys paused"
-    elif avg_change <= MARKET_REGIME_DEFENSIVE_PCT:
-        mode = "DEFENSIVE"
-        allow_new_buys = True
-        size_multiplier = MARKET_REGIME_DEFENSIVE_SIZE_MULTIPLIER
-        message = f"Market soft: avg QQQ/SPY change {avg_change:.2f}% — smaller buys only"
-    elif avg_change >= MARKET_REGIME_STRONG_PCT:
-        mode = "STRONG"
-        message = f"Market strong: avg QQQ/SPY change {avg_change:.2f}% — normal buying allowed"
-
-    return {
-        "enabled": True,
-        "mode": mode,
-        "allowNewBuys": allow_new_buys,
-        "sizeMultiplier": size_multiplier,
-        "avgChangePct": avg_change,
-        "message": message,
-        "symbols": rows,
-        "defensivePct": MARKET_REGIME_DEFENSIVE_PCT,
-        "blockPct": MARKET_REGIME_BLOCK_PCT,
-        "strongPct": MARKET_REGIME_STRONG_PCT,
-        "updatedAt": now_iso,
-    }
-
-
-def market_regime_allows_new_buys():
-    try:
-        payload = market_regime_payload()
-        if not bool(payload.get("allowNewBuys", True)):
-            return False, payload.get("message", "Market regime blocked new buys"), payload
-        return True, payload.get("message", "Market regime OK"), payload
-    except Exception as e:
-        return True, f"Market regime unavailable: {e}", {"enabled": True, "mode": "UNKNOWN", "allowNewBuys": True, "message": str(e)}
-
-
-
-# =========================
 # WEEKLY AUTO UNIVERSE ROTATION
 # =========================
 def week_start_str(dt=None):
@@ -3092,7 +3143,6 @@ def build_status_payload(bot_name, scans):
         "riskReason": risk_reason,
         "mode": "SNIPER_CONFIDENCE_MEMORY_TIMELINE_GBP",
         "market": market_status,
-        "marketRegime": market_regime_payload(),
         "fx": fx_payload(),
         "autoUniverse": auto_universe_payload(),
         "analytics": analytics_payload(),
@@ -3127,6 +3177,7 @@ def build_status_payload(bot_name, scans):
         "customSymbols": sorted(list(custom_symbols.keys())),
         "maxPositions": MAX_POSITIONS,
         "newPositionNotional": calculate_new_position_notional(),
+        "adaptiveSizing": adaptive_sizing_payload(scans[0] if scans else None),
         "allowedNewPositions": allowed_new_position_count(),
         "universe": list(current_universe),
         "config": {
@@ -3185,12 +3236,11 @@ def build_status_payload(bot_name, scans):
                 "optimiserDecision": auto_improve_decision(s["symbol"]),
             } for s in scans
         ],
-        "tradeSafety": [trade_safety_panel_row(s) for s in scans],
-        "bestSetupToday": best_setup_today_payload(scans),
         "banking": banking_payload(),
         "logs": [
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
+            f"ADAPTIVE SIZE | enabled={ADAPTIVE_POSITION_SIZING_ENABLED} | next={adaptive_sizing_payload(scans[0] if scans else None).get('suggestedNotional', 0):.2f} | mult={adaptive_sizing_payload(scans[0] if scans else None).get('finalMultiplier', 1):.2f}",
             f"FX | USDGBP={get_usd_to_gbp_rate():.4f} | source={fx_cache.get('source', 'fallback')}",
             f"DB | sqlite={SQLITE_ENABLED} | raw_trades={db_summary_payload().get('totalTrades', 0)} | closed={closed_trade_summary_payload().get('closedTrades', 0)} | pnl_gbp={closed_trade_summary_payload().get('totalPnlGbp', 0):.2f}",
             f"BACKFILL | chunk={BACKFILL_CHUNK_SIZE} | max_pages={BACKFILL_MAX_PAGES}",
@@ -3200,7 +3250,6 @@ def build_status_payload(bot_name, scans):
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
-            f"REGIME | {market_regime_payload().get('mode', 'UNKNOWN')} | {market_regime_payload().get('message', '')}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f}",
             f"POSITIONS | {len(positions)}",
             f"LOCKOUT | locked_today={', '.join(locked_symbols) if locked_symbols else 'none'}",
@@ -3221,216 +3270,179 @@ def update_status(bot_name, scans):
     latest_status.update(build_status_payload(bot_name, scans))
 
 
+
 # =========================
-# TRADE SAFETY PANEL HELPERS
+# BACKTEST / PAPER REPLAY MODE
 # =========================
-def trade_safety_panel_row(scan: Dict[str, Any]):
-    """Explain clearly why the bot can/cannot buy each scanned symbol.
-    This powers the dashboard Trade Safety Panel and does not place trades.
-    """
-    symbol = str(scan.get("symbol", "")).upper()
-    reasons: List[str] = []
-    warnings: List[str] = []
-
-    try:
-        market = get_market_status_payload()
-        market_open = bool(market.get("isOpen"))
-    except Exception:
-        market_open = False
-
-    if not bot_enabled:
-        reasons.append("Bot paused")
-    if emergency_stop:
-        reasons.append("Emergency stop active")
-    if manual_override:
-        warnings.append("Manual override is ON, auto-buy paused")
-    if not market_open:
-        reasons.append("Market closed")
-
-    try:
-        regime = market_regime_payload()
-        if regime.get("enabled") and not regime.get("allowNewBuys", True):
-            reasons.append(regime.get("message") or "Market regime blocked new buys")
-        elif regime.get("enabled") and regime.get("mode") == "DEFENSIVE":
-            warnings.append(regime.get("message") or "Market regime defensive — smaller buys")
-    except Exception as e:
-        warnings.append(f"Market regime check unavailable: {e}")
-
-    try:
-        blocked, risk_reason = risk_blocked()
-        if blocked:
-            reasons.append(risk_reason or "Risk guardrail active")
-    except Exception as e:
-        warnings.append(f"Risk check unavailable: {e}")
-
-    try:
-        can_buy, can_reason = can_buy_symbol(symbol)
-        if not can_buy:
-            reasons.append(can_reason)
-    except Exception as e:
-        warnings.append(f"Position/open-order check unavailable: {e}")
-
-    if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
-        reasons.append(f"PDT-aware daily buy limit reached ({today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE})")
-
-    try:
-        spread = float(scan.get("spread") or 0)
-        if spread > MAX_SPREAD:
-            reasons.append(f"Spread too high {spread:.4f} > max {MAX_SPREAD:.4f}")
-    except Exception:
-        pass
-
-    try:
-        confidence = float(scan.get("confidence") or 0)
-        if confidence < SNIPER_MIN_CONFIDENCE:
-            reasons.append(f"Confidence too low {confidence:.2f} < sniper {SNIPER_MIN_CONFIDENCE:.2f}")
-    except Exception:
-        pass
-
-    try:
-        quality = float(scan.get("quality_score") or 0)
-        if quality < SNIPER_MIN_QUALITY:
-            reasons.append(f"Quality too low {quality:.4f} < sniper {SNIPER_MIN_QUALITY:.4f}")
-    except Exception:
-        pass
-
-    if not bool(scan.get("ready_to_buy")):
-        reasons.append("Entry trigger not ready")
-
-    if not bool(scan.get("sniper_pass")):
-        reasons.append(str(scan.get("sniper_reason") or "Sniper filter blocked"))
-
-    if not bool(scan.get("a_plus_pass")):
-        reasons.append(str(scan.get("a_plus_reason") or "A+ quality gate blocked"))
-
-    try:
-        blacklisted, black_reason = is_temp_blacklisted(symbol)
-        if blacklisted:
-            reasons.append(f"Temporary blacklist: {black_reason}")
-    except Exception:
-        pass
-
-    # De-duplicate while keeping order.
-    clean_reasons = []
-    for r in reasons:
-        r = str(r).strip()
-        if r and r not in clean_reasons:
-            clean_reasons.append(r)
-
-    clean_warnings = []
-    for w in warnings:
-        w = str(w).strip()
-        if w and w not in clean_warnings:
-            clean_warnings.append(w)
-
-    can_trade = len(clean_reasons) == 0
-    return {
-        "symbol": symbol,
-        "canBuy": can_trade,
-        "status": "READY" if can_trade else "BLOCKED",
-        "summary": "Ready for sniper buy if selected" if can_trade else clean_reasons[0],
-        "reasons": clean_reasons,
-        "warnings": clean_warnings,
-        "confidence": float(scan.get("confidence") or 0),
-        "qualityScore": float(scan.get("quality_score") or 0),
-        "spread": float(scan.get("spread") or 0),
-        "readyToBuy": bool(scan.get("ready_to_buy")),
-        "sniperPass": bool(scan.get("sniper_pass")),
-        "aPlusPass": bool(scan.get("a_plus_pass")),
-    }
+def _max_drawdown_from_curve(points: List[Dict[str, Any]]):
+    peak = None
+    max_dd = 0.0
+    max_dd_pct = 0.0
+    for p in points:
+        equity = float(p.get("equity") or 0.0)
+        if peak is None or equity > peak:
+            peak = equity
+        if peak and peak > 0:
+            dd = equity - peak
+            dd_pct = (dd / peak) * 100.0
+            if dd < max_dd:
+                max_dd = dd
+                max_dd_pct = dd_pct
+    return max_dd, max_dd_pct
 
 
-def best_setup_today_payload(scans: List[Dict[str, Any]]):
-    """Pick the clearest best opportunity from the current scan list.
-    It ranks READY stocks first, then highest confidence, quality and tightest spread.
-    This is dashboard-only advice and does not place trades.
+def backtest_replay_payload(starting_capital: float = 1000.0, limit: int = 500):
+    """Replay existing matched closed trades as a paper/backtest report.
+
+    This does not place orders and does not pull historical candles. It uses your
+    recorded matched closed trades to estimate how the current rules performed,
+    including win rate, drawdown, symbol contribution and an equity curve.
     """
     try:
-        rows = [trade_safety_panel_row(s) for s in scans]
-        if not rows:
-            return {
-                "ok": True,
-                "symbol": "—",
-                "status": "WAITING",
-                "action": "Wait for scanner data",
-                "summary": "No scan data yet. The bot will populate this after the next scan.",
-                "confidence": 0.0,
-                "qualityScore": 0.0,
-                "spread": 0.0,
-                "reasons": [],
-                "warnings": [],
-            }
+        starting_capital = float(starting_capital or 1000.0)
+    except Exception:
+        starting_capital = 1000.0
+    starting_capital = max(1.0, starting_capital)
 
-        scan_by_symbol = {str(s.get("symbol", "")).upper(): s for s in scans}
+    try:
+        limit = int(limit or 500)
+    except Exception:
+        limit = 500
+    limit = max(10, min(limit, 5000))
 
-        def rank(row):
-            symbol = str(row.get("symbol", "")).upper()
-            scan = scan_by_symbol.get(symbol, {})
-            can_buy = 1 if row.get("canBuy") else 0
-            confidence = float(row.get("confidence") or scan.get("confidence") or 0.0)
-            quality = float(row.get("qualityScore") or scan.get("quality_score") or 0.0)
-            spread = float(row.get("spread") or scan.get("spread") or 9.0)
-            ready = 1 if scan.get("ready_to_buy") else 0
-            sniper = 1 if scan.get("sniper_pass") else 0
-            aplus = 1 if scan.get("a_plus_pass") else 0
-            return (can_buy, ready + sniper + aplus, confidence, quality, -spread)
+    try:
+        trades = closed_trades_from_db(limit)
+    except Exception:
+        trades = []
 
-        ordered = sorted(rows, key=rank, reverse=True)
-        best = ordered[0]
-        symbol = str(best.get("symbol", "—")).upper()
-        scan = scan_by_symbol.get(symbol, {})
-        can_buy = bool(best.get("canBuy"))
+    trades = [t for t in trades if str(t.get("symbol", "")).strip()]
+    trades.sort(key=lambda t: str(t.get("timestamp") or t.get("day") or ""))
 
-        if can_buy:
-            action = "READY — eligible for Money Buy"
-            summary = "This is the strongest clear setup right now."
+    equity = starting_capital
+    curve = [{"idx": 0, "label": "Start", "equity": round(equity, 4), "pnl": 0.0}]
+    wins = losses = 0
+    gross_win = 0.0
+    gross_loss = 0.0
+    best_trade = None
+    worst_trade = None
+    streak_type = "NONE"
+    current_streak = 0
+    max_win_streak = 0
+    max_loss_streak = 0
+    by_symbol: Dict[str, Dict[str, Any]] = {}
+    replayed = []
+
+    for i, t in enumerate(trades, start=1):
+        pnl = float(t.get("pnl") or 0.0)
+        symbol = str(t.get("symbol") or "").upper()
+        equity += pnl
+        win = pnl >= 0
+        if win:
+            wins += 1
+            gross_win += pnl
+            if streak_type == "WIN":
+                current_streak += 1
+            else:
+                streak_type = "WIN"
+                current_streak = 1
+            max_win_streak = max(max_win_streak, current_streak)
         else:
-            action = "WAIT — buy blocked"
-            summary = best.get("summary") or "The top candidate is not clear yet."
+            losses += 1
+            gross_loss += abs(pnl)
+            if streak_type == "LOSS":
+                current_streak += 1
+            else:
+                streak_type = "LOSS"
+                current_streak = 1
+            max_loss_streak = max(max_loss_streak, current_streak)
 
-        return {
-            "ok": True,
+        row = by_symbol.setdefault(symbol, {
             "symbol": symbol,
-            "status": "READY" if can_buy else "WAIT",
-            "action": action,
-            "summary": summary,
-            "reasons": best.get("reasons", []),
-            "warnings": best.get("warnings", []),
-            "confidence": float(best.get("confidence") or scan.get("confidence") or 0.0),
-            "confidenceLabel": scan.get("confidence_label", "LOW"),
-            "qualityScore": float(best.get("qualityScore") or scan.get("quality_score") or 0.0),
-            "spread": float(best.get("spread") or scan.get("spread") or 0.0),
-            "price": float(scan.get("price") or 0.0),
-            "readyToBuy": bool(scan.get("ready_to_buy")),
-            "sniperPass": bool(scan.get("sniper_pass")),
-            "aPlusPass": bool(scan.get("a_plus_pass")),
-            "topThree": ordered[:3],
-            "updatedAt": datetime.now(UTC).isoformat(),
-        }
-    except Exception as e:
-        return {
-            "ok": False,
-            "symbol": "—",
-            "status": "ERROR",
-            "action": "Check logs",
-            "summary": f"Best setup calculation failed: {e}",
-            "reasons": [str(e)],
-            "warnings": [],
-            "confidence": 0.0,
-            "qualityScore": 0.0,
-            "spread": 0.0,
-        }
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "totalPnl": 0.0,
+            "bestPnl": None,
+            "worstPnl": None,
+        })
+        row["trades"] += 1
+        row["totalPnl"] += pnl
+        row["wins" if win else "losses"] += 1
+        row["bestPnl"] = pnl if row["bestPnl"] is None else max(float(row["bestPnl"]), pnl)
+        row["worstPnl"] = pnl if row["worstPnl"] is None else min(float(row["worstPnl"]), pnl)
 
+        if best_trade is None or pnl > float(best_trade.get("pnl") or 0.0):
+            best_trade = t
+        if worst_trade is None or pnl < float(worst_trade.get("pnl") or 0.0):
+            worst_trade = t
+
+        point = {
+            "idx": i,
+            "label": t.get("day") or t.get("time") or str(i),
+            "timestamp": t.get("timestamp"),
+            "symbol": symbol,
+            "pnl": round(pnl, 4),
+            "pnlPct": float(t.get("pnlPct") or 0.0),
+            "equity": round(equity, 4),
+        }
+        curve.append(point)
+        replayed.append({**t, "replayEquity": round(equity, 4)})
+
+    max_dd, max_dd_pct = _max_drawdown_from_curve(curve)
+    total_pnl = equity - starting_capital
+    total_trades = len(trades)
+    win_rate = wins / max(1, total_trades)
+    profit_factor = gross_win / max(0.01, gross_loss)
+
+    symbol_rows = []
+    for row in by_symbol.values():
+        row["winRate"] = row["wins"] / max(1, row["trades"])
+        row["avgPnl"] = row["totalPnl"] / max(1, row["trades"])
+        symbol_rows.append(row)
+
+    symbol_rows.sort(key=lambda r: (float(r.get("totalPnl") or 0.0), float(r.get("winRate") or 0.0)), reverse=True)
+
+    return {
+        "ok": True,
+        "mode": "paper-replay",
+        "message": "Paper replay complete. Uses recorded closed trades only; it does not place orders.",
+        "startingCapital": round(starting_capital, 2),
+        "endingCapital": round(equity, 2),
+        "totalPnl": round(total_pnl, 4),
+        "totalReturnPct": round((total_pnl / starting_capital) * 100.0, 4),
+        "totalTrades": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "winRate": win_rate,
+        "grossWin": round(gross_win, 4),
+        "grossLoss": round(gross_loss, 4),
+        "profitFactor": round(profit_factor, 4),
+        "maxDrawdown": round(max_dd, 4),
+        "maxDrawdownPct": round(max_dd_pct, 4),
+        "maxWinStreak": max_win_streak,
+        "maxLossStreak": max_loss_streak,
+        "bestTrade": best_trade or {},
+        "worstTrade": worst_trade or {},
+        "bestSymbols": symbol_rows[:10],
+        "worstSymbols": sorted(symbol_rows, key=lambda r: (float(r.get("totalPnl") or 0.0), float(r.get("winRate") or 0.0)))[:10],
+        "equityCurve": curve[-1000:],
+        "trades": replayed[-500:],
+    }
 
 # =========================
 # ROUTES
 # =========================
 
 
-@app.get("/market-regime")
-def api_market_regime():
-    payload = market_regime_payload()
-    return {"ok": True, "marketRegime": payload, **payload}
+@app.get("/backtest-replay")
+def api_backtest_replay(request: Request, starting_capital: float = 1000.0, limit: int = 500):
+    verify_api_key(request)
+    return backtest_replay_payload(starting_capital=starting_capital, limit=limit)
+
+@app.get("/adaptive-sizing")
+def api_adaptive_sizing():
+    return {"ok": True, "adaptiveSizing": adaptive_sizing_payload(latest_scans[0] if latest_scans else None)}
+
 
 @app.get("/debug-orders")
 def debug_orders():
@@ -3600,16 +3612,6 @@ def backfill_trades(request: Request):
         result = backfill_trades_from_alpaca_full()
         update_status(BOT_NAME, latest_scans)
         return result
-
-
-
-@app.get("/trade-safety")
-def api_trade_safety():
-    return {"ok": True, "rows": [trade_safety_panel_row(s) for s in latest_scans]}
-
-@app.get("/best-setup-today")
-def api_best_setup_today():
-    return {"ok": True, "bestSetupToday": best_setup_today_payload(latest_scans)}
 
 
 # =========================
