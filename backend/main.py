@@ -3528,6 +3528,21 @@ def merge_manual_picks_into_auto_universe(status_obj: Dict[str, Any]) -> Dict[st
 def api_manual_universe():
     return {"ok": True, "symbols": load_manual_universe_picks()}
 
+
+
+def touch_quick_status(**kwargs):
+    """Small safe status updater used by manual-universe/search buttons.
+    Keeps UI feedback fields current without forcing a full status rebuild.
+    """
+    try:
+        for key, value in kwargs.items():
+            latest_status[key] = value
+        latest_status["quickStatusUpdatedAt"] = datetime.now(UTC).isoformat()
+        return True
+    except Exception as e:
+        print(f"TOUCH QUICK STATUS ERROR: {e}")
+        return False
+
 @app.post("/add-to-universe/{symbol}")
 def add_to_universe(symbol: str, request: Request):
     verify_api_key(request)
