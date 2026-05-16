@@ -1,5 +1,6 @@
-import secrets
 import os
+import secrets
+MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "260") or 260)
 
 import sqlite3
 import json
@@ -3070,6 +3071,7 @@ def build_status_payload(bot_name, scans):
                 "optimiserDecision": auto_improve_decision(s["symbol"]),
             } for s in scans
         ],
+        "banking": banking_payload(),
         "logs": [
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
@@ -4031,6 +4033,19 @@ def refresh_universe_preview():
 # PROFIT BANKING FINAL OVERRIDE
 # ============================================================
 
+def effective_trading_equity(account_equity: float) -> float:
+    try:
+        equity = float(account_equity or 0)
+    except Exception:
+        equity = 0.0
+
+    try:
+        cap = float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 260)) or 260)
+    except Exception:
+        cap = 260.0
+
+    return max(0.0, min(equity, cap)) if cap > 0 else max(0.0, equity)
+
 def banking_payload():
     try:
         account = get_account()
@@ -4039,18 +4054,15 @@ def banking_payload():
         equity = 0.0
 
     try:
-        cap = float(MAX_TRADING_CAPITAL or 0)
+        cap = float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 260)) or 260)
     except Exception:
-        cap = 0.0
+        cap = 260.0
 
-    try:
-        effective = effective_trading_equity(equity)
-    except Exception:
-        effective = min(equity, cap) if cap > 0 else equity
-
+    effective = max(0.0, min(equity, cap)) if cap > 0 else max(0.0, equity)
     banked = max(0.0, equity - effective) if cap > 0 else 0.0
 
     return {
+        "ok": True,
         "enabled": cap > 0,
         "maxTradingCapital": cap,
         "accountEquity": equity,
@@ -4058,7 +4070,6 @@ def banking_payload():
         "bankedProfitCashBuffer": banked,
         "message": "Profit banking active" if cap > 0 else "Profit banking disabled",
     }
-
 @app.get("/banking-status")
 def api_banking_status():
     return {"ok": True, **banking_payload()}

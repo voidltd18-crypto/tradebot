@@ -1,15 +1,23 @@
-Render Button Logging Patch
+UI Refresh + Profit Banking Fix
 
 Replace:
 backend/main.py
+frontend/src/App.tsx
 
-Added instant logs for:
-- money-buy
-- sell-worst
-- weekly-refresh
-- refresh-universe
+Fixes:
+- Button click shows immediate "Request sent" message.
+- UI refreshes immediately, again after 1.5s, and again after 4s.
+- Restores /banking-status.
+- Restores MAX_TRADING_CAPITAL fallback to 260.
+- Restores banking payload in /status if supported by your status builder.
 
-You will now immediately see:
-BUTTON HIT: ...
+Deploy:
+1. Render backend
+2. Vercel frontend
 
-in Render logs as soon as the button request reaches backend.
+Test:
+https://tradebot-0myo.onrender.com/banking-status
+
+Expected:
+enabled: true
+maxTradingCapital: 260.0

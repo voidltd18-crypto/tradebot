@@ -126,10 +126,26 @@ async function fetchData() {
   }
 
   async function action(endpoint:string) {
-    if (!authToken) {
+    if (!authToken && !apiKey?.trim?.()) {
       setMessage("Please login first.");
       return;
     }
+
+    setMessage(`Request sent: ${endpoint}`);
+    try {
+      const headers = typeof secureHeaders !== "undefined" ? secureHeaders : { "x-api-key": apiKey.trim() };
+      const res = await fetch(`${API_URL}${endpoint}`, { method:"POST", headers });
+      const json = await res.json().catch(() => ({}));
+      setMessage(json.message || json.detail || JSON.stringify(json) || `Done: ${endpoint}`);
+
+      await fetchData();
+      setTimeout(fetchData, 1500);
+      setTimeout(fetchData, 4000);
+    } catch (e:any) {
+      setMessage(`Action failed: ${endpoint}`);
+      setTimeout(fetchData, 1500);
+    }
+  }
     try {
       const res = await fetch(`${API_URL}${endpoint}`, { method:"POST", headers: secureHeaders });
       const json = await res.json();
