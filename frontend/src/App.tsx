@@ -498,6 +498,47 @@ const fetchData = useCallback(async (force = false) => {
   }, [viewMode]);
   const simpleView = viewMode === "simple";
 
+
+  function positionGlowStyle(position: AnyObj): React.CSSProperties {
+    const pnlPct = Number(position?.pnlPct || 0);
+
+    if (pnlPct >= 5) {
+      return {
+        borderColor: "rgba(34, 197, 94, 0.95)",
+        boxShadow: "0 0 26px rgba(34, 197, 94, 0.42), inset 0 0 18px rgba(34, 197, 94, 0.08)",
+        background: "linear-gradient(135deg, rgba(34,197,94,0.13), rgba(2,6,23,0.96) 55%)"
+      };
+    }
+
+    if (pnlPct >= 1) {
+      return {
+        borderColor: "rgba(34, 197, 94, 0.65)",
+        boxShadow: "0 0 18px rgba(34, 197, 94, 0.25), inset 0 0 14px rgba(34, 197, 94, 0.06)",
+        background: "linear-gradient(135deg, rgba(34,197,94,0.08), rgba(2,6,23,0.96) 55%)"
+      };
+    }
+
+    if (pnlPct > -1) {
+      return {
+        borderColor: "rgba(56, 189, 248, 0.35)",
+        boxShadow: "0 0 12px rgba(56, 189, 248, 0.10)"
+      };
+    }
+
+    if (pnlPct > -4) {
+      return {
+        borderColor: "rgba(251, 146, 60, 0.75)",
+        boxShadow: "0 0 20px rgba(251, 146, 60, 0.28), inset 0 0 14px rgba(251, 146, 60, 0.06)",
+        background: "linear-gradient(135deg, rgba(251,146,60,0.10), rgba(2,6,23,0.96) 55%)"
+      };
+    }
+
+    return {
+      borderColor: "rgba(248, 113, 113, 0.9)",
+      boxShadow: "0 0 28px rgba(248, 113, 113, 0.38), inset 0 0 18px rgba(248, 113, 113, 0.08)",
+      background: "linear-gradient(135deg, rgba(248,113,113,0.13), rgba(2,6,23,0.96) 55%)"
+    };
+  }
   function changeViewMode(mode: ViewMode) {
     setViewMode(mode);
     localStorage.setItem("tradebot_view_mode", mode);
@@ -665,7 +706,7 @@ const fetchData = useCallback(async (force = false) => {
       <Card title="Closed Trade History"><div className="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th></tr></thead><tbody>{closedTrades.slice(-80).reverse().map((t:AnyObj,i:number)=><tr key={i}><td>{t.time || "—"}</td><td>{t.symbol}</td><td>{usd(t.entryPrice)}</td><td>{usd(t.exitPrice)}</td><td>{Number(t.qty || 0).toFixed(4)}</td><td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td><td className={tone(t.pnl)}>{pct(t.pnlPct)}</td></tr>)}{!closedTrades.length && <tr><td colSpan={7}>No matched closed trades yet.</td></tr>}</tbody></table></div></Card>
     </main>}
 
-    {tab==="positions" && <Card title="All Positions — Best to Worst"><p className="muted">Sorted by PnL %, strongest winners at the top and weakest positions at the bottom.</p><div className="position-list">{positions.map((p:AnyObj)=><article className="position" key={p.symbol}><div><h3>{p.symbol}</h3><p>Qty {Number(p.qty || 0).toFixed(4)} · Entry {usd(p.entry)} · Price {usd(p.price)}</p><p>Value <b>{gbp(p.marketValueGbp ?? p.marketValue * rate)}</b> / {usd(p.marketValue)}</p></div><div className="position-side"><b className={tone(p.pnl)}>PnL {gbp(p.pnlGbp ?? p.pnl * rate)} / {usd(p.pnl)} / {pct(p.pnlPct)}</b><span>{p.trailingActive ? `Trailing floor ${usd(p.trailFloor)}` : `Trail starts ${usd(p.trailStartPrice)}`}</span><button className="danger" onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button></div></article>)}{!positions.length && <p className="muted">No open positions.</p>}</div></Card>}
+    {tab==="positions" && <Card title="All Positions — Best to Worst"><p className="muted">Sorted by PnL %, strongest winners glow green and weakest positions glow orange/red.</p><div className="position-list">{positions.map((p:AnyObj)=><article className="position" key={p.symbol} style={positionGlowStyle(p)}><div><h3>{p.symbol}</h3><p>Qty {Number(p.qty || 0).toFixed(4)} · Entry {usd(p.entry)} · Price {usd(p.price)}</p><p>Value <b>{gbp(p.marketValueGbp ?? p.marketValue * rate)}</b> / {usd(p.marketValue)}</p></div><div className="position-side"><b className={tone(p.pnl)}>PnL {gbp(p.pnlGbp ?? p.pnl * rate)} / {usd(p.pnl)} / {pct(p.pnlPct)}</b><span>{p.trailingActive ? `Trailing floor ${usd(p.trailFloor)}` : `Trail starts ${usd(p.trailStartPrice)}`}</span><button className="danger" onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button></div></article>)}{!positions.length && <p className="muted">No open positions.</p>}</div></Card>}
 
     {tab==="scanner" && <main><Card title="Scanner Price History">{scans.length>0 && <select value={selectedSymbol} onChange={e=>setSelectedSymbol(e.target.value)}>{scans.map((s:AnyObj)=><option key={s.symbol}>{s.symbol}</option>)}</select>}<div className="chart">{scannerChart.length ? <ResponsiveContainer width="100%" height="100%"><LineChart data={scannerChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="t" stroke="#94a3b8"/><YAxis stroke="#94a3b8"/><Tooltip/><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false}/></LineChart></ResponsiveContainer> : <p className="muted">No scanner price history yet.</p>}</div></Card></main>}
 
