@@ -144,6 +144,9 @@ const [banking, setBanking] = useState<AnyObj>({});
   function secureLogout() {
     localStorage.removeItem("tradebot_auth_token");
     localStorage.removeItem("dashboard_api_key");
+    fetchSeq.current += 1;
+    fetchInFlight.current = false;
+    lastFetchAt.current = 0;
     setAuthToken("");
     setApiKey("");
     setData({});
@@ -152,6 +155,7 @@ const [banking, setBanking] = useState<AnyObj>({});
     setMessage("Logged out.");
     setStatus("Logged out");
     setTab("overview");
+    setSelectedSymbol("");
     setStockQuery("");
     setStockResults([]);
     setReplayResult(null);
@@ -243,33 +247,7 @@ const fetchData = useCallback(async (force = false) => {
     return scheduleMidnightLogout();
   }, [authToken]);
 
-  if (!authToken) {
-    return (
-      <div className="app">
-        <h1>TradeBot Secure Login</h1>
-        <div className="card" style={{ maxWidth: 520, margin: "40px auto" }}>
-          <h2>Login</h2>
-          <p className="muted">Enter your admin username and password.</p>
-          <input
-            value={secureUsername}
-            onChange={(e) => setSecureUsername(e.target.value)}
-            placeholder="Username"
-            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
-          />
-          <input
-            type="password"
-            value={securePassword}
-            onChange={(e) => setSecurePassword(e.target.value)}
-            placeholder="Password"
-            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
-            onKeyDown={(e) => { if (e.key === "Enter") secureLogin(); }}
-          />
-          <button onClick={secureLogin}>Login</button>
-          {authError && <p className="loss">{authError}</p>}
-        </div>
-      </div>
-    );
-  }
+
 
   function saveApiKey() {
     localStorage.setItem("dashboard_api_key", apiKey);
@@ -528,6 +506,34 @@ const fetchData = useCallback(async (force = false) => {
       admin: ["overview", "reports", "positions", "scanner", "search", "activity", "admin"],
     };
     if (!allowed[mode].includes(tab)) setTab("overview");
+  }
+
+  if (!authToken) {
+    return (
+      <div className="app">
+        <h1>TradeBot Secure Login</h1>
+        <div className="card" style={{ maxWidth: 520, margin: "40px auto" }}>
+          <h2>Login</h2>
+          <p className="muted">Enter your admin username and password.</p>
+          <input
+            value={secureUsername}
+            onChange={(e) => setSecureUsername(e.target.value)}
+            placeholder="Username"
+            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
+          />
+          <input
+            type="password"
+            value={securePassword}
+            onChange={(e) => setSecurePassword(e.target.value)}
+            placeholder="Password"
+            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
+            onKeyDown={(e) => { if (e.key === "Enter") secureLogin(); }}
+          />
+          <button onClick={secureLogin}>Login</button>
+          {authError && <p className="loss">{authError}</p>}
+        </div>
+      </div>
+    );
   }
 
   return <div className="app">
