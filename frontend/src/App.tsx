@@ -111,17 +111,9 @@ const [banking, setBanking] = useState<AnyObj>({});
     }
   }
 
-  function softReloadApp() {
-    // Prevent the blank-screen state that can happen when auth changes while
-    // async dashboard requests are still resolving. This reloads automatically,
-    // so the user no longer has to manually refresh the page after login/logout.
-    window.location.replace(window.location.pathname + window.location.search);
-  }
-
   async function secureLogin() {
     try {
       setAuthError("");
-      setMessage("Logging in...");
       const res = await fetch(`${API_URL}/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -129,38 +121,22 @@ const [banking, setBanking] = useState<AnyObj>({});
       });
       const json = await readJson(res);
       if (!res.ok || !json?.token) throw new Error(json?.detail || "Login failed");
-
       localStorage.setItem("tradebot_auth_token", json.token);
       localStorage.setItem("dashboard_api_key", json.token);
-      sessionStorage.setItem("tradebot_pending_dynamic_refresh", "1");
-
       setAuthToken(json.token);
       setApiKey(json.token);
       setSecurePassword("");
-      setMessage("Login successful. Loading dashboard...");
-
-      setTimeout(softReloadApp, 80);
+      setTimeout(() => triggerDynamicMarketUniverseRefresh(json.token, "login"), 150);
     } catch (e: any) {
       setAuthError(e?.message || "Login failed");
-      setMessage("Login failed.");
     }
   }
 
   function secureLogout() {
     localStorage.removeItem("tradebot_auth_token");
     localStorage.removeItem("dashboard_api_key");
-    sessionStorage.removeItem("tradebot_pending_dynamic_refresh");
-    fetchSeq.current += 1;
-    fetchInFlight.current = false;
     setAuthToken("");
     setApiKey("");
-    setData({});
-    setReports({});
-    setBanking({});
-    setSelectedSymbol("");
-    setStockResults([]);
-    setMessage("Logged out.");
-    setTimeout(softReloadApp, 50);
   }
 
 const fetchData = useCallback(async (force = false) => {
@@ -209,14 +185,7 @@ const fetchData = useCallback(async (force = false) => {
 
   useEffect(() => {
     if (!authToken) return;
-
     fetchData(true);
-
-    if (sessionStorage.getItem("tradebot_pending_dynamic_refresh") === "1") {
-      sessionStorage.removeItem("tradebot_pending_dynamic_refresh");
-      setTimeout(() => triggerDynamicMarketUniverseRefresh(authToken, "login"), 350);
-    }
-
     const i = setInterval(() => fetchData(false), POLL_MS);
     return () => clearInterval(i);
   }, [authToken, fetchData]);
@@ -556,7 +525,7 @@ const fetchData = useCallback(async (force = false) => {
 
     {tab==="scanner" && <main><Card title="Scanner Price History">{scans.length>0 && <select value={selectedSymbol} onChange={e=>setSelectedSymbol(e.target.value)}>{scans.map((s:AnyObj)=><option key={s.symbol}>{s.symbol}</option>)}</select>}<div className="chart">{scannerChart.length ? <ResponsiveContainer width="100%" height="100%"><LineChart data={scannerChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="t" stroke="#94a3b8"/><YAxis stroke="#94a3b8"/><Tooltip/><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false}/></LineChart></ResponsiveContainer> : <p className="muted">No scanner price history yet.</p>}</div></Card></main>}
 
-    {tab==="search" && <main><Card title="Stock Search / Preview"><div className="search-row"><input value={stockQuery} onChange={e=>{setStockQuery(e.target.value); if(e.target.value.trim().length>=2) searchStocks(e.target.value); if(!e.target.value.trim()) setStockResults([])}} onKeyDown={e=>{if(e.key==="Enter") searchStocks()}} placeholder="Search ticker or company, e.g. AMD"/><button onClick={()=>searchStocks()}>{stockSearchLoading ? "Searching..." : "Search"}</button></div><div className="search-results">{stockResults.map((s:AnyObj)=><article className="search-card" key={s.symbol}><div className="search-main"><div className="logo-circle">{s.symbol.slice(0,2)}</div><div><h3>{s.name}</h3><p>{s.symbol} · NASDAQ/NYSE</p></div></div><div className="search-price"><strong>{usd(s.price)}</strong><span className={tone(s.changePct)}>{Number(s.changePct || 0)>=0 ? "↗":"↘"} {pct(s.changePct)}</span><small>{gbp(s.priceGbp)}</small></div><div className="mini-chart">{Array.isArray(s.history) && s.history.length>1 ? <ResponsiveContainer width="100%" height="100%"><LineChart data={s.history.map((p:AnyObj,i:number)=>({...p,i}))}><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false} strokeWidth={2}/><Tooltip formatter={(v:any)=>usd(v)}/></LineChart></ResponsiveContainer> : <p className="muted">Preview builds while you search.</p>}</div><div className="search-actions"><button onClick={()=>action(`/custom-buy/${s.symbol}`)}>Buy</button><button className="ghost" onClick={()=>action(`/add-to-universe/${s.symbol}`)}>Add to Universe</button></div></article>)}{!stockResults.length && <p className="muted">Type a symbol to preview price, daily movement and mini chart.</p>}</div></Card></main>}
+    {tab==="search" && <main><Card title="Stock Search / Preview"><div className="search-row"><input value={stockQuery} onChange={e=>{setStockQuery(e.target.value); if(e.target.value.trim().length>=2) searchStocks(e.target.value); if(!e.target.value.trim()) setStockResults([])}} onKeyDown={e=>{if(e.key==="Enter") searchStocks()}} placeholder="Search ticker or company, e.g. AMD"/><button onClick={()=>searchStocks()}>{stockSearchLoading ? "Searching..." : "Search"}</button></div><div className="search-results">{stockResults.map((s:AnyObj)=><article className="search-card" key={s.symbol}><div className="search-main"><div className="logo-circle">{s.symbol.slice(0,2)}</div><div><h3>{s.name}</h3><p>{s.symbol} · NASDAQ/NYSE</p></div></div><div className="search-price"><strong>{usd(s.price)}</strong><span className={tone(s.changePct)}>{Number(s.changePct || 0)>=0 ? "↗":"↘"} {pct(s.changePct)}</span><small>{gbp(s.priceGbp)}</small></div><div className="mini-chart">{Array.isArray(s.history) && s.history.length>1 ? <ResponsiveContainer width="100%" height="100%"><LineChart data={s.history.map((p:AnyObj,i:number)=>({...p,i}))}><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false} strokeWidth={2}/><Tooltip formatter={(v:any)=>usd(v)}/></LineChart></ResponsiveContainer> : <p className="muted">Preview builds while you search.</p>}</div><div className="search-actions"><button onClick={()=>action(`/custom-buy/${s.symbol}`)}>Buy</button><button className="ghost" onClick={()=>action(`/add-to-universe/${s.symbol}`)}>Add to Universe</button><button className="danger" onClick={()=>action(`/remove-from-universe/${s.symbol}`)}>Remove</button></div></article>)}{!stockResults.length && <p className="muted">Type a symbol to preview price, daily movement and mini chart.</p>}</div></Card></main>}
 
     {tab==="activity" && <main className="grid two"><Card title="Recent Trades"><div className="log-list">{trades.slice(-50).reverse().map((t:AnyObj,i:number)=><div key={i}>{t.time || "—"} · <b>{t.side} {t.symbol}</b> · {t.reason || ""}</div>)}{!trades.length && <p className="muted">No trades yet.</p>}</div></Card><Card title="Logs"><div className="log-list">{logs.map((l:string,i:number)=><div key={i}>{l}</div>)}</div></Card></main>}
 
