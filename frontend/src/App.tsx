@@ -179,7 +179,7 @@ const fetchData = useCallback(async (force = false) => {
     setMessage("Dashboard password saved.");
   }
 
-  async function refreshWeeklyUniverseView() {
+  async function refreshDailyUniverseView() {
     try {
       const res = await fetch(`${API_URL}/weekly-universe`, {
         cache: "no-store",
@@ -192,12 +192,12 @@ const fetchData = useCallback(async (force = false) => {
           ...prev,
           autoUniverse,
           universe: autoUniverse.activeSymbols || prev.universe,
-          lastAction: json?.message || "Weekly universe refreshed",
+          lastAction: json?.message || "Daily universe refreshed",
           lastActionAt: new Date().toISOString(),
         }));
       }
     } catch (e) {
-      console.error("Weekly universe follow-up failed", e);
+      console.error("Daily universe follow-up failed", e);
     }
   }
 
@@ -216,7 +216,7 @@ const fetchData = useCallback(async (force = false) => {
     if (optimistic) setData(optimistic);
 
     const isWeeklyRefresh = endpoint === "/refresh-universe";
-    setMessage(isWeeklyRefresh ? "Weekly stock refresh sent. Updating universe..." : `Sent ${endpoint}. Updating dashboard...`);
+    setMessage(isWeeklyRefresh ? "Daily stock refresh sent. Updating universe..." : `Sent ${endpoint}. Updating dashboard...`);
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), isWeeklyRefresh ? 12000 : 30000);
@@ -238,26 +238,26 @@ const fetchData = useCallback(async (force = false) => {
             ...prev,
             autoUniverse,
             universe: autoUniverse.activeSymbols || prev.universe,
-            lastAction: json?.message || "Weekly universe refreshed",
+            lastAction: json?.message || "Daily universe refreshed",
             lastActionAt: new Date().toISOString(),
           }));
         }
-        setMessage(json?.message || "Weekly universe refreshed.");
-        await refreshWeeklyUniverseView();
+        setMessage(json?.message || "Daily universe refreshed.");
+        await refreshDailyUniverseView();
       } else {
         setMessage(json.message || json.detail || JSON.stringify(json));
       }
     } catch (e:any) {
       if (isWeeklyRefresh && e?.name === "AbortError") {
-        setMessage("Weekly refresh was sent. Checking saved universe now...");
-        await refreshWeeklyUniverseView();
+        setMessage("Daily refresh was sent. Checking saved universe now...");
+        await refreshDailyUniverseView();
       } else {
         setMessage(e?.name === "AbortError" ? "Action is still processing on Render. Dashboard will refresh normally." : (e?.message || "Action failed."));
       }
     } finally {
       clearTimeout(timeout);
       await fetchData(true);
-      if (isWeeklyRefresh) setTimeout(() => refreshWeeklyUniverseView(), 2500);
+      if (isWeeklyRefresh) setTimeout(() => refreshDailyUniverseView(), 2500);
     }
   }
 
@@ -343,7 +343,7 @@ const fetchData = useCallback(async (force = false) => {
         <button onClick={secureLogout}>Logout</button>
         <button onClick={() => action("/manual-buy")}>Money Buy</button>
         <button className="danger" onClick={() => action("/manual-sell")}>Sell Worst</button>
-        <button className="purple" onClick={() => action("/refresh-universe")}>↻ Weekly Stock Refresh</button>
+        <button className="purple" onClick={() => action("/refresh-universe")}>↻ Daily Stock Refresh</button>
         <button className="ghost" onClick={() => action("/pause")}>Pause</button>
         <button onClick={() => action("/resume")}>Resume</button>
       </div><p className="notice">{message}</p></Card>
@@ -351,7 +351,7 @@ const fetchData = useCallback(async (force = false) => {
         <div><span>Positions</span><b>{positions.length}/{data?.maxPositions || 0}</b></div>
         <div><span>Next buy</span><b>{usd(data?.newPositionNotional)}</b></div>
         <div><span>Win rate</span><b>{pct((data?.dbSummary?.winRate || 0) * 100)}</b></div>
-        <div><span>Weekly universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
+        <div><span>Daily universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
         <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
       </div></Card>
 
@@ -364,14 +364,14 @@ const fetchData = useCallback(async (force = false) => {
         </div>
         <p className="muted">Profits above the cap stay as cash buffer instead of increasing future trade size.</p>
       </Card>
-      <Card title="Weekly Auto Universe" wide>
+      <Card title="Daily Auto Universe" wide>
         <p className="muted">Use the button to rebuild the stock list immediately. Manual picks stay pinned.</p>
         <div className="universe-counts">
           <div><span>Total in universe</span><b>{data?.autoUniverse?.rows?.length || 0}</b></div>
           <div><span>Active symbols</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}</b></div>
           <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
         </div>
-        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "weekly candidate"}</p></article>)}</div>
+        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "daily candidate"}</p></article>)}</div>
       </Card>
     </main>}
 
@@ -392,7 +392,7 @@ const fetchData = useCallback(async (force = false) => {
 
     {tab==="scanner" && <main><Card title="Scanner Price History">{scans.length>0 && <select value={selectedSymbol} onChange={e=>setSelectedSymbol(e.target.value)}>{scans.map((s:AnyObj)=><option key={s.symbol}>{s.symbol}</option>)}</select>}<div className="chart">{scannerChart.length ? <ResponsiveContainer width="100%" height="100%"><LineChart data={scannerChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="t" stroke="#94a3b8"/><YAxis stroke="#94a3b8"/><Tooltip/><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false}/></LineChart></ResponsiveContainer> : <p className="muted">No scanner price history yet.</p>}</div></Card></main>}
 
-    {tab==="search" && <main><Card title="Stock Search / Preview"><div className="search-row"><input value={stockQuery} onChange={e=>{setStockQuery(e.target.value); if(e.target.value.trim().length>=2) searchStocks(e.target.value); if(!e.target.value.trim()) setStockResults([])}} onKeyDown={e=>{if(e.key==="Enter") searchStocks()}} placeholder="Search ticker or company, e.g. AMD"/><button onClick={()=>searchStocks()}>{stockSearchLoading ? "Searching..." : "Search"}</button></div><div className="search-results">{stockResults.map((s:AnyObj)=><article className="search-card" key={s.symbol}><div className="search-main"><div className="logo-circle">{s.symbol.slice(0,2)}</div><div><h3>{s.name}</h3><p>{s.symbol} · NASDAQ/NYSE</p></div></div><div className="search-price"><strong>{usd(s.price)}</strong><span className={tone(s.changePct)}>{Number(s.changePct || 0)>=0 ? "↗":"↘"} {pct(s.changePct)}</span><small>{gbp(s.priceGbp)}</small></div><div className="mini-chart">{Array.isArray(s.history) && s.history.length>1 ? <ResponsiveContainer width="100%" height="100%"><LineChart data={s.history.map((p:AnyObj,i:number)=>({...p,i}))}><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false} strokeWidth={2}/><Tooltip formatter={(v:any)=>usd(v)}/></LineChart></ResponsiveContainer> : <p className="muted">Preview builds while you search.</p>}</div><div className="search-actions"><button onClick={()=>action(`/custom-buy/${s.symbol}`)}>Buy</button><button className="ghost" onClick={()=>action(`/add-to-universe/${s.symbol}`)}>Add to Universe</button></div></article>)}{!stockResults.length && <p className="muted">Type a symbol to preview price, daily movement and mini chart.</p>}</div></Card></main>}
+    {tab==="search" && <main><Card title="Stock Search / Preview"><div className="search-row"><input value={stockQuery} onChange={e=>{setStockQuery(e.target.value); if(e.target.value.trim().length>=2) searchStocks(e.target.value); if(!e.target.value.trim()) setStockResults([])}} onKeyDown={e=>{if(e.key==="Enter") searchStocks()}} placeholder="Search ticker or company, e.g. AMD"/><button onClick={()=>searchStocks()}>{stockSearchLoading ? "Searching..." : "Search"}</button></div><div className="search-results">{stockResults.map((s:AnyObj)=><article className="search-card" key={s.symbol}><div className="search-main"><div className="logo-circle">{s.symbol.slice(0,2)}</div><div><h3>{s.name}</h3><p>{s.symbol} · NASDAQ/NYSE</p></div></div><div className="search-price"><strong>{usd(s.price)}</strong><span className={tone(s.changePct)}>{Number(s.changePct || 0)>=0 ? "↗":"↘"} {pct(s.changePct)}</span><small>{gbp(s.priceGbp)}</small></div><div className="mini-chart">{Array.isArray(s.history) && s.history.length>1 ? <ResponsiveContainer width="100%" height="100%"><LineChart data={s.history.map((p:AnyObj,i:number)=>({...p,i}))}><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false} strokeWidth={2}/><Tooltip formatter={(v:any)=>usd(v)}/></LineChart></ResponsiveContainer> : <p className="muted">Preview builds while you search.</p>}</div><div className="search-actions"><button onClick={()=>action(`/custom-buy/${s.symbol}`)}>Buy</button><button className="ghost" onClick={()=>action(`/add-to-universe/${s.symbol}`)}>Add to Universe</button><button className="danger" onClick={()=>action(`/remove-from-universe/${s.symbol}`)}>Remove</button></div></article>)}{!stockResults.length && <p className="muted">Type a symbol to preview price, daily movement and mini chart.</p>}</div></Card></main>}
 
     {tab==="activity" && <main className="grid two"><Card title="Recent Trades"><div className="log-list">{trades.slice(-50).reverse().map((t:AnyObj,i:number)=><div key={i}>{t.time || "—"} · <b>{t.side} {t.symbol}</b> · {t.reason || ""}</div>)}{!trades.length && <p className="muted">No trades yet.</p>}</div></Card><Card title="Logs"><div className="log-list">{logs.map((l:string,i:number)=><div key={i}>{l}</div>)}</div></Card></main>}
 
