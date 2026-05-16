@@ -233,8 +233,8 @@ if PROFIT_OPTIMIZER_ENABLED:
 # Weekly Auto Universe Rotation
 AUTO_UNIVERSE_ENABLED = True
 AUTO_UNIVERSE_SIZE = 12
-AUTO_UNIVERSE_REFRESH_DAY = 0
-AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 12
+AUTO_UNIVERSE_REFRESH_DAY = -1  # daily mode: refresh after AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH
+AUTO_UNIVERSE_MIN_HOURS_BETWEEN_REFRESH = 20
 AUTO_UNIVERSE_KEEP_WINNERS = True
 AUTO_UNIVERSE_KEEP_WINNER_MIN_PNL = 0.50
 AUTO_UNIVERSE_KEEP_WINNER_MIN_WINRATE = 0.55
@@ -2702,7 +2702,7 @@ def get_weekly_universe_from_db(week_start=None):
         return []
 
 
-def save_weekly_universe(rows, reason="weekly refresh"):
+def save_weekly_universe(rows, reason="daily refresh"):
     if not SQLITE_ENABLED:
         return
     week = week_start_str()
@@ -2750,7 +2750,8 @@ def should_refresh_weekly_universe(force=False):
     except Exception:
         pass
 
-    return datetime.now(UTC).weekday() == AUTO_UNIVERSE_REFRESH_DAY
+    # Daily mode: once the minimum refresh age has passed, allow refresh on any day.
+    return True
 
 
 def universe_rows_from_stock_memory():
@@ -2862,7 +2863,7 @@ def build_weekly_universe(force=False):
             current_universe = [r["symbol"] for r in active]
             for s in current_universe:
                 ensure_symbol_state(s, custom=s in custom_symbols)
-            return {"ok": True, "message": "Weekly universe already fresh", "symbols": current_universe, "rows": active}
+            return {"ok": True, "message": "Daily universe already fresh", "symbols": current_universe, "rows": active}
 
     rows = universe_rows_from_stock_memory()
 
@@ -2907,7 +2908,7 @@ def build_weekly_universe(force=False):
     if not chosen:
         chosen = [{"symbol": s, "score": 0, "reason": "fallback safe universe", "status": "active"} for s in SAFE_UNIVERSE[:AUTO_UNIVERSE_SIZE]]
 
-    save_weekly_universe(chosen, "forced refresh" if force else "weekly refresh")
+    save_weekly_universe(chosen, "forced refresh" if force else "daily refresh")
     current_universe = [r["symbol"] for r in chosen]
 
     for s in current_universe:
@@ -2915,7 +2916,7 @@ def build_weekly_universe(force=False):
 
     return {
         "ok": True,
-        "message": f"Weekly universe updated with {len(current_universe)} symbols",
+        "message": f"Daily universe updated with {len(current_universe)} symbols",
         "symbols": current_universe,
         "rows": chosen,
     }
@@ -3355,7 +3356,7 @@ BOT_VERSION_NOTES = {
     "sameDayTrading": True,
     "sellThenLockUntilNextDay": True,
     "manualUniversePins": True,
-    "weeklyUniverseRefresh": True,
+    "dailyUniverseRefresh": True,
     "gbpFirstReports": True,
     "pdtAware": True,
 }
@@ -3572,9 +3573,10 @@ def api_remove_from_universe(symbol: str, request: Request):
         pass
     update_status(BOT_NAME, latest_scans)
     merge_manual_picks_into_auto_universe(latest_status)
+    touch_quick_status(lastAction=f"{symbol.upper()} removed from manual picks", lastActionAt=datetime.now(UTC).isoformat())
     return {"ok": True, "message": f"{symbol.upper()} removed from manual picks", "symbols": picks}
 
-# Wrap weekly universe builder so pinned picks survive refreshes and are tradable.
+# Wrap daily universe builder so pinned picks survive refreshes and are tradable.
 _ORIGINAL_BUILD_WEEKLY_UNIVERSE = build_weekly_universe
 
 def build_weekly_universe(force=False):
@@ -4000,10 +4002,19 @@ def weekly_universe():
         pass
     return {"ok": True, "autoUniverse": payload, **payload}
 
+@app.get("/daily-universe")
+def daily_universe():
+    payload = force_quality_auto_universe_payload()
+    try:
+        latest_status["autoUniverse"] = payload
+    except Exception:
+        pass
+    return {"ok": True, "autoUniverse": payload, **payload}
+
 @app.post("/refresh-universe")
 def refresh_universe(request: Request):
     """
-    Fast weekly stock refresh route for the dashboard button.
+    Fast daily stock refresh route for the dashboard button.
 
     Important fix:
     - Do not wait behind the trading bot lock.
@@ -4038,7 +4049,7 @@ def refresh_universe(request: Request):
     try:
         latest_status["autoUniverse"] = payload
         latest_status["universe"] = symbols or payload.get("activeSymbols", [])
-        latest_status["lastAction"] = "Quality-only weekly universe refreshed"
+        latest_status["lastAction"] = "Quality-only daily universe refreshed"
         latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
         latest_status["autoUniverseEnabled"] = True
     except Exception as e:
@@ -4046,7 +4057,7 @@ def refresh_universe(request: Request):
 
     return {
         "ok": True,
-        "message": "Quality-only weekly universe refreshed",
+        "message": "Quality-only daily universe refreshed",
         "autoUniverse": payload,
         "activeSymbols": symbols or payload.get("activeSymbols", []),
         "rows": payload.get("rows", []),
@@ -4058,7 +4069,7 @@ def refresh_universe_preview():
     payload = force_quality_auto_universe_payload()
     return {
         "ok": True,
-        "message": "Preview of quality-only universe",
+        "message": "Preview of quality-only daily universe",
         "activeSymbols": payload["activeSymbols"],
         "rows": payload["rows"],
         "autoUniverse": payload,
