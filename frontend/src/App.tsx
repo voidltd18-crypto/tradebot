@@ -137,6 +137,14 @@ const [banking, setBanking] = useState<AnyObj>({});
     localStorage.removeItem("dashboard_api_key");
     setAuthToken("");
     setApiKey("");
+    setData({});
+    setReports({});
+    setBanking({});
+    setMessage("Logged out.");
+    setStatus("Logged out");
+    setTab("overview");
+    setStockQuery("");
+    setStockResults([]);
   }
 
 const fetchData = useCallback(async (force = false) => {
@@ -437,6 +445,13 @@ const fetchData = useCallback(async (force = false) => {
         <span className={`pill ${data?.market?.isOpen ? "ok" : "warn"}`}>Market {data?.market?.label || "UNKNOWN"}</span>
         <span className={`pill ${data?.botEnabled ? "ok" : "bad"}`}>Bot {data?.botEnabled ? "ON" : "OFF"}</span>
         <span className="pill">{data?.paperMode ? "PAPER" : "LIVE"}</span>
+        <button
+          onClick={secureLogout}
+          className="ghost"
+          style={{ padding: "10px 14px", borderRadius: "999px", fontSize: "14px" }}
+        >
+          Logout
+        </button>
       </div>
     </header>
 
@@ -452,7 +467,6 @@ const fetchData = useCallback(async (force = false) => {
     {tab==="overview" && <main className="grid two">
       <Card title="Controls"><div className="actions">
         <button onClick={() => fetchData(true)}>Refresh Data</button>
-        <button onClick={secureLogout}>Logout</button>
         <button onClick={() => action("/manual-buy")}>Money Buy</button>
         <button className="danger" onClick={() => action("/manual-sell")}>Sell Worst</button>
         <button className="purple" onClick={() => action("/refresh-universe")}>↻ Dynamic Market Refresh</button>
