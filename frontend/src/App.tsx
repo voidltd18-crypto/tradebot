@@ -83,9 +83,45 @@ const [banking, setBanking] = useState<AnyObj>({});
   const token = authToken || apiKey.trim();
   const secureHeaders = token ? { "X-Auth-Token": token, "x-api-key": token } : {};
 
+  async function triggerDynamicMarketUniverseRefresh(loginToken: string, reason = "login") {
+    if (!loginToken) return;
+    try {
+      setMessage(reason === "login" ? "Login successful. Refreshing dynamic market universe..." : "Refreshing dynamic market universe...");
+      const res = await fetch(`${API_URL}/refresh-universe`, {
+        method: "POST",
+        headers: { "X-Auth-Token": loginToken, "x-api-key": loginToken },
+        cache: "no-store",
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Dynamic market refresh failed");
+
+      const autoUniverse = json?.autoUniverse || json;
+      const dynamicScanner = json?.dynamicMarketScanner || autoUniverse?.dynamicScanner;
+      setData(prev => ({
+        ...prev,
+        autoUniverse: autoUniverse?.activeSymbols || autoUniverse?.rows ? autoUniverse : prev.autoUniverse,
+        universe: autoUniverse?.activeSymbols || json?.activeSymbols || prev.universe,
+        dynamicMarketScanner: dynamicScanner || prev.dynamicMarketScanner,
+        lastAction: json?.message || "Dynamic market universe refreshed",
+        lastActionAt: new Date().toISOString(),
+      }));
+      setMessage(json?.message || "Dynamic market universe refreshed.");
+    } catch (e:any) {
+      setMessage(e?.message || "Dynamic market refresh failed. Dashboard will still load normally.");
+    }
+  }
+
+  function softReloadApp() {
+    // Prevent the blank-screen state that can happen when auth changes while
+    // async dashboard requests are still resolving. This reloads automatically,
+    // so the user no longer has to manually refresh the page after login/logout.
+    window.location.replace(window.location.pathname + window.location.search);
+  }
+
   async function secureLogin() {
     try {
       setAuthError("");
+      setMessage("Logging in...");
       const res = await fetch(`${API_URL}/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -93,21 +129,38 @@ const [banking, setBanking] = useState<AnyObj>({});
       });
       const json = await readJson(res);
       if (!res.ok || !json?.token) throw new Error(json?.detail || "Login failed");
+
       localStorage.setItem("tradebot_auth_token", json.token);
       localStorage.setItem("dashboard_api_key", json.token);
+      sessionStorage.setItem("tradebot_pending_dynamic_refresh", "1");
+
       setAuthToken(json.token);
       setApiKey(json.token);
       setSecurePassword("");
+      setMessage("Login successful. Loading dashboard...");
+
+      setTimeout(softReloadApp, 80);
     } catch (e: any) {
       setAuthError(e?.message || "Login failed");
+      setMessage("Login failed.");
     }
   }
 
   function secureLogout() {
     localStorage.removeItem("tradebot_auth_token");
     localStorage.removeItem("dashboard_api_key");
+    sessionStorage.removeItem("tradebot_pending_dynamic_refresh");
+    fetchSeq.current += 1;
+    fetchInFlight.current = false;
     setAuthToken("");
     setApiKey("");
+    setData({});
+    setReports({});
+    setBanking({});
+    setSelectedSymbol("");
+    setStockResults([]);
+    setMessage("Logged out.");
+    setTimeout(softReloadApp, 50);
   }
 
 const fetchData = useCallback(async (force = false) => {
@@ -156,7 +209,14 @@ const fetchData = useCallback(async (force = false) => {
 
   useEffect(() => {
     if (!authToken) return;
+
     fetchData(true);
+
+    if (sessionStorage.getItem("tradebot_pending_dynamic_refresh") === "1") {
+      sessionStorage.removeItem("tradebot_pending_dynamic_refresh");
+      setTimeout(() => triggerDynamicMarketUniverseRefresh(authToken, "login"), 350);
+    }
+
     const i = setInterval(() => fetchData(false), POLL_MS);
     return () => clearInterval(i);
   }, [authToken, fetchData]);
@@ -332,21 +392,30 @@ const fetchData = useCallback(async (force = false) => {
       setMessage("Please login first.");
       return;
     }
-    setMessage("Refreshing dynamic market scanner...");
+    setMessage("Refreshing dynamic market universe...");
     try {
-      const res = await fetch(`${API_URL}/dynamic-market-scanner/refresh`, {
+      const res = await fetch(`${API_URL}/refresh-universe`, {
         method: "POST",
         headers: secureHeaders,
         cache: "no-store",
       });
       const json = await readJson(res);
-      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Dynamic scanner failed");
-      setData(prev => ({ ...prev, dynamicMarketScanner: json.dynamicMarketScanner || json }));
-      setMessage(json?.message || "Dynamic market scanner refreshed.");
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Dynamic market refresh failed");
+      const autoUniverse = json?.autoUniverse || json;
+      const dynamicScanner = json?.dynamicMarketScanner || autoUniverse?.dynamicScanner;
+      setData(prev => ({
+        ...prev,
+        autoUniverse: autoUniverse?.activeSymbols || autoUniverse?.rows ? autoUniverse : prev.autoUniverse,
+        universe: autoUniverse?.activeSymbols || json?.activeSymbols || prev.universe,
+        dynamicMarketScanner: dynamicScanner || prev.dynamicMarketScanner,
+        lastAction: json?.message || "Dynamic market universe refreshed",
+        lastActionAt: new Date().toISOString(),
+      }));
+      setMessage(json?.message || "Dynamic market universe refreshed.");
       await refreshWeeklyUniverseView();
       await fetchData(true);
     } catch (e:any) {
-      setMessage(e?.message || "Dynamic scanner failed.");
+      setMessage(e?.message || "Dynamic market refresh failed.");
     }
   }
 
@@ -436,7 +505,7 @@ const fetchData = useCallback(async (force = false) => {
           <div><span>Source</span><b>{dynamicScanner?.source || "market movers"}</b></div>
           <div><span>Refresh</span><b>{dynamicScanner?.updatedAt ? new Date(dynamicScanner.updatedAt).toLocaleTimeString() : "Waiting"}</b></div>
         </div>
-        <div className="actions"><button className="purple" onClick={refreshDynamicScanner}>Refresh Dynamic Scanner</button></div>
+        <div className="actions"><button className="purple" onClick={refreshDynamicScanner}>Refresh Dynamic Market</button></div>
         <p className="muted">This searches market movers/active stocks first, applies price/volume/spread filters, then merges the best candidates with your manual pinned stocks and core safety list.</p>
         {dynamicScanner?.error && <p className="notice danger-text">Scanner warning: {dynamicScanner.error}</p>}
         <div className="scan-grid">{dynamicRows.slice(0,12).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>Score {Number(r.score || 0).toFixed(2)}</strong></div><p>{r.reason || "dynamic candidate"}</p><small>{r.price ? `Price ${usd(r.price)} · ` : ""}{r.changePct !== undefined ? `Change ${pct(r.changePct)} · ` : ""}{r.volume ? `Volume ${Number(r.volume).toLocaleString()}` : ""}</small></article>)}</div>
