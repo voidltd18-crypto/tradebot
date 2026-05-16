@@ -5,7 +5,7 @@ import { Area, AreaChart, Bar, BarChart, CartesianGrid, Line, LineChart, Respons
 const API_URL = import.meta.env.VITE_API_BASE || "https://tradebot-0myo.onrender.com";
 const BOT_VERSION = "v1.1-strict-profit-mode";
 type AnyObj = Record<string, any>;
-type Tab = "overview" | "reports" | "positions" | "scanner" | "search" | "backtest" | "activity" | "admin";
+type Tab = "overview" | "reports" | "positions" | "scanner" | "search" | "safety" | "activity" | "admin";
 
 const usd = (n:any) => `$${Number(n || 0).toFixed(2)}`;
 const gbp = (n:any) => `£${Number(n || 0).toFixed(2)}`;
@@ -46,9 +46,6 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [stockQuery, setStockQuery] = useState("");
   const [stockResults, setStockResults] = useState<any[]>([]);
   const [stockSearchLoading, setStockSearchLoading] = useState(false);
-  const [backtest, setBacktest] = useState<AnyObj>({});
-  const [backtestCapital, setBacktestCapital] = useState("1000");
-  const [backtestLoading, setBacktestLoading] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
   const lastFetchAt = useRef(0);
@@ -56,6 +53,9 @@ const [banking, setBanking] = useState<AnyObj>({});
 
   const rate = Number(data?.fx?.usdToGbp || 0.7403);
   const scans = Array.isArray(data?.scans) ? data.scans : [];
+  const safetyRows = Array.isArray(data?.tradeSafety) ? data.tradeSafety : [];
+  const bestSetup = data?.bestSetupToday || {};
+  const marketRegime = data?.marketRegime || {};
   const positions = Array.isArray(data?.positions) ? data.positions : [];
   const trades = Array.isArray(data?.trades) ? data.trades : [];
   const logs = Array.isArray(data?.logs) ? data.logs : [];
@@ -66,7 +66,6 @@ const [banking, setBanking] = useState<AnyObj>({});
   const bankingEquity = Number(banking?.accountEquity ?? data?.banking?.accountEquity ?? data?.account?.equity ?? 0);
   const bankingEffective = Number(banking?.effectiveTradingEquity ?? data?.banking?.effectiveTradingEquity ?? 0);
   const bankingBuffer = Number(banking?.bankedProfitCashBuffer ?? data?.banking?.bankedProfitCashBuffer ?? 0);
-  const adaptiveSizing = data?.adaptiveSizing || {};
 
   
   const token = authToken || apiKey.trim();
@@ -196,12 +195,12 @@ const fetchData = useCallback(async (force = false) => {
           ...prev,
           autoUniverse,
           universe: autoUniverse.activeSymbols || prev.universe,
-          lastAction: json?.message || "Weekly universe refreshed",
+          lastAction: json?.message || "Daily universe refreshed",
           lastActionAt: new Date().toISOString(),
         }));
       }
     } catch (e) {
-      console.error("Weekly universe follow-up failed", e);
+      console.error("Daily universe follow-up failed", e);
     }
   }
 
@@ -220,7 +219,7 @@ const fetchData = useCallback(async (force = false) => {
     if (optimistic) setData(optimistic);
 
     const isWeeklyRefresh = endpoint === "/refresh-universe";
-    setMessage(isWeeklyRefresh ? "Weekly stock refresh sent. Updating universe..." : `Sent ${endpoint}. Updating dashboard...`);
+    setMessage(isWeeklyRefresh ? "Daily stock refresh sent. Updating universe..." : `Sent ${endpoint}. Updating dashboard...`);
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), isWeeklyRefresh ? 12000 : 30000);
@@ -242,11 +241,11 @@ const fetchData = useCallback(async (force = false) => {
             ...prev,
             autoUniverse,
             universe: autoUniverse.activeSymbols || prev.universe,
-            lastAction: json?.message || "Weekly universe refreshed",
+            lastAction: json?.message || "Daily universe refreshed",
             lastActionAt: new Date().toISOString(),
           }));
         }
-        setMessage(json?.message || "Weekly universe refreshed.");
+        setMessage(json?.message || "Daily universe refreshed.");
         await refreshWeeklyUniverseView();
       } else {
         setMessage(json.message || json.detail || JSON.stringify(json));
@@ -277,31 +276,6 @@ const fetchData = useCallback(async (force = false) => {
       setMessage("Stock search failed.");
     } finally {
       setStockSearchLoading(false);
-    }
-  }
-
-
-  async function runBacktestReplay() {
-    if (!token) {
-      setMessage("Please login first.");
-      return;
-    }
-    setBacktestLoading(true);
-    setMessage("Running paper replay...");
-    try {
-      const capital = Number(backtestCapital || 1000);
-      const res = await fetch(`${API_URL}/backtest-replay?starting_capital=${encodeURIComponent(String(capital))}&limit=1000`, {
-        cache: "no-store",
-        headers: secureHeaders,
-      });
-      const json = await readJson(res);
-      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Backtest failed");
-      setBacktest(json);
-      setMessage(json?.message || "Paper replay complete.");
-    } catch (e:any) {
-      setMessage(e?.message || "Backtest failed.");
-    } finally {
-      setBacktestLoading(false);
     }
   }
 
@@ -344,9 +318,7 @@ const fetchData = useCallback(async (force = false) => {
   const earned = Number(reports.earnedSinceDeposit ?? 0);
   const totalGainLoss = Number(reports.totalGainLoss ?? 0);
   const lost = Number(reports.lostSinceDeposit ?? 0);
-  const backtestCurve = Array.isArray(backtest?.equityCurve) ? backtest.equityCurve : [];
-  const backtestTrades = Array.isArray(backtest?.trades) ? backtest.trades : [];
-  const tabs: Tab[] = ["overview","reports","positions","scanner","search","backtest","activity","admin"];
+  const tabs: Tab[] = ["overview","reports","positions","scanner","search","safety","activity","admin"];
 
   return <div className="app">
     <header className="topbar">
@@ -374,31 +346,46 @@ const fetchData = useCallback(async (force = false) => {
         <button onClick={secureLogout}>Logout</button>
         <button onClick={() => action("/manual-buy")}>Money Buy</button>
         <button className="danger" onClick={() => action("/manual-sell")}>Sell Worst</button>
-        <button className="purple" onClick={() => action("/refresh-universe")}>↻ Weekly Stock Refresh</button>
+        <button className="purple" onClick={() => action("/refresh-universe")}>↻ Daily Stock Refresh</button>
         <button className="ghost" onClick={() => action("/pause")}>Pause</button>
         <button onClick={() => action("/resume")}>Resume</button>
       </div><p className="notice">{message}</p></Card>
       <Card title="Live Summary"><div className="summary">
         <div><span>Positions</span><b>{positions.length}/{data?.maxPositions || 0}</b></div>
-        <div><span>Next buy</span><b>{usd(adaptiveSizing?.suggestedNotional ?? data?.newPositionNotional)}</b></div>
+        <div><span>Next buy</span><b>{usd(data?.newPositionNotional)}</b></div>
         <div><span>Win rate</span><b>{pct((data?.dbSummary?.winRate || 0) * 100)}</b></div>
-        <div><span>Weekly universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
+        <div><span>Daily universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
         <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
       </div></Card>
 
-
-      <Card title="Adaptive Position Sizing" wide>
+      <Card title="Market Regime Filter" wide>
         <div className="summary">
-          <div><span>Status</span><b className={adaptiveSizing?.enabled === false ? "warn" : "gain"}>{adaptiveSizing?.enabled === false ? "OFF" : "ON"}</b></div>
-          <div><span>Symbol</span><b>{adaptiveSizing?.symbol || "—"}</b></div>
-          <div><span>Base size</span><b>{usd(adaptiveSizing?.baseNotional ?? data?.newPositionNotional)}</b></div>
-          <div><span>Adaptive size</span><b>{usd(adaptiveSizing?.suggestedNotional ?? data?.newPositionNotional)}</b></div>
-          <div><span>Multiplier</span><b>{Number(adaptiveSizing?.finalMultiplier ?? 1).toFixed(2)}x</b></div>
-          <div><span>Confidence</span><b>{adaptiveSizing?.confidenceLabel || "—"} {Number(adaptiveSizing?.confidence || 0).toFixed(2)}</b></div>
+          <div><span>Mode</span><b className={marketRegime?.allowNewBuys === false ? "loss" : marketRegime?.mode === "DEFENSIVE" ? "warn" : "gain"}>{marketRegime?.mode || "UNKNOWN"}</b></div>
+          <div><span>New buys</span><b className={marketRegime?.allowNewBuys === false ? "loss" : "gain"}>{marketRegime?.allowNewBuys === false ? "PAUSED" : "ALLOWED"}</b></div>
+          <div><span>Buy size</span><b>{Math.round(Number(marketRegime?.sizeMultiplier ?? 1) * 100)}%</b></div>
+          <div><span>QQQ/SPY avg</span><b className={tone(marketRegime?.avgChangePct)}>{pct(marketRegime?.avgChangePct)}</b></div>
         </div>
-        <p className="muted">Scales buy size using confidence, symbol memory, recent streaks, drawdown and volatility. Market regime can still reduce it further when defensive.</p>
-        {Array.isArray(adaptiveSizing?.warnings) && adaptiveSizing.warnings.length > 0 && <p className="notice danger-text">{adaptiveSizing.warnings.slice(0,3).join(" | ")}</p>}
-        {Array.isArray(adaptiveSizing?.reasons) && adaptiveSizing.reasons.length > 0 && <p className="muted">{adaptiveSizing.reasons.slice(0,4).join(" | ")}</p>}
+        <p className={marketRegime?.allowNewBuys === false ? "notice danger-text" : "notice"}>{marketRegime?.message || "Waiting for market regime data."}</p>
+        {Array.isArray(marketRegime?.symbols) && marketRegime.symbols.length > 0 && <div className="scan-grid">{marketRegime.symbols.map((r:AnyObj)=><article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong className={tone(r.changePct)}>{pct(r.changePct)}</strong></div><p>Price {usd(r.price)} · baseline {usd(r.baseline)}</p><small>Spread {Number(r.spread || 0).toFixed(4)}</small></article>)}</div>}
+      </Card>
+
+      <Card title="Best Setup Today" wide>
+        <div className="summary">
+          <div><span>Top symbol</span><b>{bestSetup?.symbol || "—"}</b></div>
+          <div><span>Status</span><b className={bestSetup?.status === "READY" ? "gain" : "loss"}>{bestSetup?.status || "WAITING"}</b></div>
+          <div><span>Action</span><b>{bestSetup?.action || "Wait for scanner data"}</b></div>
+          <div><span>Confidence</span><b>{Number(bestSetup?.confidence || 0).toFixed(2)} · {bestSetup?.confidenceLabel || "LOW"}</b></div>
+          <div><span>Quality</span><b>{Number(bestSetup?.qualityScore || 0).toFixed(4)}</b></div>
+          <div><span>Spread</span><b>{Number(bestSetup?.spread || 0).toFixed(4)}</b></div>
+        </div>
+        <p className="notice">{bestSetup?.summary || "No best setup yet. Wait for the next scan."}</p>
+        {Array.isArray(bestSetup?.reasons) && bestSetup.reasons.length > 0 && <p className="muted">Blocker: {bestSetup.reasons.slice(0,3).join(" | ")}</p>}
+        {Array.isArray(bestSetup?.topThree) && bestSetup.topThree.length > 0 && <div className="scan-grid">{bestSetup.topThree.map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong className={r.canBuy ? "gain" : "loss"}>{r.status || (r.canBuy ? "READY" : "BLOCKED")}</strong></div><p>{r.summary || (Array.isArray(r.reasons) && r.reasons[0]) || "Waiting for setup"}</p><small>Confidence {Number(r.confidence || 0).toFixed(2)} · Quality {Number(r.qualityScore || 0).toFixed(4)} · Spread {Number(r.spread || 0).toFixed(4)}</small></article>)}</div>}
+      </Card>
+
+      <Card title="Trade Safety Panel" wide>
+        <p className="muted">Shows why each scanned stock can or cannot be bought right now.</p>
+        <div className="scan-grid">{(safetyRows.length ? safetyRows : scans.map((s:AnyObj)=>({symbol:s.symbol, canBuy:s.readyToBuy && s.sniperPass && s.aPlusPass, status:(s.readyToBuy && s.sniperPass && s.aPlusPass)?"READY":"BLOCKED", summary:s.aPlusReason || s.sniperReason || "Waiting for setup", confidence:s.confidence, qualityScore:s.qualityScore, spread:s.spread}))).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong className={r.canBuy ? "gain" : "loss"}>{r.status || (r.canBuy ? "READY" : "BLOCKED")}</strong></div><p>{r.summary || (Array.isArray(r.reasons) && r.reasons[0]) || "No reason supplied"}</p><small>Confidence {Number(r.confidence || 0).toFixed(2)} · Quality {Number(r.qualityScore || 0).toFixed(4)} · Spread {Number(r.spread || 0).toFixed(4)}</small></article>)}</div>
       </Card>
 
       <Card title="Profit Banking">
@@ -410,14 +397,14 @@ const fetchData = useCallback(async (force = false) => {
         </div>
         <p className="muted">Profits above the cap stay as cash buffer instead of increasing future trade size.</p>
       </Card>
-      <Card title="Weekly Auto Universe" wide>
-        <p className="muted">Use the button to rebuild the stock list immediately. Manual picks stay pinned.</p>
+      <Card title="Daily Auto Universe" wide>
+        <p className="muted">Use the button to rebuild the daily stock list immediately. Manual picks stay pinned.</p>
         <div className="universe-counts">
           <div><span>Total in universe</span><b>{data?.autoUniverse?.rows?.length || 0}</b></div>
           <div><span>Active symbols</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}</b></div>
           <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
         </div>
-        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "weekly candidate"}</p></article>)}</div>
+        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "daily candidate"}</p></article>)}</div>
       </Card>
     </main>}
 
@@ -438,45 +425,9 @@ const fetchData = useCallback(async (force = false) => {
 
     {tab==="scanner" && <main><Card title="Scanner Price History">{scans.length>0 && <select value={selectedSymbol} onChange={e=>setSelectedSymbol(e.target.value)}>{scans.map((s:AnyObj)=><option key={s.symbol}>{s.symbol}</option>)}</select>}<div className="chart">{scannerChart.length ? <ResponsiveContainer width="100%" height="100%"><LineChart data={scannerChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="t" stroke="#94a3b8"/><YAxis stroke="#94a3b8"/><Tooltip/><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false}/></LineChart></ResponsiveContainer> : <p className="muted">No scanner price history yet.</p>}</div></Card></main>}
 
-    {tab==="search" && <main><Card title="Stock Search / Preview"><div className="search-row"><input value={stockQuery} onChange={e=>{setStockQuery(e.target.value); if(e.target.value.trim().length>=2) searchStocks(e.target.value); if(!e.target.value.trim()) setStockResults([])}} onKeyDown={e=>{if(e.key==="Enter") searchStocks()}} placeholder="Search ticker or company, e.g. AMD"/><button onClick={()=>searchStocks()}>{stockSearchLoading ? "Searching..." : "Search"}</button></div><div className="search-results">{stockResults.map((s:AnyObj)=><article className="search-card" key={s.symbol}><div className="search-main"><div className="logo-circle">{s.symbol.slice(0,2)}</div><div><h3>{s.name}</h3><p>{s.symbol} · NASDAQ/NYSE</p></div></div><div className="search-price"><strong>{usd(s.price)}</strong><span className={tone(s.changePct)}>{Number(s.changePct || 0)>=0 ? "↗":"↘"} {pct(s.changePct)}</span><small>{gbp(s.priceGbp)}</small></div><div className="mini-chart">{Array.isArray(s.history) && s.history.length>1 ? <ResponsiveContainer width="100%" height="100%"><LineChart data={s.history.map((p:AnyObj,i:number)=>({...p,i}))}><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false} strokeWidth={2}/><Tooltip formatter={(v:any)=>usd(v)}/></LineChart></ResponsiveContainer> : <p className="muted">Preview builds while you search.</p>}</div><div className="search-actions"><button onClick={()=>action(`/custom-buy/${s.symbol}`)}>Buy</button><button className="ghost" onClick={()=>action(`/add-to-universe/${s.symbol}`)}>Add to Universe</button></div></article>)}{!stockResults.length && <p className="muted">Type a symbol to preview price, daily movement and mini chart.</p>}</div></Card></main>}
+    {tab==="search" && <main><Card title="Stock Search / Preview"><div className="search-row"><input value={stockQuery} onChange={e=>{setStockQuery(e.target.value); if(e.target.value.trim().length>=2) searchStocks(e.target.value); if(!e.target.value.trim()) setStockResults([])}} onKeyDown={e=>{if(e.key==="Enter") searchStocks()}} placeholder="Search ticker or company, e.g. AMD"/><button onClick={()=>searchStocks()}>{stockSearchLoading ? "Searching..." : "Search"}</button></div><div className="search-results">{stockResults.map((s:AnyObj)=><article className="search-card" key={s.symbol}><div className="search-main"><div className="logo-circle">{s.symbol.slice(0,2)}</div><div><h3>{s.name}</h3><p>{s.symbol} · NASDAQ/NYSE</p></div></div><div className="search-price"><strong>{usd(s.price)}</strong><span className={tone(s.changePct)}>{Number(s.changePct || 0)>=0 ? "↗":"↘"} {pct(s.changePct)}</span><small>{gbp(s.priceGbp)}</small></div><div className="mini-chart">{Array.isArray(s.history) && s.history.length>1 ? <ResponsiveContainer width="100%" height="100%"><LineChart data={s.history.map((p:AnyObj,i:number)=>({...p,i}))}><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false} strokeWidth={2}/><Tooltip formatter={(v:any)=>usd(v)}/></LineChart></ResponsiveContainer> : <p className="muted">Preview builds while you search.</p>}</div><div className="search-actions"><button onClick={()=>action(`/custom-buy/${s.symbol}`)}>Buy</button><button className="ghost" onClick={()=>action(`/add-to-universe/${s.symbol}`)}>Add to Universe</button><button className="danger" onClick={()=>action(`/remove-from-universe/${s.symbol}`)}>Remove</button></div></article>)}{!stockResults.length && <p className="muted">Type a symbol to preview price, daily movement and mini chart.</p>}</div></Card></main>}
 
-
-    {tab==="backtest" && <main>
-      <Card title="Backtest / Paper Replay" wide>
-        <p className="muted">Replays your recorded matched closed trades as a paper backtest. It does not place orders and it does not change the bot.</p>
-        <div className="actions report-actions">
-          <input value={backtestCapital} onChange={e=>setBacktestCapital(e.target.value)} placeholder="Starting capital, e.g. 1000" style={{maxWidth:220}} />
-          <button onClick={runBacktestReplay}>{backtestLoading ? "Running..." : "Run Paper Replay"}</button>
-        </div>
-        <div className="summary">
-          <div><span>Starting</span><b>{usd(backtest?.startingCapital)}</b></div>
-          <div><span>Ending</span><b>{usd(backtest?.endingCapital)}</b></div>
-          <div><span>Total PnL</span><b className={tone(backtest?.totalPnl)}>{usd(backtest?.totalPnl)}</b></div>
-          <div><span>Return</span><b className={tone(backtest?.totalReturnPct)}>{pct(backtest?.totalReturnPct)}</b></div>
-          <div><span>Win rate</span><b>{pct(Number(backtest?.winRate || 0) * 100)}</b></div>
-          <div><span>Trades</span><b>{backtest?.totalTrades || 0}</b></div>
-          <div><span>Profit factor</span><b>{Number(backtest?.profitFactor || 0).toFixed(2)}</b></div>
-          <div><span>Max drawdown</span><b className="loss">{usd(backtest?.maxDrawdown)} / {pct(backtest?.maxDrawdownPct)}</b></div>
-        </div>
-      </Card>
-
-      <Card title="Replay Equity Curve" wide>
-        <div className="chart">{backtestCurve.length > 1 ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={backtestCurve}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="label" stroke="#94a3b8" minTickGap={28}/><YAxis stroke="#94a3b8"/><Tooltip formatter={(v:any)=>usd(v)}/><Area type="monotone" dataKey="equity" stroke="#38bdf8" fill="#38bdf833"/></AreaChart></ResponsiveContainer> : <p className="muted">Run a paper replay to see the equity curve.</p>}</div>
-      </Card>
-
-      <main className="grid two">
-        <Card title="Best Symbols">
-          <div className="table-wrap"><table><thead><tr><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>Total PnL</th><th>Avg</th></tr></thead><tbody>{(backtest?.bestSymbols || []).slice(0,10).map((r:AnyObj)=><tr key={r.symbol}><td>{r.symbol}</td><td>{r.trades}</td><td>{pct(Number(r.winRate || 0)*100)}</td><td className={tone(r.totalPnl)}>{usd(r.totalPnl)}</td><td>{usd(r.avgPnl)}</td></tr>)}{!(backtest?.bestSymbols || []).length && <tr><td colSpan={5}>No replay data yet.</td></tr>}</tbody></table></div>
-        </Card>
-        <Card title="Worst Symbols">
-          <div className="table-wrap"><table><thead><tr><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>Total PnL</th><th>Avg</th></tr></thead><tbody>{(backtest?.worstSymbols || []).slice(0,10).map((r:AnyObj)=><tr key={r.symbol}><td>{r.symbol}</td><td>{r.trades}</td><td>{pct(Number(r.winRate || 0)*100)}</td><td className={tone(r.totalPnl)}>{usd(r.totalPnl)}</td><td>{usd(r.avgPnl)}</td></tr>)}{!(backtest?.worstSymbols || []).length && <tr><td colSpan={5}>No replay data yet.</td></tr>}</tbody></table></div>
-        </Card>
-      </main>
-
-      <Card title="Replay Trades" wide>
-        <div className="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>Replay Equity</th></tr></thead><tbody>{backtestTrades.slice(-100).reverse().map((t:AnyObj,i:number)=><tr key={i}><td>{t.time || t.day || "—"}</td><td>{t.symbol}</td><td>{usd(t.entryPrice)}</td><td>{usd(t.exitPrice)}</td><td>{Number(t.qty || 0).toFixed(4)}</td><td className={tone(t.pnl)}>{usd(t.pnl)}</td><td>{usd(t.replayEquity)}</td></tr>)}{!backtestTrades.length && <tr><td colSpan={7}>Run a paper replay to list trades.</td></tr>}</tbody></table></div>
-      </Card>
-    </main>}
+    {tab==="safety" && <main><Card title="Best Setup Today" wide><div className="summary"><div><span>Top symbol</span><b>{bestSetup?.symbol || "—"}</b></div><div><span>Status</span><b className={bestSetup?.status === "READY" ? "gain" : "loss"}>{bestSetup?.status || "WAITING"}</b></div><div><span>Action</span><b>{bestSetup?.action || "Wait"}</b></div><div><span>Confidence</span><b>{Number(bestSetup?.confidence || 0).toFixed(2)}</b></div></div><p className="notice">{bestSetup?.summary || "Waiting for scanner data."}</p></Card><Card title="Trade Safety Panel" wide><p className="muted">Green means the stock is currently clear for a buy attempt. Red shows the first blocker plus detailed reasons.</p><div className="table-wrap"><table><thead><tr><th>Symbol</th><th>Status</th><th>Main reason</th><th>Details</th><th>Confidence</th><th>Quality</th><th>Spread</th></tr></thead><tbody>{(safetyRows.length ? safetyRows : []).map((r:AnyObj)=><tr key={r.symbol}><td><b>{r.symbol}</b></td><td className={r.canBuy ? "gain" : "loss"}>{r.status || (r.canBuy ? "READY" : "BLOCKED")}</td><td>{r.summary || "—"}</td><td>{Array.isArray(r.reasons) && r.reasons.length ? r.reasons.slice(0,4).join(" | ") : "Clear"}</td><td>{Number(r.confidence || 0).toFixed(2)}</td><td>{Number(r.qualityScore || 0).toFixed(4)}</td><td>{Number(r.spread || 0).toFixed(4)}</td></tr>)}{!safetyRows.length && <tr><td colSpan={7}>No safety rows yet. Wait for the scanner to run or refresh data.</td></tr>}</tbody></table></div></Card></main>}
 
     {tab==="activity" && <main className="grid two"><Card title="Recent Trades"><div className="log-list">{trades.slice(-50).reverse().map((t:AnyObj,i:number)=><div key={i}>{t.time || "—"} · <b>{t.side} {t.symbol}</b> · {t.reason || ""}</div>)}{!trades.length && <p className="muted">No trades yet.</p>}</div></Card><Card title="Logs"><div className="log-list">{logs.map((l:string,i:number)=><div key={i}>{l}</div>)}</div></Card></main>}
 
