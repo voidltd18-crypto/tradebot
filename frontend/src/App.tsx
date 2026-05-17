@@ -167,8 +167,8 @@ const [banking, setBanking] = useState<AnyObj>({});
   useEffect(() => {
     if (!authToken) return;
 
-    const LOGOUT_HOUR = 12;
-    const LOGOUT_MINUTE = 05;
+    const LOGOUT_HOUR = 00;
+    const LOGOUT_MINUTE = 00;
 
     const checkAutoLogout = () => {
       const now = new Date();
