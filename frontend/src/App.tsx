@@ -163,6 +163,43 @@ const [banking, setBanking] = useState<AnyObj>({});
     setReplayLoading(false);
   }
 
+
+  useEffect(() => {
+    if (!authToken) return;
+
+    const LOGOUT_HOUR = 23;
+    const LOGOUT_MINUTE = 10;
+
+    const checkAutoLogout = () => {
+      const now = new Date();
+
+      const logoutTime = new Date();
+      logoutTime.setHours(LOGOUT_HOUR, LOGOUT_MINUTE, 0, 0);
+
+      const alreadyLoggedOut =
+        localStorage.getItem("autoLoggedOutDate") === now.toDateString();
+
+      if (now >= logoutTime && !alreadyLoggedOut) {
+        localStorage.setItem("autoLoggedOutDate", now.toDateString());
+        secureLogout();
+      }
+    };
+
+    checkAutoLogout();
+
+    const interval = setInterval(checkAutoLogout, 10000);
+
+    window.addEventListener("focus", checkAutoLogout);
+    document.addEventListener("visibilitychange", checkAutoLogout);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener("focus", checkAutoLogout);
+      document.removeEventListener("visibilitychange", checkAutoLogout);
+    };
+  }, [authToken]);
+
+
 const fetchData = useCallback(async (force = false) => {
     if (!authToken) return;
 
