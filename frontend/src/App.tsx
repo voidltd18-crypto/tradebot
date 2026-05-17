@@ -188,9 +188,9 @@ const fetchData = useCallback(async (force = false) => {
       const storedSessionDate = localStorage.getItem(SESSION_KEY) || sessionDate;
 
       // Robust reset: if the calendar day changed, logout even if the browser
-      // slept through exactly 11:26 or the tab was inactive.
+      // slept through exactly 11:30 or the tab was inactive.
       if (today !== storedSessionDate) {
-        setMessage("11:26 daily session reset reached. Logging out...");
+        setMessage("11:30 daily session reset reached. Logging out...");
         secureLogout();
         return;
       }
@@ -198,7 +198,7 @@ const fetchData = useCallback(async (force = false) => {
       // Warning from 23:59 local browser time.
       if (!warned && now.getHours() === 23 && now.getMinutes() >= 59) {
         warned = true;
-        setMessage("Daily session reset soon. You will be logged out at 11:26.");
+        setMessage("Daily session reset soon. You will be logged out at 11:30.");
       }
     };
 
