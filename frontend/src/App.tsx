@@ -6,6 +6,7 @@ const API_URL = import.meta.env.VITE_API_BASE || "https://tradebot-0myo.onrender
 const BOT_VERSION = "v1.1-strict-profit-mode";
 type AnyObj = Record<string, any>;
 type Tab = "overview" | "reports" | "positions" | "scanner" | "search" | "activity" | "admin";
+type ViewMode = "simple" | "advanced" | "admin";
 
 const usd = (n:any) => `$${Number(n || 0).toFixed(2)}`;
 const gbp = (n:any) => `£${Number(n || 0).toFixed(2)}`;
@@ -30,6 +31,10 @@ async function readJson(res: Response) {
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
+  const [viewMode, setViewMode] = useState<ViewMode>(() => {
+    const saved = localStorage.getItem("tradebot_view_mode") as ViewMode | null;
+    return saved === "advanced" || saved === "admin" || saved === "simple" ? saved : "simple";
+  });
   const [data, setData] = useState<AnyObj>({});
   const [reports, setReports] = useState<AnyObj>({});
   
@@ -46,6 +51,11 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [stockQuery, setStockQuery] = useState("");
   const [stockResults, setStockResults] = useState<any[]>([]);
   const [stockSearchLoading, setStockSearchLoading] = useState(false);
+  const [tradingCapInput, setTradingCapInput] = useState<string>("");
+  const [tradingCapSaving, setTradingCapSaving] = useState(false);
+  const [replayCapInput, setReplayCapInput] = useState<string>("");
+  const [replayLoading, setReplayLoading] = useState(false);
+  const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
   const lastFetchAt = useRef(0);
@@ -53,37 +63,62 @@ const [banking, setBanking] = useState<AnyObj>({});
 
   const rate = Number(data?.fx?.usdToGbp || 0.7403);
   const scans = Array.isArray(data?.scans) ? data.scans : [];
-  const positions = Array.isArray(data?.positions) ? data.positions : [];
+  const rawPositions = Array.isArray(data?.positions) ? data.positions : [];
+  const positions = [...rawPositions].sort((a:AnyObj, b:AnyObj) => Number(b?.pnlPct || 0) - Number(a?.pnlPct || 0));
   const trades = Array.isArray(data?.trades) ? data.trades : [];
   const logs = Array.isArray(data?.logs) ? data.logs : [];
   const closedTrades = Array.isArray(reports?.closedTrades) ? reports.closedTrades : [];
   const equityHistory = Array.isArray(reports?.equityHistory) ? reports.equityHistory : (Array.isArray(data?.tradeTimeline) ? data.tradeTimeline : []);
   const bankingEnabled = Boolean(banking?.enabled || data?.banking?.enabled);
   const bankingCap = Number(banking?.maxTradingCapital ?? data?.banking?.maxTradingCapital ?? 0);
+  const bankingCapGbp = Number(banking?.maxTradingCapitalGbp ?? data?.banking?.maxTradingCapitalGbp ?? bankingCap * rate);
+  const bankingCapCurrency = String(banking?.tradingCapCurrency ?? data?.banking?.tradingCapCurrency ?? "USD");
+  const bankingCapSource = String(banking?.tradingCapSource ?? data?.banking?.tradingCapSource ?? "env");
   const bankingEquity = Number(banking?.accountEquity ?? data?.banking?.accountEquity ?? data?.account?.equity ?? 0);
   const bankingEffective = Number(banking?.effectiveTradingEquity ?? data?.banking?.effectiveTradingEquity ?? 0);
+  const bankingEffectiveGbp = Number(banking?.effectiveTradingEquityGbp ?? data?.banking?.effectiveTradingEquityGbp ?? bankingEffective * rate);
   const bankingBuffer = Number(banking?.bankedProfitCashBuffer ?? data?.banking?.bankedProfitCashBuffer ?? 0);
+  const bankingBufferGbp = Number(banking?.bankedProfitCashBufferGbp ?? data?.banking?.bankedProfitCashBufferGbp ?? bankingBuffer * rate);
+  const dynamicScanner = data?.dynamicMarketScanner || data?.autoUniverse?.dynamicScanner || {};
+  const dynamicRows = Array.isArray(dynamicScanner?.rows) ? dynamicScanner.rows : [];
+  const dynamicPickCount = Number(data?.autoUniverse?.dynamicPickCount || dynamicRows.length || 0);
+
+  useEffect(() => {
+    const gbpCap = Number(banking?.maxTradingCapitalGbp ?? data?.banking?.maxTradingCapitalGbp ?? 0);
+    if (gbpCap > 0 && !tradingCapInput) setTradingCapInput(String(Math.round(gbpCap)));
+    if (gbpCap > 0 && !replayCapInput) setReplayCapInput(String(Math.round(gbpCap)));
+  }, [banking?.maxTradingCapitalGbp, data?.banking?.maxTradingCapitalGbp]);
 
   
   const token = authToken || apiKey.trim();
   const secureHeaders = token ? { "X-Auth-Token": token, "x-api-key": token } : {};
 
-  function localSessionDateKey(date = new Date()) {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, "0");
-    const day = String(date.getDate()).padStart(2, "0");
-    return `${year}-${month}-${day}`;
-  }
+  async function triggerDynamicMarketUniverseRefresh(loginToken: string, reason = "login") {
+    if (!loginToken) return;
+    try {
+      setMessage(reason === "login" ? "Login successful. Refreshing dynamic market universe..." : "Refreshing dynamic market universe...");
+      const res = await fetch(`${API_URL}/refresh-universe`, {
+        method: "POST",
+        headers: { "X-Auth-Token": loginToken, "x-api-key": loginToken },
+        cache: "no-store",
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Dynamic market refresh failed");
 
-  function ensureSessionDate() {
-    const key = "tradebot_session_date";
-    const current = localStorage.getItem(key);
-    if (!current) {
-      const today = localSessionDateKey();
-      localStorage.setItem(key, today);
-      return today;
+      const autoUniverse = json?.autoUniverse || json;
+      const dynamicScanner = json?.dynamicMarketScanner || autoUniverse?.dynamicScanner;
+      setData(prev => ({
+        ...prev,
+        autoUniverse: autoUniverse?.activeSymbols || autoUniverse?.rows ? autoUniverse : prev.autoUniverse,
+        universe: autoUniverse?.activeSymbols || json?.activeSymbols || prev.universe,
+        dynamicMarketScanner: dynamicScanner || prev.dynamicMarketScanner,
+        lastAction: json?.message || "Dynamic market universe refreshed",
+        lastActionAt: new Date().toISOString(),
+      }));
+      setMessage(json?.message || "Dynamic market universe refreshed.");
+    } catch (e:any) {
+      setMessage(e?.message || "Dynamic market refresh failed. Dashboard will still load normally.");
     }
-    return current;
   }
 
   async function secureLogin() {
@@ -98,10 +133,10 @@ const [banking, setBanking] = useState<AnyObj>({});
       if (!res.ok || !json?.token) throw new Error(json?.detail || "Login failed");
       localStorage.setItem("tradebot_auth_token", json.token);
       localStorage.setItem("dashboard_api_key", json.token);
-      localStorage.setItem("tradebot_session_date", localSessionDateKey());
       setAuthToken(json.token);
       setApiKey(json.token);
       setSecurePassword("");
+      setTimeout(() => triggerDynamicMarketUniverseRefresh(json.token, "login"), 150);
     } catch (e: any) {
       setAuthError(e?.message || "Login failed");
     }
@@ -110,7 +145,6 @@ const [banking, setBanking] = useState<AnyObj>({});
   function secureLogout() {
     localStorage.removeItem("tradebot_auth_token");
     localStorage.removeItem("dashboard_api_key");
-    localStorage.removeItem("tradebot_session_date");
     fetchSeq.current += 1;
     fetchInFlight.current = false;
     lastFetchAt.current = 0;
@@ -122,6 +156,11 @@ const [banking, setBanking] = useState<AnyObj>({});
     setMessage("Logged out.");
     setStatus("Logged out");
     setTab("overview");
+    setSelectedSymbol("");
+    setStockQuery("");
+    setStockResults([]);
+    setReplayResult(null);
+    setReplayLoading(false);
   }
 
 const fetchData = useCallback(async (force = false) => {
@@ -178,73 +217,42 @@ const fetchData = useCallback(async (force = false) => {
   useEffect(() => {
     if (!authToken) return;
 
-    const SESSION_KEY = "tradebot_session_date";
-    const sessionDate = ensureSessionDate();
-    let warned = false;
+    // Change these two values if you want a different automatic logout time.
+    // Uses your browser/device local time, not Render server time.
+    const AUTO_LOGOUT_HOUR = 0;
+    const AUTO_LOGOUT_MINUTE = 0;
 
-    const checkDailySessionReset = () => {
+    const checkAutoLogout = () => {
       const now = new Date();
-      const today = localSessionDateKey(now);
-      const storedSessionDate = localStorage.getItem(SESSION_KEY) || sessionDate;
+      const todayKey = now.toDateString();
+      const logoutTime = new Date(now);
+      logoutTime.setHours(AUTO_LOGOUT_HOUR, AUTO_LOGOUT_MINUTE, 0, 0);
 
-      // Robust reset: if the calendar day changed, logout even if the browser
-      // slept through exactly 11:30 or the tab was inactive.
-      if (today !== storedSessionDate) {
-        setMessage("11:30 daily session reset reached. Logging out...");
+      const lastAutoLogoutDate = localStorage.getItem("tradebot_auto_logout_date");
+
+      // Important: use >= so the logout cannot be missed if the tab sleeps,
+      // the laptop wakes late, or the check runs a few seconds after the target time.
+      if (now >= logoutTime && lastAutoLogoutDate !== todayKey) {
+        localStorage.setItem("tradebot_auto_logout_date", todayKey);
+        setMessage(`${String(AUTO_LOGOUT_HOUR).padStart(2, "0")}:${String(AUTO_LOGOUT_MINUTE).padStart(2, "0")} daily session reset. Logging out...`);
         secureLogout();
-        return;
-      }
-
-      // Warning from 23:59 local browser time.
-      if (!warned && now.getHours() === 23 && now.getMinutes() >= 59) {
-        warned = true;
-        setMessage("Daily session reset soon. You will be logged out at 11:30.");
       }
     };
 
-    checkDailySessionReset();
-    const interval = window.setInterval(checkDailySessionReset, 10000);
+    checkAutoLogout();
+    const interval = window.setInterval(checkAutoLogout, 10000);
 
-    const onVisibility = () => {
-      if (!document.hidden) checkDailySessionReset();
-    };
-    document.addEventListener("visibilitychange", onVisibility);
-    window.addEventListener("focus", checkDailySessionReset);
+    window.addEventListener("focus", checkAutoLogout);
+    document.addEventListener("visibilitychange", checkAutoLogout);
 
     return () => {
       window.clearInterval(interval);
-      document.removeEventListener("visibilitychange", onVisibility);
-      window.removeEventListener("focus", checkDailySessionReset);
+      window.removeEventListener("focus", checkAutoLogout);
+      document.removeEventListener("visibilitychange", checkAutoLogout);
     };
   }, [authToken]);
 
-  if (!authToken) {
-    return (
-      <div className="app">
-        <h1>TradeBot Secure Login</h1>
-        <div className="card" style={{ maxWidth: 520, margin: "40px auto" }}>
-          <h2>Login</h2>
-          <p className="muted">Enter your admin username and password.</p>
-          <input
-            value={secureUsername}
-            onChange={(e) => setSecureUsername(e.target.value)}
-            placeholder="Username"
-            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
-          />
-          <input
-            type="password"
-            value={securePassword}
-            onChange={(e) => setSecurePassword(e.target.value)}
-            placeholder="Password"
-            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
-            onKeyDown={(e) => { if (e.key === "Enter") secureLogin(); }}
-          />
-          <button onClick={secureLogin}>Login</button>
-          {authError && <p className="loss">{authError}</p>}
-        </div>
-      </div>
-    );
-  }
+
 
   function saveApiKey() {
     localStorage.setItem("dashboard_api_key", apiKey);
@@ -264,7 +272,7 @@ const fetchData = useCallback(async (force = false) => {
           ...prev,
           autoUniverse,
           universe: autoUniverse.activeSymbols || prev.universe,
-          lastAction: json?.message || "Weekly universe refreshed",
+          lastAction: json?.message || "Dynamic universe refreshed",
           lastActionAt: new Date().toISOString(),
         }));
       }
@@ -288,7 +296,7 @@ const fetchData = useCallback(async (force = false) => {
     if (optimistic) setData(optimistic);
 
     const isWeeklyRefresh = endpoint === "/refresh-universe";
-    setMessage(isWeeklyRefresh ? "Weekly stock refresh sent. Updating universe..." : `Sent ${endpoint}. Updating dashboard...`);
+    setMessage(isWeeklyRefresh ? "Dynamic market refresh sent. Updating universe..." : `Sent ${endpoint}. Updating dashboard...`);
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), isWeeklyRefresh ? 12000 : 30000);
@@ -310,18 +318,18 @@ const fetchData = useCallback(async (force = false) => {
             ...prev,
             autoUniverse,
             universe: autoUniverse.activeSymbols || prev.universe,
-            lastAction: json?.message || "Weekly universe refreshed",
+            lastAction: json?.message || "Dynamic universe refreshed",
             lastActionAt: new Date().toISOString(),
           }));
         }
-        setMessage(json?.message || "Weekly universe refreshed.");
+        setMessage(json?.message || "Dynamic universe refreshed.");
         await refreshWeeklyUniverseView();
       } else {
         setMessage(json.message || json.detail || JSON.stringify(json));
       }
     } catch (e:any) {
       if (isWeeklyRefresh && e?.name === "AbortError") {
-        setMessage("Weekly refresh was sent. Checking saved universe now...");
+        setMessage("Dynamic refresh was sent. Checking saved universe now...");
         await refreshWeeklyUniverseView();
       } else {
         setMessage(e?.name === "AbortError" ? "Action is still processing on Render. Dashboard will refresh normally." : (e?.message || "Action failed."));
@@ -345,6 +353,106 @@ const fetchData = useCallback(async (force = false) => {
       setMessage("Stock search failed.");
     } finally {
       setStockSearchLoading(false);
+    }
+  }
+
+  async function saveTradingCap(capOverride?: number) {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+
+    const capGbp = Number(capOverride ?? tradingCapInput);
+    if (!Number.isFinite(capGbp) || capGbp <= 0) {
+      setMessage("Enter a valid trading cap in GBP.");
+      return;
+    }
+
+    setTradingCapSaving(true);
+    setMessage(`Saving trading cap at £${capGbp.toFixed(2)}...`);
+
+    try {
+      const res = await fetch(`${API_URL}/trading-cap`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ capGbp, currency: "GBP" }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save trading cap");
+      setBanking(json || {});
+      setData(prev => ({ ...prev, banking: json, newPositionNotional: json?.newPositionNotional ?? prev.newPositionNotional }));
+      setTradingCapInput(String(Math.round(Number(json?.maxTradingCapitalGbp || capGbp))));
+      setMessage(json?.message || "Trading cap saved.");
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not save trading cap.");
+    } finally {
+      setTradingCapSaving(false);
+    }
+  }
+
+  async function refreshDynamicScanner() {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+    setMessage("Refreshing dynamic market universe...");
+    try {
+      const res = await fetch(`${API_URL}/refresh-universe`, {
+        method: "POST",
+        headers: secureHeaders,
+        cache: "no-store",
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Dynamic market refresh failed");
+      const autoUniverse = json?.autoUniverse || json;
+      const dynamicScanner = json?.dynamicMarketScanner || autoUniverse?.dynamicScanner;
+      setData(prev => ({
+        ...prev,
+        autoUniverse: autoUniverse?.activeSymbols || autoUniverse?.rows ? autoUniverse : prev.autoUniverse,
+        universe: autoUniverse?.activeSymbols || json?.activeSymbols || prev.universe,
+        dynamicMarketScanner: dynamicScanner || prev.dynamicMarketScanner,
+        lastAction: json?.message || "Dynamic market universe refreshed",
+        lastActionAt: new Date().toISOString(),
+      }));
+      setMessage(json?.message || "Dynamic market universe refreshed.");
+      await refreshWeeklyUniverseView();
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Dynamic market refresh failed.");
+    }
+  }
+
+  async function runBacktestReplay() {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+
+    const capGbp = Number(replayCapInput || tradingCapInput || bankingCapGbp || 0);
+    if (!Number.isFinite(capGbp) || capGbp <= 0) {
+      setMessage("Enter a valid replay cap in GBP.");
+      return;
+    }
+
+    setReplayLoading(true);
+    setMessage(`Running paper replay using £${capGbp.toFixed(2)} cap...`);
+    try {
+      const res = await fetch(`${API_URL}/backtest-replay`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ capGbp }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Replay failed");
+      setReplayResult(json);
+      setMessage(json?.message || "Backtest / paper replay complete.");
+    } catch (e:any) {
+      setMessage(e?.message || "Replay failed.");
+    } finally {
+      setReplayLoading(false);
     }
   }
 
@@ -387,7 +495,92 @@ const fetchData = useCallback(async (force = false) => {
   const earned = Number(reports.earnedSinceDeposit ?? 0);
   const totalGainLoss = Number(reports.totalGainLoss ?? 0);
   const lost = Number(reports.lostSinceDeposit ?? 0);
-  const tabs: Tab[] = ["overview","reports","positions","scanner","search","activity","admin"];
+  const tabs: Tab[] = useMemo(() => {
+    if (viewMode === "simple") return ["overview", "positions", "search"];
+    if (viewMode === "advanced") return ["overview", "reports", "positions", "scanner", "search", "activity"];
+    return ["overview", "reports", "positions", "scanner", "search", "activity", "admin"];
+  }, [viewMode]);
+  const simpleView = viewMode === "simple";
+
+
+  function positionGlowStyle(position: AnyObj): React.CSSProperties {
+    const pnlPct = Number(position?.pnlPct || 0);
+
+    if (pnlPct >= 5) {
+      return {
+        borderColor: "rgba(34, 197, 94, 0.95)",
+        boxShadow: "0 0 26px rgba(34, 197, 94, 0.42), inset 0 0 18px rgba(34, 197, 94, 0.08)",
+        background: "linear-gradient(135deg, rgba(34,197,94,0.13), rgba(2,6,23,0.96) 55%)"
+      };
+    }
+
+    if (pnlPct >= 1) {
+      return {
+        borderColor: "rgba(34, 197, 94, 0.65)",
+        boxShadow: "0 0 18px rgba(34, 197, 94, 0.25), inset 0 0 14px rgba(34, 197, 94, 0.06)",
+        background: "linear-gradient(135deg, rgba(34,197,94,0.08), rgba(2,6,23,0.96) 55%)"
+      };
+    }
+
+    if (pnlPct > -1) {
+      return {
+        borderColor: "rgba(56, 189, 248, 0.35)",
+        boxShadow: "0 0 12px rgba(56, 189, 248, 0.10)"
+      };
+    }
+
+    if (pnlPct > -4) {
+      return {
+        borderColor: "rgba(251, 146, 60, 0.75)",
+        boxShadow: "0 0 20px rgba(251, 146, 60, 0.28), inset 0 0 14px rgba(251, 146, 60, 0.06)",
+        background: "linear-gradient(135deg, rgba(251,146,60,0.10), rgba(2,6,23,0.96) 55%)"
+      };
+    }
+
+    return {
+      borderColor: "rgba(248, 113, 113, 0.9)",
+      boxShadow: "0 0 28px rgba(248, 113, 113, 0.38), inset 0 0 18px rgba(248, 113, 113, 0.08)",
+      background: "linear-gradient(135deg, rgba(248,113,113,0.13), rgba(2,6,23,0.96) 55%)"
+    };
+  }
+  function changeViewMode(mode: ViewMode) {
+    setViewMode(mode);
+    localStorage.setItem("tradebot_view_mode", mode);
+    const allowed: Record<ViewMode, Tab[]> = {
+      simple: ["overview", "positions", "search"],
+      advanced: ["overview", "reports", "positions", "scanner", "search", "activity"],
+      admin: ["overview", "reports", "positions", "scanner", "search", "activity", "admin"],
+    };
+    if (!allowed[mode].includes(tab)) setTab("overview");
+  }
+
+  if (!authToken) {
+    return (
+      <div className="app">
+        <h1>TradeBot Secure Login</h1>
+        <div className="card" style={{ maxWidth: 520, margin: "40px auto" }}>
+          <h2>Login</h2>
+          <p className="muted">Enter your admin username and password.</p>
+          <input
+            value={secureUsername}
+            onChange={(e) => setSecureUsername(e.target.value)}
+            placeholder="Username"
+            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
+          />
+          <input
+            type="password"
+            value={securePassword}
+            onChange={(e) => setSecurePassword(e.target.value)}
+            placeholder="Password"
+            style={{ width: "100%", padding: "14px", borderRadius: "12px", marginBottom: "12px" }}
+            onKeyDown={(e) => { if (e.key === "Enter") secureLogin(); }}
+          />
+          <button onClick={secureLogin}>Login</button>
+          {authError && <p className="loss">{authError}</p>}
+        </div>
+      </div>
+    );
+  }
 
   return <div className="app">
     <header className="topbar">
@@ -397,6 +590,13 @@ const fetchData = useCallback(async (force = false) => {
         <span className={`pill ${data?.market?.isOpen ? "ok" : "warn"}`}>Market {data?.market?.label || "UNKNOWN"}</span>
         <span className={`pill ${data?.botEnabled ? "ok" : "bad"}`}>Bot {data?.botEnabled ? "ON" : "OFF"}</span>
         <span className="pill">{data?.paperMode ? "PAPER" : "LIVE"}</span>
+        <button
+          onClick={secureLogout}
+          className="ghost"
+          style={{ padding: "10px 14px", borderRadius: "999px", fontSize: "14px" }}
+        >
+          Logout
+        </button>
       </div>
     </header>
 
@@ -407,15 +607,21 @@ const fetchData = useCallback(async (force = false) => {
       <Stat label="Total Gain/Loss" value={gbp(totalGainLoss * rate)} sub={`Deposited ${gbp(totalDeposited * rate)} / ${usd(totalDeposited)}`} className={tone(totalGainLoss)} />
     </section>
 
+    <nav className="tabs mode-tabs" aria-label="Dashboard mode">
+      <button className={viewMode==="simple" ? "active":""} onClick={() => changeViewMode("simple")}>SIMPLE VIEW</button>
+      <button className={viewMode==="advanced" ? "active":""} onClick={() => changeViewMode("advanced")}>ADVANCED VIEW</button>
+      <button className={viewMode==="admin" ? "active":""} onClick={() => changeViewMode("admin")}>ADMIN VIEW</button>
+    </nav>
+
     <nav className="tabs">{tabs.map(t => <button key={t} className={tab===t ? "active":""} onClick={() => setTab(t)}>{t.toUpperCase()}</button>)}</nav>
 
     {tab==="overview" && <main className="grid two">
+      {simpleView && <Card title="Simple View" wide><p className="muted">Showing only the essentials. Switch to Advanced View for scanner, universe, reports and logs, or Admin View for settings.</p></Card>}
       <Card title="Controls"><div className="actions">
         <button onClick={() => fetchData(true)}>Refresh Data</button>
-        <button onClick={secureLogout}>Logout</button>
         <button onClick={() => action("/manual-buy")}>Money Buy</button>
         <button className="danger" onClick={() => action("/manual-sell")}>Sell Worst</button>
-        <button className="purple" onClick={() => action("/refresh-universe")}>↻ Weekly Stock Refresh</button>
+        <button className="purple" onClick={() => action("/refresh-universe")}>↻ Dynamic Market Refresh</button>
         <button className="ghost" onClick={() => action("/pause")}>Pause</button>
         <button onClick={() => action("/resume")}>Resume</button>
       </div><p className="notice">{message}</p></Card>
@@ -423,28 +629,52 @@ const fetchData = useCallback(async (force = false) => {
         <div><span>Positions</span><b>{positions.length}/{data?.maxPositions || 0}</b></div>
         <div><span>Next buy</span><b>{usd(data?.newPositionNotional)}</b></div>
         <div><span>Win rate</span><b>{pct((data?.dbSummary?.winRate || 0) * 100)}</b></div>
-        <div><span>Weekly universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
+        <div><span>Dynamic universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
         <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
       </div></Card>
 
-      <Card title="Profit Banking">
+      {!simpleView && <> 
+
+      <Card title="Dynamic Market Scanner" wide>
+        <div className="summary">
+          <div><span>Status</span><b className={dynamicScanner?.enabled === false ? "loss" : "gain"}>{dynamicScanner?.enabled === false ? "OFF" : "ON"}</b></div>
+          <div><span>Discovered picks</span><b>{dynamicPickCount}</b></div>
+          <div><span>Source</span><b>{dynamicScanner?.source || "market movers"}</b></div>
+          <div><span>Refresh</span><b>{dynamicScanner?.updatedAt ? new Date(dynamicScanner.updatedAt).toLocaleTimeString() : "Waiting"}</b></div>
+        </div>
+        <div className="actions"><button className="purple" onClick={refreshDynamicScanner}>Refresh Dynamic Market</button></div>
+        <p className="muted">This searches market movers/active stocks first, applies price/volume/spread filters, then merges the best candidates with your manual pinned stocks and core safety list.</p>
+        {dynamicScanner?.error && <p className="notice danger-text">Scanner warning: {dynamicScanner.error}</p>}
+        <div className="scan-grid">{dynamicRows.slice(0,12).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>Score {Number(r.score || 0).toFixed(2)}</strong></div><p>{r.reason || "dynamic candidate"}</p><small>{r.price ? `Price ${usd(r.price)} · ` : ""}{r.changePct !== undefined ? `Change ${pct(r.changePct)} · ` : ""}{r.volume ? `Volume ${Number(r.volume).toLocaleString()}` : ""}</small></article>)}</div>
+      </Card>
+
+      <Card title="Profit Banking / Trading Cap">
         <div className="summary">
           <div><span>Status</span><b className={bankingEnabled ? "gain" : ""}>{bankingEnabled ? "ON" : "OFF"}</b></div>
-          <div><span>Trading cap</span><b>{usd(bankingCap)} · {gbp(bankingCap * rate)}</b></div>
-          <div><span>Used for sizing</span><b>{usd(bankingEffective)} · {gbp(bankingEffective * rate)}</b></div>
-          <div><span>Banked buffer</span><b className="gain">{usd(bankingBuffer)} · {gbp(bankingBuffer * rate)}</b></div>
+          <div><span>Trading cap</span><b>{gbp(bankingCapGbp)} · {usd(bankingCap)}</b></div>
+          <div><span>Used for sizing</span><b>{gbp(bankingEffectiveGbp)} · {usd(bankingEffective)}</b></div>
+          <div><span>Banked buffer</span><b className="gain">{gbp(bankingBufferGbp)} · {usd(bankingBuffer)}</b></div>
         </div>
-        <p className="muted">Profits above the cap stay as cash buffer instead of increasing future trade size.</p>
+        <label className="field"><span>Change trading cap (£)</span><input value={tradingCapInput} onChange={e=>setTradingCapInput(e.target.value)} placeholder="200" inputMode="decimal" /></label>
+        <div className="actions">
+          <button className="ghost" onClick={()=>{setTradingCapInput("100"); saveTradingCap(100)}} disabled={tradingCapSaving}>£100</button>
+          <button className="ghost" onClick={()=>{setTradingCapInput("200"); saveTradingCap(200)}} disabled={tradingCapSaving}>£200</button>
+          <button className="ghost" onClick={()=>{setTradingCapInput("260"); saveTradingCap(260)}} disabled={tradingCapSaving}>£260</button>
+          <button onClick={()=>saveTradingCap()} disabled={tradingCapSaving}>{tradingCapSaving ? "Saving..." : "Save Cap"}</button>
+        </div>
+        <p className="muted">Saved cap source: {bankingCapSource}. Profits above the cap stay as cash buffer instead of increasing future trade size.</p>
       </Card>
-      <Card title="Weekly Auto Universe" wide>
-        <p className="muted">Use the button to rebuild the stock list immediately. Manual picks stay pinned.</p>
+      <Card title="Dynamic Auto Universe" wide>
+        <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
         <div className="universe-counts">
           <div><span>Total in universe</span><b>{data?.autoUniverse?.rows?.length || 0}</b></div>
           <div><span>Active symbols</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}</b></div>
           <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
+          <div><span>Dynamic picks</span><b>{data?.autoUniverse?.dynamicPickCount || dynamicPickCount}</b></div>
         </div>
-        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "weekly candidate"}</p></article>)}</div>
+        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : r.dynamicPick ? "Dynamic ⚡" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "dynamic candidate"}</p></article>)}</div>
       </Card>
+      </>}
     </main>}
 
     {tab==="reports" && <main>
@@ -457,17 +687,37 @@ const fetchData = useCallback(async (force = false) => {
       </section>
       <Card title="Price / Equity History"><div className="chart-controls"><button className={chartCurrency==="GBP" ? "active":""} onClick={() => setChartCurrency("GBP")}>GBP</button><button className={chartCurrency==="USD" ? "active":""} onClick={() => setChartCurrency("USD")}>USD</button></div><div className="chart">{reportChart.length ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={reportChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="label" stroke="#94a3b8" minTickGap={28}/><YAxis stroke="#94a3b8"/><Tooltip formatter={(v:any) => chartCurrency==="GBP" ? gbp(v) : usd(v)}/><Area type="monotone" dataKey="equity" stroke="#38bdf8" fill="#38bdf833"/></AreaChart></ResponsiveContainer> : <p className="muted">No price/equity history yet.</p>}</div></Card>
       <Card title="Daily PnL"><div className="chart small-chart">{dailyPnlChart.length ? <ResponsiveContainer width="100%" height="100%"><BarChart data={dailyPnlChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="day" stroke="#94a3b8"/><YAxis stroke="#94a3b8"/><Tooltip formatter={(v:any) => chartCurrency==="GBP" ? gbp(v) : usd(v)}/><Bar dataKey="pnl" fill="#38bdf8"/></BarChart></ResponsiveContainer> : <p className="muted">Daily PnL bars will appear as trades are recorded.</p>}</div></Card>
+      <Card title="Backtest / Paper Replay" wide>
+        <p className="muted">Run a quick report using your closed trade history and a chosen trading cap. This does not place trades.</p>
+        <label className="field"><span>Replay trading cap (£)</span><input value={replayCapInput} onChange={e=>setReplayCapInput(e.target.value)} placeholder="200" inputMode="decimal" /></label>
+        <div className="actions">
+          <button className="ghost" onClick={()=>setReplayCapInput("100")}>£100</button>
+          <button className="ghost" onClick={()=>setReplayCapInput("200")}>£200</button>
+          <button className="ghost" onClick={()=>setReplayCapInput("260")}>£260</button>
+          <button onClick={runBacktestReplay} disabled={replayLoading}>{replayLoading ? "Running..." : "Run Replay Report"}</button>
+        </div>
+        {replayResult && <div className="summary">
+          <div><span>Trades tested</span><b>{replayResult?.tradesTested || 0}</b></div>
+          <div><span>Win rate</span><b>{pct(Number(replayResult?.winRate || 0) * 100)}</b></div>
+          <div><span>Replay PnL</span><b className={tone(replayResult?.replayPnlGbp)}>{gbp(replayResult?.replayPnlGbp)} · {usd(replayResult?.replayPnlUsd)}</b></div>
+          <div><span>Best symbol</span><b>{replayResult?.bestSymbol || "—"}</b></div>
+          <div><span>Worst symbol</span><b>{replayResult?.worstSymbol || "—"}</b></div>
+          <div><span>Max drawdown</span><b className="loss">{gbp(replayResult?.maxDrawdownGbp)}</b></div>
+        </div>}
+        {replayResult?.notes && <p className="notice">{replayResult.notes}</p>}
+        {Array.isArray(replayResult?.bySymbol) && replayResult.bySymbol.length > 0 && <div className="table-wrap"><table><thead><tr><th>Symbol</th><th>Trades</th><th>Win rate</th><th>PnL</th></tr></thead><tbody>{replayResult.bySymbol.slice(0,12).map((r:AnyObj)=><tr key={r.symbol}><td>{r.symbol}</td><td>{r.trades}</td><td>{pct(Number(r.winRate || 0) * 100)}</td><td className={tone(r.pnlGbp)}>{gbp(r.pnlGbp)} / {usd(r.pnlUsd)}</td></tr>)}</tbody></table></div>}
+      </Card>
       <Card title="Closed Trade History"><div className="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th></tr></thead><tbody>{closedTrades.slice(-80).reverse().map((t:AnyObj,i:number)=><tr key={i}><td>{t.time || "—"}</td><td>{t.symbol}</td><td>{usd(t.entryPrice)}</td><td>{usd(t.exitPrice)}</td><td>{Number(t.qty || 0).toFixed(4)}</td><td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td><td className={tone(t.pnl)}>{pct(t.pnlPct)}</td></tr>)}{!closedTrades.length && <tr><td colSpan={7}>No matched closed trades yet.</td></tr>}</tbody></table></div></Card>
     </main>}
 
-    {tab==="positions" && <Card title="All Positions"><div className="position-list">{positions.map((p:AnyObj)=><article className="position" key={p.symbol}><div><h3>{p.symbol}</h3><p>Qty {Number(p.qty || 0).toFixed(4)} · Entry {usd(p.entry)} · Price {usd(p.price)}</p><p>Value <b>{gbp(p.marketValueGbp ?? p.marketValue * rate)}</b> / {usd(p.marketValue)}</p></div><div className="position-side"><b className={tone(p.pnl)}>PnL {gbp(p.pnlGbp ?? p.pnl * rate)} / {usd(p.pnl)} / {pct(p.pnlPct)}</b><span>{p.trailingActive ? `Trailing floor ${usd(p.trailFloor)}` : `Trail starts ${usd(p.trailStartPrice)}`}</span><button className="danger" onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button></div></article>)}{!positions.length && <p className="muted">No open positions.</p>}</div></Card>}
+    {tab==="positions" && <Card title="All Positions — Best to Worst"><p className="muted">Sorted by PnL %, strongest winners glow green and weakest positions glow orange/red.</p><div className="position-list">{positions.map((p:AnyObj)=><article className="position" key={p.symbol} style={positionGlowStyle(p)}><div><h3>{p.symbol}</h3><p>Qty {Number(p.qty || 0).toFixed(4)} · Entry {usd(p.entry)} · Price {usd(p.price)}</p><p>Value <b>{gbp(p.marketValueGbp ?? p.marketValue * rate)}</b> / {usd(p.marketValue)}</p></div><div className="position-side"><b className={tone(p.pnl)}>PnL {gbp(p.pnlGbp ?? p.pnl * rate)} / {usd(p.pnl)} / {pct(p.pnlPct)}</b><span>{p.trailingActive ? `Trailing floor ${usd(p.trailFloor)}` : `Trail starts ${usd(p.trailStartPrice)}`}</span><button className="danger" onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button></div></article>)}{!positions.length && <p className="muted">No open positions.</p>}</div></Card>}
 
     {tab==="scanner" && <main><Card title="Scanner Price History">{scans.length>0 && <select value={selectedSymbol} onChange={e=>setSelectedSymbol(e.target.value)}>{scans.map((s:AnyObj)=><option key={s.symbol}>{s.symbol}</option>)}</select>}<div className="chart">{scannerChart.length ? <ResponsiveContainer width="100%" height="100%"><LineChart data={scannerChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="t" stroke="#94a3b8"/><YAxis stroke="#94a3b8"/><Tooltip/><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false}/></LineChart></ResponsiveContainer> : <p className="muted">No scanner price history yet.</p>}</div></Card></main>}
 
-    {tab==="search" && <main><Card title="Stock Search / Preview"><div className="search-row"><input value={stockQuery} onChange={e=>{setStockQuery(e.target.value); if(e.target.value.trim().length>=2) searchStocks(e.target.value); if(!e.target.value.trim()) setStockResults([])}} onKeyDown={e=>{if(e.key==="Enter") searchStocks()}} placeholder="Search ticker or company, e.g. AMD"/><button onClick={()=>searchStocks()}>{stockSearchLoading ? "Searching..." : "Search"}</button></div><div className="search-results">{stockResults.map((s:AnyObj)=><article className="search-card" key={s.symbol}><div className="search-main"><div className="logo-circle">{s.symbol.slice(0,2)}</div><div><h3>{s.name}</h3><p>{s.symbol} · NASDAQ/NYSE</p></div></div><div className="search-price"><strong>{usd(s.price)}</strong><span className={tone(s.changePct)}>{Number(s.changePct || 0)>=0 ? "↗":"↘"} {pct(s.changePct)}</span><small>{gbp(s.priceGbp)}</small></div><div className="mini-chart">{Array.isArray(s.history) && s.history.length>1 ? <ResponsiveContainer width="100%" height="100%"><LineChart data={s.history.map((p:AnyObj,i:number)=>({...p,i}))}><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false} strokeWidth={2}/><Tooltip formatter={(v:any)=>usd(v)}/></LineChart></ResponsiveContainer> : <p className="muted">Preview builds while you search.</p>}</div><div className="search-actions"><button onClick={()=>action(`/custom-buy/${s.symbol}`)}>Buy</button><button className="ghost" onClick={()=>action(`/add-to-universe/${s.symbol}`)}>Add to Universe</button></div></article>)}{!stockResults.length && <p className="muted">Type a symbol to preview price, daily movement and mini chart.</p>}</div></Card></main>}
+    {tab==="search" && <main><Card title="Stock Search / Preview"><div className="search-row"><input value={stockQuery} onChange={e=>{setStockQuery(e.target.value); if(e.target.value.trim().length>=2) searchStocks(e.target.value); if(!e.target.value.trim()) setStockResults([])}} onKeyDown={e=>{if(e.key==="Enter") searchStocks()}} placeholder="Search ticker or company, e.g. AMD"/><button onClick={()=>searchStocks()}>{stockSearchLoading ? "Searching..." : "Search"}</button></div><div className="search-results">{stockResults.map((s:AnyObj)=><article className="search-card" key={s.symbol}><div className="search-main"><div className="logo-circle">{s.symbol.slice(0,2)}</div><div><h3>{s.name}</h3><p>{s.symbol} · NASDAQ/NYSE</p></div></div><div className="search-price"><strong>{usd(s.price)}</strong><span className={tone(s.changePct)}>{Number(s.changePct || 0)>=0 ? "↗":"↘"} {pct(s.changePct)}</span><small>{gbp(s.priceGbp)}</small></div><div className="mini-chart">{Array.isArray(s.history) && s.history.length>1 ? <ResponsiveContainer width="100%" height="100%"><LineChart data={s.history.map((p:AnyObj,i:number)=>({...p,i}))}><Line type="monotone" dataKey="value" stroke="#38bdf8" dot={false} strokeWidth={2}/><Tooltip formatter={(v:any)=>usd(v)}/></LineChart></ResponsiveContainer> : <p className="muted">Preview builds while you search.</p>}</div><div className="search-actions"><button onClick={()=>action(`/custom-buy/${s.symbol}`)}>Buy</button><button className="ghost" onClick={()=>action(`/add-to-universe/${s.symbol}`)}>Add to Universe</button><button className="danger" onClick={()=>action(`/remove-from-universe/${s.symbol}`)}>Remove</button></div></article>)}{!stockResults.length && <p className="muted">Type a symbol to preview price, daily movement and mini chart.</p>}</div></Card></main>}
 
     {tab==="activity" && <main className="grid two"><Card title="Recent Trades"><div className="log-list">{trades.slice(-50).reverse().map((t:AnyObj,i:number)=><div key={i}>{t.time || "—"} · <b>{t.side} {t.symbol}</b> · {t.reason || ""}</div>)}{!trades.length && <p className="muted">No trades yet.</p>}</div></Card><Card title="Logs"><div className="log-list">{logs.map((l:string,i:number)=><div key={i}>{l}</div>)}</div></Card></main>}
 
-    {tab==="admin" && <Card title="Admin"><label className="field"><span>Dashboard password</span><input type="password" value={apiKey} onChange={e=>setApiKey(e.target.value)}/></label><div className="actions"><button onClick={saveApiKey}>Save</button><button className="ghost" onClick={()=>{localStorage.removeItem("dashboard_api_key"); setApiKey("")}}>Clear</button></div><pre>{JSON.stringify({ api:API_URL, botEnabled:data?.botEnabled, market:data?.market, manualPicks:data?.manualUniversePicks }, null, 2)}</pre></Card>}
+    {tab==="admin" && <Card title="Admin"><label className="field"><span>Dashboard password</span><input type="password" value={apiKey} onChange={e=>setApiKey(e.target.value)}/></label><div className="actions"><button onClick={saveApiKey}>Save</button><button className="ghost" onClick={()=>{localStorage.removeItem("dashboard_api_key"); setApiKey("")}}>Clear</button></div><pre>{JSON.stringify({ api:API_URL, botEnabled:data?.botEnabled, market:data?.market, manualPicks:data?.manualUniversePicks, tradingCapGbp:bankingCapGbp, tradingCapSource:bankingCapSource }, null, 2)}</pre></Card>}
   </div>;
 }
