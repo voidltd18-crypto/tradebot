@@ -77,7 +77,7 @@ SAFE_UNIVERSE = [
 CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
-MAX_POSITIONS = 12
+MAX_POSITIONS = 6
 MAX_NEW_BUYS_PER_LOOP = 1
 MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
@@ -2904,12 +2904,17 @@ def build_weekly_universe(force=False):
     chosen = []
     seen = set()
     for r in combined:
+        symbol = str(r.get("symbol", "")).upper().strip()
         if len(chosen) >= AUTO_UNIVERSE_SIZE:
             break
-        if r["symbol"] in seen:
+        if symbol in seen:
             continue
+        if "QUALITY_ONLY_MODE" in globals() and QUALITY_ONLY_MODE and symbol in BLOCKED_WEAK_TICKERS:
+            print(f"QUALITY BLOCKED UNIVERSE SKIP {symbol}")
+            continue
+        r["symbol"] = symbol
         chosen.append(r)
-        seen.add(r["symbol"])
+        seen.add(symbol)
 
     if not chosen:
         chosen = [{"symbol": s, "score": 0, "reason": "fallback safe universe", "status": "active"} for s in SAFE_UNIVERSE[:AUTO_UNIVERSE_SIZE]]
@@ -2936,11 +2941,31 @@ def auto_universe_payload():
         preview = universe_rows_from_stock_memory()[:AUTO_UNIVERSE_SIZE]
         active = preview
 
+    # Final UI safety filter: never show blocked weak tickers in the dashboard universe.
+    try:
+        if "QUALITY_ONLY_MODE" in globals() and QUALITY_ONLY_MODE:
+            active = [
+                r for r in active
+                if str(r.get("symbol", "")).upper().strip() not in BLOCKED_WEAK_TICKERS
+            ]
+    except Exception as e:
+        print(f"AUTO UNIVERSE BLOCK FILTER ERROR: {e}")
+
+    active_symbols = [r["symbol"] for r in active] if active else list(current_universe)
+    try:
+        if "QUALITY_ONLY_MODE" in globals() and QUALITY_ONLY_MODE:
+            active_symbols = [
+                str(s).upper().strip() for s in active_symbols
+                if str(s).upper().strip() not in BLOCKED_WEAK_TICKERS
+            ]
+    except Exception:
+        pass
+
     return {
         "enabled": AUTO_UNIVERSE_ENABLED,
-        "size": AUTO_UNIVERSE_SIZE,
+        "size": len(active_symbols),
         "weekStart": week_start_str(),
-        "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe),
+        "activeSymbols": active_symbols,
         "rows": active,
         "lastRefresh": get_last_universe_refresh(),
         "candidatePoolSize": len(AUTO_UNIVERSE_CANDIDATE_POOL),
@@ -3302,6 +3327,11 @@ def run_bot_loop():
             with bot_lock:
                 reset_daily_flags_if_needed()
                 cleanup_temp_blacklist()
+                try:
+                    refresh_dynamic_market_candidates_if_needed()
+                except Exception as e:
+                    print(f"DYNAMIC SCANNER LOOP ERROR: {e}")
+                refresh_universe_if_needed()
                 clock = trading_client.get_clock()
 
                 if not clock.is_open:
@@ -3310,19 +3340,11 @@ def run_bot_loop():
                     time.sleep(CHECK_INTERVAL)
                     continue
 
-                try:
-                    refresh_dynamic_market_candidates_if_needed()
-                except Exception as e:
-                    print(f"DYNAMIC SCANNER LOOP ERROR: {e}")
-                refresh_universe_if_needed()
-
                 scans = []
                 for symbol in current_universe:
                     try:
-                        # Final safety gate: do not scan/trade blocked weak tickers,
-                        # even if a refresh/cache/DB merge accidentally re-adds them.
-                        if "QUALITY_ONLY_MODE" in globals() and QUALITY_ONLY_MODE and str(symbol).upper().strip() in BLOCKED_WEAK_TICKERS:
-                            print(f"QUALITY BLOCKED SKIP {str(symbol).upper().strip()}")
+                        if "is_quality_blocked_symbol" in globals() and is_quality_blocked_symbol(symbol):
+                            print(f"QUALITY BLOCKED SKIP {symbol}")
                             continue
 
                         scan = compute_scan(symbol)
@@ -4253,6 +4275,15 @@ def force_quality_auto_universe_payload():
             rows = quality_universe_rows()
         else:
             rows = []
+        # Final UI safety filter: remove blocked weak tickers from rows and symbols.
+        try:
+            if "QUALITY_ONLY_MODE" in globals() and QUALITY_ONLY_MODE:
+                rows = [
+                    r for r in rows
+                    if str(r.get("symbol", "")).upper().strip() not in BLOCKED_WEAK_TICKERS
+                ]
+        except Exception as e:
+            print(f"FORCE QUALITY ROW FILTER ERROR: {e}")
         symbols = [r["symbol"] for r in rows]
     except Exception:
         rows = []
