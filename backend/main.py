@@ -3303,9 +3303,9 @@ def run_bot_loop():
                     time.sleep(CHECK_INTERVAL)
                     continue
 
-            try:
-                if "refresh_dynamic_market_candidates_if_needed" in globals():
-                    refresh_dynamic_market_candidates_if_needed()
+                try:
+                    if "refresh_dynamic_market_candidates_if_needed" in globals():
+                        refresh_dynamic_market_candidates_if_needed()
                 except Exception as e:
                     print(f"DYNAMIC SCANNER LOOP ERROR: {e}")
 
@@ -3809,6 +3809,254 @@ def api_clear_loser_cooldown(request: Request):
 
 
 
+
+# =========================
+# DYNAMIC MARKET SCANNER v1.0
+# =========================
+DYNAMIC_MARKET_SCANNER_ENABLED = os.getenv("DYNAMIC_MARKET_SCANNER_ENABLED", "true").lower() == "true"
+DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS = int(os.getenv("DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS", "12"))
+DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS = int(os.getenv("DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS", str(3600)))
+DYNAMIC_MARKET_SCANNER_FILE = os.path.join("backend", "state", "dynamic_market_scanner.json")
+DYNAMIC_MARKET_MIN_PRICE = float(os.getenv("DYNAMIC_MARKET_MIN_PRICE", "3"))
+DYNAMIC_MARKET_MAX_PRICE = float(os.getenv("DYNAMIC_MARKET_MAX_PRICE", "800"))
+DYNAMIC_MARKET_MIN_VOLUME = int(os.getenv("DYNAMIC_MARKET_MIN_VOLUME", "500000"))
+DYNAMIC_MARKET_MAX_SPREAD = float(os.getenv("DYNAMIC_MARKET_MAX_SPREAD", "0.025"))
+DYNAMIC_MARKET_YAHOO_SCREENS = [
+    x.strip()
+    for x in os.getenv("DYNAMIC_MARKET_YAHOO_SCREENS", "day_gainers,most_actives,aggressive_small_caps").split(",")
+    if x.strip()
+]
+
+DYNAMIC_SCANNER_CACHE: Dict[str, Any] = {
+    "updatedAt": "",
+    "symbols": [],
+    "rows": [],
+    "source": "empty",
+    "error": "",
+}
+
+
+def _load_dynamic_scanner_cache() -> Dict[str, Any]:
+    global DYNAMIC_SCANNER_CACHE
+    try:
+        if os.path.exists(DYNAMIC_MARKET_SCANNER_FILE):
+            with open(DYNAMIC_MARKET_SCANNER_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                DYNAMIC_SCANNER_CACHE = {**DYNAMIC_SCANNER_CACHE, **data}
+    except Exception as e:
+        print(f"DYNAMIC SCANNER LOAD ERROR: {e}")
+    return DYNAMIC_SCANNER_CACHE
+
+
+def _save_dynamic_scanner_cache(data: Dict[str, Any]) -> Dict[str, Any]:
+    global DYNAMIC_SCANNER_CACHE
+    try:
+        os.makedirs(os.path.dirname(DYNAMIC_MARKET_SCANNER_FILE), exist_ok=True)
+        with open(DYNAMIC_MARKET_SCANNER_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"DYNAMIC SCANNER SAVE ERROR: {e}")
+    DYNAMIC_SCANNER_CACHE = {**DYNAMIC_SCANNER_CACHE, **data}
+    return DYNAMIC_SCANNER_CACHE
+
+
+def _dynamic_cache_age_seconds() -> float:
+    data = _load_dynamic_scanner_cache()
+    try:
+        updated = datetime.fromisoformat(str(data.get("updatedAt", "")).replace("Z", "+00:00"))
+        return max(0.0, (datetime.now(UTC) - updated).total_seconds())
+    except Exception:
+        return 999999999.0
+
+
+def _clean_dynamic_symbol(symbol: str) -> str:
+    sym = str(symbol or "").upper().strip()
+    if not re.fullmatch(r"[A-Z]{1,5}([.-][A-Z])?", sym):
+        return ""
+    return sym.replace(".", "-")
+
+
+def _yahoo_dynamic_screen(screen_id: str, count: int = 50) -> List[Dict[str, Any]]:
+    url = f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds={screen_id}&count={count}"
+    headers = {"User-Agent": "Mozilla/5.0 TradeBot dynamic scanner"}
+    response = requests.get(url, headers=headers, timeout=8)
+    response.raise_for_status()
+    data = response.json()
+    quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+    return quotes if isinstance(quotes, list) else []
+
+
+def _score_dynamic_quote(q: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
+    symbol = _clean_dynamic_symbol(q.get("symbol"))
+    blocked = globals().get("BLOCKED_WEAK_TICKERS", set())
+    if not symbol or symbol in blocked:
+        return None
+
+    exchange = str(q.get("fullExchangeName") or q.get("exchange") or "").upper()
+    quote_type = str(q.get("quoteType") or "").upper()
+    if quote_type and quote_type not in {"EQUITY", "ETF"}:
+        return None
+    if any(bad in exchange for bad in ["PNK", "OTC", "OTHER OTC"]):
+        return None
+
+    try:
+        price = float(q.get("regularMarketPrice") or q.get("postMarketPrice") or q.get("preMarketPrice") or 0.0)
+        volume = int(float(q.get("regularMarketVolume") or q.get("averageDailyVolume3Month") or 0))
+        change_pct = float(q.get("regularMarketChangePercent") or 0.0)
+        market_cap = float(q.get("marketCap") or 0.0)
+    except Exception:
+        return None
+
+    if price < DYNAMIC_MARKET_MIN_PRICE or price > DYNAMIC_MARKET_MAX_PRICE:
+        return None
+    if volume < DYNAMIC_MARKET_MIN_VOLUME:
+        return None
+
+    spread = 0.0
+    try:
+        aq = get_quote(symbol)
+        spread = float(aq.get("spread") or 0.0)
+        if spread > DYNAMIC_MARKET_MAX_SPREAD:
+            return None
+    except Exception:
+        spread = 0.0
+
+    score = 0.0
+    score += max(-8.0, min(12.0, change_pct)) * 1.25
+    score += min(10.0, math.log10(max(volume, 1)) * 1.15)
+    if market_cap > 1_000_000_000:
+        score += 4.0
+    if source == "day_gainers" and change_pct > 0:
+        score += 3.0
+    if source == "most_actives":
+        score += 1.5
+    if spread > 0:
+        score += max(0.0, 3.0 - (spread * 120.0))
+
+    return {
+        "symbol": symbol,
+        "score": round(score, 4),
+        "reason": f"dynamic scanner | {source} | change={change_pct:.2f}% | volume={volume:,}" + (f" | spread={spread:.4f}" if spread else ""),
+        "status": "active",
+        "dynamicPick": True,
+        "source": source,
+        "price": price,
+        "changePct": change_pct,
+        "volume": volume,
+        "marketCap": market_cap,
+        "spread": spread,
+    }
+
+
+def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
+    if not DYNAMIC_MARKET_SCANNER_ENABLED:
+        data = {
+            "enabled": False,
+            "symbols": [],
+            "rows": [],
+            "source": "disabled",
+            "updatedAt": datetime.now(UTC).isoformat(),
+            "error": "",
+        }
+        return _save_dynamic_scanner_cache(data)
+
+    if not force and _dynamic_cache_age_seconds() < DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS:
+        return _load_dynamic_scanner_cache()
+
+    rows_by_symbol: Dict[str, Dict[str, Any]] = {}
+    errors = []
+
+    for screen in DYNAMIC_MARKET_YAHOO_SCREENS:
+        try:
+            for quote in _yahoo_dynamic_screen(screen, count=60):
+                row = _score_dynamic_quote(quote, screen)
+                if not row:
+                    continue
+                prev = rows_by_symbol.get(row["symbol"])
+                if not prev or float(row.get("score") or 0) > float(prev.get("score") or 0):
+                    rows_by_symbol[row["symbol"]] = row
+        except Exception as e:
+            errors.append(f"{screen}: {e}")
+            print(f"DYNAMIC SCANNER SOURCE ERROR {screen}: {e}")
+
+    rows = sorted(rows_by_symbol.values(), key=lambda r: float(r.get("score") or 0), reverse=True)[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]
+
+    if not rows:
+        fallback = globals().get("QUALITY_ONLY_UNIVERSE", SAFE_UNIVERSE)
+        for i, sym in enumerate(fallback[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]):
+            rows.append({
+                "symbol": sym,
+                "score": round(50 - i, 4),
+                "reason": "dynamic scanner fallback | core quality universe",
+                "status": "active",
+                "dynamicPick": False,
+                "source": "fallback",
+            })
+
+    payload = {
+        "enabled": True,
+        "mode": "dynamic-market-scanner",
+        "updatedAt": datetime.now(UTC).isoformat(),
+        "refreshSeconds": DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS,
+        "maxSymbols": DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS,
+        "source": ",".join(DYNAMIC_MARKET_YAHOO_SCREENS),
+        "symbols": [r["symbol"] for r in rows],
+        "rows": rows,
+        "filters": {
+            "minPrice": DYNAMIC_MARKET_MIN_PRICE,
+            "maxPrice": DYNAMIC_MARKET_MAX_PRICE,
+            "minVolume": DYNAMIC_MARKET_MIN_VOLUME,
+            "maxSpread": DYNAMIC_MARKET_MAX_SPREAD,
+        },
+        "error": " | ".join(errors[-3:]),
+    }
+    return _save_dynamic_scanner_cache(payload)
+
+
+def refresh_dynamic_market_candidates_if_needed() -> Dict[str, Any]:
+    return refresh_dynamic_market_candidates(force=False)
+
+
+def dynamic_market_scanner_payload() -> Dict[str, Any]:
+    data = _load_dynamic_scanner_cache()
+    if not data.get("rows"):
+        data = refresh_dynamic_market_candidates(force=False)
+    return {"enabled": DYNAMIC_MARKET_SCANNER_ENABLED, **data}
+
+
+def dynamic_market_rows() -> List[Dict[str, Any]]:
+    if not DYNAMIC_MARKET_SCANNER_ENABLED:
+        return []
+    return list(dynamic_market_scanner_payload().get("rows") or [])
+
+
+def dynamic_market_symbols() -> List[str]:
+    return [str(r.get("symbol", "")).upper() for r in dynamic_market_rows() if r.get("symbol")]
+
+
+@app.get("/dynamic-market-scanner")
+def api_dynamic_market_scanner():
+    payload = dynamic_market_scanner_payload()
+    return {"ok": True, "dynamicMarketScanner": payload, **payload}
+
+
+@app.post("/dynamic-market-scanner/refresh")
+def api_dynamic_market_scanner_refresh(request: Request):
+    verify_api_key(request)
+    payload = refresh_dynamic_market_candidates(force=False)
+    try:
+        if "apply_quality_only_universe" in globals():
+            apply_quality_only_universe()
+        update_status(BOT_NAME, latest_scans)
+        latest_status["dynamicMarketScanner"] = payload
+        latest_status["lastAction"] = "Dynamic market scanner refreshed"
+        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
+    except Exception as e:
+        print(f"DYNAMIC SCANNER STATUS UPDATE ERROR: {e}")
+    return {"ok": True, "message": "Dynamic market scanner refreshed", "dynamicMarketScanner": payload, **payload}
+
+
 # =========================
 # QUALITY-ONLY UNIVERSE LOCK v1.3
 # =========================
@@ -3827,28 +4075,71 @@ BLOCKED_WEAK_TICKERS = {
 }
 
 def quality_only_symbols():
-    symbols = list(QUALITY_ONLY_UNIVERSE)
+    symbols = []
 
-    # Keep manual picks only if they are not explicitly blocked.
+    # Manual pins first, unless explicitly blocked.
     try:
         if "load_manual_universe_picks" in globals() and callable(globals()["load_manual_universe_picks"]):
             for sym in load_manual_universe_picks():
                 sym = str(sym).upper().strip()
                 if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
-                    symbols.insert(0, sym)
+                    symbols.append(sym)
     except Exception as e:
         print(f"QUALITY ONLY MANUAL MERGE ERROR: {e}")
+
+    # Dynamic scanner picks next.
+    try:
+        if DYNAMIC_MARKET_SCANNER_ENABLED:
+            for sym in dynamic_market_symbols():
+                sym = str(sym).upper().strip()
+                if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
+                    symbols.append(sym)
+    except Exception as e:
+        print(f"QUALITY ONLY DYNAMIC MERGE ERROR: {e}")
+
+    # Core quality names as safety fallback.
+    for sym in QUALITY_ONLY_UNIVERSE:
+        sym = str(sym).upper().strip()
+        if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
+            symbols.append(sym)
 
     return symbols
 
 def quality_only_rows():
     rows = []
+    dynamic_by_symbol = {}
+    try:
+        dynamic_by_symbol = {str(r.get("symbol", "")).upper(): r for r in dynamic_market_rows()}
+    except Exception:
+        dynamic_by_symbol = {}
+
+    manual_picks = set()
+    try:
+        manual_picks = {str(s).upper() for s in load_manual_universe_picks()}
+    except Exception:
+        manual_picks = set()
+
     for i, sym in enumerate(quality_only_symbols()):
+        dyn = dynamic_by_symbol.get(sym)
+        is_manual = sym in manual_picks
+        is_dynamic = bool(dyn)
+        base_score = 100 - (i * 3.0)
+        score = float(dyn.get("score", base_score)) if dyn else base_score
+        reason = dyn.get("reason") if dyn else "core quality universe | weak tickers blocked"
+        if is_manual:
+            reason = "manual pick | pinned to universe" + (f" | {reason}" if reason else "")
+            score = max(score, 99.0)
         rows.append({
             "symbol": sym,
-            "score": round(100 - (i * 3.0), 2),
-            "reason": "quality-only universe | weak tickers blocked",
+            "score": round(score, 2),
+            "reason": reason,
             "status": "active",
+            "manualPick": is_manual,
+            "dynamicPick": is_dynamic,
+            "source": dyn.get("source") if dyn else "core-quality",
+            "changePct": dyn.get("changePct") if dyn else None,
+            "volume": dyn.get("volume") if dyn else None,
+            "price": dyn.get("price") if dyn else None,
         })
     return rows
 
