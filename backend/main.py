@@ -3319,6 +3319,12 @@ def run_bot_loop():
                 scans = []
                 for symbol in current_universe:
                     try:
+                        # Final safety gate: do not scan/trade blocked weak tickers,
+                        # even if a refresh/cache/DB merge accidentally re-adds them.
+                        if "QUALITY_ONLY_MODE" in globals() and QUALITY_ONLY_MODE and str(symbol).upper().strip() in BLOCKED_WEAK_TICKERS:
+                            print(f"QUALITY BLOCKED SKIP {str(symbol).upper().strip()}")
+                            continue
+
                         scan = compute_scan(symbol)
                         scans.append(scan)
                         print(f"{symbol} | price={scan['price']:.2f} | quality={scan['quality_score']:.4f} | confidence={scan['confidence']:.2f} | sniper={scan['sniper_pass']}")
