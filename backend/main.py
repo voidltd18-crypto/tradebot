@@ -3303,7 +3303,8 @@ def run_bot_loop():
                     time.sleep(CHECK_INTERVAL)
                     continue
 
-                try:
+            try:
+                if "refresh_dynamic_market_candidates_if_needed" in globals():
                     refresh_dynamic_market_candidates_if_needed()
                 except Exception as e:
                     print(f"DYNAMIC SCANNER LOOP ERROR: {e}")
