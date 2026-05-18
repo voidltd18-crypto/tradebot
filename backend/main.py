@@ -4037,7 +4037,7 @@ def api_dynamic_market_scanner():
 @app.post("/dynamic-market-scanner/refresh")
 def api_dynamic_market_scanner_refresh(request: Request):
     verify_api_key(request)
-    payload = refresh_dynamic_market_candidates(force=True)
+    payload = refresh_dynamic_market_candidates(force=False)
     try:
         apply_quality_only_universe()
         update_status(BOT_NAME, latest_scans)
@@ -4308,7 +4308,7 @@ def refresh_universe(request: Request):
 
     try:
         if "refresh_dynamic_market_candidates" in globals():
-            refresh_dynamic_market_candidates(force=True)
+            refresh_dynamic_market_candidates(force=False)
         if "apply_quality_only_universe" in globals():
             apply_quality_only_universe()
         elif "apply_quality_universe_to_status" in globals():
