@@ -3832,8 +3832,9 @@ QUALITY_ONLY_UNIVERSE = [
 ]
 
 BLOCKED_WEAK_TICKERS = {
-    "LAC", "LCID", "PLUG", "SOFI", "SNAP", "NUVB",
-    "RIVN", "F", "AAL", "GIS", "PYPL"
+    "NVDA", "AMD", "MSFT", "AAPL", "META",
+    "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
+    "TSLA", "PLTR", "UBER", "QQQ", "SMH",
 }
 
 def quality_only_symbols():
