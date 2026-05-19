@@ -781,9 +781,6 @@ def get_all_positions():
                 "inUniverse": symbol in current_universe,
                 "custom": bool(state.get(symbol, {}).get("custom")),
                 "lockedToday": is_locked_today(symbol),
-                "pdtBlocked": bool(pdt_block_event),
-                "pdtBlockLabel": "PDT BLOCK" if pdt_block_event else "",
-                "pdtBlockEvent": pdt_block_event or {},
                 "boughtToday": was_bought_today(symbol),
                 "minutesSinceBuy": minutes_since_today_buy(symbol),
                 "partialProfitTaken": has_taken_partial_profit(symbol),
@@ -1091,14 +1088,8 @@ def calculate_new_position_notional():
     account = get_account()
     equity = float(account.equity)
     buying_power = float(account.buying_power)
-
-    # Profit banking cap now controls sizing. If account equity grows above
-    # the saved cap, new trade sizes are calculated from the capped amount,
-    # not full account equity.
-    sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
-
-    target_value = sizing_equity * TARGET_POSITION_VALUE_PCT
-    max_value = sizing_equity * MAX_POSITION_VALUE_PCT
+    target_value = equity * TARGET_POSITION_VALUE_PCT
+    max_value = equity * MAX_POSITION_VALUE_PCT
     usable_cash = max(0.0, buying_power - CASH_BUFFER)
     return round(max(0.0, min(target_value, max_value, usable_cash)), 2)
 
@@ -1110,11 +1101,10 @@ def confidence_notional(scan):
     confidence, label = calculate_confidence(scan)
     mult = HIGH_CONFIDENCE_SIZE_MULTIPLIER if label == "HIGH" else MEDIUM_CONFIDENCE_SIZE_MULTIPLIER if label == "MEDIUM" else LOW_CONFIDENCE_SIZE_MULTIPLIER
     try:
-        account_equity = float(get_account().equity)
-        sizing_equity = effective_trading_equity(account_equity) if "effective_trading_equity" in globals() else account_equity
+        equity = float(get_account().equity)
     except Exception:
-        sizing_equity = 0.0
-    cap = sizing_equity * MAX_CONFIDENCE_POSITION_VALUE_PCT if sizing_equity > 0 else base
+        equity = 0.0
+    cap = equity * MAX_CONFIDENCE_POSITION_VALUE_PCT if equity > 0 else base
     return round(max(0.0, min(base * mult, cap)), 2)
 
 
@@ -2893,15 +2883,14 @@ def build_weekly_universe(force=False):
 
     combined = held_rows + rows
 
-    # Fill empty slots with candidate pool only if hardcoded fallback is explicitly enabled.
+    # Fill empty slots with candidate pool.
     existing = {r["symbol"] for r in combined}
-    if globals().get("DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK", False):
-        for symbol in AUTO_UNIVERSE_CANDIDATE_POOL:
-            if len(combined) >= AUTO_UNIVERSE_SIZE * 2:
-                break
-            if symbol not in existing and symbol not in BLOCKED_WEAK_TICKERS:
-                combined.append(score_candidate_symbol(symbol))
-                existing.add(symbol)
+    for symbol in AUTO_UNIVERSE_CANDIDATE_POOL:
+        if len(combined) >= AUTO_UNIVERSE_SIZE * 2:
+            break
+        if symbol not in existing:
+            combined.append(score_candidate_symbol(symbol))
+            existing.add(symbol)
 
     combined.sort(key=lambda r: r["score"], reverse=True)
 
@@ -2915,12 +2904,8 @@ def build_weekly_universe(force=False):
         chosen.append(r)
         seen.add(r["symbol"])
 
-    if not chosen and globals().get("DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK", False):
-        chosen = [
-            {"symbol": s, "score": 0, "reason": "emergency fallback safe universe", "status": "active"}
-            for s in SAFE_UNIVERSE[:AUTO_UNIVERSE_SIZE]
-            if s not in BLOCKED_WEAK_TICKERS
-        ]
+    if not chosen:
+        chosen = [{"symbol": s, "score": 0, "reason": "fallback safe universe", "status": "active"} for s in SAFE_UNIVERSE[:AUTO_UNIVERSE_SIZE]]
 
     save_weekly_universe(chosen, "forced refresh" if force else "weekly refresh")
     current_universe = [r["symbol"] for r in chosen]
@@ -2996,7 +2981,6 @@ def build_status_payload(bot_name, scans):
         "market": market_status,
         "fx": fx_payload(),
         "autoUniverse": auto_universe_payload(),
-        "dynamicMarketScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
         "strictOneCyclePerStockPerDay": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
@@ -3205,13 +3189,18 @@ def manual_override_off(request: Request):
 
 @app.post("/manual-buy")
 def manual_buy(request: Request):
+    print("BUTTON HIT: manual-buy", flush=True)
     verify_api_key(request)
-    with bot_lock:
+    if not bot_lock.acquire(timeout=10):
+        return {"ok": False, "message": "Bot is busy scanning. Try Money Buy again in a few seconds."}
+    try:
         if not trading_client.get_clock().is_open:
             return {"ok": False, "message": "Market closed"}
         result = money_mode_buy(latest_scans, manual=True)
         update_status(BOT_NAME, latest_scans)
         return {"ok": True, "message": result}
+    finally:
+        bot_lock.release()
 
 
 @app.post("/custom-buy/{symbol}")
@@ -3225,11 +3214,16 @@ def custom_buy(symbol: str, request: Request):
 
 @app.post("/manual-sell")
 def manual_sell(request: Request):
+    print("BUTTON HIT: manual-sell", flush=True)
     verify_api_key(request)
-    with bot_lock:
+    if not bot_lock.acquire(timeout=10):
+        return {"ok": False, "message": "Bot is busy scanning. Try Sell Worst again in a few seconds."}
+    try:
         result = close_worst_or_largest_position(reason="MANUAL SELL")
         update_status(BOT_NAME, latest_scans)
         return result
+    finally:
+        bot_lock.release()
 
 
 @app.post("/sell/{symbol}")
@@ -3307,59 +3301,54 @@ def run_bot_loop():
 
     while True:
         try:
+            sleep_for = CHECK_INTERVAL
+
             with bot_lock:
                 reset_daily_flags_if_needed()
                 cleanup_temp_blacklist()
-                try:
-                    refresh_dynamic_market_candidates_if_needed()
-                except Exception as e:
-                    print(f"DYNAMIC SCANNER LOOP ERROR: {e}")
                 refresh_universe_if_needed()
                 clock = trading_client.get_clock()
 
                 if not clock.is_open:
                     print("Market closed. Waiting...")
                     update_status(BOT_NAME, latest_scans)
-                    time.sleep(CHECK_INTERVAL)
-                    continue
+                    # IMPORTANT:
+                    # Do NOT sleep while holding bot_lock.
+                    # Manual dashboard actions such as Money Buy / Sell Worst need
+                    # to acquire this same lock. Sleeping here caused the browser to
+                    # show OPTIONS/preflight while the real POST waited behind the bot.
+                    scans = None
+                else:
+                    scans = []
+                    for symbol in current_universe:
+                        try:
+                            scan = compute_scan(symbol)
+                            scans.append(scan)
+                            print(f"{symbol} | price={scan['price']:.2f} | quality={scan['quality_score']:.4f} | confidence={scan['confidence']:.2f} | sniper={scan['sniper_pass']}")
+                        except Exception as e:
+                            print(f"SCAN ERROR {symbol}: {e}")
 
-                if QUALITY_ONLY_MODE and not current_universe:
-                    print("SCANNER WAITING | no live market symbols available")
                     latest_scans.clear()
-                    update_status(BOT_NAME, [])
-                    time.sleep(CHECK_INTERVAL)
-                    continue
+                    latest_scans.extend(scans)
 
-                scans = []
-                for symbol in current_universe:
-                    try:
-                        scan = compute_scan(symbol)
-                        scans.append(scan)
-                        print(f"{symbol} | price={scan['price']:.2f} | quality={scan['quality_score']:.4f} | confidence={scan['confidence']:.2f} | sniper={scan['sniper_pass']}")
-                    except Exception as e:
-                        print(f"SCAN ERROR {symbol}: {e}")
+                    if bot_enabled and not emergency_stop:
+                        manage_money_mode_positions()
+                        if PROFIT_MODE_ENABLED and ROTATION_MODE_ENABLED:
+                            rr = maybe_rotate_weakest_into_best(scans)
+                            if rr:
+                                print(rr)
+                        if not manual_override:
+                            result = money_mode_buy(scans, manual=False)
+                            if result:
+                                print(result)
 
-                latest_scans.clear()
-                latest_scans.extend(scans)
+                    update_status(BOT_NAME, scans)
 
-                if bot_enabled and not emergency_stop:
-                    manage_money_mode_positions()
-                    if PROFIT_MODE_ENABLED and ROTATION_MODE_ENABLED:
-                        rr = maybe_rotate_weakest_into_best(scans)
-                        if rr:
-                            print(rr)
-                    if not manual_override:
-                        result = money_mode_buy(scans, manual=False)
-                        if result:
-                            print(result)
-                update_status(BOT_NAME, scans)
-
-            time.sleep(CHECK_INTERVAL)
+            time.sleep(sleep_for)
 
         except Exception as e:
             print(f"Main loop error: {e}")
             time.sleep(10)
-
 
 @app.on_event("startup")
 def startup_event():
@@ -3830,271 +3819,6 @@ def api_clear_loser_cooldown(request: Request):
 
 
 
-
-# =========================
-# DYNAMIC MARKET SCANNER v1.0
-# =========================
-DYNAMIC_MARKET_SCANNER_ENABLED = os.getenv("DYNAMIC_MARKET_SCANNER_ENABLED", "true").lower() == "true"
-DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS = int(os.getenv("DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS", "12"))
-DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS = int(os.getenv("DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS", str(60 * 60 * 4)))
-DYNAMIC_MARKET_SCANNER_FILE = os.path.join("backend", "state", "dynamic_market_scanner.json")
-DYNAMIC_MARKET_MIN_PRICE = float(os.getenv("DYNAMIC_MARKET_MIN_PRICE", "3"))
-DYNAMIC_MARKET_MAX_PRICE = float(os.getenv("DYNAMIC_MARKET_MAX_PRICE", "800"))
-DYNAMIC_MARKET_MIN_VOLUME = int(os.getenv("DYNAMIC_MARKET_MIN_VOLUME", "500000"))
-DYNAMIC_MARKET_MAX_SPREAD = float(os.getenv("DYNAMIC_MARKET_MAX_SPREAD", "0.025"))
-DYNAMIC_MARKET_YAHOO_SCREENS = [
-    s.strip() for s in os.getenv("DYNAMIC_MARKET_YAHOO_SCREENS", "day_gainers,most_actives,aggressive_small_caps").split(",") if s.strip()
-]
-
-# True whole-market scanner mode:
-# - live Yahoo movers are the source of truth
-# - no fake NVDA/AMD/MSFT fallback list when Yahoo is limited
-# - if Yahoo fails, UI shows scanner unavailable/waiting
-DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK = os.getenv("DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK", "false").lower() == "true"
-
-DYNAMIC_SCANNER_CACHE: Dict[str, Any] = {"updatedAt": "", "symbols": [], "rows": [], "source": "empty", "error": ""}
-
-
-def _load_dynamic_scanner_cache() -> Dict[str, Any]:
-    global DYNAMIC_SCANNER_CACHE
-    try:
-        if os.path.exists(DYNAMIC_MARKET_SCANNER_FILE):
-            with open(DYNAMIC_MARKET_SCANNER_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                DYNAMIC_SCANNER_CACHE = {**DYNAMIC_SCANNER_CACHE, **data}
-    except Exception as e:
-        print(f"DYNAMIC SCANNER LOAD ERROR: {e}")
-    return DYNAMIC_SCANNER_CACHE
-
-
-def _save_dynamic_scanner_cache(data: Dict[str, Any]) -> Dict[str, Any]:
-    global DYNAMIC_SCANNER_CACHE
-    try:
-        os.makedirs(os.path.dirname(DYNAMIC_MARKET_SCANNER_FILE), exist_ok=True)
-        with open(DYNAMIC_MARKET_SCANNER_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f"DYNAMIC SCANNER SAVE ERROR: {e}")
-    DYNAMIC_SCANNER_CACHE = {**DYNAMIC_SCANNER_CACHE, **data}
-    return DYNAMIC_SCANNER_CACHE
-
-
-def _dynamic_cache_age_seconds() -> float:
-    data = _load_dynamic_scanner_cache()
-    try:
-        updated = datetime.fromisoformat(str(data.get("updatedAt", "")).replace("Z", "+00:00"))
-        return max(0.0, (datetime.now(UTC) - updated).total_seconds())
-    except Exception:
-        return 999999999.0
-
-
-def _clean_dynamic_symbol(symbol: str) -> str:
-    sym = str(symbol or "").upper().strip()
-    # Keep normal US tickers and class shares such as BRK-B, but reject odd Yahoo suffixes.
-    if not re.fullmatch(r"[A-Z]{1,5}([.-][A-Z])?", sym):
-        return ""
-    return sym.replace(".", "-")
-
-
-def _yahoo_dynamic_screen(screen_id: str, count: int = 50) -> List[Dict[str, Any]]:
-    url = f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds={screen_id}&count={count}"
-    headers = {"User-Agent": "Mozilla/5.0 TradeBot dynamic scanner"}
-    response = requests.get(url, headers=headers, timeout=8)
-    response.raise_for_status()
-    data = response.json()
-    quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
-    return quotes if isinstance(quotes, list) else []
-
-
-def _score_dynamic_quote(q: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
-    symbol = _clean_dynamic_symbol(q.get("symbol"))
-    if not symbol or symbol in BLOCKED_WEAK_TICKERS:
-        return None
-
-    exchange = str(q.get("fullExchangeName") or q.get("exchange") or "").upper()
-    quote_type = str(q.get("quoteType") or "").upper()
-    if quote_type and quote_type not in {"EQUITY", "ETF"}:
-        return None
-    if any(bad in exchange for bad in ["PNK", "OTC", "OTHER OTC"]):
-        return None
-
-    price = float(q.get("regularMarketPrice") or q.get("postMarketPrice") or q.get("preMarketPrice") or 0.0)
-    volume = int(float(q.get("regularMarketVolume") or q.get("averageDailyVolume3Month") or 0))
-    change_pct = float(q.get("regularMarketChangePercent") or 0.0)
-    market_cap = float(q.get("marketCap") or 0.0)
-
-    if price < DYNAMIC_MARKET_MIN_PRICE or price > DYNAMIC_MARKET_MAX_PRICE:
-        return None
-    if volume < DYNAMIC_MARKET_MIN_VOLUME:
-        return None
-
-    # Optional live quote spread check using Alpaca. If unavailable, do not reject; just score lower.
-    spread = 0.0
-    spread_ok = True
-    try:
-        aq = get_quote(symbol)
-        spread = float(aq.get("spread") or 0.0)
-        if spread > DYNAMIC_MARKET_MAX_SPREAD:
-            spread_ok = False
-    except Exception:
-        spread = 0.0
-
-    if not spread_ok:
-        return None
-
-    score = 0.0
-    score += max(-8.0, min(12.0, change_pct)) * 1.25
-    score += min(10.0, math.log10(max(volume, 1)) * 1.15)
-    if market_cap > 1_000_000_000:
-        score += 4.0
-    if source == "day_gainers" and change_pct > 0:
-        score += 3.0
-    if source == "most_actives":
-        score += 1.5
-    if spread > 0:
-        score += max(0.0, 3.0 - (spread * 120.0))
-
-    return {
-        "symbol": symbol,
-        "score": round(score, 4),
-        "reason": f"dynamic scanner | {source} | change={change_pct:.2f}% | volume={volume:,}" + (f" | spread={spread:.4f}" if spread else ""),
-        "status": "active",
-        "dynamicPick": True,
-        "source": source,
-        "price": price,
-        "changePct": change_pct,
-        "volume": volume,
-        "marketCap": market_cap,
-        "spread": spread,
-    }
-
-
-def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
-    if not DYNAMIC_MARKET_SCANNER_ENABLED:
-        data = {
-            "enabled": False,
-            "symbols": [],
-            "rows": [],
-            "source": "disabled",
-            "updatedAt": datetime.now(UTC).isoformat(),
-            "error": "",
-            "status": "disabled",
-            "message": "Dynamic market scanner disabled",
-        }
-        return _save_dynamic_scanner_cache(data)
-
-    if not force and _dynamic_cache_age_seconds() < DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS:
-        return _load_dynamic_scanner_cache()
-
-    rows_by_symbol: Dict[str, Dict[str, Any]] = {}
-    errors = []
-
-    for screen in DYNAMIC_MARKET_YAHOO_SCREENS:
-        try:
-            for quote in _yahoo_dynamic_screen(screen, count=60):
-                row = _score_dynamic_quote(quote, screen)
-                if not row:
-                    continue
-                prev = rows_by_symbol.get(row["symbol"])
-                if not prev or float(row.get("score") or 0) > float(prev.get("score") or 0):
-                    rows_by_symbol[row["symbol"]] = row
-        except Exception as e:
-            errors.append(f"{screen}: {e}")
-            print(f"DYNAMIC SCANNER SOURCE ERROR {screen}: {e}")
-
-    rows = sorted(rows_by_symbol.values(), key=lambda r: float(r.get("score") or 0), reverse=True)[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]
-
-    # IMPORTANT:
-    # No hardcoded fallback unless explicitly enabled with:
-    # DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK=true
-    # This keeps the scanner honest: if Yahoo is limited, the UI says unavailable
-    # instead of pretending core stocks are fresh market scan results.
-    if not rows and DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK:
-        for i, sym in enumerate(QUALITY_ONLY_UNIVERSE[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]):
-            if sym in BLOCKED_WEAK_TICKERS:
-                continue
-            rows.append({
-                "symbol": sym,
-                "score": round(50 - i, 4),
-                "reason": "emergency fallback | core quality universe",
-                "status": "active",
-                "dynamicPick": False,
-                "source": "fallback",
-            })
-
-    scanner_status = "ready" if rows else "unavailable"
-    scanner_message = (
-        f"Scanner found {len(rows)} live market movers"
-        if rows else
-        "No live scanner results available. Yahoo may be rate-limited or market data unavailable."
-    )
-
-    payload = {
-        "enabled": True,
-        "mode": "whole-market-live-scanner",
-        "status": scanner_status,
-        "message": scanner_message,
-        "updatedAt": datetime.now(UTC).isoformat(),
-        "refreshSeconds": DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS,
-        "maxSymbols": DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS,
-        "source": ",".join(DYNAMIC_MARKET_YAHOO_SCREENS) if rows else "market movers",
-        "symbols": [r["symbol"] for r in rows],
-        "rows": rows,
-        "filters": {
-            "minPrice": DYNAMIC_MARKET_MIN_PRICE,
-            "maxPrice": DYNAMIC_MARKET_MAX_PRICE,
-            "minVolume": DYNAMIC_MARKET_MIN_VOLUME,
-            "maxSpread": DYNAMIC_MARKET_MAX_SPREAD,
-        },
-        "hardcodedFallbackEnabled": DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK,
-        "error": " | ".join(errors[-3:]),
-    }
-    return _save_dynamic_scanner_cache(payload)
-
-
-def refresh_dynamic_market_candidates_if_needed() -> Dict[str, Any]:
-    return refresh_dynamic_market_candidates(force=False)
-
-
-def dynamic_market_scanner_payload() -> Dict[str, Any]:
-    data = _load_dynamic_scanner_cache()
-    if not data.get("rows") and not data.get("updatedAt"):
-        data = refresh_dynamic_market_candidates(force=False)
-    return {"enabled": DYNAMIC_MARKET_SCANNER_ENABLED, **data}
-
-
-def dynamic_market_rows() -> List[Dict[str, Any]]:
-    if not DYNAMIC_MARKET_SCANNER_ENABLED:
-        return []
-    return list(dynamic_market_scanner_payload().get("rows") or [])
-
-
-def dynamic_market_symbols() -> List[str]:
-    return [str(r.get("symbol", "")).upper() for r in dynamic_market_rows() if r.get("symbol")]
-
-
-@app.get("/dynamic-market-scanner")
-def api_dynamic_market_scanner():
-    payload = dynamic_market_scanner_payload()
-    return {"ok": True, "dynamicMarketScanner": payload, **payload}
-
-
-@app.post("/dynamic-market-scanner/refresh")
-def api_dynamic_market_scanner_refresh(request: Request):
-    verify_api_key(request)
-    payload = refresh_dynamic_market_candidates(force=False)
-    try:
-        apply_quality_only_universe()
-        update_status(BOT_NAME, latest_scans)
-        latest_status["dynamicMarketScanner"] = payload
-        latest_status["lastAction"] = "Dynamic market scanner refreshed"
-        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
-    except Exception as e:
-        print(f"DYNAMIC SCANNER STATUS UPDATE ERROR: {e}")
-    return {"ok": True, "message": "Dynamic market scanner refreshed", "dynamicMarketScanner": payload, **payload}
-
-
 # =========================
 # QUALITY-ONLY UNIVERSE LOCK v1.3
 # =========================
@@ -4113,73 +3837,28 @@ BLOCKED_WEAK_TICKERS = {
 }
 
 def quality_only_symbols():
-    symbols = []
+    symbols = list(QUALITY_ONLY_UNIVERSE)
 
-    # Manual pins always get first priority unless explicitly blocked.
+    # Keep manual picks only if they are not explicitly blocked.
     try:
         if "load_manual_universe_picks" in globals() and callable(globals()["load_manual_universe_picks"]):
             for sym in load_manual_universe_picks():
                 sym = str(sym).upper().strip()
                 if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
-                    symbols.append(sym)
+                    symbols.insert(0, sym)
     except Exception as e:
         print(f"QUALITY ONLY MANUAL MERGE ERROR: {e}")
 
-    # Whole-market live scanner is now the main source of truth.
-    try:
-        if DYNAMIC_MARKET_SCANNER_ENABLED:
-            for sym in dynamic_market_symbols():
-                sym = str(sym).upper().strip()
-                if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
-                    symbols.append(sym)
-    except Exception as e:
-        print(f"QUALITY ONLY DYNAMIC MERGE ERROR: {e}")
-
-    # No automatic hardcoded fallback unless explicitly enabled.
-    if DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK:
-        for sym in QUALITY_ONLY_UNIVERSE:
-            sym = str(sym).upper().strip()
-            if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
-                symbols.append(sym)
-
-    return symbols[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]
-
+    return symbols
 
 def quality_only_rows():
     rows = []
-    dynamic_by_symbol = {}
-    try:
-        dynamic_by_symbol = {str(r.get("symbol", "")).upper(): r for r in dynamic_market_rows()}
-    except Exception:
-        dynamic_by_symbol = {}
-
-    manual_picks = set()
-    try:
-        manual_picks = {str(s).upper() for s in load_manual_universe_picks()}
-    except Exception:
-        manual_picks = set()
-
     for i, sym in enumerate(quality_only_symbols()):
-        dyn = dynamic_by_symbol.get(sym)
-        is_manual = sym in manual_picks
-        is_dynamic = bool(dyn)
-        base_score = 100 - (i * 3.0)
-        score = float(dyn.get("score", base_score)) if dyn else base_score
-        reason = dyn.get("reason") if dyn else "manual pick | scanner source"
-        if is_manual:
-            reason = "manual pick | pinned to universe" + (f" | {reason}" if reason else "")
-            score = max(score, 99.0)
         rows.append({
             "symbol": sym,
-            "score": round(score, 2),
-            "reason": reason,
+            "score": round(100 - (i * 3.0), 2),
+            "reason": "quality-only universe | weak tickers blocked",
             "status": "active",
-            "manualPick": is_manual,
-            "dynamicPick": is_dynamic,
-            "source": dyn.get("source") if dyn else "core-quality",
-            "changePct": dyn.get("changePct") if dyn else None,
-            "volume": dyn.get("volume") if dyn else None,
-            "price": dyn.get("price") if dyn else None,
         })
     return rows
 
@@ -4212,12 +3891,11 @@ def apply_quality_only_universe():
     try:
         latest_status["autoUniverse"] = {
             "enabled": True,
-            "mode": "dynamic-quality-hybrid" if DYNAMIC_MARKET_SCANNER_ENABLED else "quality-only",
+            "mode": "quality-only",
             "size": len(symbols),
             "activeSymbols": symbols,
             "rows": rows,
             "blockedWeakTickers": sorted(list(BLOCKED_WEAK_TICKERS)),
-            "dynamicScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
             "lastRefresh": datetime.now(UTC).isoformat(),
             "manualPickCount": len([s for s in symbols if s not in QUALITY_ONLY_UNIVERSE]),
         }
@@ -4300,12 +3978,24 @@ def force_quality_auto_universe_payload():
         symbols = []
 
     if not symbols:
-        symbols = []
-        rows = []
+        symbols = [
+            "NVDA", "AMD", "MSFT", "AAPL", "META",
+            "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
+            "TSLA", "PLTR", "UBER", "QQQ", "SMH",
+        ]
+        rows = [
+            {
+                "symbol": s,
+                "score": round(100 - (i * 3), 2),
+                "reason": "quality-only universe | forced UI sync",
+                "status": "active",
+            }
+            for i, s in enumerate(symbols)
+        ]
 
     return {
         "enabled": True,
-        "mode": "dynamic-quality-hybrid" if DYNAMIC_MARKET_SCANNER_ENABLED else "quality-only",
+        "mode": "quality-only",
         "size": len(symbols),
         "weekStart": datetime.now(UTC).date().isoformat(),
         "monthStart": datetime.now(UTC).replace(day=1).date().isoformat(),
@@ -4313,9 +4003,7 @@ def force_quality_auto_universe_payload():
         "rows": rows,
         "lastRefresh": datetime.now(UTC).isoformat(),
         "candidatePoolSize": len(symbols),
-        "dynamicPickCount": len([r for r in rows if r.get("dynamicPick")]),
         "manualPickCount": len([r for r in rows if r.get("manualPick")]),
-        "dynamicScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
         "keepWinners": True,
     }
 
@@ -4343,8 +4031,6 @@ def refresh_universe(request: Request):
     verify_api_key(request)
 
     try:
-        if "refresh_dynamic_market_candidates" in globals():
-            refresh_dynamic_market_candidates(force=False)
         if "apply_quality_only_universe" in globals():
             apply_quality_only_universe()
         elif "apply_quality_universe_to_status" in globals():
@@ -4371,13 +4057,12 @@ def refresh_universe(request: Request):
         latest_status["lastAction"] = "Quality-only weekly universe refreshed"
         latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
         latest_status["autoUniverseEnabled"] = True
-        latest_status["dynamicMarketScanner"] = dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {}
     except Exception as e:
         print(f"REFRESH UNIVERSE STATUS ERROR: {e}")
 
     return {
         "ok": True,
-        "message": "Dynamic market universe refreshed",
+        "message": "Quality-only weekly universe refreshed",
         "autoUniverse": payload,
         "activeSymbols": symbols or payload.get("activeSymbols", []),
         "rows": payload.get("rows", []),
@@ -4399,102 +4084,8 @@ def refresh_universe_preview():
 
 
 # ============================================================
-# PROFIT BANKING / PERSISTENT TRADING CAP OVERRIDE
+# PROFIT BANKING FINAL OVERRIDE
 # ============================================================
-
-def trading_cap_file_path() -> str:
-    """Persistent cap file.
-
-    On Render, set TRADING_CAP_FILE to your disk path if your disk is not mounted
-    at /var/data. If /var/data exists, the bot will use it automatically.
-    """
-    env_path = os.getenv("TRADING_CAP_FILE", "").strip()
-    if env_path:
-        return env_path
-    if os.path.isdir("/var/data"):
-        return "/var/data/trading_cap.json"
-    base = os.getenv("RENDER_DISK_PATH", "backend/state")
-    return os.path.join(base, "trading_cap.json")
-
-
-def _default_trading_cap_usd() -> float:
-    try:
-        return float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 200)) or 200)
-    except Exception:
-        return 200.0
-
-
-def load_trading_cap_setting() -> Dict[str, Any]:
-    path = trading_cap_file_path()
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            value = float(data.get("value") or 0)
-            currency = str(data.get("currency") or "GBP").upper()
-            if value > 0 and currency in ["GBP", "USD"]:
-                return {
-                    "value": value,
-                    "currency": currency,
-                    "source": "saved",
-                    "path": path,
-                    "updatedAt": data.get("updatedAt", ""),
-                }
-    except Exception as e:
-        print(f"TRADING CAP LOAD ERROR: {e}")
-
-    # Backwards-compatible fallback: old env/code cap is USD.
-    return {
-        "value": _default_trading_cap_usd(),
-        "currency": "USD",
-        "source": "env",
-        "path": path,
-        "updatedAt": "",
-    }
-
-
-def save_trading_cap_setting(value: float, currency: str = "GBP") -> Dict[str, Any]:
-    currency = str(currency or "GBP").upper().strip()
-    if currency not in ["GBP", "USD"]:
-        currency = "GBP"
-    value = float(value or 0)
-    if value < 0:
-        value = 0.0
-
-    path = trading_cap_file_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    data = {
-        "value": round(value, 2),
-        "currency": currency,
-        "updatedAt": datetime.now(UTC).isoformat(),
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    return load_trading_cap_setting()
-
-
-def trading_cap_usd() -> float:
-    setting = load_trading_cap_setting()
-    value = float(setting.get("value") or 0.0)
-    currency = str(setting.get("currency") or "USD").upper()
-    if value <= 0:
-        return 0.0
-    if currency == "GBP":
-        rate = get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP
-        return value / max(rate, 0.0001)
-    return value
-
-
-def trading_cap_gbp() -> float:
-    setting = load_trading_cap_setting()
-    value = float(setting.get("value") or 0.0)
-    currency = str(setting.get("currency") or "USD").upper()
-    if value <= 0:
-        return 0.0
-    if currency == "GBP":
-        return value
-    return money_gbp(value)
-
 
 def effective_trading_equity(account_equity: float) -> float:
     try:
@@ -4502,9 +4093,12 @@ def effective_trading_equity(account_equity: float) -> float:
     except Exception:
         equity = 0.0
 
-    cap = trading_cap_usd()
-    return max(0.0, min(equity, cap)) if cap > 0 else max(0.0, equity)
+    try:
+        cap = float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 200)) or 200)
+    except Exception:
+        cap = 200.0
 
+    return max(0.0, min(equity, cap)) if cap > 0 else max(0.0, equity)
 
 def banking_payload():
     try:
@@ -4513,177 +4107,23 @@ def banking_payload():
     except Exception:
         equity = 0.0
 
-    setting = load_trading_cap_setting()
-    cap_usd = trading_cap_usd()
-    cap_gbp = trading_cap_gbp()
+    try:
+        cap = float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 200)) or 200)
+    except Exception:
+        cap = 200.0
 
-    effective = max(0.0, min(equity, cap_usd)) if cap_usd > 0 else max(0.0, equity)
-    banked = max(0.0, equity - effective) if cap_usd > 0 else 0.0
+    effective = max(0.0, min(equity, cap)) if cap > 0 else max(0.0, equity)
+    banked = max(0.0, equity - effective) if cap > 0 else 0.0
 
     return {
         "ok": True,
-        "enabled": cap_usd > 0,
-        "maxTradingCapital": cap_usd,
-        "maxTradingCapitalUsd": cap_usd,
-        "maxTradingCapitalGbp": cap_gbp,
-        "tradingCapValue": float(setting.get("value") or 0.0),
-        "tradingCapCurrency": setting.get("currency", "USD"),
-        "tradingCapSource": setting.get("source", "env"),
-        "tradingCapFile": setting.get("path", trading_cap_file_path()),
-        "tradingCapUpdatedAt": setting.get("updatedAt", ""),
+        "enabled": cap > 0,
+        "maxTradingCapital": cap,
         "accountEquity": equity,
         "effectiveTradingEquity": effective,
-        "effectiveTradingEquityGbp": money_gbp(effective),
         "bankedProfitCashBuffer": banked,
-        "bankedProfitCashBufferGbp": money_gbp(banked),
-        "message": "Profit banking active" if cap_usd > 0 else "Profit banking disabled",
+        "message": "Profit banking active" if cap > 0 else "Profit banking disabled",
     }
-
-
 @app.get("/banking-status")
 def api_banking_status():
     return {"ok": True, **banking_payload()}
-
-
-@app.get("/trading-cap")
-def api_get_trading_cap():
-    return {"ok": True, **banking_payload()}
-
-
-@app.post("/trading-cap")
-def api_set_trading_cap(request: Request, payload: dict = Body(...)):
-    verify_api_key(request)
-    try:
-        # Dashboard sends GBP by default, because that is how the user thinks
-        # about the trading cap. Backend converts it to USD internally for Alpaca.
-        value = payload.get("capGbp", payload.get("value", payload.get("cap")))
-        currency = str(payload.get("currency", "GBP")).upper()
-        value = float(value)
-        if value <= 0:
-            return {"ok": False, "message": "Trading cap must be greater than 0"}
-        setting = save_trading_cap_setting(value, currency)
-        payload_out = banking_payload()
-        try:
-            latest_status["banking"] = payload_out
-            latest_status["newPositionNotional"] = calculate_new_position_notional()
-            latest_status["lastAction"] = f"Trading cap saved: {currency} {value:.2f}"
-            latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
-        except Exception:
-            pass
-        return {
-            "ok": True,
-            "message": f"Trading cap saved at {currency} {value:.2f}",
-            "setting": setting,
-            **payload_out,
-        }
-    except Exception as e:
-        return {"ok": False, "message": f"Could not save trading cap: {e}"}
-
-
-
-# =========================
-# BACKTEST / PAPER REPLAY REPORT
-# =========================
-@app.post("/backtest-replay")
-def api_backtest_replay(payload: dict = Body(default={}), request: Request = None):
-    if request is not None:
-        verify_api_key(request)
-
-    try:
-        cap_gbp = float(payload.get("capGbp") or 0.0)
-    except Exception:
-        cap_gbp = 0.0
-
-    try:
-        rate = get_usd_to_gbp_rate()
-    except Exception:
-        rate = FX_FALLBACK_USD_TO_GBP
-
-    cap_usd = cap_gbp / max(rate, 0.0001) if cap_gbp > 0 else 0.0
-
-    try:
-        closed = closed_trades_from_db(10000)
-    except Exception:
-        closed = []
-
-    rows = []
-    equity = cap_gbp if cap_gbp > 0 else 0.0
-    peak = equity
-    max_drawdown = 0.0
-    wins = 0
-    losses = 0
-    total_pnl_gbp = 0.0
-    total_pnl_usd = 0.0
-    by_symbol: Dict[str, Dict[str, Any]] = {}
-
-    for t in closed:
-        try:
-            symbol = str(t.get("symbol", "")).upper()
-            pnl_usd = float(t.get("pnl") or 0.0)
-            pnl_gbp = float(t.get("pnlGbp") or (pnl_usd * rate))
-            if not symbol:
-                continue
-
-            wins += 1 if pnl_usd >= 0 else 0
-            losses += 1 if pnl_usd < 0 else 0
-            total_pnl_usd += pnl_usd
-            total_pnl_gbp += pnl_gbp
-            equity += pnl_gbp
-            peak = max(peak, equity)
-            max_drawdown = max(max_drawdown, peak - equity)
-
-            row = by_symbol.setdefault(symbol, {
-                "symbol": symbol,
-                "trades": 0,
-                "wins": 0,
-                "losses": 0,
-                "pnlUsd": 0.0,
-                "pnlGbp": 0.0,
-                "winRate": 0.0,
-            })
-            row["trades"] += 1
-            row["wins"] += 1 if pnl_usd >= 0 else 0
-            row["losses"] += 1 if pnl_usd < 0 else 0
-            row["pnlUsd"] += pnl_usd
-            row["pnlGbp"] += pnl_gbp
-
-            rows.append({
-                "time": t.get("time") or t.get("timestamp") or "",
-                "symbol": symbol,
-                "pnlUsd": pnl_usd,
-                "pnlGbp": pnl_gbp,
-                "equityGbp": equity,
-            })
-        except Exception:
-            continue
-
-    symbol_rows = []
-    for row in by_symbol.values():
-        row["winRate"] = row["wins"] / max(1, row["trades"])
-        row["pnlUsd"] = round(float(row["pnlUsd"]), 4)
-        row["pnlGbp"] = round(float(row["pnlGbp"]), 4)
-        symbol_rows.append(row)
-
-    symbol_rows.sort(key=lambda r: float(r.get("pnlGbp") or 0.0), reverse=True)
-    best_symbol = symbol_rows[0]["symbol"] if symbol_rows else "—"
-    worst_symbol = symbol_rows[-1]["symbol"] if symbol_rows else "—"
-
-    return {
-        "ok": True,
-        "message": "Backtest / paper replay report complete",
-        "capGbp": cap_gbp,
-        "capUsd": cap_usd,
-        "tradesTested": len(rows),
-        "wins": wins,
-        "losses": losses,
-        "winRate": wins / max(1, wins + losses),
-        "replayPnlUsd": round(total_pnl_usd, 4),
-        "replayPnlGbp": round(total_pnl_gbp, 4),
-        "endingEquityGbp": round(equity, 4),
-        "maxDrawdownGbp": round(max_drawdown, 4),
-        "bestSymbol": best_symbol,
-        "worstSymbol": worst_symbol,
-        "bySymbol": symbol_rows,
-        "equityCurve": rows[-500:],
-        "notes": "Uses matched closed-trade history. It is a reporting replay, not a live trade signal and does not place orders.",
-    }
