@@ -69,7 +69,7 @@ if not API_KEY or not API_SECRET:
 BOT_NAME = "Rebuilt Sniper Profit Bot"
 
 SAFE_UNIVERSE = [
-    "NVDA", "AMD", "MSFT", "AAPL", "META",
+    "TTWO", "NVDA", "AMD", "MSFT", "AAPL", "META",
     "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
     "TSLA", "PLTR", "UBER", "QQQ", "SMH",
 ]
