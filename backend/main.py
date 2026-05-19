@@ -781,6 +781,9 @@ def get_all_positions():
                 "inUniverse": symbol in current_universe,
                 "custom": bool(state.get(symbol, {}).get("custom")),
                 "lockedToday": is_locked_today(symbol),
+                "pdtBlocked": bool(pdt_block_event),
+                "pdtBlockLabel": "PDT BLOCK" if pdt_block_event else "",
+                "pdtBlockEvent": pdt_block_event or {},
                 "boughtToday": was_bought_today(symbol),
                 "minutesSinceBuy": minutes_since_today_buy(symbol),
                 "partialProfitTaken": has_taken_partial_profit(symbol),
@@ -1115,22 +1118,7 @@ def confidence_notional(scan):
     return round(max(0.0, min(base * mult, cap)), 2)
 
 
-def is_hard_blocked_symbol(symbol: str) -> bool:
-    sym = str(symbol or "").upper().strip()
-    try:
-        if "QUALITY_ONLY_MODE" in globals() and not QUALITY_ONLY_MODE:
-            return False
-    except Exception:
-        pass
-    try:
-        return sym in BLOCKED_WEAK_TICKERS
-    except Exception:
-        return sym in {"LAC", "LCID", "PLUG", "SOFI", "SNAP", "NUVB", "RIVN", "F", "AAL", "GIS", "PYPL"}
-
-
 def can_buy_symbol(symbol: str):
-    if is_hard_blocked_symbol(symbol):
-        return False, f"{str(symbol).upper()} blocked by quality-only weak ticker list"
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and is_locked_today(symbol):
         return False, f"{symbol} locked until tomorrow"
     if has_open_order(symbol):
@@ -2704,37 +2692,21 @@ def get_last_universe_refresh():
 def get_weekly_universe_from_db(week_start=None):
     if not SQLITE_ENABLED:
         return []
-
     week_start = week_start or week_start_str()
-
     try:
         init_db()
         conn = db_connect()
-
         rows = conn.execute("""
             SELECT symbol, score, reason, status
             FROM weekly_universe
             WHERE week_start = ? AND status = 'active'
             ORDER BY score DESC
         """, (week_start,)).fetchall()
-
         conn.close()
-
-        cleaned = []
-        for r in rows:
-            symbol = str(r["symbol"]).upper().strip()
-            if "BLOCKED_WEAK_TICKERS" in globals() and symbol in BLOCKED_WEAK_TICKERS:
-                print(f"QUALITY BLOCKED DB UNIVERSE SKIP {symbol}")
-                continue
-            cleaned.append({
-                "symbol": symbol,
-                "score": r["score"],
-                "reason": r["reason"],
-                "status": r["status"]
-            })
-
-        return cleaned
-
+        return [
+            {"symbol": r["symbol"], "score": r["score"], "reason": r["reason"], "status": r["status"]}
+            for r in rows
+        ]
     except Exception as e:
         print(f"WEEKLY UNIVERSE READ ERROR: {e}")
         return []
@@ -2810,9 +2782,6 @@ def universe_rows_from_stock_memory():
     for m in memory:
         symbol = str(m.get("symbol", "")).upper()
         if not symbol:
-            continue
-        if "BLOCKED_WEAK_TICKERS" in globals() and symbol in BLOCKED_WEAK_TICKERS:
-            print(f"QUALITY BLOCKED MEMORY UNIVERSE SKIP {symbol}")
             continue
 
         trades = int(m.get("trades") or 0)
@@ -2924,14 +2893,15 @@ def build_weekly_universe(force=False):
 
     combined = held_rows + rows
 
-    # Fill empty slots with candidate pool.
+    # Fill empty slots with candidate pool only if hardcoded fallback is explicitly enabled.
     existing = {r["symbol"] for r in combined}
-    for symbol in AUTO_UNIVERSE_CANDIDATE_POOL:
-        if len(combined) >= AUTO_UNIVERSE_SIZE * 2:
-            break
-        if symbol not in existing:
-            combined.append(score_candidate_symbol(symbol))
-            existing.add(symbol)
+    if globals().get("DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK", False):
+        for symbol in AUTO_UNIVERSE_CANDIDATE_POOL:
+            if len(combined) >= AUTO_UNIVERSE_SIZE * 2:
+                break
+            if symbol not in existing and symbol not in BLOCKED_WEAK_TICKERS:
+                combined.append(score_candidate_symbol(symbol))
+                existing.add(symbol)
 
     combined.sort(key=lambda r: r["score"], reverse=True)
 
@@ -2940,20 +2910,17 @@ def build_weekly_universe(force=False):
     for r in combined:
         if len(chosen) >= AUTO_UNIVERSE_SIZE:
             break
-        symbol = str(r.get("symbol", "")).upper().strip()
-        if not symbol:
+        if r["symbol"] in seen:
             continue
-        if "BLOCKED_WEAK_TICKERS" in globals() and symbol in BLOCKED_WEAK_TICKERS:
-            print(f"QUALITY BLOCKED BUILD UNIVERSE SKIP {symbol}")
-            continue
-        if symbol in seen:
-            continue
-        r["symbol"] = symbol
         chosen.append(r)
-        seen.add(symbol)
+        seen.add(r["symbol"])
 
-    if not chosen:
-        chosen = [{"symbol": s, "score": 0, "reason": "fallback safe universe", "status": "active"} for s in SAFE_UNIVERSE[:AUTO_UNIVERSE_SIZE]]
+    if not chosen and globals().get("DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK", False):
+        chosen = [
+            {"symbol": s, "score": 0, "reason": "emergency fallback safe universe", "status": "active"}
+            for s in SAFE_UNIVERSE[:AUTO_UNIVERSE_SIZE]
+            if s not in BLOCKED_WEAK_TICKERS
+        ]
 
     save_weekly_universe(chosen, "forced refresh" if force else "weekly refresh")
     current_universe = [r["symbol"] for r in chosen]
@@ -2977,28 +2944,11 @@ def auto_universe_payload():
         preview = universe_rows_from_stock_memory()[:AUTO_UNIVERSE_SIZE]
         active = preview
 
-    try:
-        active = [
-            r for r in active
-            if str(r.get("symbol", "")).upper().strip() not in BLOCKED_WEAK_TICKERS
-        ]
-    except Exception as e:
-        print(f"AUTO UNIVERSE BLOCK FILTER ERROR: {e}")
-
-    active_symbols = [str(r["symbol"]).upper().strip() for r in active] if active else list(current_universe)
-    try:
-        active_symbols = [
-            s for s in active_symbols
-            if str(s).upper().strip() not in BLOCKED_WEAK_TICKERS
-        ]
-    except Exception:
-        pass
-
     return {
         "enabled": AUTO_UNIVERSE_ENABLED,
-        "size": len(active_symbols),
+        "size": AUTO_UNIVERSE_SIZE,
         "weekStart": week_start_str(),
-        "activeSymbols": active_symbols,
+        "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe),
         "rows": active,
         "lastRefresh": get_last_universe_refresh(),
         "candidatePoolSize": len(AUTO_UNIVERSE_CANDIDATE_POOL),
@@ -3373,13 +3323,16 @@ def run_bot_loop():
                     time.sleep(CHECK_INTERVAL)
                     continue
 
+                if QUALITY_ONLY_MODE and not current_universe:
+                    print("SCANNER WAITING | no live market symbols available")
+                    latest_scans.clear()
+                    update_status(BOT_NAME, [])
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+
                 scans = []
                 for symbol in current_universe:
                     try:
-                        if is_hard_blocked_symbol(symbol):
-                            print(f"QUALITY BLOCKED SCAN SKIP {symbol}")
-                            continue
-
                         scan = compute_scan(symbol)
                         scans.append(scan)
                         print(f"{symbol} | price={scan['price']:.2f} | quality={scan['quality_score']:.4f} | confidence={scan['confidence']:.2f} | sniper={scan['sniper_pass']}")
@@ -3621,8 +3574,6 @@ def touch_quick_status(**kwargs):
 def add_to_universe(symbol: str, request: Request):
     verify_api_key(request)
     sym = symbol.upper().strip()
-    if is_hard_blocked_symbol(sym):
-        return {"ok": False, "message": f"{sym} is blocked by the weak ticker list"}
     try:
         picks = add_manual_universe_pick(sym)
         add_symbol_to_universe(sym, custom=True)
@@ -3895,6 +3846,12 @@ DYNAMIC_MARKET_YAHOO_SCREENS = [
     s.strip() for s in os.getenv("DYNAMIC_MARKET_YAHOO_SCREENS", "day_gainers,most_actives,aggressive_small_caps").split(",") if s.strip()
 ]
 
+# True whole-market scanner mode:
+# - live Yahoo movers are the source of truth
+# - no fake NVDA/AMD/MSFT fallback list when Yahoo is limited
+# - if Yahoo fails, UI shows scanner unavailable/waiting
+DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK = os.getenv("DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK", "false").lower() == "true"
+
 DYNAMIC_SCANNER_CACHE: Dict[str, Any] = {"updatedAt": "", "symbols": [], "rows": [], "source": "empty", "error": ""}
 
 
@@ -4015,7 +3972,16 @@ def _score_dynamic_quote(q: Dict[str, Any], source: str) -> Optional[Dict[str, A
 
 def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
     if not DYNAMIC_MARKET_SCANNER_ENABLED:
-        data = {"enabled": False, "symbols": [], "rows": [], "source": "disabled", "updatedAt": datetime.now(UTC).isoformat(), "error": ""}
+        data = {
+            "enabled": False,
+            "symbols": [],
+            "rows": [],
+            "source": "disabled",
+            "updatedAt": datetime.now(UTC).isoformat(),
+            "error": "",
+            "status": "disabled",
+            "message": "Dynamic market scanner disabled",
+        }
         return _save_dynamic_scanner_cache(data)
 
     if not force and _dynamic_cache_age_seconds() < DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS:
@@ -4039,25 +4005,40 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
 
     rows = sorted(rows_by_symbol.values(), key=lambda r: float(r.get("score") or 0), reverse=True)[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]
 
-    # Safe fallback keeps the bot tradable if external screener data is unavailable.
-    if not rows:
+    # IMPORTANT:
+    # No hardcoded fallback unless explicitly enabled with:
+    # DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK=true
+    # This keeps the scanner honest: if Yahoo is limited, the UI says unavailable
+    # instead of pretending core stocks are fresh market scan results.
+    if not rows and DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK:
         for i, sym in enumerate(QUALITY_ONLY_UNIVERSE[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]):
+            if sym in BLOCKED_WEAK_TICKERS:
+                continue
             rows.append({
                 "symbol": sym,
                 "score": round(50 - i, 4),
-                "reason": "dynamic scanner fallback | core quality universe",
+                "reason": "emergency fallback | core quality universe",
                 "status": "active",
                 "dynamicPick": False,
                 "source": "fallback",
             })
 
+    scanner_status = "ready" if rows else "unavailable"
+    scanner_message = (
+        f"Scanner found {len(rows)} live market movers"
+        if rows else
+        "No live scanner results available. Yahoo may be rate-limited or market data unavailable."
+    )
+
     payload = {
         "enabled": True,
-        "mode": "dynamic-market-scanner",
+        "mode": "whole-market-live-scanner",
+        "status": scanner_status,
+        "message": scanner_message,
         "updatedAt": datetime.now(UTC).isoformat(),
         "refreshSeconds": DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS,
         "maxSymbols": DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS,
-        "source": ",".join(DYNAMIC_MARKET_YAHOO_SCREENS),
+        "source": ",".join(DYNAMIC_MARKET_YAHOO_SCREENS) if rows else "market movers",
         "symbols": [r["symbol"] for r in rows],
         "rows": rows,
         "filters": {
@@ -4066,6 +4047,7 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
             "minVolume": DYNAMIC_MARKET_MIN_VOLUME,
             "maxSpread": DYNAMIC_MARKET_MAX_SPREAD,
         },
+        "hardcodedFallbackEnabled": DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK,
         "error": " | ".join(errors[-3:]),
     }
     return _save_dynamic_scanner_cache(payload)
@@ -4077,7 +4059,7 @@ def refresh_dynamic_market_candidates_if_needed() -> Dict[str, Any]:
 
 def dynamic_market_scanner_payload() -> Dict[str, Any]:
     data = _load_dynamic_scanner_cache()
-    if not data.get("rows"):
+    if not data.get("rows") and not data.get("updatedAt"):
         data = refresh_dynamic_market_candidates(force=False)
     return {"enabled": DYNAMIC_MARKET_SCANNER_ENABLED, **data}
 
@@ -4143,7 +4125,7 @@ def quality_only_symbols():
     except Exception as e:
         print(f"QUALITY ONLY MANUAL MERGE ERROR: {e}")
 
-    # Dynamic scanner picks are the main discovery layer.
+    # Whole-market live scanner is now the main source of truth.
     try:
         if DYNAMIC_MARKET_SCANNER_ENABLED:
             for sym in dynamic_market_symbols():
@@ -4153,13 +4135,15 @@ def quality_only_symbols():
     except Exception as e:
         print(f"QUALITY ONLY DYNAMIC MERGE ERROR: {e}")
 
-    # Core quality names are the safety fallback and stable baseline.
-    for sym in QUALITY_ONLY_UNIVERSE:
-        sym = str(sym).upper().strip()
-        if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
-            symbols.append(sym)
+    # No automatic hardcoded fallback unless explicitly enabled.
+    if DYNAMIC_SCANNER_USE_HARDCODED_FALLBACK:
+        for sym in QUALITY_ONLY_UNIVERSE:
+            sym = str(sym).upper().strip()
+            if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
+                symbols.append(sym)
 
-    return symbols
+    return symbols[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]
+
 
 def quality_only_rows():
     rows = []
@@ -4181,7 +4165,7 @@ def quality_only_rows():
         is_dynamic = bool(dyn)
         base_score = 100 - (i * 3.0)
         score = float(dyn.get("score", base_score)) if dyn else base_score
-        reason = dyn.get("reason") if dyn else "core quality universe | weak tickers blocked"
+        reason = dyn.get("reason") if dyn else "manual pick | scanner source"
         if is_manual:
             reason = "manual pick | pinned to universe" + (f" | {reason}" if reason else "")
             score = max(score, 99.0)
@@ -4310,33 +4294,14 @@ def force_quality_auto_universe_payload():
             rows = quality_universe_rows()
         else:
             rows = []
-        try:
-            rows = [
-                r for r in rows
-                if str(r.get("symbol", "")).upper().strip() not in BLOCKED_WEAK_TICKERS
-            ]
-        except Exception as e:
-            print(f"FORCE QUALITY ROW FILTER ERROR: {e}")
         symbols = [r["symbol"] for r in rows]
     except Exception:
         rows = []
         symbols = []
 
     if not symbols:
-        symbols = [
-            "NVDA", "AMD", "MSFT", "AAPL", "META",
-            "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
-            "TSLA", "PLTR", "UBER", "QQQ", "SMH",
-        ]
-        rows = [
-            {
-                "symbol": s,
-                "score": round(100 - (i * 3), 2),
-                "reason": "quality-only universe | forced UI sync",
-                "status": "active",
-            }
-            for i, s in enumerate(symbols)
-        ]
+        symbols = []
+        rows = []
 
     return {
         "enabled": True,
