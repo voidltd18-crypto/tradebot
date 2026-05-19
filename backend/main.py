@@ -784,6 +784,9 @@ def get_all_positions():
                 "boughtToday": was_bought_today(symbol),
                 "minutesSinceBuy": minutes_since_today_buy(symbol),
                 "partialProfitTaken": has_taken_partial_profit(symbol),
+                "pdtBlocked": is_pdt_blocked_today(symbol) if "is_pdt_blocked_today" in globals() else False,
+                "pdtBlockEvent": get_pdt_block_event_for_symbol(symbol) if "get_pdt_block_event_for_symbol" in globals() else None,
+                "pdtBlockLabel": "PDT BLOCK" if ("is_pdt_blocked_today" in globals() and is_pdt_blocked_today(symbol)) else "",
                 "partialProfitTriggerPct": PARTIAL_PROFIT_TRIGGER_PCT,
                 "fastStopLossPct": FAST_STOP_LOSS_PCT,
                 "stallExitAfterMinutes": STALL_EXIT_AFTER_MINUTES,
@@ -1132,6 +1135,27 @@ def add_alpaca_rejection_event(symbol: str, reason: str, error_text: str):
         alpaca_rejection_events.pop(0)
     print(f"{event['message']} | {event['error']}")
     notify(f"⚠️ {event['message']} Reason: {event['error']}")
+
+
+def get_pdt_block_event_for_symbol(symbol: str):
+    """Return today's latest PDT block event for this symbol, for UI badges/cards."""
+    sym = str(symbol or "").upper().strip()
+    today = today_str()
+    for event in reversed(alpaca_rejection_events):
+        try:
+            if (
+                str(event.get("symbol", "")).upper().strip() == sym
+                and event.get("day") == today
+                and str(event.get("type", "")).upper() == "PDT BLOCK"
+            ):
+                return event
+        except Exception:
+            continue
+    return None
+
+
+def is_pdt_blocked_today(symbol: str) -> bool:
+    return get_pdt_block_event_for_symbol(symbol) is not None
 
 
 def add_pdt_warning(symbol: str, reason: str):
@@ -3189,18 +3213,13 @@ def manual_override_off(request: Request):
 
 @app.post("/manual-buy")
 def manual_buy(request: Request):
-    print("BUTTON HIT: manual-buy", flush=True)
     verify_api_key(request)
-    if not bot_lock.acquire(timeout=10):
-        return {"ok": False, "message": "Bot is busy scanning. Try Money Buy again in a few seconds."}
-    try:
+    with bot_lock:
         if not trading_client.get_clock().is_open:
             return {"ok": False, "message": "Market closed"}
         result = money_mode_buy(latest_scans, manual=True)
         update_status(BOT_NAME, latest_scans)
         return {"ok": True, "message": result}
-    finally:
-        bot_lock.release()
 
 
 @app.post("/custom-buy/{symbol}")
@@ -3214,16 +3233,11 @@ def custom_buy(symbol: str, request: Request):
 
 @app.post("/manual-sell")
 def manual_sell(request: Request):
-    print("BUTTON HIT: manual-sell", flush=True)
     verify_api_key(request)
-    if not bot_lock.acquire(timeout=10):
-        return {"ok": False, "message": "Bot is busy scanning. Try Sell Worst again in a few seconds."}
-    try:
+    with bot_lock:
         result = close_worst_or_largest_position(reason="MANUAL SELL")
         update_status(BOT_NAME, latest_scans)
         return result
-    finally:
-        bot_lock.release()
 
 
 @app.post("/sell/{symbol}")
@@ -3301,8 +3315,6 @@ def run_bot_loop():
 
     while True:
         try:
-            sleep_for = CHECK_INTERVAL
-
             with bot_lock:
                 reset_daily_flags_if_needed()
                 cleanup_temp_blacklist()
@@ -3312,43 +3324,39 @@ def run_bot_loop():
                 if not clock.is_open:
                     print("Market closed. Waiting...")
                     update_status(BOT_NAME, latest_scans)
-                    # IMPORTANT:
-                    # Do NOT sleep while holding bot_lock.
-                    # Manual dashboard actions such as Money Buy / Sell Worst need
-                    # to acquire this same lock. Sleeping here caused the browser to
-                    # show OPTIONS/preflight while the real POST waited behind the bot.
-                    scans = None
-                else:
-                    scans = []
-                    for symbol in current_universe:
-                        try:
-                            scan = compute_scan(symbol)
-                            scans.append(scan)
-                            print(f"{symbol} | price={scan['price']:.2f} | quality={scan['quality_score']:.4f} | confidence={scan['confidence']:.2f} | sniper={scan['sniper_pass']}")
-                        except Exception as e:
-                            print(f"SCAN ERROR {symbol}: {e}")
+                    time.sleep(CHECK_INTERVAL)
+                    continue
 
-                    latest_scans.clear()
-                    latest_scans.extend(scans)
+                scans = []
+                for symbol in current_universe:
+                    try:
+                        scan = compute_scan(symbol)
+                        scans.append(scan)
+                        print(f"{symbol} | price={scan['price']:.2f} | quality={scan['quality_score']:.4f} | confidence={scan['confidence']:.2f} | sniper={scan['sniper_pass']}")
+                    except Exception as e:
+                        print(f"SCAN ERROR {symbol}: {e}")
 
-                    if bot_enabled and not emergency_stop:
-                        manage_money_mode_positions()
-                        if PROFIT_MODE_ENABLED and ROTATION_MODE_ENABLED:
-                            rr = maybe_rotate_weakest_into_best(scans)
-                            if rr:
-                                print(rr)
-                        if not manual_override:
-                            result = money_mode_buy(scans, manual=False)
-                            if result:
-                                print(result)
+                latest_scans.clear()
+                latest_scans.extend(scans)
 
-                    update_status(BOT_NAME, scans)
+                if bot_enabled and not emergency_stop:
+                    manage_money_mode_positions()
+                    if PROFIT_MODE_ENABLED and ROTATION_MODE_ENABLED:
+                        rr = maybe_rotate_weakest_into_best(scans)
+                        if rr:
+                            print(rr)
+                    if not manual_override:
+                        result = money_mode_buy(scans, manual=False)
+                        if result:
+                            print(result)
+                update_status(BOT_NAME, scans)
 
-            time.sleep(sleep_for)
+            time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
             print(f"Main loop error: {e}")
             time.sleep(10)
+
 
 @app.on_event("startup")
 def startup_event():
@@ -3832,9 +3840,8 @@ QUALITY_ONLY_UNIVERSE = [
 ]
 
 BLOCKED_WEAK_TICKERS = {
-    "NVDA", "AMD", "MSFT", "AAPL", "META",
-    "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
-    "TSLA", "PLTR", "UBER", "QQQ", "SMH",
+    "LAC", "LCID", "PLUG", "SOFI", "SNAP", "NUVB",
+    "RIVN", "F", "AAL", "GIS", "PYPL"
 }
 
 def quality_only_symbols():
