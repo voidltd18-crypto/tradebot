@@ -56,7 +56,8 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [replayCapInput, setReplayCapInput] = useState<string>("");
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
-  const [priceGoalInput, setPriceGoalInput] = useState<string>(() => localStorage.getItem("tradebot_price_goal_gbp") || "");
+  const [strategyStrictness, setStrategyStrictness] = useState<number>(0);
+  const [strategySaving, setStrategySaving] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
   const lastFetchAt = useRef(0);
@@ -83,12 +84,20 @@ const [banking, setBanking] = useState<AnyObj>({});
   const dynamicScanner = data?.dynamicMarketScanner || data?.autoUniverse?.dynamicScanner || {};
   const dynamicRows = Array.isArray(dynamicScanner?.rows) ? dynamicScanner.rows : [];
   const dynamicPickCount = Number(data?.autoUniverse?.dynamicPickCount || dynamicRows.length || 0);
+  const strategySettings = data?.strategySettings || {};
+  const strictnessLabels = ["Safe", "Balanced", "Aggressive"];
+  const strictnessLabel = strictnessLabels[Math.max(0, Math.min(2, Number(strategyStrictness || 0)))] || "Safe";
 
   useEffect(() => {
     const gbpCap = Number(banking?.maxTradingCapitalGbp ?? data?.banking?.maxTradingCapitalGbp ?? 0);
     if (gbpCap > 0 && !tradingCapInput) setTradingCapInput(String(Math.round(gbpCap)));
     if (gbpCap > 0 && !replayCapInput) setReplayCapInput(String(Math.round(gbpCap)));
   }, [banking?.maxTradingCapitalGbp, data?.banking?.maxTradingCapitalGbp]);
+
+  useEffect(() => {
+    const level = Number(data?.strategySettings?.level);
+    if (Number.isFinite(level)) setStrategyStrictness(Math.max(0, Math.min(2, level)));
+  }, [data?.strategySettings?.level]);
 
   
   const token = authToken || apiKey.trim();
@@ -164,43 +173,6 @@ const [banking, setBanking] = useState<AnyObj>({});
     setReplayLoading(false);
   }
 
-
-  useEffect(() => {
-    if (!authToken) return;
-
-    const LOGOUT_HOUR = 00;
-    const LOGOUT_MINUTE = 00;
-
-    const checkAutoLogout = () => {
-      const now = new Date();
-
-      const logoutTime = new Date();
-      logoutTime.setHours(LOGOUT_HOUR, LOGOUT_MINUTE, 0, 0);
-
-      const alreadyLoggedOut =
-        localStorage.getItem("autoLoggedOutDate") === now.toDateString();
-
-      if (now >= logoutTime && !alreadyLoggedOut) {
-        localStorage.setItem("autoLoggedOutDate", now.toDateString());
-        secureLogout();
-      }
-    };
-
-    checkAutoLogout();
-
-    const interval = setInterval(checkAutoLogout, 10000);
-
-    window.addEventListener("focus", checkAutoLogout);
-    document.addEventListener("visibilitychange", checkAutoLogout);
-
-    return () => {
-      clearInterval(interval);
-      window.removeEventListener("focus", checkAutoLogout);
-      document.removeEventListener("visibilitychange", checkAutoLogout);
-    };
-  }, [authToken]);
-
-
 const fetchData = useCallback(async (force = false) => {
     if (!authToken) return;
 
@@ -255,39 +227,35 @@ const fetchData = useCallback(async (force = false) => {
   useEffect(() => {
     if (!authToken) return;
 
-    // Change these two values if you want a different automatic logout time.
-    // Uses your browser/device local time, not Render server time.
-    const AUTO_LOGOUT_HOUR = 0;
-    const AUTO_LOGOUT_MINUTE = 0;
+    let warnedForDate = "";
 
-    const checkAutoLogout = () => {
+    const scheduleMidnightLogout = () => {
       const now = new Date();
-      const todayKey = now.toDateString();
-      const logoutTime = new Date(now);
-      logoutTime.setHours(AUTO_LOGOUT_HOUR, AUTO_LOGOUT_MINUTE, 0, 0);
+      const nextMidnight = new Date(now);
+      nextMidnight.setHours(24, 0, 0, 0);
+      const msUntilMidnight = Math.max(1000, nextMidnight.getTime() - now.getTime());
+      const msUntilWarning = Math.max(1000, msUntilMidnight - 60000);
 
-      const lastAutoLogoutDate = localStorage.getItem("tradebot_auto_logout_date");
+      const warningTimer = window.setTimeout(() => {
+        const todayKey = new Date().toISOString().slice(0, 10);
+        if (warnedForDate !== todayKey) {
+          warnedForDate = todayKey;
+          setMessage("Daily session reset soon. You will be logged out at 00:00.");
+        }
+      }, msUntilWarning);
 
-      // Important: use >= so the logout cannot be missed if the tab sleeps,
-      // the laptop wakes late, or the check runs a few seconds after the target time.
-      if (now >= logoutTime && lastAutoLogoutDate !== todayKey) {
-        localStorage.setItem("tradebot_auto_logout_date", todayKey);
-        setMessage(`${String(AUTO_LOGOUT_HOUR).padStart(2, "0")}:${String(AUTO_LOGOUT_MINUTE).padStart(2, "0")} daily session reset. Logging out...`);
+      const logoutTimer = window.setTimeout(() => {
+        setMessage("00:00 daily session reset. Logging out...");
         secureLogout();
-      }
+      }, msUntilMidnight + 500);
+
+      return () => {
+        window.clearTimeout(warningTimer);
+        window.clearTimeout(logoutTimer);
+      };
     };
 
-    checkAutoLogout();
-    const interval = window.setInterval(checkAutoLogout, 10000);
-
-    window.addEventListener("focus", checkAutoLogout);
-    document.addEventListener("visibilitychange", checkAutoLogout);
-
-    return () => {
-      window.clearInterval(interval);
-      window.removeEventListener("focus", checkAutoLogout);
-      document.removeEventListener("visibilitychange", checkAutoLogout);
-    };
+    return scheduleMidnightLogout();
   }, [authToken]);
 
 
@@ -430,6 +398,38 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
+  async function saveStrategyStrictness(levelOverride?: number) {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+
+    const level = Math.max(0, Math.min(2, Number(levelOverride ?? strategyStrictness ?? 0)));
+    const preset = level <= 0 ? "safe" : level >= 2 ? "aggressive" : "balanced";
+
+    setStrategySaving(true);
+    setMessage(`Saving trading strictness: ${strictnessLabels[level]}...`);
+
+    try {
+      const res = await fetch(`${API_URL}/strategy-settings`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ level, preset }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save trading strictness");
+      setStrategyStrictness(level);
+      setData(prev => ({ ...prev, strategySettings: json, aPlusMinConfidence: json?.aPlusMinConfidence ?? prev.aPlusMinConfidence }));
+      setMessage(json?.message || `Trading strictness set to ${strictnessLabels[level]}.`);
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not save trading strictness.");
+    } finally {
+      setStrategySaving(false);
+    }
+  }
+
   async function refreshDynamicScanner() {
     if (!token) {
       setMessage("Please login first.");
@@ -532,9 +532,6 @@ const fetchData = useCallback(async (force = false) => {
   const totalDeposited = Number(reports.totalDeposited ?? 0);
   const earned = Number(reports.earnedSinceDeposit ?? 0);
   const totalGainLoss = Number(reports.totalGainLoss ?? 0);
-  const equityGbpNow = Number(data?.account?.equity || 0) * rate;
-  const priceGoalValue = Number(priceGoalInput || 0);
-  const priceGoalReached = priceGoalValue > 0 && equityGbpNow >= priceGoalValue;
   const lost = Number(reports.lostSinceDeposit ?? 0);
   const tabs: Tab[] = useMemo(() => {
     if (viewMode === "simple") return ["overview", "positions", "search"];
@@ -646,41 +643,6 @@ const fetchData = useCallback(async (force = false) => {
       <Stat label="Buying Power" value={gbp(Number(data?.account?.buyingPower || 0) * rate)} sub={usd(data?.account?.buyingPower)} />
       <Stat label="Day PnL" value={gbp(Number(data?.account?.pnlDay || 0) * rate)} sub={usd(data?.account?.pnlDay)} className={tone(data?.account?.pnlDay)} />
       <Stat label="Total Gain/Loss" value={gbp(totalGainLoss * rate)} sub={`Deposited ${gbp(totalDeposited * rate)} / ${usd(totalDeposited)}`} className={tone(totalGainLoss)} />
-      <section
-        className="card stat"
-        style={{
-          borderColor: priceGoalReached ? "rgba(34, 197, 94, 0.9)" : undefined,
-          boxShadow: priceGoalReached ? "0 0 24px rgba(34, 197, 94, 0.38), inset 0 0 16px rgba(34, 197, 94, 0.08)" : undefined,
-          background: priceGoalReached ? "linear-gradient(135deg, rgba(34,197,94,0.13), rgba(15,23,42,0.96) 55%)" : undefined,
-        }}
-      >
-        <span>Price Goal</span>
-        <input
-          value={priceGoalInput}
-          onChange={(e) => {
-            const value = e.target.value;
-            setPriceGoalInput(value);
-            localStorage.setItem("tradebot_price_goal_gbp", value);
-          }}
-          placeholder="£ target"
-          inputMode="decimal"
-          style={{
-            width: "100%",
-            marginTop: 8,
-            padding: "8px 10px",
-            borderRadius: 10,
-            border: "1px solid rgba(148, 163, 184, 0.28)",
-            background: "rgba(2, 6, 23, 0.65)",
-            color: "white",
-            fontWeight: 800,
-            outline: "none",
-          }}
-        />
-        <strong className={priceGoalReached ? "gain" : ""} style={{ fontSize: "18px", marginTop: 8 }}>
-          {priceGoalReached ? "TARGET REACHED ✅" : priceGoalValue > 0 ? `Target ${gbp(priceGoalValue)}` : "Set target"}
-        </strong>
-        <small>Current {gbp(equityGbpNow)}</small>
-      </section>
     </section>
 
     <nav className="tabs mode-tabs" aria-label="Dashboard mode">
@@ -739,6 +701,31 @@ const fetchData = useCallback(async (force = false) => {
           <button onClick={()=>saveTradingCap()} disabled={tradingCapSaving}>{tradingCapSaving ? "Saving..." : "Save Cap"}</button>
         </div>
         <p className="muted">Saved cap source: {bankingCapSource}. Profits above the cap stay as cash buffer instead of increasing future trade size.</p>
+      </Card>
+      <Card title="Trading Strictness">
+        <div className="summary">
+          <div><span>Mode</span><b>{strategySettings?.label || strictnessLabel}</b></div>
+          <div><span>A+ confidence</span><b>{Number(strategySettings?.aPlusMinConfidence ?? data?.aPlusMinConfidence ?? 0).toFixed(2)}</b></div>
+          <div><span>Sniper confidence</span><b>{Number(strategySettings?.sniperMinConfidence ?? data?.config?.sniperMinConfidence ?? 0).toFixed(2)}</b></div>
+        </div>
+        <label className="field">
+          <span>Safe ← Balanced → Aggressive</span>
+          <input
+            type="range"
+            min="0"
+            max="2"
+            step="1"
+            value={strategyStrictness}
+            onChange={e=>setStrategyStrictness(Number(e.target.value))}
+          />
+        </label>
+        <div className="actions">
+          <button className="ghost" onClick={()=>{setStrategyStrictness(0); saveStrategyStrictness(0)}} disabled={strategySaving}>Safe</button>
+          <button className="ghost" onClick={()=>{setStrategyStrictness(1); saveStrategyStrictness(1)}} disabled={strategySaving}>Balanced</button>
+          <button className="ghost" onClick={()=>{setStrategyStrictness(2); saveStrategyStrictness(2)}} disabled={strategySaving}>Aggressive</button>
+          <button onClick={()=>saveStrategyStrictness()} disabled={strategySaving}>{strategySaving ? "Saving..." : `Save ${strictnessLabel}`}</button>
+        </div>
+        <p className="muted">Safe is more selective. Balanced should allow more trades. Aggressive loosens the confidence gates further without removing risk checks.</p>
       </Card>
       <Card title="Dynamic Auto Universe" wide>
         <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
