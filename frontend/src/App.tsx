@@ -58,6 +58,8 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
   const [strategyStrictness, setStrategyStrictness] = useState<number>(0);
   const [strategySaving, setStrategySaving] = useState(false);
+  const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
+  const [positionsSaving, setPositionsSaving] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
   const lastFetchAt = useRef(0);
@@ -85,6 +87,7 @@ const [banking, setBanking] = useState<AnyObj>({});
   const dynamicRows = Array.isArray(dynamicScanner?.rows) ? dynamicScanner.rows : [];
   const dynamicPickCount = Number(data?.autoUniverse?.dynamicPickCount || dynamicRows.length || 0);
   const strategySettings = data?.strategySettings || {};
+  const positionSettings = data?.positionSettings || {};
   const strictnessLabels = ["Safe", "Balanced", "Aggressive"];
   const strictnessLabel = strictnessLabels[Math.max(0, Math.min(2, Number(strategyStrictness || 0)))] || "Safe";
 
@@ -98,6 +101,11 @@ const [banking, setBanking] = useState<AnyObj>({});
     const level = Number(data?.strategySettings?.level);
     if (Number.isFinite(level)) setStrategyStrictness(Math.max(0, Math.min(2, level)));
   }, [data?.strategySettings?.level]);
+
+  useEffect(() => {
+    const maxPos = Number(data?.positionSettings?.maxPositions ?? data?.maxPositions ?? data?.config?.maxPositions);
+    if (Number.isFinite(maxPos) && maxPos > 0) setMaxPositionsInput(Math.max(1, Math.min(10, maxPos)));
+  }, [data?.positionSettings?.maxPositions, data?.maxPositions, data?.config?.maxPositions]);
 
   
   const token = authToken || apiKey.trim();
@@ -430,6 +438,37 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
+  async function saveMaxPositions(valueOverride?: number) {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+
+    const value = Math.max(1, Math.min(10, Number(valueOverride ?? maxPositionsInput ?? 6)));
+
+    setPositionsSaving(true);
+    setMessage(`Saving max positions: ${value}...`);
+
+    try {
+      const res = await fetch(`${API_URL}/position-settings`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ maxPositions: value }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save max positions");
+      setMaxPositionsInput(Number(json?.maxPositions || value));
+      setData(prev => ({ ...prev, positionSettings: json, maxPositions: json?.maxPositions ?? value }));
+      setMessage(json?.message || `Max positions set to ${value}.`);
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not save max positions.");
+    } finally {
+      setPositionsSaving(false);
+    }
+  }
+
   async function refreshDynamicScanner() {
     if (!token) {
       setMessage("Please login first.");
@@ -726,6 +765,31 @@ const fetchData = useCallback(async (force = false) => {
           <button onClick={()=>saveStrategyStrictness()} disabled={strategySaving}>{strategySaving ? "Saving..." : `Save ${strictnessLabel}`}</button>
         </div>
         <p className="muted">Safe is more selective. Balanced should allow more trades. Aggressive loosens the confidence gates further without removing risk checks.</p>
+      </Card>
+      <Card title="Max Positions">
+        <div className="summary">
+          <div><span>Current limit</span><b>{Number(positionSettings?.maxPositions ?? data?.maxPositions ?? 0)}</b></div>
+          <div><span>Open positions</span><b>{positions.length}</b></div>
+          <div><span>Allowed new</span><b>{Number(data?.allowedNewPositions ?? 0)}</b></div>
+        </div>
+        <label className="field">
+          <span>Choose maximum open positions</span>
+          <input
+            type="range"
+            min="1"
+            max="10"
+            step="1"
+            value={maxPositionsInput}
+            onChange={e=>setMaxPositionsInput(Number(e.target.value))}
+          />
+        </label>
+        <div className="actions">
+          <button className="ghost" onClick={()=>{setMaxPositionsInput(2); saveMaxPositions(2)}} disabled={positionsSaving}>2</button>
+          <button className="ghost" onClick={()=>{setMaxPositionsInput(4); saveMaxPositions(4)}} disabled={positionsSaving}>4</button>
+          <button className="ghost" onClick={()=>{setMaxPositionsInput(6); saveMaxPositions(6)}} disabled={positionsSaving}>6</button>
+          <button onClick={()=>saveMaxPositions()} disabled={positionsSaving}>{positionsSaving ? "Saving..." : `Save ${maxPositionsInput}`}</button>
+        </div>
+        <p className="muted">Lower numbers concentrate the bot into fewer holdings. If you already hold more than the new limit, the bot will stop opening new positions until holdings drop below it.</p>
       </Card>
       <Card title="Dynamic Auto Universe" wide>
         <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
