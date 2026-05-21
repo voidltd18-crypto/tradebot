@@ -69,7 +69,7 @@ if not API_KEY or not API_SECRET:
 BOT_NAME = "Rebuilt Sniper Profit Bot"
 
 SAFE_UNIVERSE = [
-    "TTWO", "NVDA", "AMD", "MSFT", "AAPL", "META",
+    "NVDA", "AMD", "MSFT", "AAPL", "META",
     "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
     "TSLA", "PLTR", "UBER", "QQQ", "SMH",
 ]
@@ -77,7 +77,7 @@ SAFE_UNIVERSE = [
 CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
-MAX_POSITIONS = 12
+MAX_POSITIONS = 6
 MAX_NEW_BUYS_PER_LOOP = 1
 MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
@@ -175,7 +175,7 @@ CONFIDENCE_SIZING_ENABLED = True
 STOCK_MEMORY_ENABLED = True
 TRADE_TIMELINE_ENABLED = True
 
-SNIPER_MIN_CONFIDENCE = 0.65
+SNIPER_MIN_CONFIDENCE = 0.58
 SNIPER_MIN_QUALITY = 0.020
 SNIPER_MAX_SPREAD = 0.012
 SNIPER_MIN_PULLBACK = 0.0015
@@ -184,7 +184,7 @@ SNIPER_MIN_MOMENTUM = -0.003
 
 # A+ trade quality gate
 A_PLUS_GATE_ENABLED = True
-A_PLUS_MIN_CONFIDENCE = 0.62
+A_PLUS_MIN_CONFIDENCE = 0.70
 A_PLUS_MIN_QUALITY = 0.026
 A_PLUS_MAX_SPREAD = 0.010
 A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM = True
@@ -2904,17 +2904,12 @@ def build_weekly_universe(force=False):
     chosen = []
     seen = set()
     for r in combined:
-        symbol = str(r.get("symbol", "")).upper().strip()
         if len(chosen) >= AUTO_UNIVERSE_SIZE:
             break
-        if symbol in seen:
+        if r["symbol"] in seen:
             continue
-        if "QUALITY_ONLY_MODE" in globals() and QUALITY_ONLY_MODE and symbol in BLOCKED_WEAK_TICKERS:
-            print(f"QUALITY BLOCKED UNIVERSE SKIP {symbol}")
-            continue
-        r["symbol"] = symbol
         chosen.append(r)
-        seen.add(symbol)
+        seen.add(r["symbol"])
 
     if not chosen:
         chosen = [{"symbol": s, "score": 0, "reason": "fallback safe universe", "status": "active"} for s in SAFE_UNIVERSE[:AUTO_UNIVERSE_SIZE]]
@@ -2941,31 +2936,11 @@ def auto_universe_payload():
         preview = universe_rows_from_stock_memory()[:AUTO_UNIVERSE_SIZE]
         active = preview
 
-    # Final UI safety filter: never show blocked weak tickers in the dashboard universe.
-    try:
-        if "QUALITY_ONLY_MODE" in globals() and QUALITY_ONLY_MODE:
-            active = [
-                r for r in active
-                if str(r.get("symbol", "")).upper().strip() not in BLOCKED_WEAK_TICKERS
-            ]
-    except Exception as e:
-        print(f"AUTO UNIVERSE BLOCK FILTER ERROR: {e}")
-
-    active_symbols = [r["symbol"] for r in active] if active else list(current_universe)
-    try:
-        if "QUALITY_ONLY_MODE" in globals() and QUALITY_ONLY_MODE:
-            active_symbols = [
-                str(s).upper().strip() for s in active_symbols
-                if str(s).upper().strip() not in BLOCKED_WEAK_TICKERS
-            ]
-    except Exception:
-        pass
-
     return {
         "enabled": AUTO_UNIVERSE_ENABLED,
-        "size": len(active_symbols),
+        "size": AUTO_UNIVERSE_SIZE,
         "weekStart": week_start_str(),
-        "activeSymbols": active_symbols,
+        "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe),
         "rows": active,
         "lastRefresh": get_last_universe_refresh(),
         "candidatePoolSize": len(AUTO_UNIVERSE_CANDIDATE_POOL),
@@ -3037,6 +3012,7 @@ def build_status_payload(bot_name, scans):
         "stallExitEnabled": STALL_EXIT_ENABLED,
         "stallExitAfterMinutes": STALL_EXIT_AFTER_MINUTES,
         "aPlusGateEnabled": A_PLUS_GATE_ENABLED,
+        "strategySettings": current_strategy_settings_payload() if "current_strategy_settings_payload" in globals() else {},
         "aPlusMinConfidence": A_PLUS_MIN_CONFIDENCE,
         "aPlusMinQuality": A_PLUS_MIN_QUALITY,
         "tempBlacklist": temp_blacklist,
@@ -3135,6 +3111,167 @@ def build_status_payload(bot_name, scans):
 def update_status(bot_name, scans):
     latest_status.clear()
     latest_status.update(build_status_payload(bot_name, scans))
+
+
+
+# ============================================================
+# STRATEGY STRICTNESS / LIVE GATE SETTINGS
+# ============================================================
+
+STRATEGY_SETTINGS_FILE = os.path.join("backend", "state", "strategy_settings.json")
+
+STRATEGY_PRESETS = {
+    "safe": {
+        "label": "Safe",
+        "aPlusMinConfidence": 0.70,
+        "sniperMinConfidence": 0.58,
+        "aPlusMinQuality": 0.026,
+        "sniperMinQuality": 0.020,
+    },
+    "balanced": {
+        "label": "Balanced",
+        "aPlusMinConfidence": 0.62,
+        "sniperMinConfidence": 0.54,
+        "aPlusMinQuality": 0.022,
+        "sniperMinQuality": 0.017,
+    },
+    "aggressive": {
+        "label": "Aggressive",
+        "aPlusMinConfidence": 0.55,
+        "sniperMinConfidence": 0.50,
+        "aPlusMinQuality": 0.018,
+        "sniperMinQuality": 0.014,
+    },
+}
+
+def _strategy_preset_from_level(level: int) -> str:
+    try:
+        level = int(level)
+    except Exception:
+        level = 1
+    if level <= 0:
+        return "safe"
+    if level >= 2:
+        return "aggressive"
+    return "balanced"
+
+
+def _save_strategy_settings(payload: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(STRATEGY_SETTINGS_FILE), exist_ok=True)
+        with open(STRATEGY_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        print(f"STRATEGY SETTINGS SAVE ERROR: {e}")
+
+
+def _load_strategy_settings() -> Dict[str, Any]:
+    try:
+        if os.path.exists(STRATEGY_SETTINGS_FILE):
+            with open(STRATEGY_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        print(f"STRATEGY SETTINGS LOAD ERROR: {e}")
+    return {"level": 0, "preset": "safe"}
+
+
+def apply_strategy_settings(level: int = None, preset: str = None, save: bool = True) -> Dict[str, Any]:
+    global A_PLUS_MIN_CONFIDENCE, SNIPER_MIN_CONFIDENCE, A_PLUS_MIN_QUALITY, SNIPER_MIN_QUALITY
+
+    if preset:
+        preset_key = str(preset).lower().strip()
+    else:
+        preset_key = _strategy_preset_from_level(0 if level is None else int(level))
+
+    if preset_key not in STRATEGY_PRESETS:
+        preset_key = "safe"
+
+    if level is None:
+        level = {"safe": 0, "balanced": 1, "aggressive": 2}.get(preset_key, 0)
+
+    cfg = STRATEGY_PRESETS[preset_key]
+
+    A_PLUS_MIN_CONFIDENCE = float(cfg["aPlusMinConfidence"])
+    SNIPER_MIN_CONFIDENCE = float(cfg["sniperMinConfidence"])
+    A_PLUS_MIN_QUALITY = float(cfg["aPlusMinQuality"])
+    SNIPER_MIN_QUALITY = float(cfg["sniperMinQuality"])
+
+    payload = {
+        "ok": True,
+        "level": int(level),
+        "preset": preset_key,
+        "label": cfg["label"],
+        "aPlusMinConfidence": A_PLUS_MIN_CONFIDENCE,
+        "sniperMinConfidence": SNIPER_MIN_CONFIDENCE,
+        "aPlusMinQuality": A_PLUS_MIN_QUALITY,
+        "sniperMinQuality": SNIPER_MIN_QUALITY,
+        "updatedAt": datetime.now(UTC).isoformat(),
+        "presets": STRATEGY_PRESETS,
+    }
+
+    if save:
+        _save_strategy_settings(payload)
+
+    try:
+        latest_status["strategySettings"] = payload
+        latest_status["aPlusMinConfidence"] = A_PLUS_MIN_CONFIDENCE
+        latest_status["aPlusMinQuality"] = A_PLUS_MIN_QUALITY
+        latest_status["config"]["sniperMinConfidence"] = SNIPER_MIN_CONFIDENCE
+        latest_status["config"]["sniperMinQuality"] = SNIPER_MIN_QUALITY
+        latest_status["lastAction"] = f"Trading strictness set to {cfg['label']}"
+        latest_status["lastActionAt"] = payload["updatedAt"]
+    except Exception:
+        pass
+
+    return payload
+
+
+def current_strategy_settings_payload() -> Dict[str, Any]:
+    saved = _load_strategy_settings()
+    preset_key = str(saved.get("preset") or _strategy_preset_from_level(int(saved.get("level", 0)))).lower()
+    if preset_key not in STRATEGY_PRESETS:
+        preset_key = "safe"
+
+    # Keep runtime values as source of truth after startup has applied saved config.
+    return {
+        "ok": True,
+        "level": int(saved.get("level", {"safe": 0, "balanced": 1, "aggressive": 2}.get(preset_key, 0))),
+        "preset": preset_key,
+        "label": STRATEGY_PRESETS[preset_key]["label"],
+        "aPlusMinConfidence": float(A_PLUS_MIN_CONFIDENCE),
+        "sniperMinConfidence": float(SNIPER_MIN_CONFIDENCE),
+        "aPlusMinQuality": float(A_PLUS_MIN_QUALITY),
+        "sniperMinQuality": float(SNIPER_MIN_QUALITY),
+        "updatedAt": saved.get("updatedAt", ""),
+        "presets": STRATEGY_PRESETS,
+    }
+
+
+@app.get("/strategy-settings")
+def api_get_strategy_settings():
+    return current_strategy_settings_payload()
+
+
+@app.post("/strategy-settings")
+def api_set_strategy_settings(request: Request, payload: dict = Body(...)):
+    verify_api_key(request)
+    level = payload.get("level")
+    preset = payload.get("preset")
+    result = apply_strategy_settings(level=level, preset=preset, save=True)
+    return {**result, "message": f"Trading strictness set to {result['label']}"}
+
+
+try:
+    saved_strategy = _load_strategy_settings()
+    apply_strategy_settings(
+        level=int(saved_strategy.get("level", 0)),
+        preset=saved_strategy.get("preset", "safe"),
+        save=False,
+    )
+except Exception as e:
+    print(f"STRATEGY SETTINGS STARTUP APPLY ERROR: {e}")
 
 
 # =========================
@@ -3343,10 +3480,6 @@ def run_bot_loop():
                 scans = []
                 for symbol in current_universe:
                     try:
-                        if "is_quality_blocked_symbol" in globals() and is_quality_blocked_symbol(symbol):
-                            print(f"QUALITY BLOCKED SKIP {symbol}")
-                            continue
-
                         scan = compute_scan(symbol)
                         scans.append(scan)
                         print(f"{symbol} | price={scan['price']:.2f} | quality={scan['quality_score']:.4f} | confidence={scan['confidence']:.2f} | sniper={scan['sniper_pass']}")
@@ -4066,7 +4199,7 @@ def api_dynamic_market_scanner():
 @app.post("/dynamic-market-scanner/refresh")
 def api_dynamic_market_scanner_refresh(request: Request):
     verify_api_key(request)
-    payload = refresh_dynamic_market_candidates(force=False)
+    payload = refresh_dynamic_market_candidates(force=True)
     try:
         apply_quality_only_universe()
         update_status(BOT_NAME, latest_scans)
@@ -4275,15 +4408,6 @@ def force_quality_auto_universe_payload():
             rows = quality_universe_rows()
         else:
             rows = []
-        # Final UI safety filter: remove blocked weak tickers from rows and symbols.
-        try:
-            if "QUALITY_ONLY_MODE" in globals() and QUALITY_ONLY_MODE:
-                rows = [
-                    r for r in rows
-                    if str(r.get("symbol", "")).upper().strip() not in BLOCKED_WEAK_TICKERS
-                ]
-        except Exception as e:
-            print(f"FORCE QUALITY ROW FILTER ERROR: {e}")
         symbols = [r["symbol"] for r in rows]
     except Exception:
         rows = []
@@ -4346,7 +4470,7 @@ def refresh_universe(request: Request):
 
     try:
         if "refresh_dynamic_market_candidates" in globals():
-            refresh_dynamic_market_candidates(force=False)
+            refresh_dynamic_market_candidates(force=True)
         if "apply_quality_only_universe" in globals():
             apply_quality_only_universe()
         elif "apply_quality_universe_to_status" in globals():
