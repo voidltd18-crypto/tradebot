@@ -3021,6 +3021,7 @@ def build_status_payload(bot_name, scans):
         "lockedSymbolsToday": locked_symbols,
         "customSymbols": sorted(list(custom_symbols.keys())),
         "maxPositions": MAX_POSITIONS,
+        "positionSettings": current_position_settings_payload() if "current_position_settings_payload" in globals() else {},
         "newPositionNotional": calculate_new_position_notional(),
         "allowedNewPositions": allowed_new_position_count(),
         "universe": list(current_universe),
@@ -3272,6 +3273,106 @@ try:
     )
 except Exception as e:
     print(f"STRATEGY SETTINGS STARTUP APPLY ERROR: {e}")
+
+
+
+# ============================================================
+# LIVE POSITION LIMIT SETTINGS
+# ============================================================
+
+POSITION_SETTINGS_FILE = os.path.join("backend", "state", "position_settings.json")
+
+def _save_position_settings(payload: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(POSITION_SETTINGS_FILE), exist_ok=True)
+        with open(POSITION_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        print(f"POSITION SETTINGS SAVE ERROR: {e}")
+
+
+def _load_position_settings() -> Dict[str, Any]:
+    try:
+        if os.path.exists(POSITION_SETTINGS_FILE):
+            with open(POSITION_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        print(f"POSITION SETTINGS LOAD ERROR: {e}")
+    return {"maxPositions": int(MAX_POSITIONS)}
+
+
+def apply_position_settings(max_positions: int = None, save: bool = True) -> Dict[str, Any]:
+    global MAX_POSITIONS, STRICT_MAX_POSITIONS
+
+    try:
+        value = int(max_positions if max_positions is not None else MAX_POSITIONS)
+    except Exception:
+        value = int(MAX_POSITIONS)
+
+    value = max(1, min(10, value))
+
+    MAX_POSITIONS = value
+
+    try:
+        STRICT_MAX_POSITIONS = value
+    except Exception:
+        pass
+
+    payload = {
+        "ok": True,
+        "maxPositions": int(MAX_POSITIONS),
+        "min": 1,
+        "max": 10,
+        "updatedAt": datetime.now(UTC).isoformat(),
+    }
+
+    if save:
+        _save_position_settings(payload)
+
+    try:
+        latest_status["positionSettings"] = payload
+        latest_status["maxPositions"] = int(MAX_POSITIONS)
+        latest_status["allowedNewPositions"] = allowed_new_position_count()
+        latest_status["config"]["maxPositions"] = int(MAX_POSITIONS)
+        latest_status["lastAction"] = f"Max positions set to {MAX_POSITIONS}"
+        latest_status["lastActionAt"] = payload["updatedAt"]
+    except Exception:
+        pass
+
+    return payload
+
+
+def current_position_settings_payload() -> Dict[str, Any]:
+    saved = _load_position_settings()
+    return {
+        "ok": True,
+        "maxPositions": int(MAX_POSITIONS),
+        "savedMaxPositions": int(saved.get("maxPositions", MAX_POSITIONS)),
+        "min": 1,
+        "max": 10,
+        "updatedAt": saved.get("updatedAt", ""),
+    }
+
+
+@app.get("/position-settings")
+def api_get_position_settings():
+    return current_position_settings_payload()
+
+
+@app.post("/position-settings")
+def api_set_position_settings(request: Request, payload: dict = Body(...)):
+    verify_api_key(request)
+    result = apply_position_settings(max_positions=payload.get("maxPositions"), save=True)
+    return {**result, "message": f"Max positions set to {result['maxPositions']}"}
+
+
+try:
+    saved_positions = _load_position_settings()
+    apply_position_settings(max_positions=int(saved_positions.get("maxPositions", MAX_POSITIONS)), save=False)
+except Exception as e:
+    print(f"POSITION SETTINGS STARTUP APPLY ERROR: {e}")
 
 
 # =========================
