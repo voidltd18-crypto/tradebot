@@ -84,6 +84,12 @@ TARGET_POSITION_VALUE_PCT = 0.08
 MIN_ORDER_NOTIONAL = 1.00
 CASH_BUFFER = 0.50
 
+# Full-buy mode:
+# When max positions is 1, use nearly all available trading capital/buying power
+# instead of small partial sizing.
+FULL_BUY_WHEN_ONE_POSITION = os.getenv("FULL_BUY_WHEN_ONE_POSITION", "true").lower() == "true"
+FULL_BUY_CASH_BUFFER = float(os.getenv("FULL_BUY_CASH_BUFFER", "2.00") or 2.00)
+
 MAX_SPREAD = 0.015
 PREFER_SPREAD_UNDER = 0.006
 
@@ -1094,6 +1100,12 @@ def calculate_new_position_notional():
     # not full account equity.
     sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
 
+    # Full-buy mode for one-position trading.
+    # Uses nearly all available capped trading capital/buying power, leaving a small buffer.
+    if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
+        usable_cash = max(0.0, buying_power - FULL_BUY_CASH_BUFFER)
+        return round(max(0.0, min(sizing_equity, usable_cash)), 2)
+
     target_value = sizing_equity * TARGET_POSITION_VALUE_PCT
     max_value = sizing_equity * MAX_POSITION_VALUE_PCT
     usable_cash = max(0.0, buying_power - CASH_BUFFER)
@@ -1102,8 +1114,15 @@ def calculate_new_position_notional():
 
 def confidence_notional(scan):
     base = calculate_new_position_notional()
+
+    # In one-position full-buy mode, do not downsize by confidence.
+    # The entry gates still control trade quality; this only changes allocation size.
+    if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
+        return base
+
     if not CONFIDENCE_SIZING_ENABLED:
         return base
+
     confidence, label = calculate_confidence(scan)
     mult = HIGH_CONFIDENCE_SIZE_MULTIPLIER if label == "HIGH" else MEDIUM_CONFIDENCE_SIZE_MULTIPLIER if label == "MEDIUM" else LOW_CONFIDENCE_SIZE_MULTIPLIER
     try:
@@ -3028,6 +3047,8 @@ def build_status_payload(bot_name, scans):
         "config": {
             "checkInterval": CHECK_INTERVAL,
             "maxPositions": MAX_POSITIONS,
+            "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
+            "fullBuyCashBuffer": FULL_BUY_CASH_BUFFER,
             "targetPositionValuePct": TARGET_POSITION_VALUE_PCT,
             "maxPositionValuePct": MAX_POSITION_VALUE_PCT,
             "stopLoss": STOP_LOSS,
