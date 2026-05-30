@@ -533,6 +533,44 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
+  async function setManualBaseline() {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+
+    const gbpValue = Number(manualBaselineInput);
+    if (!Number.isFinite(gbpValue) || gbpValue <= 0) {
+      setMessage("Enter a valid GBP baseline value.");
+      return;
+    }
+
+    const fx = Number(data?.fx?.usdToGbp || reports?.fx?.usdToGbp || 0.745);
+    const usdValue = fx > 0 ? gbpValue / fx : gbpValue;
+
+    setBaselineSaving(true);
+    setMessage(`Setting baseline to £${gbpValue.toFixed(2)}...`);
+
+    try {
+      const res = await fetch(`${API_URL}/set-baseline`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ baseline: usdValue }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not set baseline");
+
+      setMessage(`Baseline set to about £${gbpValue.toFixed(2)}.`);
+      await fetchReports();
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not set baseline.");
+    } finally {
+      setBaselineSaving(false);
+    }
+  }
+
   async function resetBaseline() {
     if (!confirm("Reset PnL baseline to current equity? This only resets reporting.")) return;
     await action("/reset-baseline");
@@ -805,7 +843,16 @@ const fetchData = useCallback(async (force = false) => {
     </main>}
 
     {tab==="reports" && <main>
-      <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button></div>
+      <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
+          <input
+            className="input"
+            placeholder="Baseline £ e.g. 989.86"
+            value={manualBaselineInput}
+            onChange={e=>setManualBaselineInput(e.target.value)}
+          />
+          <button onClick={setManualBaseline} disabled={baselineSaving}>
+            {baselineSaving ? "Saving..." : "Set Manual Baseline"}
+          </button></div>
       <section className="stats">
         <Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={`${usd(totalDeposited)} · ${reports.depositSource ? `Source: ${reports.depositSource}` : ""}`} />
         <Stat label="Earned Since Deposit" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)} />
