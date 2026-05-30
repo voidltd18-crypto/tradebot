@@ -545,7 +545,7 @@ const fetchData = useCallback(async (force = false) => {
       return;
     }
 
-    const fx = Number(data?.fx?.usdToGbp || reports?.fx?.usdToGbp || 0.745);
+    const fx = Number(data?.fx?.usdToGbp || 0.745);
     const usdValue = fx > 0 ? gbpValue / fx : gbpValue;
 
     setBaselineSaving(true);
