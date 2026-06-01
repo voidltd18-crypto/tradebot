@@ -2983,7 +2983,7 @@ def auto_universe_payload():
         try:
             rows = quality_only_rows()[:AUTO_UNIVERSE_SIZE]
             rows = sorted(rows, key=lambda r: float(r.get("score") or 0.0), reverse=True)[:AUTO_UNIVERSE_SIZE]
-        symbols = [r["symbol"] for r in rows]
+            symbols = [r["symbol"] for r in rows]
             return {
                 "enabled": AUTO_UNIVERSE_ENABLED,
                 "mode": "market-first-dynamic",
