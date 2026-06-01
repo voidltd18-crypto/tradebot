@@ -3022,15 +3022,12 @@ def build_status_payload(bot_name, scans):
         "customSymbols": sorted(list(custom_symbols.keys())),
         "maxPositions": MAX_POSITIONS,
         "positionSettings": current_position_settings_payload() if "current_position_settings_payload" in globals() else {},
-        "buySizeSettings": current_buy_size_settings_payload() if "current_buy_size_settings_payload" in globals() else {},
         "newPositionNotional": calculate_new_position_notional(),
         "allowedNewPositions": allowed_new_position_count(),
         "universe": list(current_universe),
         "config": {
             "checkInterval": CHECK_INTERVAL,
             "maxPositions": MAX_POSITIONS,
-            "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
-            "fullBuyCashBuffer": FULL_BUY_CASH_BUFFER,
             "targetPositionValuePct": TARGET_POSITION_VALUE_PCT,
             "maxPositionValuePct": MAX_POSITION_VALUE_PCT,
             "stopLoss": STOP_LOSS,
@@ -3376,97 +3373,6 @@ try:
     apply_position_settings(max_positions=int(saved_positions.get("maxPositions", MAX_POSITIONS)), save=False)
 except Exception as e:
     print(f"POSITION SETTINGS STARTUP APPLY ERROR: {e}")
-
-
-
-# ============================================================
-# LIVE BUY SIZE MODE SETTINGS
-# ============================================================
-
-BUY_SIZE_SETTINGS_FILE = os.path.join("backend", "state", "buy_size_settings.json")
-
-def _save_buy_size_settings(payload: Dict[str, Any]) -> None:
-    try:
-        os.makedirs(os.path.dirname(BUY_SIZE_SETTINGS_FILE), exist_ok=True)
-        with open(BUY_SIZE_SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-    except Exception as e:
-        print(f"BUY SIZE SETTINGS SAVE ERROR: {e}")
-
-
-def _load_buy_size_settings() -> Dict[str, Any]:
-    try:
-        if os.path.exists(BUY_SIZE_SETTINGS_FILE):
-            with open(BUY_SIZE_SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except Exception as e:
-        print(f"BUY SIZE SETTINGS LOAD ERROR: {e}")
-    return {"mode": "full" if FULL_BUY_WHEN_ONE_POSITION else "partial"}
-
-
-def apply_buy_size_settings(mode: str = None, save: bool = True) -> Dict[str, Any]:
-    global FULL_BUY_WHEN_ONE_POSITION
-
-    selected = str(mode or "").lower().strip()
-    if selected not in {"partial", "full"}:
-        selected = "full" if FULL_BUY_WHEN_ONE_POSITION else "partial"
-
-    FULL_BUY_WHEN_ONE_POSITION = selected == "full"
-
-    payload = {
-        "ok": True,
-        "mode": selected,
-        "fullBuyWhenOnePosition": bool(FULL_BUY_WHEN_ONE_POSITION),
-        "label": "Full Buy" if FULL_BUY_WHEN_ONE_POSITION else "Partial Buy",
-        "updatedAt": datetime.now(UTC).isoformat(),
-    }
-
-    if save:
-        _save_buy_size_settings(payload)
-
-    try:
-        latest_status["buySizeSettings"] = payload
-        latest_status["config"]["fullBuyWhenOnePosition"] = FULL_BUY_WHEN_ONE_POSITION
-        latest_status["lastAction"] = f"Buy size mode set to {payload['label']}"
-        latest_status["lastActionAt"] = payload["updatedAt"]
-    except Exception:
-        pass
-
-    return payload
-
-
-def current_buy_size_settings_payload() -> Dict[str, Any]:
-    saved = _load_buy_size_settings()
-    mode = "full" if FULL_BUY_WHEN_ONE_POSITION else "partial"
-    return {
-        "ok": True,
-        "mode": mode,
-        "savedMode": saved.get("mode", mode),
-        "fullBuyWhenOnePosition": bool(FULL_BUY_WHEN_ONE_POSITION),
-        "label": "Full Buy" if FULL_BUY_WHEN_ONE_POSITION else "Partial Buy",
-        "updatedAt": saved.get("updatedAt", ""),
-    }
-
-
-@app.get("/buy-size-settings")
-def api_get_buy_size_settings():
-    return current_buy_size_settings_payload()
-
-
-@app.post("/buy-size-settings")
-def api_set_buy_size_settings(request: Request, payload: dict = Body(...)):
-    verify_api_key(request)
-    result = apply_buy_size_settings(mode=payload.get("mode"), save=True)
-    return {**result, "message": f"Buy size mode set to {result['label']}"}
-
-
-try:
-    saved_buy_size = _load_buy_size_settings()
-    apply_buy_size_settings(mode=saved_buy_size.get("mode"), save=False)
-except Exception as e:
-    print(f"BUY SIZE SETTINGS STARTUP APPLY ERROR: {e}")
 
 
 # =========================
