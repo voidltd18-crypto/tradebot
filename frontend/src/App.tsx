@@ -62,6 +62,7 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [strategySaving, setStrategySaving] = useState(false);
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
   const [positionsSaving, setPositionsSaving] = useState(false);
+  const [buyModeSaving, setBuyModeSaving] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
   const lastFetchAt = useRef(0);
@@ -471,6 +472,42 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
+  async function setBuySizeMode(mode: "partial" | "full") {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+
+    setBuyModeSaving(true);
+    setMessage(`Setting buy mode to ${mode === "full" ? "Full Buy" : "Partial Buy"}...`);
+
+    try {
+      const res = await fetch(`${API_URL}/buy-size-mode`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ mode }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not set buy mode");
+
+      setData(prev => ({
+        ...prev,
+        config: {
+          ...(prev?.config || {}),
+          fullBuyWhenOnePosition: json?.fullBuyWhenOnePosition,
+        },
+      }));
+
+      setMessage(json?.message || "Buy size mode updated.");
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not set buy mode.");
+    } finally {
+      setBuyModeSaving(false);
+    }
+  }
+
   async function refreshDynamicScanner() {
     if (!token) {
       setMessage("Please login first.");
@@ -828,6 +865,30 @@ const fetchData = useCallback(async (force = false) => {
           <button onClick={()=>saveMaxPositions()} disabled={positionsSaving}>{positionsSaving ? "Saving..." : `Save ${maxPositionsInput}`}</button>
         </div>
         <p className="muted">Lower numbers concentrate the bot into fewer holdings. If you already hold more than the new limit, the bot will stop opening new positions until holdings drop below it.</p>
+      </Card>
+      <Card title="Buy Size Mode">
+        <div className="summary">
+          <div><span>Current mode</span><b>{data?.config?.fullBuyWhenOnePosition ? "Full Buy" : "Partial Buy"}</b></div>
+          <div><span>Max positions</span><b>{Number(data?.maxPositions ?? data?.config?.maxPositions ?? 0)}</b></div>
+          <div><span>Next buy</span><b>{fmtGbp(Number(data?.newPositionNotional || 0))}</b></div>
+        </div>
+        <div className="actions">
+          <button
+            className={!data?.config?.fullBuyWhenOnePosition ? "" : "ghost"}
+            onClick={()=>setBuySizeMode("partial")}
+            disabled={buyModeSaving}
+          >
+            Partial Buy
+          </button>
+          <button
+            className={data?.config?.fullBuyWhenOnePosition ? "" : "ghost"}
+            onClick={()=>setBuySizeMode("full")}
+            disabled={buyModeSaving}
+          >
+            Full Buy
+          </button>
+        </div>
+        <p className="muted">Partial uses normal confidence sizing. Full Buy uses nearly all capped buying power when Max Positions is 1.</p>
       </Card>
       <Card title="Dynamic Auto Universe" wide>
         <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
