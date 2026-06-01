@@ -84,6 +84,12 @@ TARGET_POSITION_VALUE_PCT = 0.08
 MIN_ORDER_NOTIONAL = 1.00
 CASH_BUFFER = 0.50
 
+# Buy size mode.
+# True = full allocation when Max Positions is 1.
+# False = normal partial/confidence sizing.
+FULL_BUY_WHEN_ONE_POSITION = os.getenv("FULL_BUY_WHEN_ONE_POSITION", "true").lower() == "true"
+FULL_BUY_CASH_BUFFER = float(os.getenv("FULL_BUY_CASH_BUFFER", "2.00") or 2.00)
+
 MAX_SPREAD = 0.015
 PREFER_SPREAD_UNDER = 0.006
 
@@ -1089,10 +1095,15 @@ def calculate_new_position_notional():
     equity = float(account.equity)
     buying_power = float(account.buying_power)
 
-    # Profit banking cap now controls sizing. If account equity grows above
-    # the saved cap, new trade sizes are calculated from the capped amount,
-    # not full account equity.
-    sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
+    try:
+        sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
+    except Exception:
+        sizing_equity = equity
+
+    # Full-buy mode for one-position trading.
+    if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
+        usable_cash = max(0.0, buying_power - FULL_BUY_CASH_BUFFER)
+        return round(max(0.0, min(sizing_equity, usable_cash)), 2)
 
     target_value = sizing_equity * TARGET_POSITION_VALUE_PCT
     max_value = sizing_equity * MAX_POSITION_VALUE_PCT
@@ -1102,8 +1113,14 @@ def calculate_new_position_notional():
 
 def confidence_notional(scan):
     base = calculate_new_position_notional()
+
+    # In one-position full-buy mode, do not downsize by confidence.
+    if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
+        return base
+
     if not CONFIDENCE_SIZING_ENABLED:
         return base
+
     confidence, label = calculate_confidence(scan)
     mult = HIGH_CONFIDENCE_SIZE_MULTIPLIER if label == "HIGH" else MEDIUM_CONFIDENCE_SIZE_MULTIPLIER if label == "MEDIUM" else LOW_CONFIDENCE_SIZE_MULTIPLIER
     try:
@@ -3028,6 +3045,8 @@ def build_status_payload(bot_name, scans):
         "config": {
             "checkInterval": CHECK_INTERVAL,
             "maxPositions": MAX_POSITIONS,
+            "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
+            "fullBuyCashBuffer": FULL_BUY_CASH_BUFFER,
             "targetPositionValuePct": TARGET_POSITION_VALUE_PCT,
             "maxPositionValuePct": MAX_POSITION_VALUE_PCT,
             "stopLoss": STOP_LOSS,
@@ -3547,6 +3566,45 @@ def backfill_trades(request: Request):
         result = backfill_trades_from_alpaca_full()
         update_status(BOT_NAME, latest_scans)
         return result
+
+
+
+@app.get("/buy-size-mode")
+def get_buy_size_mode():
+    return {
+        "ok": True,
+        "mode": "full" if FULL_BUY_WHEN_ONE_POSITION else "partial",
+        "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
+        "label": "Full Buy" if FULL_BUY_WHEN_ONE_POSITION else "Partial Buy",
+    }
+
+
+@app.post("/buy-size-mode")
+def set_buy_size_mode(request: Request, payload: dict = Body(...)):
+    verify_api_key(request)
+    global FULL_BUY_WHEN_ONE_POSITION
+
+    mode = str(payload.get("mode", "")).lower().strip()
+    if mode not in ["partial", "full"]:
+        return {"ok": False, "message": "Mode must be partial or full"}
+
+    FULL_BUY_WHEN_ONE_POSITION = mode == "full"
+
+    try:
+        latest_status.setdefault("config", {})
+        latest_status["config"]["fullBuyWhenOnePosition"] = FULL_BUY_WHEN_ONE_POSITION
+        latest_status["lastAction"] = f"Buy size mode set to {'Full Buy' if FULL_BUY_WHEN_ONE_POSITION else 'Partial Buy'}"
+        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
+    except Exception:
+        pass
+
+    return {
+        "ok": True,
+        "mode": mode,
+        "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
+        "label": "Full Buy" if FULL_BUY_WHEN_ONE_POSITION else "Partial Buy",
+        "message": f"Buy size mode set to {'Full Buy' if FULL_BUY_WHEN_ONE_POSITION else 'Partial Buy'}",
+    }
 
 
 # =========================
