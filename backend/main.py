@@ -3102,7 +3102,7 @@ def build_status_payload(bot_name, scans):
         ],
         "banking": banking_payload(),
         "logs": [
-            f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
+            f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()} | buy_mode={'full' if FULL_BUY_WHEN_ONE_POSITION else 'partial'}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
             f"FX | USDGBP={get_usd_to_gbp_rate():.4f} | source={fx_cache.get('source', 'fallback')}",
             f"DB | sqlite={SQLITE_ENABLED} | raw_trades={db_summary_payload().get('totalTrades', 0)} | closed={closed_trade_summary_payload().get('closedTrades', 0)} | pnl_gbp={closed_trade_summary_payload().get('totalPnlGbp', 0):.2f}",
@@ -3593,6 +3593,7 @@ def set_buy_size_mode(request: Request, payload: dict = Body(...)):
     try:
         latest_status.setdefault("config", {})
         latest_status["config"]["fullBuyWhenOnePosition"] = FULL_BUY_WHEN_ONE_POSITION
+        latest_status["newPositionNotional"] = calculate_new_position_notional()
         latest_status["lastAction"] = f"Buy size mode set to {'Full Buy' if FULL_BUY_WHEN_ONE_POSITION else 'Partial Buy'}"
         latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
     except Exception:
