@@ -2880,6 +2880,39 @@ def build_weekly_universe(force=False):
     if not AUTO_UNIVERSE_ENABLED:
         return {"ok": False, "message": "Auto universe disabled", "symbols": current_universe}
 
+    # Market-first mode must not be overwritten by the old trust-memory weekly builder.
+    if globals().get("DYNAMIC_UNIVERSE_MARKET_FIRST", False) and "quality_only_rows" in globals():
+        try:
+            rows = quality_only_rows()
+            chosen = []
+            seen = set()
+            for r in rows:
+                sym = str(r.get("symbol", "")).upper().strip()
+                if not sym or sym in seen:
+                    continue
+                chosen.append(r)
+                seen.add(sym)
+                if len(chosen) >= AUTO_UNIVERSE_SIZE:
+                    break
+
+            if chosen:
+                current_universe = [r["symbol"] for r in chosen]
+                for s in current_universe:
+                    ensure_symbol_state(s, custom=s in custom_symbols)
+                try:
+                    save_weekly_universe(chosen, "market-first dynamic refresh" if force else "market-first dynamic")
+                except Exception as e:
+                    print(f"MARKET FIRST SAVE WEEKLY ERROR: {e}")
+                return {
+                    "ok": True,
+                    "message": f"Market-first universe active with {len(current_universe)} symbols",
+                    "symbols": current_universe,
+                    "rows": chosen,
+                    "mode": "market-first-dynamic",
+                }
+        except Exception as e:
+            print(f"MARKET FIRST WEEKLY BUILD ERROR: {e}")
+
     if not should_refresh_weekly_universe(force=force):
         active = get_weekly_universe_from_db()
         if active:
@@ -2946,6 +2979,27 @@ def build_weekly_universe(force=False):
 
 
 def auto_universe_payload():
+    if globals().get("DYNAMIC_UNIVERSE_MARKET_FIRST", False) and "quality_only_rows" in globals():
+        try:
+            rows = quality_only_rows()[:AUTO_UNIVERSE_SIZE]
+            rows = sorted(rows, key=lambda r: float(r.get("score") or 0.0), reverse=True)[:AUTO_UNIVERSE_SIZE]
+        symbols = [r["symbol"] for r in rows]
+            return {
+                "enabled": AUTO_UNIVERSE_ENABLED,
+                "mode": "market-first-dynamic",
+                "size": len(symbols),
+                "weekStart": week_start_str(),
+                "activeSymbols": symbols,
+                "rows": rows,
+                "lastRefresh": datetime.now(UTC).isoformat(),
+                "candidatePoolSize": len(symbols),
+                "dynamicPickCount": len([r for r in rows if r.get("dynamicPick")]),
+                "manualPickCount": len([r for r in rows if r.get("manualPick")]),
+                "keepWinners": True,
+            }
+        except Exception as e:
+            print(f"MARKET FIRST AUTO UNIVERSE PAYLOAD ERROR: {e}")
+
     active = get_weekly_universe_from_db()
 
     # If DB has not been populated yet but stock memory exists, show live preview.
@@ -3115,6 +3169,7 @@ def build_status_payload(bot_name, scans):
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
+            f"DYNAMIC SCANNER | enabled={DYNAMIC_MARKET_SCANNER_ENABLED if 'DYNAMIC_MARKET_SCANNER_ENABLED' in globals() else False} | mode={'market-first' if globals().get('DYNAMIC_UNIVERSE_MARKET_FIRST', False) else 'trust'} | source={(dynamic_market_scanner_payload().get('source') if 'dynamic_market_scanner_payload' in globals() else 'none')} | rows={len(dynamic_market_scanner_payload().get('rows', [])) if 'dynamic_market_scanner_payload' in globals() else 0} | error={(dynamic_market_scanner_payload().get('error') if 'dynamic_market_scanner_payload' in globals() else '')}",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f}",
             f"POSITIONS | {len(positions)}",
@@ -4732,6 +4787,8 @@ def refresh_universe(request: Request):
     try:
         if "refresh_dynamic_market_candidates" in globals():
             refresh_dynamic_market_candidates(force=True)
+        if "build_weekly_universe" in globals():
+            build_weekly_universe(force=True)
         if "apply_quality_only_universe" in globals():
             apply_quality_only_universe()
         elif "apply_quality_universe_to_status" in globals():
