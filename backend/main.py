@@ -3021,6 +3021,9 @@ def build_status_payload(bot_name, scans):
         "autoImproveEnabled": AUTO_IMPROVE_ENABLED,
         "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
         "autoUniverseEnabled": AUTO_UNIVERSE_ENABLED,
+        "dynamicUniverseMarketFirst": DYNAMIC_UNIVERSE_MARKET_FIRST,
+        "dynamicUniverseMarketWeight": DYNAMIC_UNIVERSE_MARKET_WEIGHT,
+        "dynamicUniverseTrustWeight": DYNAMIC_UNIVERSE_TRUST_WEIGHT,
         "fastExitModeEnabled": FAST_EXIT_MODE_ENABLED,
         "partialProfitEnabled": PARTIAL_PROFIT_ENABLED,
         "partialProfitTriggerPct": PARTIAL_PROFIT_TRIGGER_PCT,
@@ -4166,6 +4169,14 @@ DYNAMIC_MARKET_YAHOO_SCREENS = [
     s.strip() for s in os.getenv("DYNAMIC_MARKET_YAHOO_SCREENS", "day_gainers,most_actives,aggressive_small_caps").split(",") if s.strip()
 ]
 
+# Market-first universe scoring:
+# Keeps your historical trust system, but stops it dominating the universe.
+# Market movers/volume/change get priority; trade history becomes a bonus.
+DYNAMIC_UNIVERSE_MARKET_FIRST = os.getenv("DYNAMIC_UNIVERSE_MARKET_FIRST", "true").lower() == "true"
+DYNAMIC_UNIVERSE_MARKET_WEIGHT = float(os.getenv("DYNAMIC_UNIVERSE_MARKET_WEIGHT", "0.80") or 0.80)
+DYNAMIC_UNIVERSE_TRUST_WEIGHT = float(os.getenv("DYNAMIC_UNIVERSE_TRUST_WEIGHT", "0.20") or 0.20)
+DYNAMIC_UNIVERSE_FRESH_BONUS = float(os.getenv("DYNAMIC_UNIVERSE_FRESH_BONUS", "12") or 12)
+
 DYNAMIC_SCANNER_CACHE: Dict[str, Any] = {"updatedAt": "", "symbols": [], "rows": [], "source": "empty", "error": ""}
 
 
@@ -4381,7 +4392,7 @@ def api_dynamic_market_scanner_refresh(request: Request):
         latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
     except Exception as e:
         print(f"DYNAMIC SCANNER STATUS UPDATE ERROR: {e}")
-    return {"ok": True, "message": "Dynamic market scanner refreshed", "dynamicMarketScanner": payload, **payload}
+    return {"ok": True, "message": "Dynamic market scanner refreshed with market-first scoring", "dynamicMarketScanner": payload, **payload}
 
 
 # =========================
@@ -4431,6 +4442,53 @@ def quality_only_symbols():
 
     return symbols
 
+def _trust_bonus_for_symbol(symbol: str) -> Dict[str, Any]:
+    """
+    Converts closed-trade memory into a small bonus/penalty.
+    This keeps proven winners helpful, but no longer lets old history dominate fresh movers.
+    """
+    sym = str(symbol).upper().strip()
+    try:
+        memory = stock_memory_from_closed_trades()
+    except Exception:
+        try:
+            memory = stock_memory_from_db()
+        except Exception:
+            memory = []
+
+    for m in memory:
+        if str(m.get("symbol", "")).upper() != sym:
+            continue
+
+        trades = int(m.get("trades") or 0)
+        win_rate = float(m.get("winRate") or 0.0)
+        avg_pnl = float(m.get("avgPnl") or 0.0)
+        total_pnl = float(m.get("totalPnl") or 0.0)
+        trust = str(m.get("trust") or "NEW").upper()
+
+        bonus = 0.0
+        bonus += min(trades, 10) * 0.35
+        bonus += (win_rate - 0.50) * 10.0
+        bonus += max(-3.0, min(3.0, avg_pnl * 1.5))
+        bonus += max(-4.0, min(4.0, total_pnl * 0.20))
+
+        if trust == "GOOD":
+            bonus += 3.0
+        elif trust == "BAD":
+            bonus -= 5.0
+
+        return {
+            "bonus": round(bonus, 4),
+            "trust": trust,
+            "trades": trades,
+            "winRate": win_rate,
+            "avgPnl": avg_pnl,
+            "totalPnl": total_pnl,
+        }
+
+    return {"bonus": 0.0, "trust": "NEW", "trades": 0, "winRate": 0.0, "avgPnl": 0.0, "totalPnl": 0.0}
+
+
 def quality_only_rows():
     rows = []
     dynamic_by_symbol = {}
@@ -4449,12 +4507,36 @@ def quality_only_rows():
         dyn = dynamic_by_symbol.get(sym)
         is_manual = sym in manual_picks
         is_dynamic = bool(dyn)
-        base_score = 100 - (i * 3.0)
-        score = float(dyn.get("score", base_score)) if dyn else base_score
-        reason = dyn.get("reason") if dyn else "core quality universe | weak tickers blocked"
+
+        trust = _trust_bonus_for_symbol(sym)
+
+        if DYNAMIC_UNIVERSE_MARKET_FIRST and is_dynamic:
+            market_score = float(dyn.get("score", 0.0) or 0.0)
+            trust_score = float(trust.get("bonus", 0.0) or 0.0)
+            score = (
+                market_score * DYNAMIC_UNIVERSE_MARKET_WEIGHT
+                + trust_score * DYNAMIC_UNIVERSE_TRUST_WEIGHT
+                + DYNAMIC_UNIVERSE_FRESH_BONUS
+            )
+            reason = (
+                f"market-first dynamic | {dyn.get('source', 'scanner')} | "
+                f"marketScore={market_score:.2f} | trustBonus={trust_score:.2f} | "
+                f"change={float(dyn.get('changePct') or 0):.2f}% | volume={int(float(dyn.get('volume') or 0)):,}"
+            )
+        elif dyn:
+            score = float(dyn.get("score", 0.0) or 0.0)
+            reason = dyn.get("reason") or "dynamic scanner"
+        else:
+            score = 25.0 - (i * 1.25) + float(trust.get("bonus", 0.0) or 0.0)
+            reason = (
+                f"core quality fallback | trust {trust.get('trust')} | trades={trust.get('trades')} | "
+                f"winRate={float(trust.get('winRate') or 0)*100:.2f}% | avgPnL=${float(trust.get('avgPnl') or 0):.2f}"
+            )
+
         if is_manual:
             reason = "manual pick | pinned to universe" + (f" | {reason}" if reason else "")
             score = max(score, 99.0)
+
         rows.append({
             "symbol": sym,
             "score": round(score, 2),
@@ -4466,7 +4548,14 @@ def quality_only_rows():
             "changePct": dyn.get("changePct") if dyn else None,
             "volume": dyn.get("volume") if dyn else None,
             "price": dyn.get("price") if dyn else None,
+            "trust": trust.get("trust"),
+            "trustTrades": trust.get("trades"),
+            "trustWinRate": trust.get("winRate"),
+            "trustBonus": trust.get("bonus"),
+            "marketFirst": bool(DYNAMIC_UNIVERSE_MARKET_FIRST),
         })
+
+    rows.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
     return rows
 
 def apply_quality_only_universe():
