@@ -870,7 +870,7 @@ const fetchData = useCallback(async (force = false) => {
         <div className="summary">
           <div><span>Current mode</span><b>{data?.config?.fullBuyWhenOnePosition ? "Full Buy" : "Partial Buy"}</b></div>
           <div><span>Max positions</span><b>{Number(data?.maxPositions ?? data?.config?.maxPositions ?? 0)}</b></div>
-          <div><span>Next buy</span><b>{gbp(Number(data?.newPositionNotional || 0))}</b></div>
+          <div><span>Next buy</span><b>{usd(data?.newPositionNotional)}</b></div>
         </div>
         <div className="actions">
           <button
