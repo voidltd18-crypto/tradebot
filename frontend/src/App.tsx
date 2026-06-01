@@ -56,6 +56,8 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [replayCapInput, setReplayCapInput] = useState<string>("");
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
+  const [manualBaselineInput, setManualBaselineInput] = useState<string>("");
+  const [baselineSaving, setBaselineSaving] = useState(false);
   const [strategyStrictness, setStrategyStrictness] = useState<number>(0);
   const [strategySaving, setStrategySaving] = useState(false);
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
@@ -538,6 +540,42 @@ const fetchData = useCallback(async (force = false) => {
     await action("/reset-baseline");
   }
 
+  async function setManualBaseline() {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+
+    const valueGbp = Number(manualBaselineInput);
+    if (!Number.isFinite(valueGbp) || valueGbp <= 0) {
+      setMessage("Enter a valid baseline amount in GBP.");
+      return;
+    }
+
+    const fxRate = Number(rate || 0.7403);
+    const valueUsd = fxRate > 0 ? valueGbp / fxRate : valueGbp;
+
+    setBaselineSaving(true);
+    setMessage(`Setting baseline to £${valueGbp.toFixed(2)}...`);
+
+    try {
+      const res = await fetch(`${API_URL}/set-baseline`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ baseline: valueUsd }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not set baseline");
+      setMessage(`Baseline set to about £${valueGbp.toFixed(2)}.`);
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not set baseline.");
+    } finally {
+      setBaselineSaving(false);
+    }
+  }
+
   function chartLabel(raw:any, i:number) {
     const d = new Date(raw || "");
     if (Number.isNaN(d.getTime())) return raw ? String(raw).slice(0,16) : `#${i+1}`;
@@ -805,7 +843,20 @@ const fetchData = useCallback(async (force = false) => {
     </main>}
 
     {tab==="reports" && <main>
-      <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button></div>
+      <div className="actions report-actions">
+        <button onClick={() => fetchData(true)}>Refresh Reports</button>
+        <button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
+        <input
+          value={manualBaselineInput}
+          onChange={e=>setManualBaselineInput(e.target.value)}
+          placeholder="Baseline £"
+          inputMode="decimal"
+          style={{maxWidth: "130px"}}
+        />
+        <button onClick={setManualBaseline} disabled={baselineSaving}>
+          {baselineSaving ? "Saving..." : "Set Manual Baseline"}
+        </button>
+      </div>
       <section className="stats">
         <Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={`${usd(totalDeposited)} · ${reports.depositSource ? `Source: ${reports.depositSource}` : ""}`} />
         <Stat label="Earned Since Deposit" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)} />
