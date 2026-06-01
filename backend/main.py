@@ -4216,6 +4216,7 @@ DYNAMIC_MARKET_SCANNER_ENABLED = os.getenv("DYNAMIC_MARKET_SCANNER_ENABLED", "tr
 DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS = int(os.getenv("DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS", "12"))
 DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS = int(os.getenv("DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS", str(60 * 60 * 4)))
 DYNAMIC_MARKET_SCANNER_FILE = os.path.join("backend", "state", "dynamic_market_scanner.json")
+DYNAMIC_MARKET_LAST_GOOD_FILE = os.path.join("backend", "state", "dynamic_market_last_good.json")
 DYNAMIC_MARKET_MIN_PRICE = float(os.getenv("DYNAMIC_MARKET_MIN_PRICE", "3"))
 DYNAMIC_MARKET_MAX_PRICE = float(os.getenv("DYNAMIC_MARKET_MAX_PRICE", "800"))
 DYNAMIC_MARKET_MIN_VOLUME = int(os.getenv("DYNAMIC_MARKET_MIN_VOLUME", "500000"))
@@ -4350,6 +4351,68 @@ def _score_dynamic_quote(q: Dict[str, Any], source: str) -> Optional[Dict[str, A
     }
 
 
+
+def _load_last_good_dynamic_scan() -> Dict[str, Any]:
+    try:
+        if os.path.exists(DYNAMIC_MARKET_LAST_GOOD_FILE):
+            with open(DYNAMIC_MARKET_LAST_GOOD_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and data.get("rows"):
+                return data
+    except Exception as e:
+        print(f"DYNAMIC LAST GOOD LOAD ERROR: {e}")
+    return {}
+
+
+def _save_last_good_dynamic_scan(payload: Dict[str, Any]) -> None:
+    try:
+        rows = payload.get("rows") or []
+        # Only save real Yahoo/API market rows, never the fallback list.
+        real_rows = [r for r in rows if str(r.get("source", "")).lower() != "fallback" and r.get("volume")]
+        if not real_rows:
+            return
+        os.makedirs(os.path.dirname(DYNAMIC_MARKET_LAST_GOOD_FILE), exist_ok=True)
+        data = {
+            **payload,
+            "rows": real_rows,
+            "symbols": [r["symbol"] for r in real_rows if r.get("symbol")],
+            "savedAt": datetime.now(UTC).isoformat(),
+            "cacheType": "last-good-dynamic-scan",
+        }
+        with open(DYNAMIC_MARKET_LAST_GOOD_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        print(f"DYNAMIC LAST GOOD SAVE ERROR: {e}")
+
+
+def _last_good_dynamic_scan_payload(errors=None) -> Optional[Dict[str, Any]]:
+    data = _load_last_good_dynamic_scan()
+    if not data or not data.get("rows"):
+        return None
+
+    rows = data.get("rows") or []
+    return {
+        "enabled": True,
+        "mode": "dynamic-market-scanner",
+        "updatedAt": datetime.now(UTC).isoformat(),
+        "refreshSeconds": DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS,
+        "maxSymbols": DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS,
+        "source": "last-good-cache",
+        "symbols": [r["symbol"] for r in rows if r.get("symbol")],
+        "rows": rows[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS],
+        "filters": {
+            "minPrice": DYNAMIC_MARKET_MIN_PRICE,
+            "maxPrice": DYNAMIC_MARKET_MAX_PRICE,
+            "minVolume": DYNAMIC_MARKET_MIN_VOLUME,
+            "maxSpread": DYNAMIC_MARKET_MAX_SPREAD,
+        },
+        "error": "Yahoo/API failed, using last good scan"
+                 + (f" | {' | '.join((errors or [])[-3:])}" if errors else ""),
+        "cacheType": "last-good-dynamic-scan",
+        "lastGoodSavedAt": data.get("savedAt") or data.get("updatedAt", ""),
+    }
+
+
 def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
     if not DYNAMIC_MARKET_SCANNER_ENABLED:
         data = {"enabled": False, "symbols": [], "rows": [], "source": "disabled", "updatedAt": datetime.now(UTC).isoformat(), "error": ""}
@@ -4376,7 +4439,15 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
 
     rows = sorted(rows_by_symbol.values(), key=lambda r: float(r.get("score") or 0), reverse=True)[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]
 
-    # Safe fallback keeps the bot tradable if external screener data is unavailable.
+    # If Yahoo/API fails or returns nothing, use the previous successful real scan first.
+    # This prevents 429 rate limits from knocking the bot back to fallback names.
+    if not rows:
+        cached = _last_good_dynamic_scan_payload(errors)
+        if cached:
+            return _save_dynamic_scanner_cache(cached)
+
+    # Safe fallback keeps the bot tradable if external screener data is unavailable
+    # and no previous good scan exists yet.
     if not rows:
         for i, sym in enumerate(QUALITY_ONLY_UNIVERSE[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]):
             rows.append({
@@ -4384,8 +4455,11 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
                 "score": round(50 - i, 4),
                 "reason": "dynamic scanner fallback | core quality universe",
                 "status": "active",
-                "dynamicPick": False,
+                "dynamicPick": True,
                 "source": "fallback",
+                "price": 0.0,
+                "changePct": 0.0,
+                "volume": 0,
             })
 
     payload = {
@@ -4405,6 +4479,10 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
         },
         "error": " | ".join(errors[-3:]),
     }
+
+    if rows and any(str(r.get("source", "")).lower() != "fallback" and r.get("volume") for r in rows):
+        _save_last_good_dynamic_scan(payload)
+
     return _save_dynamic_scanner_cache(payload)
 
 
@@ -4447,7 +4525,7 @@ def api_dynamic_market_scanner_refresh(request: Request):
         latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
     except Exception as e:
         print(f"DYNAMIC SCANNER STATUS UPDATE ERROR: {e}")
-    return {"ok": True, "message": "Dynamic market scanner refreshed with market-first scoring", "dynamicMarketScanner": payload, **payload}
+    return {"ok": True, "message": "Dynamic market scanner refreshed with market-first scoring and last-good cache", "dynamicMarketScanner": payload, **payload}
 
 
 # =========================
