@@ -62,6 +62,8 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [strategySaving, setStrategySaving] = useState(false);
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
   const [positionsSaving, setPositionsSaving] = useState(false);
+  const [buySizeMode, setBuySizeMode] = useState<"partial" | "full">("full");
+  const [buySizeSaving, setBuySizeSaving] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
   const lastFetchAt = useRef(0);
@@ -90,6 +92,7 @@ const [banking, setBanking] = useState<AnyObj>({});
   const dynamicPickCount = Number(data?.autoUniverse?.dynamicPickCount || dynamicRows.length || 0);
   const strategySettings = data?.strategySettings || {};
   const positionSettings = data?.positionSettings || {};
+  const buySizeSettings = data?.buySizeSettings || {};
   const strictnessLabels = ["Safe", "Balanced", "Aggressive"];
   const strictnessLabel = strictnessLabels[Math.max(0, Math.min(2, Number(strategyStrictness || 0)))] || "Safe";
 
@@ -108,6 +111,11 @@ const [banking, setBanking] = useState<AnyObj>({});
     const maxPos = Number(data?.positionSettings?.maxPositions ?? data?.maxPositions ?? data?.config?.maxPositions);
     if (Number.isFinite(maxPos) && maxPos > 0) setMaxPositionsInput(Math.max(1, Math.min(10, maxPos)));
   }, [data?.positionSettings?.maxPositions, data?.maxPositions, data?.config?.maxPositions]);
+
+  useEffect(() => {
+    const mode = String(data?.buySizeSettings?.mode || (data?.config?.fullBuyWhenOnePosition ? "full" : "partial")).toLowerCase();
+    if (mode === "partial" || mode === "full") setBuySizeMode(mode as "partial" | "full");
+  }, [data?.buySizeSettings?.mode, data?.config?.fullBuyWhenOnePosition]);
 
   
   const token = authToken || apiKey.trim();
@@ -471,6 +479,37 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
+  async function saveBuySizeMode(modeOverride?: "partial" | "full") {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+
+    const mode = modeOverride || buySizeMode;
+
+    setBuySizeSaving(true);
+    setMessage(`Saving buy size mode: ${mode === "full" ? "Full Buy" : "Partial Buy"}...`);
+
+    try {
+      const res = await fetch(`${API_URL}/buy-size-settings`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ mode }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save buy size mode");
+      setBuySizeMode(json?.mode === "partial" ? "partial" : "full");
+      setData(prev => ({ ...prev, buySizeSettings: json, config: { ...(prev?.config || {}), fullBuyWhenOnePosition: json?.fullBuyWhenOnePosition } }));
+      setMessage(json?.message || `Buy size mode set to ${json?.label || mode}.`);
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not save buy size mode.");
+    } finally {
+      setBuySizeSaving(false);
+    }
+  }
+
   async function refreshDynamicScanner() {
     if (!token) {
       setMessage("Please login first.");
@@ -828,6 +867,30 @@ const fetchData = useCallback(async (force = false) => {
           <button onClick={()=>saveMaxPositions()} disabled={positionsSaving}>{positionsSaving ? "Saving..." : `Save ${maxPositionsInput}`}</button>
         </div>
         <p className="muted">Lower numbers concentrate the bot into fewer holdings. If you already hold more than the new limit, the bot will stop opening new positions until holdings drop below it.</p>
+      </Card>
+      <Card title="Buy Size Mode">
+        <div className="summary">
+          <div><span>Current mode</span><b>{buySizeSettings?.label || (buySizeMode === "full" ? "Full Buy" : "Partial Buy")}</b></div>
+          <div><span>Max positions</span><b>{Number(positionSettings?.maxPositions ?? data?.maxPositions ?? 0)}</b></div>
+          <div><span>Next notional</span><b>{fmtGbp(Number(data?.newPositionNotional || 0))}</b></div>
+        </div>
+        <div className="actions">
+          <button
+            className={buySizeMode === "partial" ? "" : "ghost"}
+            onClick={()=>{setBuySizeMode("partial"); saveBuySizeMode("partial")}}
+            disabled={buySizeSaving}
+          >
+            Partial Buy
+          </button>
+          <button
+            className={buySizeMode === "full" ? "" : "ghost"}
+            onClick={()=>{setBuySizeMode("full"); saveBuySizeMode("full")}}
+            disabled={buySizeSaving}
+          >
+            Full Buy
+          </button>
+        </div>
+        <p className="muted">Partial keeps smaller position sizing. Full Buy uses nearly all capped buying power when Max Positions is 1.</p>
       </Card>
       <Card title="Dynamic Auto Universe" wide>
         <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
