@@ -4535,9 +4535,9 @@ def api_dynamic_market_scanner_refresh(request: Request):
 QUALITY_ONLY_MODE = os.getenv("QUALITY_ONLY_MODE", "true").lower() == "true"
 
 QUALITY_ONLY_UNIVERSE = [
-    "NVDA", "AMD", "MSFT", "AAPL", "META",
+    "RIVN", "NVDA", "AMD", "PYPL", "AAPL", "META",
     "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
-    "TSLA", "PLTR", "UBER", "QQQ", "SMH",
+    "INTC", "PLTR", "UBER", "QQQ", "NUVB"
 ]
 
 BLOCKED_WEAK_TICKERS = {
@@ -4809,9 +4809,10 @@ def force_quality_auto_universe_payload():
 
     if not symbols:
         symbols = [
-            "NVDA", "AMD", "MSFT", "AAPL", "META",
-            "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
-            "TSLA", "PLTR", "UBER", "QQQ", "SMH",
+                    "RIVN", "NVDA", "AMD", "PYPL", "AAPL", "META",
+                    "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
+                    "INTC", "PLTR", "UBER", "QQQ", "NUVB"
+
         ]
         rows = [
             {
