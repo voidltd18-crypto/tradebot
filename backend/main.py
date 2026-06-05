@@ -3696,18 +3696,6 @@ def reset_baseline(request: Request):
     except Exception as e:
         return {"ok": False, "message": str(e)}
 
-@app.post("/set-baseline")
-def set_baseline(request: Request, payload: dict = Body(...)):
-    verify_api_key(request)
-    try:
-        value = _safe_num(payload.get("baseline"), 0)
-        if value <= 0:
-            return {"ok": False, "message": "Baseline must be greater than 0"}
-        save_equity_baseline(value)
-        return {"ok": True, "message": f"Baseline manually set to ${value:.2f}", "baseline": value}
-    except Exception as e:
-        return {"ok": False, "message": str(e)}
-
 @app.get("/baseline")
 def get_baseline():
     return {"ok": True, "baseline": load_equity_baseline()}
