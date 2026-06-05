@@ -58,6 +58,7 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
   const [strategyStrictness, setStrategyStrictness] = useState<number>(0);
   const [strategySaving, setStrategySaving] = useState(false);
+  const [buySizeMode, setBuySizeMode] = useState<"full"|"partial">("full");
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
   const [positionsSaving, setPositionsSaving] = useState(false);
   const fetchSeq = useRef(0);
@@ -438,7 +439,19 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
-  async function saveMaxPositions(valueOverride?: number) {
+  
+  async function saveBuySizeMode(mode:"full"|"partial") {
+    const res = await api("/buy-size-mode", {
+      method:"POST",
+      body: JSON.stringify({mode})
+    });
+    setBuySizeMode(mode);
+    setMessage(`Buy mode set to ${mode}`);
+    fetchData(true);
+    return res;
+  }
+
+async function saveMaxPositions(valueOverride?: number) {
     if (!token) {
       setMessage("Please login first.");
       return;
@@ -876,6 +889,18 @@ const fetchData = useCallback(async (force = false) => {
         </div>
         <p className="muted">Lower numbers concentrate the bot into fewer holdings. If you already hold more than the new limit, the bot will stop opening new positions until holdings drop below it.</p>
       </Card>
+
+      <Card title="Buy Size Mode">
+        <div className="summary">
+          <div><span>Current Mode</span><b>{buySizeMode === "full" ? "Full Buy" : "Partial Buy"}</b></div>
+        </div>
+        <div className="actions">
+          <button className="ghost" onClick={()=>saveBuySizeMode("partial")}>Partial Buy</button>
+          <button onClick={()=>saveBuySizeMode("full")}>Full Buy</button>
+        </div>
+        <p className="muted">Full Buy uses most available capital when holding one position. Partial Buy spreads capital across positions.</p>
+      </Card>
+
       <Card title="Dynamic Auto Universe" wide>
         <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
         <div className="universe-counts">
@@ -889,7 +914,7 @@ const fetchData = useCallback(async (force = false) => {
       </>}
     </main>}
 
-    {tab==="reports" && <main>
+    {tab==="reports" && <main className="reports-page">
       <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
           <input
             className="input"
