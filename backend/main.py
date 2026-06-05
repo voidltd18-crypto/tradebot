@@ -45,7 +45,7 @@ from alpaca.data.requests import StockLatestQuoteRequest
 # =========================
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-DASHBOARD_API_KEY = os.getenv("DASHBOARD_API_KEY") or os.getenv("ADMIN_PASSWORD") or os.getenv("API_ACCESS_KEY") or ""
+DASHBOARD_API_KEY = os.getenv("DASHBOARD_API_KEY") or os.getenv("ADMIN_PASSWORD") or os.getenv("API_ACCESS_KEY") or "" or os.getenv("ADMIN_PASSWORD") or os.getenv("API_ACCESS_KEY") or ""
 
 PAPER = os.getenv("PAPER", "false").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -302,6 +302,146 @@ starting_equity_today: Optional[float] = None
 starting_equity_day: Optional[str] = None
 last_rotation_ts = 0
 fx_cache: Dict[str, Any] = {"rate": FX_FALLBACK_USD_TO_GBP, "updated": 0, "source": "fallback"}
+
+
+
+# =========================
+# DASHBOARD SETTINGS / PROFIT BANKING
+# =========================
+STATE_DIR = os.path.join("backend", "state")
+TRADING_CAP_FILE = os.path.join(STATE_DIR, "trading_cap.json")
+BASELINE_FILE = os.path.join(STATE_DIR, "equity_baseline.json")
+
+def _safe_num(v, default=0.0):
+    try:
+        return float(v or default)
+    except Exception:
+        return float(default)
+
+def _ensure_state_dir():
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+def _read_json_file(path: str, default: dict):
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"STATE READ ERROR {path}: {e}", flush=True)
+    return dict(default)
+
+def _write_json_file(path: str, payload: dict):
+    try:
+        _ensure_state_dir()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as e:
+        print(f"STATE WRITE ERROR {path}: {e}", flush=True)
+
+def load_trading_cap_gbp() -> float:
+    saved = _read_json_file(TRADING_CAP_FILE, {})
+    saved_cap = _safe_num(saved.get("capGbp"), 0)
+    if saved_cap > 0:
+        return saved_cap
+
+    env_gbp = _safe_num(os.getenv("MAX_TRADING_CAPITAL_GBP"), 0)
+    if env_gbp > 0:
+        return env_gbp
+
+    env_usd = _safe_num(os.getenv("MAX_TRADING_CAPITAL"), 0)
+    if env_usd > 0:
+        return money_gbp(env_usd) if "money_gbp" in globals() else env_usd
+
+    return 260.0
+
+def save_trading_cap_gbp(cap_gbp: float):
+    _write_json_file(TRADING_CAP_FILE, {
+        "capGbp": float(cap_gbp or 0),
+        "savedAt": datetime.now(UTC).isoformat(),
+    })
+
+def trading_cap_usd() -> float:
+    cap_gbp = load_trading_cap_gbp()
+    rate = get_usd_to_gbp_rate() if "get_usd_to_gbp_rate" in globals() else 0.78
+    if rate <= 0:
+        rate = 0.78
+    return float(cap_gbp) / float(rate)
+
+def effective_trading_equity(account_equity: float) -> float:
+    equity = _safe_num(account_equity, 0)
+    cap = trading_cap_usd()
+    if cap > 0:
+        return max(0.0, min(equity, cap))
+    return max(0.0, equity)
+
+def banking_payload():
+    try:
+        account = get_account()
+        equity = float(account.equity)
+    except Exception:
+        equity = 0.0
+
+    cap_gbp = load_trading_cap_gbp()
+    cap_usd = trading_cap_usd()
+    effective = effective_trading_equity(equity)
+    buffer_usd = max(0.0, equity - effective)
+    source = "saved" if _safe_num(_read_json_file(TRADING_CAP_FILE, {}).get("capGbp"), 0) > 0 else "env/default"
+
+    return {
+        "ok": True,
+        "enabled": cap_usd > 0,
+        "maxTradingCapital": cap_usd,
+        "maxTradingCapitalGbp": cap_gbp,
+        "tradingCapCurrency": "GBP",
+        "tradingCapSource": source,
+        "accountEquity": equity,
+        "accountEquityGbp": money_gbp(equity) if "money_gbp" in globals() else equity,
+        "effectiveTradingEquity": effective,
+        "effectiveTradingEquityGbp": money_gbp(effective) if "money_gbp" in globals() else effective,
+        "bankedProfitCashBuffer": buffer_usd,
+        "bankedProfitCashBufferGbp": money_gbp(buffer_usd) if "money_gbp" in globals() else buffer_usd,
+        "newPositionNotional": calculate_new_position_notional() if "calculate_new_position_notional" in globals() else 0,
+        "message": "Profit banking active" if cap_usd > 0 else "Profit banking disabled",
+    }
+
+def load_equity_baseline() -> float:
+    saved = _read_json_file(BASELINE_FILE, {})
+    return _safe_num(saved.get("baseline"), 0)
+
+def save_equity_baseline(value: float) -> None:
+    _write_json_file(BASELINE_FILE, {
+        "baseline": float(value or 0),
+        "resetAt": datetime.now(UTC).isoformat(),
+    })
+
+def strategy_settings_payload():
+    level = 1
+    try:
+        if A_PLUS_MIN_CONFIDENCE <= 0.58 or SNIPER_MIN_CONFIDENCE <= 0.52:
+            level = 2
+        elif A_PLUS_MIN_CONFIDENCE >= 0.72 or SNIPER_MIN_CONFIDENCE >= 0.65:
+            level = 0
+    except Exception:
+        level = 1
+    label = "Aggressive" if level == 2 else "Safe" if level == 0 else "Balanced"
+    return {
+        "ok": True,
+        "level": level,
+        "label": label,
+        "aPlusMinConfidence": A_PLUS_MIN_CONFIDENCE,
+        "sniperMinConfidence": SNIPER_MIN_CONFIDENCE,
+    }
+
+def position_settings_payload():
+    return {
+        "ok": True,
+        "maxPositions": MAX_POSITIONS,
+        "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
+        "fullBuyCashBuffer": FULL_BUY_CASH_BUFFER,
+    }
 
 
 # =========================
@@ -1095,28 +1235,26 @@ def calculate_new_position_notional():
     equity = float(account.equity)
     buying_power = float(account.buying_power)
 
-    # Profit banking cap now controls sizing. If account equity grows above
-    # the saved cap, new trade sizes are calculated from the capped amount,
-    # not full account equity.
     sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
 
     # Full-buy mode for one-position trading.
-    # Uses nearly all available capped trading capital/buying power, leaving a small buffer.
+    # Uses nearly all available capped trading capital/buying power, leaving a small cash buffer.
     if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
         usable_cash = max(0.0, buying_power - FULL_BUY_CASH_BUFFER)
         return round(max(0.0, min(sizing_equity, usable_cash)), 2)
 
+    # Partial-buy mode for multiple positions.
     target_value = sizing_equity * TARGET_POSITION_VALUE_PCT
     max_value = sizing_equity * MAX_POSITION_VALUE_PCT
     usable_cash = max(0.0, buying_power - CASH_BUFFER)
     return round(max(0.0, min(target_value, max_value, usable_cash)), 2)
 
 
+
 def confidence_notional(scan):
     base = calculate_new_position_notional()
 
-    # In one-position full-buy mode, do not downsize by confidence.
-    # The entry gates still control trade quality; this only changes allocation size.
+    # If max positions is 1, full-buy mode already controls sizing.
     if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
         return base
 
@@ -1126,12 +1264,13 @@ def confidence_notional(scan):
     confidence, label = calculate_confidence(scan)
     mult = HIGH_CONFIDENCE_SIZE_MULTIPLIER if label == "HIGH" else MEDIUM_CONFIDENCE_SIZE_MULTIPLIER if label == "MEDIUM" else LOW_CONFIDENCE_SIZE_MULTIPLIER
     try:
-        account_equity = float(get_account().equity)
-        sizing_equity = effective_trading_equity(account_equity) if "effective_trading_equity" in globals() else account_equity
+        equity = float(get_account().equity)
+        sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
     except Exception:
         sizing_equity = 0.0
     cap = sizing_equity * MAX_CONFIDENCE_POSITION_VALUE_PCT if sizing_equity > 0 else base
     return round(max(0.0, min(base * mult, cap)), 2)
+
 
 
 def can_buy_symbol(symbol: str):
@@ -3568,6 +3707,138 @@ def backfill_trades(request: Request):
         result = backfill_trades_from_alpaca_full()
         update_status(BOT_NAME, latest_scans)
         return result
+
+
+
+# =========================
+# REPORTS / BANKING / SETTINGS ROUTES
+# =========================
+
+@app.get("/banking-status")
+def api_banking_status():
+    return banking_payload()
+
+@app.post("/trading-cap")
+def api_set_trading_cap(payload: dict = Body(...), request: Request = None):
+    if request is not None:
+        verify_api_key(request)
+    cap_gbp = _safe_num(payload.get("capGbp") or payload.get("cap") or payload.get("value"), 0)
+    if cap_gbp <= 0:
+        raise HTTPException(status_code=400, detail="Invalid trading cap")
+    save_trading_cap_gbp(cap_gbp)
+    return banking_payload()
+
+@app.get("/baseline")
+def api_get_baseline():
+    return {"ok": True, "baseline": load_equity_baseline(), "baselineGbp": money_gbp(load_equity_baseline())}
+
+@app.post("/set-baseline")
+def api_set_baseline(payload: dict = Body(...), request: Request = None):
+    if request is not None:
+        verify_api_key(request)
+    value = _safe_num(payload.get("baseline") or payload.get("value"), 0)
+    if value <= 0:
+        raise HTTPException(status_code=400, detail="Invalid baseline")
+    save_equity_baseline(value)
+    return {"ok": True, "message": f"Baseline set to ${value:.2f}", "baseline": value, "baselineGbp": money_gbp(value)}
+
+@app.post("/reset-baseline")
+def api_reset_baseline(request: Request):
+    verify_api_key(request)
+    try:
+        equity = float(get_account().equity)
+    except Exception:
+        equity = _safe_num(latest_status.get("account", {}).get("equity"), 0)
+    save_equity_baseline(equity)
+    return {"ok": True, "message": f"Baseline reset to ${equity:.2f}", "baseline": equity, "baselineGbp": money_gbp(equity)}
+
+@app.get("/reports")
+def api_reports():
+    status = latest_status if isinstance(latest_status, dict) else {}
+    account = status.get("account") or {}
+    try:
+        live_account = get_account()
+        equity = float(live_account.equity)
+    except Exception:
+        equity = _safe_num(account.get("equity"), 0)
+
+    baseline = load_equity_baseline()
+    total_deposited = baseline if baseline > 0 else equity
+    deposit_source = "reset-baseline" if baseline > 0 else "equity-baseline"
+
+    total_withdrawn = _safe_num(os.getenv("TOTAL_WITHDRAWN_USD"), 0)
+    total_gain_loss = equity + total_withdrawn - total_deposited
+
+    closed = closed_trades_from_db(1000) if "closed_trades_from_db" in globals() else status.get("closedTrades", [])
+    timeline = trades_from_db(1000) if "trades_from_db" in globals() else status.get("tradeTimeline", [])
+    equity_history = []
+    daily = {}
+
+    for i, e in enumerate(timeline if isinstance(timeline, list) else []):
+        if not isinstance(e, dict):
+            continue
+        raw_time = e.get("time") or e.get("timestamp") or e.get("t") or ""
+        pnl = _safe_num(e.get("pnl"), 0)
+        day = str(raw_time)[:10] if raw_time else f"Session {i+1}"
+        daily[day] = daily.get(day, 0.0) + pnl
+        equity_history.append({
+            "idx": i,
+            "time": raw_time,
+            "symbol": e.get("symbol") or "",
+            "side": e.get("side") or "",
+            "equity": _safe_num(e.get("equity") or e.get("value"), equity),
+            "equityGbp": _safe_num(e.get("equityGbp") or money_gbp(_safe_num(e.get("equity") or e.get("value"), equity))),
+            "pnl": pnl,
+            "pnlGbp": _safe_num(e.get("pnlGbp") or money_gbp(pnl)),
+            "pnlPct": _safe_num(e.get("pnlPct"), 0),
+            "reason": e.get("reason") or "",
+        })
+
+    daily_pnl = [{"day": k, "pnl": v, "pnlGbp": money_gbp(v)} for k, v in sorted(daily.items())]
+
+    return {
+        "ok": True,
+        "depositSource": deposit_source,
+        "totalDeposited": total_deposited,
+        "totalDepositedGbp": money_gbp(total_deposited),
+        "totalWithdrawn": total_withdrawn,
+        "currentEquity": equity,
+        "currentEquityGbp": money_gbp(equity),
+        "totalGainLoss": total_gain_loss,
+        "totalGainLossGbp": money_gbp(total_gain_loss),
+        "earnedSinceDeposit": max(total_gain_loss, 0.0),
+        "lostSinceDeposit": abs(min(total_gain_loss, 0.0)),
+        "equityHistory": equity_history,
+        "dailyPnl": daily_pnl,
+        "closedTrades": closed,
+    }
+
+@app.post("/strategy-settings")
+def api_strategy_settings(payload: dict = Body(...), request: Request = None):
+    if request is not None:
+        verify_api_key(request)
+    global A_PLUS_MIN_CONFIDENCE, SNIPER_MIN_CONFIDENCE
+    level = int(_safe_num(payload.get("level"), 1))
+    level = max(0, min(2, level))
+    if level == 0:
+        A_PLUS_MIN_CONFIDENCE = 0.72
+        SNIPER_MIN_CONFIDENCE = 0.65
+    elif level == 2:
+        A_PLUS_MIN_CONFIDENCE = 0.55
+        SNIPER_MIN_CONFIDENCE = 0.50
+    else:
+        A_PLUS_MIN_CONFIDENCE = 0.65
+        SNIPER_MIN_CONFIDENCE = 0.58
+    return {**strategy_settings_payload(), "message": f"Trading strictness set to {strategy_settings_payload()['label']}"}
+
+@app.post("/position-settings")
+def api_position_settings(payload: dict = Body(...), request: Request = None):
+    if request is not None:
+        verify_api_key(request)
+    global MAX_POSITIONS
+    value = int(_safe_num(payload.get("maxPositions"), MAX_POSITIONS))
+    MAX_POSITIONS = max(1, min(10, value))
+    return {**position_settings_payload(), "message": f"Max positions set to {MAX_POSITIONS}"}
 
 
 # =========================
