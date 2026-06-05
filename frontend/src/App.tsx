@@ -56,13 +56,10 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [replayCapInput, setReplayCapInput] = useState<string>("");
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
-  const [manualBaselineInput, setManualBaselineInput] = useState<string>("");
-  const [baselineSaving, setBaselineSaving] = useState(false);
   const [strategyStrictness, setStrategyStrictness] = useState<number>(0);
   const [strategySaving, setStrategySaving] = useState(false);
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
   const [positionsSaving, setPositionsSaving] = useState(false);
-  const [buyModeSaving, setBuyModeSaving] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
   const lastFetchAt = useRef(0);
@@ -472,42 +469,6 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
-  async function setBuySizeMode(mode: "partial" | "full") {
-    if (!token) {
-      setMessage("Please login first.");
-      return;
-    }
-
-    setBuyModeSaving(true);
-    setMessage(`Setting buy mode to ${mode === "full" ? "Full Buy" : "Partial Buy"}...`);
-
-    try {
-      const res = await fetch(`${API_URL}/buy-size-mode`, {
-        method: "POST",
-        headers: { ...secureHeaders, "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({ mode }),
-      });
-      const json = await readJson(res);
-      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not set buy mode");
-
-      setData(prev => ({
-        ...prev,
-        config: {
-          ...(prev?.config || {}),
-          fullBuyWhenOnePosition: json?.fullBuyWhenOnePosition,
-        },
-      }));
-
-      setMessage(json?.message || "Buy size mode updated.");
-      await fetchData(true);
-    } catch (e:any) {
-      setMessage(e?.message || "Could not set buy mode.");
-    } finally {
-      setBuyModeSaving(false);
-    }
-  }
-
   async function refreshDynamicScanner() {
     if (!token) {
       setMessage("Please login first.");
@@ -572,45 +533,47 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
-  async function resetBaseline() {
-    if (!confirm("Reset PnL baseline to current equity? This only resets reporting.")) return;
-    await action("/reset-baseline");
-  }
-
   async function setManualBaseline() {
     if (!token) {
       setMessage("Please login first.");
       return;
     }
 
-    const valueGbp = Number(manualBaselineInput);
-    if (!Number.isFinite(valueGbp) || valueGbp <= 0) {
-      setMessage("Enter a valid baseline amount in GBP.");
+    const gbpValue = Number(manualBaselineInput);
+    if (!Number.isFinite(gbpValue) || gbpValue <= 0) {
+      setMessage("Enter a valid GBP baseline value.");
       return;
     }
 
-    const fxRate = Number(rate || 0.7403);
-    const valueUsd = fxRate > 0 ? valueGbp / fxRate : valueGbp;
+    const fx = Number(data?.fx?.usdToGbp || 0.745);
+    const usdValue = fx > 0 ? gbpValue / fx : gbpValue;
 
     setBaselineSaving(true);
-    setMessage(`Setting baseline to £${valueGbp.toFixed(2)}...`);
+    setMessage(`Setting baseline to £${gbpValue.toFixed(2)}...`);
 
     try {
       const res = await fetch(`${API_URL}/set-baseline`, {
         method: "POST",
         headers: { ...secureHeaders, "Content-Type": "application/json" },
         cache: "no-store",
-        body: JSON.stringify({ baseline: valueUsd }),
+        body: JSON.stringify({ baseline: usdValue }),
       });
       const json = await readJson(res);
       if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not set baseline");
-      setMessage(`Baseline set to about £${valueGbp.toFixed(2)}.`);
+
+      setMessage(`Baseline set to about £${gbpValue.toFixed(2)}.`);
+      await fetchReports();
       await fetchData(true);
     } catch (e:any) {
       setMessage(e?.message || "Could not set baseline.");
     } finally {
       setBaselineSaving(false);
     }
+  }
+
+  async function resetBaseline() {
+    if (!confirm("Reset PnL baseline to current equity? This only resets reporting.")) return;
+    await action("/reset-baseline");
   }
 
   function chartLabel(raw:any, i:number) {
@@ -866,30 +829,6 @@ const fetchData = useCallback(async (force = false) => {
         </div>
         <p className="muted">Lower numbers concentrate the bot into fewer holdings. If you already hold more than the new limit, the bot will stop opening new positions until holdings drop below it.</p>
       </Card>
-      <Card title="Buy Size Mode">
-        <div className="summary">
-          <div><span>Current mode</span><b>{data?.config?.fullBuyWhenOnePosition ? "Full Buy" : "Partial Buy"}</b></div>
-          <div><span>Max positions</span><b>{Number(data?.maxPositions ?? data?.config?.maxPositions ?? 0)}</b></div>
-          <div><span>Next buy</span><b>{usd(data?.newPositionNotional)}</b></div>
-        </div>
-        <div className="actions">
-          <button
-            className={!data?.config?.fullBuyWhenOnePosition ? "" : "ghost"}
-            onClick={()=>setBuySizeMode("partial")}
-            disabled={buyModeSaving}
-          >
-            Partial Buy
-          </button>
-          <button
-            className={data?.config?.fullBuyWhenOnePosition ? "" : "ghost"}
-            onClick={()=>setBuySizeMode("full")}
-            disabled={buyModeSaving}
-          >
-            Full Buy
-          </button>
-        </div>
-        <p className="muted">Partial uses normal confidence sizing. Full Buy uses nearly all capped buying power when Max Positions is 1.</p>
-      </Card>
       <Card title="Dynamic Auto Universe" wide>
         <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
         <div className="universe-counts">
@@ -904,20 +843,16 @@ const fetchData = useCallback(async (force = false) => {
     </main>}
 
     {tab==="reports" && <main>
-      <div className="actions report-actions">
-        <button onClick={() => fetchData(true)}>Refresh Reports</button>
-        <button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
-        <input
-          value={manualBaselineInput}
-          onChange={e=>setManualBaselineInput(e.target.value)}
-          placeholder="Baseline £"
-          inputMode="decimal"
-          style={{maxWidth: "130px"}}
-        />
-        <button onClick={setManualBaseline} disabled={baselineSaving}>
-          {baselineSaving ? "Saving..." : "Set Manual Baseline"}
-        </button>
-      </div>
+      <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
+          <input
+            className="input"
+            placeholder="Baseline £ e.g. 989.86"
+            value={manualBaselineInput}
+            onChange={e=>setManualBaselineInput(e.target.value)}
+          />
+          <button onClick={setManualBaseline} disabled={baselineSaving}>
+            {baselineSaving ? "Saving..." : "Set Manual Baseline"}
+          </button></div>
       <section className="stats">
         <Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={`${usd(totalDeposited)} · ${reports.depositSource ? `Source: ${reports.depositSource}` : ""}`} />
         <Stat label="Earned Since Deposit" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)} />
