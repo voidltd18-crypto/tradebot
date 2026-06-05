@@ -56,8 +56,6 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [replayCapInput, setReplayCapInput] = useState<string>("");
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
-  const [manualBaselineInput, setManualBaselineInput] = useState<string>("");
-  const [baselineSaving, setBaselineSaving] = useState(false);
   const [strategyStrictness, setStrategyStrictness] = useState<number>(0);
   const [strategySaving, setStrategySaving] = useState(false);
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
@@ -535,23 +533,7 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
-  
-  async function fetchReports() {
-    try {
-      const res = await fetch(`${API_URL}/reports`, {
-        cache: "no-store",
-        headers: secureHeaders,
-      });
-      const json = await readJson(res);
-      if (json && typeof json === "object") setReports(prev => ({ ...prev, ...json }));
-      return json;
-    } catch (e) {
-      console.error("Reports refresh failed", e);
-      return null;
-    }
-  }
-
-async function setManualBaseline() {
+  async function setManualBaseline() {
     if (!token) {
       setMessage("Please login first.");
       return;
@@ -716,6 +698,57 @@ async function setManualBaseline() {
   }
 
   return <div className="app">
+
+      <style>{`
+        /* EMERGENCY_REPORTS_DARK_FIX */
+        .reports-page,
+        .dark-reports {
+          background: #070b18 !important;
+          color: #eaf1ff !important;
+          min-height: 100vh !important;
+        }
+        .reports-page *,
+        .dark-reports * {
+          color: inherit;
+        }
+        .reports-page .card,
+        .dark-reports .card,
+        .reports-page section,
+        .dark-reports section {
+          background: #11182a !important;
+          color: #eaf1ff !important;
+          border-color: #26324a !important;
+        }
+        .reports-page input,
+        .dark-reports input,
+        .reports-page select,
+        .dark-reports select {
+          background: #070b18 !important;
+          color: #eaf1ff !important;
+          border: 1px solid #26324a !important;
+        }
+        .reports-page table,
+        .dark-reports table,
+        .reports-page thead,
+        .dark-reports thead,
+        .reports-page tbody,
+        .dark-reports tbody,
+        .reports-page tr,
+        .dark-reports tr,
+        .reports-page td,
+        .dark-reports td,
+        .reports-page th,
+        .dark-reports th {
+          background: #070b18 !important;
+          color: #eaf1ff !important;
+          border-color: #26324a !important;
+        }
+        .reports-page .muted,
+        .dark-reports .muted {
+          color: #9aa7bd !important;
+        }
+      `}</style>
+
     <header className="topbar">
       <div><p className="eyebrow">Rebuilt Sniper Profit Bot</p><h1>TradeBot</h1></div>
       <div className="pills">
@@ -860,7 +893,7 @@ async function setManualBaseline() {
       </>}
     </main>}
 
-    {tab==="reports" && <main className="reports-page">}
+    {tab==="reports" && <main className="reports-page dark-reports">}
       <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
           <input
             className="input"
@@ -872,7 +905,6 @@ async function setManualBaseline() {
             {baselineSaving ? "Saving..." : "Set Manual Baseline"}
           </button></div>
       <section className="stats">
-        <Stat label="Baseline Source" value={reports.depositSource || "—"} sub={reports.totalDeposited ? `${gbp(Number(reports.totalDeposited || 0) * rate)} baseline` : "Set manual baseline if needed"} />
         <Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={`${usd(totalDeposited)} · ${reports.depositSource ? `Source: ${reports.depositSource}` : ""}`} />
         <Stat label="Earned Since Deposit" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)} />
         <Stat label="Lost Since Deposit" value={gbp(lost * rate)} sub={usd(lost)} className="loss" />
