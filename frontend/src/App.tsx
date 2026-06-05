@@ -56,6 +56,8 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [replayCapInput, setReplayCapInput] = useState<string>("");
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
+  const [manualBaselineInput, setManualBaselineInput] = useState<string>("");
+  const [baselineSaving, setBaselineSaving] = useState(false);
   const [strategyStrictness, setStrategyStrictness] = useState<number>(0);
   const [strategySaving, setStrategySaving] = useState(false);
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
@@ -533,7 +535,23 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
-  async function setManualBaseline() {
+  
+  async function fetchReports() {
+    try {
+      const res = await fetch(`${API_URL}/reports`, {
+        cache: "no-store",
+        headers: secureHeaders,
+      });
+      const json = await readJson(res);
+      if (json && typeof json === "object") setReports(prev => ({ ...prev, ...json }));
+      return json;
+    } catch (e) {
+      console.error("Reports refresh failed", e);
+      return null;
+    }
+  }
+
+async function setManualBaseline() {
     if (!token) {
       setMessage("Please login first.");
       return;
@@ -842,7 +860,7 @@ const fetchData = useCallback(async (force = false) => {
       </>}
     </main>}
 
-    {tab==="reports" && <main>
+    {tab==="reports" && <main className="reports-page">}
       <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
           <input
             className="input"
@@ -854,6 +872,7 @@ const fetchData = useCallback(async (force = false) => {
             {baselineSaving ? "Saving..." : "Set Manual Baseline"}
           </button></div>
       <section className="stats">
+        <Stat label="Baseline Source" value={reports.depositSource || "—"} sub={reports.totalDeposited ? `${gbp(Number(reports.totalDeposited || 0) * rate)} baseline` : "Set manual baseline if needed"} />
         <Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={`${usd(totalDeposited)} · ${reports.depositSource ? `Source: ${reports.depositSource}` : ""}`} />
         <Stat label="Earned Since Deposit" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)} />
         <Stat label="Lost Since Deposit" value={gbp(lost * rate)} sub={usd(lost)} className="loss" />
