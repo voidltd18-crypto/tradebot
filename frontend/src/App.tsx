@@ -707,10 +707,6 @@ const fetchData = useCallback(async (force = false) => {
           color: #eaf1ff !important;
           min-height: 100vh !important;
         }
-        .reports-page *,
-        .dark-reports * {
-          color: inherit;
-        }
         .reports-page .card,
         .dark-reports .card,
         .reports-page section,
@@ -893,7 +889,7 @@ const fetchData = useCallback(async (force = false) => {
       </>}
     </main>}
 
-    {tab==="reports" && <main className="reports-page dark-reports">}
+    {tab==="reports" && <main>
       <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
           <input
             className="input"
