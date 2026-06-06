@@ -56,10 +56,12 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [replayCapInput, setReplayCapInput] = useState<string>("");
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
+  const [manualBaselineInput, setManualBaselineInput] = useState<string>("");
+  const [baselineSaving, setBaselineSaving] = useState(false);
   const [strategyStrictness, setStrategyStrictness] = useState<number>(0);
   const [strategySaving, setStrategySaving] = useState(false);
-  const [buySizeMode, setBuySizeMode] = useState<"full"|"partial">("full");
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
+  const [buySizeMode, setBuySizeMode] = useState<"full"|"partial">("full");
   const [positionsSaving, setPositionsSaving] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
@@ -441,14 +443,22 @@ const fetchData = useCallback(async (force = false) => {
 
   
   async function saveBuySizeMode(mode:"full"|"partial") {
-    const res = await api("/buy-size-mode", {
-      method:"POST",
-      body: JSON.stringify({mode})
-    });
-    setBuySizeMode(mode);
-    setMessage(`Buy mode set to ${mode}`);
-    fetchData(true);
-    return res;
+    try {
+      setMessage(`Saving ${mode === "full" ? "Full Buy" : "Partial Buy"} mode...`);
+      const res = await fetch(`${API_URL}/buy-size-mode`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ mode }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save buy size mode");
+      setBuySizeMode(mode);
+      setMessage(json?.message || `Buy size mode set to ${mode}.`);
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not save buy size mode.");
+    }
   }
 
 async function saveMaxPositions(valueOverride?: number) {
@@ -713,6 +723,37 @@ async function saveMaxPositions(valueOverride?: number) {
   return <div className="app">
 
       <style>{`
+        /* REPORTS_FORCE_DARK_RUNTIME_FIX */
+        .reports-page {
+          background: #070b18 !important;
+          color: #eaf1ff !important;
+          min-height: 100vh !important;
+        }
+        .reports-page .card,
+        .reports-page section {
+          background: #11182a !important;
+          color: #eaf1ff !important;
+          border-color: #26324a !important;
+        }
+        .reports-page input,
+        .reports-page select,
+        .reports-page table,
+        .reports-page thead,
+        .reports-page tbody,
+        .reports-page tr,
+        .reports-page td,
+        .reports-page th {
+          background: #070b18 !important;
+          color: #eaf1ff !important;
+          border-color: #26324a !important;
+        }
+        .reports-page .muted {
+          color: #9aa7bd !important;
+        }
+      `}</style>
+
+
+      <style>{`
         /* EMERGENCY_REPORTS_DARK_FIX */
         .reports-page,
         .dark-reports {
@@ -892,13 +933,14 @@ async function saveMaxPositions(valueOverride?: number) {
 
       <Card title="Buy Size Mode">
         <div className="summary">
-          <div><span>Current Mode</span><b>{buySizeMode === "full" ? "Full Buy" : "Partial Buy"}</b></div>
+          <div><span>Current mode</span><b>{buySizeMode === "full" ? "Full Buy" : "Partial Buy"}</b></div>
+          <div><span>Best with</span><b>{buySizeMode === "full" ? "Max Positions = 1" : "Max Positions > 1"}</b></div>
         </div>
         <div className="actions">
-          <button className="ghost" onClick={()=>saveBuySizeMode("partial")}>Partial Buy</button>
-          <button onClick={()=>saveBuySizeMode("full")}>Full Buy</button>
+          <button className={buySizeMode === "partial" ? "active" : "ghost"} onClick={()=>saveBuySizeMode("partial")}>Partial Buy</button>
+          <button className={buySizeMode === "full" ? "active" : "ghost"} onClick={()=>saveBuySizeMode("full")}>Full Buy</button>
         </div>
-        <p className="muted">Full Buy uses most available capital when holding one position. Partial Buy spreads capital across positions.</p>
+        <p className="muted">Full Buy uses most available capped capital for one position. Partial Buy splits capital across several smaller positions.</p>
       </Card>
 
       <Card title="Dynamic Auto Universe" wide>
