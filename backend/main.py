@@ -87,8 +87,7 @@ CASH_BUFFER = 0.50
 # Full-buy mode:
 # When max positions is 1, use nearly all available trading capital/buying power
 # instead of small partial sizing.
-BUY_SIZE_MODE = os.getenv("BUY_SIZE_MODE", "full").lower()
-FULL_BUY_WHEN_ONE_POSITION = BUY_SIZE_MODE == "full" or os.getenv("FULL_BUY_WHEN_ONE_POSITION", "true").lower() == "true"
+FULL_BUY_WHEN_ONE_POSITION = os.getenv("FULL_BUY_WHEN_ONE_POSITION", "true").lower() == "true"
 FULL_BUY_CASH_BUFFER = float(os.getenv("FULL_BUY_CASH_BUFFER", "2.00") or 2.00)
 
 MAX_SPREAD = 0.015
@@ -330,6 +329,44 @@ def verify_api_key(request: Request):
     if key != DASHBOARD_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+
+
+
+# =========================
+# BASELINE STORAGE FIX
+# =========================
+BASELINE_STATE_DIR = os.path.join("backend", "state")
+BASELINE_STATE_FILE = os.path.join(BASELINE_STATE_DIR, "equity_baseline.json")
+
+def _baseline_num(v, default=0.0):
+    try:
+        return float(v or default)
+    except Exception:
+        return float(default)
+
+def get_saved_baseline():
+    try:
+        if os.path.exists(BASELINE_STATE_FILE):
+            with open(BASELINE_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return _baseline_num(data.get("baseline"), 0.0)
+    except Exception as e:
+        print(f"BASELINE READ ERROR: {e}", flush=True)
+    return 0.0
+
+def save_saved_baseline(value: float):
+    try:
+        os.makedirs(BASELINE_STATE_DIR, exist_ok=True)
+        payload = {
+            "baseline": float(value),
+            "savedAt": datetime.now(UTC).isoformat() if "datetime" in globals() else "",
+        }
+        with open(BASELINE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return payload
+    except Exception as e:
+        print(f"BASELINE SAVE ERROR: {e}", flush=True)
+        raise
 
 @app.post("/login")
 def login(payload: dict = Body(...)):
@@ -3383,30 +3420,6 @@ def api_get_position_settings():
     return current_position_settings_payload()
 
 
-
-
-@app.post("/buy-size-mode")
-def api_buy_size_mode(payload: dict = Body(...), request: Request = None):
-    if request is not None:
-        verify_api_key(request)
-
-    global FULL_BUY_WHEN_ONE_POSITION, BUY_SIZE_MODE
-
-    mode = str(payload.get("mode", "")).lower().strip()
-    if mode not in ("partial", "full"):
-        raise HTTPException(status_code=400, detail="mode must be partial or full")
-
-    BUY_SIZE_MODE = mode
-    FULL_BUY_WHEN_ONE_POSITION = mode == "full"
-
-    return {
-        "ok": True,
-        "message": f"Buy size mode set to {mode}",
-        "buySizeMode": mode,
-        "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
-        "positionSettings": position_settings_payload() if "position_settings_payload" in globals() else {},
-    }
-
 @app.post("/position-settings")
 def api_set_position_settings(request: Request, payload: dict = Body(...)):
     verify_api_key(request)
@@ -3725,6 +3738,57 @@ def reset_baseline(request: Request):
 def get_baseline():
     return {"ok": True, "baseline": load_equity_baseline()}
 
+
+
+@app.get("/baseline")
+def api_get_baseline():
+    baseline = get_saved_baseline()
+    return {
+        "ok": True,
+        "baseline": baseline,
+        "baselineGbp": money_gbp(baseline) if "money_gbp" in globals() else baseline,
+        "source": "saved" if baseline > 0 else "none",
+    }
+
+@app.post("/set-baseline")
+def api_set_baseline(payload: dict = Body(...), request: Request = None):
+    if request is not None:
+        verify_api_key(request)
+
+    value = _baseline_num(payload.get("baseline") or payload.get("value") or payload.get("amount"), 0.0)
+    if value <= 0:
+        raise HTTPException(status_code=400, detail="Invalid baseline")
+
+    saved = save_saved_baseline(value)
+    return {
+        "ok": True,
+        "message": f"Baseline saved at ${value:.2f}",
+        "baseline": value,
+        "baselineGbp": money_gbp(value) if "money_gbp" in globals() else value,
+        "saved": saved,
+    }
+
+@app.post("/reset-baseline")
+def api_reset_baseline(request: Request = None):
+    if request is not None:
+        verify_api_key(request)
+
+    try:
+        account = get_account()
+        equity = float(account.equity)
+    except Exception:
+        equity = 0.0
+
+    saved = save_saved_baseline(equity)
+    return {
+        "ok": True,
+        "message": f"Baseline reset to current equity ${equity:.2f}",
+        "baseline": equity,
+        "baselineGbp": money_gbp(equity) if "money_gbp" in globals() else equity,
+        "saved": saved,
+    }
+
+
 @app.get("/reports")
 def reports():
     status = latest_status if isinstance(latest_status, dict) else {}
@@ -3733,7 +3797,7 @@ def reports():
     equity = _safe_num(account.get("equity"))
     equity_gbp = _safe_num(account.get("equityGbp"))
     total_withdrawn = _safe_num(globals().get("TOTAL_WITHDRAWN_USD", 0))
-    baseline = load_equity_baseline()
+    baseline = get_saved_baseline() if "get_saved_baseline" in globals() else load_equity_baseline()
     total_deposited = baseline if baseline > 0 else _safe_num(globals().get("TOTAL_DEPOSITED_USD", 0))
     deposit_source = "reset-baseline" if baseline > 0 else "env"
     if total_deposited <= 0:
