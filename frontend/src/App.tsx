@@ -534,88 +534,10 @@ const fetchData = useCallback(async (force = false) => {
   }
 
   async function setManualBaseline() {
-    try {
-      setBaselineSaving(true);
-      const raw = String(manualBaselineInput || "").trim().replace("£", "").replace("$", "");
-      const value = Number(raw);
-
-      if (!value || value <= 0) {
-        setMessage("Enter a valid baseline amount.");
-        return;
-      }
-
-      const token = authToken || apiKey || localStorage.getItem("tradebot_auth_token") || localStorage.getItem("dashboard_api_key") || "";
-      const res = await fetch(`${API_URL}/set-baseline`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": token,
-          "X-Auth-Token": token,
-        },
-        cache: "no-store",
-        body: JSON.stringify({ baseline: value }),
-      });
-
-      const json = await readJson(res);
-      if (!res.ok || json?.ok === false) {
-        throw new Error(json?.detail || json?.message || "Could not save baseline");
-      }
-
-      setMessage(json?.message || "Baseline saved.");
-      setReports(prev => ({
-        ...prev,
-        totalDeposited: json.baseline,
-        totalDepositedGbp: json.baselineGbp,
-        depositSource: "saved",
-      }));
-
-      await fetchReports?.();
-      await fetchData(true);
-      setTimeout(() => fetchReports?.(), 1500);
-    } catch (e:any) {
-      setMessage(e?.message || "Could not save baseline.");
-    } finally {
-      setBaselineSaving(false);
+    if (!token) {
+      setMessage("Please login first.");
+      return;
     }
-  }
-
-
-
-  async function resetBaselineToCurrentEquity() {
-    try {
-      setBaselineSaving(true);
-      const token = authToken || apiKey || localStorage.getItem("tradebot_auth_token") || localStorage.getItem("dashboard_api_key") || "";
-      const res = await fetch(`${API_URL}/reset-baseline`, {
-        method: "POST",
-        headers: {
-          "x-api-key": token,
-          "X-Auth-Token": token,
-        },
-        cache: "no-store",
-      });
-
-      const json = await readJson(res);
-      if (!res.ok || json?.ok === false) {
-        throw new Error(json?.detail || json?.message || "Could not reset baseline");
-      }
-
-      setMessage(json?.message || "Baseline reset.");
-      setReports(prev => ({
-        ...prev,
-        totalDeposited: json.baseline,
-        totalDepositedGbp: json.baselineGbp,
-        depositSource: "saved",
-      }));
-
-      await fetchReports?.();
-      await fetchData(true);
-      setTimeout(() => fetchReports?.(), 1500);
-    } catch (e:any) {
-      setMessage(e?.message || "Could not reset baseline.");
-    } finally {
-      setBaselineSaving(false);
-    }
-  }
 
     const gbpValue = Number(manualBaselineInput);
     if (!Number.isFinite(gbpValue) || gbpValue <= 0) {
@@ -776,6 +698,53 @@ const fetchData = useCallback(async (force = false) => {
   }
 
   return <div className="app">
+
+      <style>{`
+        /* EMERGENCY_REPORTS_DARK_FIX */
+        .reports-page,
+        .dark-reports {
+          background: #070b18 !important;
+          color: #eaf1ff !important;
+          min-height: 100vh !important;
+        }
+        .reports-page .card,
+        .dark-reports .card,
+        .reports-page section,
+        .dark-reports section {
+          background: #11182a !important;
+          color: #eaf1ff !important;
+          border-color: #26324a !important;
+        }
+        .reports-page input,
+        .dark-reports input,
+        .reports-page select,
+        .dark-reports select {
+          background: #070b18 !important;
+          color: #eaf1ff !important;
+          border: 1px solid #26324a !important;
+        }
+        .reports-page table,
+        .dark-reports table,
+        .reports-page thead,
+        .dark-reports thead,
+        .reports-page tbody,
+        .dark-reports tbody,
+        .reports-page tr,
+        .dark-reports tr,
+        .reports-page td,
+        .dark-reports td,
+        .reports-page th,
+        .dark-reports th {
+          background: #070b18 !important;
+          color: #eaf1ff !important;
+          border-color: #26324a !important;
+        }
+        .reports-page .muted,
+        .dark-reports .muted {
+          color: #9aa7bd !important;
+        }
+      `}</style>
+
     <header className="topbar">
       <div><p className="eyebrow">Rebuilt Sniper Profit Bot</p><h1>TradeBot</h1></div>
       <div className="pills">
