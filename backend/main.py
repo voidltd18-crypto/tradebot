@@ -1,6 +1,5 @@
 import os
 import secrets
-import hashlib
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "200") or 200)
 
 import sqlite3
@@ -334,66 +333,91 @@ def verify_api_key(request: Request):
 
 
 
-# =========================
-# LOGIN ROUTES
-# =========================
+def buy_size_preview_payload():
+    try:
+        account = get_account()
+        equity = float(getattr(account, "equity", 0) or 0)
+        buying_power = float(getattr(account, "buying_power", 0) or 0)
+    except Exception:
+        equity = 0.0
+        buying_power = 0.0
 
-def _login_token(username: str) -> str:
-    secret = os.getenv("AUTH_SECRET") or os.getenv("ADMIN_PASSWORD") or os.getenv("DASHBOARD_API_KEY") or os.getenv("API_ACCESS_KEY") or "tradebot"
-    return hashlib.sha256(f"{username}:{secret}".encode("utf-8")).hexdigest()
+    try:
+        max_positions = int(MAX_POSITIONS)
+    except Exception:
+        max_positions = 1
 
-@app.post("/login")
-def login(payload: dict = Body(...)):
-    username = str(payload.get("username", "")).strip()
-    password = str(payload.get("password", ""))
+    try:
+        open_positions = len(get_positions())
+    except Exception:
+        try:
+            open_positions = len(get_all_positions())
+        except Exception:
+            open_positions = 0
 
-    admin_username = os.getenv("ADMIN_USERNAME", "admin")
-    admin_password = (
-        os.getenv("ADMIN_PASSWORD")
-        or os.getenv("DASHBOARD_API_KEY")
-        or os.getenv("API_ACCESS_KEY")
-        or ""
-    )
+    try:
+        capped_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
+    except Exception:
+        capped_equity = equity
 
-    if not admin_password:
-        raise HTTPException(status_code=503, detail="Admin password not configured")
+    try:
+        cash_buffer = float(CASH_BUFFER)
+    except Exception:
+        cash_buffer = 0.50
 
-    if not secrets.compare_digest(username, admin_username) or not secrets.compare_digest(password, admin_password):
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+    try:
+        full_buffer = float(FULL_BUY_CASH_BUFFER) if "FULL_BUY_CASH_BUFFER" in globals() else 2.00
+    except Exception:
+        full_buffer = 2.00
 
-    token = os.getenv("DASHBOARD_API_KEY") or os.getenv("API_ACCESS_KEY") or admin_password or _login_token(username)
+    usable_partial_cash = max(0.0, buying_power - cash_buffer)
+    usable_full_cash = max(0.0, buying_power - full_buffer)
+
+    partial_by_slots = capped_equity / max(1, max_positions)
+    partial_usd = max(0.0, min(partial_by_slots, usable_partial_cash))
+    full_usd = max(0.0, min(capped_equity, usable_full_cash))
+
+    try:
+        partial_gbp = money_gbp(partial_usd)
+        full_gbp = money_gbp(full_usd)
+        capped_gbp = money_gbp(capped_equity)
+        buying_power_gbp = money_gbp(buying_power)
+    except Exception:
+        partial_gbp = partial_usd
+        full_gbp = full_usd
+        capped_gbp = capped_equity
+        buying_power_gbp = buying_power
+
+    mode = "full" if (FULL_BUY_WHEN_ONE_POSITION if "FULL_BUY_WHEN_ONE_POSITION" in globals() else True) else "partial"
+    if "load_buy_size_mode" in globals():
+        try:
+            mode = load_buy_size_mode()
+        except Exception:
+            pass
 
     return {
         "ok": True,
-        "token": token,
-        "username": username,
+        "mode": mode,
+        "partialUsd": round(partial_usd, 2),
+        "partialGbp": round(partial_gbp, 2),
+        "fullUsd": round(full_usd, 2),
+        "fullGbp": round(full_gbp, 2),
+        "cappedEquityUsd": round(capped_equity, 2),
+        "cappedEquityGbp": round(capped_gbp, 2),
+        "buyingPowerUsd": round(buying_power, 2),
+        "buyingPowerGbp": round(buying_power_gbp, 2),
+        "maxPositions": max_positions,
+        "openPositions": open_positions,
+        "remainingSlots": max(0, max_positions - open_positions),
+        "cashBufferUsd": cash_buffer,
+        "fullBuyCashBufferUsd": full_buffer,
     }
 
-@app.get("/auth-check")
-def auth_check(request: Request):
-    key = (
-        request.headers.get("x-api-key")
-        or request.headers.get("X-API-Key")
-        or request.headers.get("X-Auth-Token")
-        or request.query_params.get("api_key")
-        or request.query_params.get("token")
-        or ""
-    )
 
-    expected = (
-        os.getenv("DASHBOARD_API_KEY")
-        or os.getenv("API_ACCESS_KEY")
-        or os.getenv("ADMIN_PASSWORD")
-        or ""
-    )
 
-    if not expected:
-        raise HTTPException(status_code=503, detail="Admin password not configured")
-
-    if not secrets.compare_digest(key, expected):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    return {"ok": True, "authenticated": True}
+@app.get("/buy-size-preview")
+def api_buy_size_preview():
+    return buy_size_preview_payload()
 
 @app.post("/login")
 def login(payload: dict = Body(...)):
@@ -413,6 +437,10 @@ def login(payload: dict = Body(...)):
     return {"ok": True, "token": DASHBOARD_API_KEY or admin_password, "username": username}
 
 
+@app.get("/auth-check")
+def auth_check(request: Request):
+    verify_api_key(request)
+    return {"ok": True, "authenticated": True}
 
 # =========================
 # UTIL
