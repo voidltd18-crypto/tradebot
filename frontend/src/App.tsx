@@ -56,10 +56,14 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [replayCapInput, setReplayCapInput] = useState<string>("");
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
+  const [manualBaselineInput, setManualBaselineInput] = useState<string>("");
+  const [baselineSaving, setBaselineSaving] = useState(false);
   const [strategyStrictness, setStrategyStrictness] = useState<number>(0);
   const [strategySaving, setStrategySaving] = useState(false);
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
   const [positionsSaving, setPositionsSaving] = useState(false);
+  const [buySizeMode, setBuySizeMode] = useState<"full"|"partial">("full");
+  const [buySizeSaving, setBuySizeSaving] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
   const lastFetchAt = useRef(0);
@@ -101,6 +105,16 @@ const [banking, setBanking] = useState<AnyObj>({});
     const level = Number(data?.strategySettings?.level);
     if (Number.isFinite(level)) setStrategyStrictness(Math.max(0, Math.min(2, level)));
   }, [data?.strategySettings?.level]);
+
+
+  useEffect(() => {
+    const mode = data?.positionSettings?.buySizeMode;
+    if (mode === "full" || mode === "partial") {
+      setBuySizeMode(mode);
+    } else if (typeof data?.positionSettings?.fullBuyWhenOnePosition === "boolean") {
+      setBuySizeMode(data.positionSettings.fullBuyWhenOnePosition ? "full" : "partial");
+    }
+  }, [data?.positionSettings?.buySizeMode, data?.positionSettings?.fullBuyWhenOnePosition]);
 
   useEffect(() => {
     const maxPos = Number(data?.positionSettings?.maxPositions ?? data?.maxPositions ?? data?.config?.maxPositions);
@@ -438,6 +452,37 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
+
+  async function saveBuySizeMode(mode:"full"|"partial") {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+
+    setBuySizeSaving(true);
+    setMessage(`Saving ${mode === "full" ? "Full Buy" : "Partial Buy"} mode...`);
+
+    try {
+      const res = await fetch(`${API_URL}/buy-size-mode`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ mode }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save buy size mode");
+      const savedMode = json?.buySizeMode === "partial" ? "partial" : "full";
+      setBuySizeMode(savedMode);
+      setData(prev => ({ ...prev, positionSettings: { ...(prev.positionSettings || {}), ...(json.positionSettings || {}), buySizeMode: savedMode, fullBuyWhenOnePosition: savedMode === "full" } }));
+      setMessage(json?.message || `Buy size mode saved as ${savedMode}.`);
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not save buy size mode.");
+    } finally {
+      setBuySizeSaving(false);
+    }
+  }
+
   async function saveMaxPositions(valueOverride?: number) {
     if (!token) {
       setMessage("Please login first.");
@@ -700,49 +745,11 @@ const fetchData = useCallback(async (force = false) => {
   return <div className="app">
 
       <style>{`
-        /* EMERGENCY_REPORTS_DARK_FIX */
-        .reports-page,
-        .dark-reports {
-          background: #070b18 !important;
-          color: #eaf1ff !important;
-          min-height: 100vh !important;
-        }
-        .reports-page .card,
-        .dark-reports .card,
-        .reports-page section,
-        .dark-reports section {
-          background: #11182a !important;
-          color: #eaf1ff !important;
-          border-color: #26324a !important;
-        }
-        .reports-page input,
-        .dark-reports input,
-        .reports-page select,
-        .dark-reports select {
-          background: #070b18 !important;
-          color: #eaf1ff !important;
-          border: 1px solid #26324a !important;
-        }
-        .reports-page table,
-        .dark-reports table,
-        .reports-page thead,
-        .dark-reports thead,
-        .reports-page tbody,
-        .dark-reports tbody,
-        .reports-page tr,
-        .dark-reports tr,
-        .reports-page td,
-        .dark-reports td,
-        .reports-page th,
-        .dark-reports th {
-          background: #070b18 !important;
-          color: #eaf1ff !important;
-          border-color: #26324a !important;
-        }
-        .reports-page .muted,
-        .dark-reports .muted {
-          color: #9aa7bd !important;
-        }
+        /* REPORTS_FORCE_DARK_RUNTIME_FIX */
+        .reports-page { background:#070b18 !important; color:#eaf1ff !important; min-height:100vh !important; }
+        .reports-page .card, .reports-page section { background:#11182a !important; color:#eaf1ff !important; border-color:#26324a !important; }
+        .reports-page input, .reports-page select, .reports-page table, .reports-page tr, .reports-page td, .reports-page th { background:#070b18 !important; color:#eaf1ff !important; border-color:#26324a !important; }
+        .reports-page .muted { color:#9aa7bd !important; }
       `}</style>
 
     <header className="topbar">
@@ -876,6 +883,19 @@ const fetchData = useCallback(async (force = false) => {
         </div>
         <p className="muted">Lower numbers concentrate the bot into fewer holdings. If you already hold more than the new limit, the bot will stop opening new positions until holdings drop below it.</p>
       </Card>
+
+      <Card title="Buy Size Mode">
+        <div className="summary">
+          <div><span>Current mode</span><b>{buySizeMode === "full" ? "Full Buy" : "Partial Buy"}</b></div>
+          <div><span>Best with</span><b>{buySizeMode === "full" ? "Max Positions = 1" : "Max Positions > 1"}</b></div>
+        </div>
+        <div className="actions">
+          <button className={buySizeMode === "partial" ? "active" : "ghost"} onClick={()=>saveBuySizeMode("partial")} disabled={buySizeSaving}>Partial Buy</button>
+          <button className={buySizeMode === "full" ? "active" : "ghost"} onClick={()=>saveBuySizeMode("full")} disabled={buySizeSaving}>Full Buy</button>
+        </div>
+        <p className="muted">Full Buy uses most available capped capital for one position. Partial Buy splits capital across several smaller positions.</p>
+      </Card>
+
       <Card title="Dynamic Auto Universe" wide>
         <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
         <div className="universe-counts">
@@ -889,7 +909,7 @@ const fetchData = useCallback(async (force = false) => {
       </>}
     </main>}
 
-    {tab==="reports" && <main>
+    {tab==="reports" && <main className="reports-page">
       <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
           <input
             className="input"
