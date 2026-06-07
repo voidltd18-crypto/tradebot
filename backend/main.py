@@ -1,9 +1,7 @@
-import os
-import json
-import secrets
-MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "200") or 200)
 
+import os
 import sqlite3
+import json
 import time
 import math
 import re
@@ -45,7 +43,7 @@ from alpaca.data.requests import StockLatestQuoteRequest
 # =========================
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-DASHBOARD_API_KEY = os.getenv("DASHBOARD_API_KEY") or os.getenv("ADMIN_PASSWORD") or os.getenv("API_ACCESS_KEY") or ""
+DASHBOARD_API_KEY = os.getenv("DASHBOARD_API_KEY")
 
 PAPER = os.getenv("PAPER", "false").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -69,27 +67,19 @@ if not API_KEY or not API_SECRET:
 BOT_NAME = "Rebuilt Sniper Profit Bot"
 
 SAFE_UNIVERSE = [
-    "NVDA", "AMD", "MSFT", "AAPL", "META",
-    "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
-    "TSLA", "PLTR", "UBER", "QQQ", "SMH",
+    "SOFI", "PLTR", "F", "RIVN", "LCID", "AAL", "NIO", "PLUG", "OPEN", "PFE", "T",
+    "NVDA", "MSFT", "AAPL", "GOOGL", "AMZN", "META", "AVGO", "AMD", "XOM"
 ]
 
 CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
-MAX_POSITIONS = 6
+MAX_POSITIONS = 12
 MAX_NEW_BUYS_PER_LOOP = 1
 MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
 MIN_ORDER_NOTIONAL = 1.00
 CASH_BUFFER = 0.50
-
-# Full-buy mode:
-# When max positions is 1, use nearly all available trading capital/buying power
-# instead of small partial sizing.
-BUY_SIZE_MODE = os.getenv("BUY_SIZE_MODE", "full").lower()
-FULL_BUY_WHEN_ONE_POSITION = BUY_SIZE_MODE == "full" or os.getenv("FULL_BUY_WHEN_ONE_POSITION", "true").lower() == "true"
-FULL_BUY_CASH_BUFFER = float(os.getenv("FULL_BUY_CASH_BUFFER", "2.00") or 2.00)
 
 MAX_SPREAD = 0.015
 PREFER_SPREAD_UNDER = 0.006
@@ -133,6 +123,13 @@ MIN_HOLD_MINUTES_BEFORE_PROFIT_SELL = 45
 MIN_HOLD_MINUTES_BEFORE_ROTATION = 60
 HARD_STOP_LOSS_PCT = -3.50
 MAX_NEW_BUYS_PER_DAY_PDT_AWARE = 6
+
+# PDT tracker: under-$25k accounts should stay below 4 day trades in any rolling
+# 5-business-day window. Default to 2 for a safety buffer.
+PDT_TRACKER_ENABLED = True
+MAX_DAY_TRADES_ROLLING_5D = int(os.getenv("MAX_DAY_TRADES_ROLLING_5D", "2"))
+DAY_TRADE_LOG_FILE = "day_trade_log.json"
+SOLD_TODAY_LOCKS_FILE = "sold_today_locks.json"
 
 # Faster Exit / Partial Profit Mode
 FAST_EXIT_MODE_ENABLED = True
@@ -250,11 +247,7 @@ AUTO_UNIVERSE_REMOVE_LOSER_MAX_PNL = -1.00
 AUTO_UNIVERSE_MIN_PRICE = 1.00
 AUTO_UNIVERSE_MAX_PRICE = 800.00
 AUTO_UNIVERSE_MAX_SPREAD = 0.020
-AUTO_UNIVERSE_CANDIDATE_POOL = [
-    "NVDA", "AMD", "MSFT", "AAPL", "META",
-    "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
-    "TSLA", "PLTR", "UBER", "QQQ", "SMH",
-]
+AUTO_UNIVERSE_CANDIDATE_POOL = ["SOFI","PLTR","F","RIVN","LCID","AAL","NIO","PLUG","OPEN","PFE","T","NVDA","MSFT","AAPL","GOOGL","AMZN","META","AVGO","AMD","XOM","TSLA","MARA","RIOT","COIN","HOOD","SHOP","SQ","PYPL","UBER","ABNB","DKNG","RBLX","SNAP","ROKU","BABA","INTC","MU","BAC","C","WFC","GM","CCL","DAL","UAL","DIS","NKE","WMT","CVS","KO","JPM"]
 
 # =========================
 # CLIENTS
@@ -278,6 +271,8 @@ for symbol in current_universe:
     }
 
 locked_today: Dict[str, str] = {}
+sold_today_locks: Dict[str, str] = {}
+day_trade_log: List[Dict[str, Any]] = []
 custom_symbols: Dict[str, bool] = {}
 last_universe_refresh_ts = 0
 
@@ -331,79 +326,6 @@ def verify_api_key(request: Request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-
-
-# =========================
-# BUY SIZE MODE STORAGE
-# =========================
-BUY_SIZE_STATE_DIR = os.path.join("backend", "state")
-BUY_SIZE_STATE_FILE = os.path.join(BUY_SIZE_STATE_DIR, "buy_size_mode.json")
-
-def load_buy_size_mode() -> str:
-    try:
-        if os.path.exists(BUY_SIZE_STATE_FILE):
-            with open(BUY_SIZE_STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            mode = str(data.get("mode", "full")).lower().strip()
-            if mode in ("full", "partial"):
-                return mode
-    except Exception as e:
-        print(f"BUY SIZE MODE READ ERROR: {e}", flush=True)
-
-    mode = str(os.getenv("BUY_SIZE_MODE", "full")).lower().strip()
-    return mode if mode in ("full", "partial") else "full"
-
-def save_buy_size_mode(mode: str) -> str:
-    mode = str(mode or "full").lower().strip()
-    if mode not in ("full", "partial"):
-        mode = "full"
-    try:
-        os.makedirs(BUY_SIZE_STATE_DIR, exist_ok=True)
-        payload = {"mode": mode}
-        try:
-            payload["savedAt"] = datetime.now(UTC).isoformat()
-        except Exception:
-            payload["savedAt"] = ""
-        with open(BUY_SIZE_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-    except Exception as e:
-        print(f"BUY SIZE MODE SAVE ERROR: {e}", flush=True)
-    return mode
-
-def apply_buy_size_mode(mode: str) -> str:
-    global BUY_SIZE_MODE, FULL_BUY_WHEN_ONE_POSITION
-    mode = str(mode or "full").lower().strip()
-    if mode not in ("full", "partial"):
-        mode = "full"
-    BUY_SIZE_MODE = mode
-    FULL_BUY_WHEN_ONE_POSITION = mode == "full"
-    return mode
-
-apply_buy_size_mode(load_buy_size_mode())
-
-@app.post("/login")
-def login(payload: dict = Body(...)):
-    username = str(payload.get("username", "")).strip()
-    password = str(payload.get("password", ""))
-
-    admin_username = os.getenv("ADMIN_USERNAME", "admin")
-    admin_password = os.getenv("ADMIN_PASSWORD", DASHBOARD_API_KEY)
-
-    if not admin_password:
-        raise HTTPException(status_code=503, detail="Admin password not configured")
-
-    if not secrets.compare_digest(username, admin_username) or not secrets.compare_digest(password, admin_password):
-        raise HTTPException(status_code=401, detail="Invalid username or password")
-
-    # Existing protected endpoints already expect x-api-key, so return that as the session token.
-    return {"ok": True, "token": DASHBOARD_API_KEY or admin_password, "username": username}
-
-
-@app.get("/auth-check")
-def auth_check(request: Request):
-    verify_api_key(request)
-    return {"ok": True, "authenticated": True}
-
 # =========================
 # UTIL
 # =========================
@@ -451,10 +373,12 @@ def safe_save_json(path: str, data):
 
 
 def load_persistent_state():
-    global trade_history, stock_memory, temp_blacklist
+    global trade_history, stock_memory, temp_blacklist, sold_today_locks, day_trade_log
     trade_history = safe_load_json(TRADE_HISTORY_FILE, [])
     stock_memory = safe_load_json(STOCK_MEMORY_FILE, {})
     temp_blacklist = safe_load_json(TEMP_BLACKLIST_FILE, {})
+    sold_today_locks = safe_load_json(SOLD_TODAY_LOCKS_FILE, {})
+    day_trade_log = safe_load_json(DAY_TRADE_LOG_FILE, [])
 
 
 def save_trade_history():
@@ -467,6 +391,14 @@ def save_stock_memory():
 
 def save_temp_blacklist():
     safe_save_json(TEMP_BLACKLIST_FILE, temp_blacklist)
+
+
+def save_sold_today_locks():
+    safe_save_json(SOLD_TODAY_LOCKS_FILE, sold_today_locks)
+
+
+def save_day_trade_log():
+    safe_save_json(DAY_TRADE_LOG_FILE, day_trade_log[-200:])
 
 
 def cleanup_temp_blacklist():
@@ -596,9 +528,20 @@ def reset_daily_flags_if_needed():
     global starting_equity_today, starting_equity_day
 
     today = today_str()
+    lock_changed = False
     for symbol, day in list(locked_today.items()):
         if day != today:
             del locked_today[symbol]
+
+    for symbol, day in list(sold_today_locks.items()):
+        if day != today:
+            del sold_today_locks[symbol]
+            lock_changed = True
+
+    if lock_changed:
+        save_sold_today_locks()
+
+    cleanup_old_day_trade_log()
 
     for symbol, day in list(partial_profit_taken.items()):
         if day != today:
@@ -618,12 +561,21 @@ def reset_daily_flags_if_needed():
 
 
 def lock_symbol_until_tomorrow(symbol: str):
+    symbol = symbol.upper()
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY:
         locked_today[symbol] = today_str()
+    sold_today_locks[symbol] = today_str()
+    save_sold_today_locks()
 
 
 def is_locked_today(symbol: str):
-    return locked_today.get(symbol) == today_str()
+    symbol = symbol.upper()
+    return locked_today.get(symbol) == today_str() or sold_today_locks.get(symbol) == today_str()
+
+
+def sold_today_lock_symbols():
+    today = today_str()
+    return sorted([s for s, d in sold_today_locks.items() if d == today])
 
 
 def floor_qty(qty: float, decimals: int = 6):
@@ -881,6 +833,94 @@ def minutes_since_today_buy(symbol: str):
 def today_buy_count():
     today = today_str()
     return len([t for t in trade_events if t.get("side") == "BUY" and t.get("day") == today])
+
+
+def business_days_back(days: int = 5):
+    result = []
+    d = datetime.now(UTC).date()
+    while len(result) < days:
+        if d.weekday() < 5:
+            result.append(d.strftime("%Y-%m-%d"))
+        d = d - timedelta(days=1)
+    return set(result)
+
+
+def cleanup_old_day_trade_log():
+    global day_trade_log
+    keep_days = business_days_back(5)
+    before = len(day_trade_log)
+    day_trade_log = [e for e in day_trade_log if e.get("day") in keep_days]
+    if len(day_trade_log) != before:
+        save_day_trade_log()
+
+
+def day_trade_key(symbol: str, day: Optional[str] = None):
+    return f"{day or today_str()}:{symbol.upper()}"
+
+
+def day_trade_keys_in_window():
+    cleanup_old_day_trade_log()
+    keep_days = business_days_back(5)
+    return {day_trade_key(e.get("symbol", ""), e.get("day")) for e in day_trade_log if e.get("day") in keep_days and e.get("symbol")}
+
+
+def rolling_day_trade_count():
+    return len(day_trade_keys_in_window())
+
+
+def has_recorded_day_trade_today(symbol: str):
+    return day_trade_key(symbol) in day_trade_keys_in_window()
+
+
+def would_create_day_trade(symbol: str):
+    return was_bought_today(symbol) and not has_recorded_day_trade_today(symbol)
+
+
+def pdt_tracker_allows_sell(symbol: str, reason: str):
+    if not PDT_TRACKER_ENABLED:
+        return True, "PDT tracker off"
+
+    if not would_create_day_trade(symbol):
+        return True, "not a new day trade"
+
+    used = rolling_day_trade_count()
+    remaining = MAX_DAY_TRADES_ROLLING_5D - used
+    if remaining <= 0:
+        return False, f"PDT tracker blocked same-day sell for {symbol}: {used}/{MAX_DAY_TRADES_ROLLING_5D} day trades used in rolling 5 business days"
+
+    return True, f"PDT tracker allows same-day sell for {symbol}: {used}/{MAX_DAY_TRADES_ROLLING_5D} used before this sell"
+
+
+def record_day_trade_if_needed(symbol: str, reason: str):
+    if not PDT_TRACKER_ENABLED or not was_bought_today(symbol):
+        return
+
+    key = day_trade_key(symbol)
+    if key in day_trade_keys_in_window():
+        return
+
+    day_trade_log.append({
+        "day": today_str(),
+        "time": now_time(),
+        "symbol": symbol.upper(),
+        "reason": reason,
+    })
+    save_day_trade_log()
+    print(f"PDT TRACKER | recorded day trade {symbol.upper()} | used={rolling_day_trade_count()}/{MAX_DAY_TRADES_ROLLING_5D}")
+
+
+def pdt_tracker_payload():
+    cleanup_old_day_trade_log()
+    used = rolling_day_trade_count()
+    return {
+        "enabled": PDT_TRACKER_ENABLED,
+        "maxDayTradesRolling5D": MAX_DAY_TRADES_ROLLING_5D,
+        "usedRolling5D": used,
+        "remainingRolling5D": max(0, MAX_DAY_TRADES_ROLLING_5D - used),
+        "windowBusinessDays": sorted(list(business_days_back(5))),
+        "events": day_trade_log[-20:],
+        "soldTodayLocks": sold_today_lock_symbols(),
+    }
 
 
 def get_memory(symbol: str):
@@ -1145,49 +1185,30 @@ def calculate_new_position_notional():
     account = get_account()
     equity = float(account.equity)
     buying_power = float(account.buying_power)
-
-    # Profit banking cap now controls sizing. If account equity grows above
-    # the saved cap, new trade sizes are calculated from the capped amount,
-    # not full account equity.
-    sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
-
-    # Full-buy mode for one-position trading.
-    # Uses nearly all available capped trading capital/buying power, leaving a small buffer.
-    if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
-        usable_cash = max(0.0, buying_power - FULL_BUY_CASH_BUFFER)
-        return round(max(0.0, min(sizing_equity, usable_cash)), 2)
-
-    target_value = sizing_equity * TARGET_POSITION_VALUE_PCT
-    max_value = sizing_equity * MAX_POSITION_VALUE_PCT
+    target_value = equity * TARGET_POSITION_VALUE_PCT
+    max_value = equity * MAX_POSITION_VALUE_PCT
     usable_cash = max(0.0, buying_power - CASH_BUFFER)
     return round(max(0.0, min(target_value, max_value, usable_cash)), 2)
 
 
 def confidence_notional(scan):
     base = calculate_new_position_notional()
-
-    # In one-position full-buy mode, do not downsize by confidence.
-    # The entry gates still control trade quality; this only changes allocation size.
-    if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
-        return base
-
     if not CONFIDENCE_SIZING_ENABLED:
         return base
-
     confidence, label = calculate_confidence(scan)
     mult = HIGH_CONFIDENCE_SIZE_MULTIPLIER if label == "HIGH" else MEDIUM_CONFIDENCE_SIZE_MULTIPLIER if label == "MEDIUM" else LOW_CONFIDENCE_SIZE_MULTIPLIER
     try:
-        account_equity = float(get_account().equity)
-        sizing_equity = effective_trading_equity(account_equity) if "effective_trading_equity" in globals() else account_equity
+        equity = float(get_account().equity)
     except Exception:
-        sizing_equity = 0.0
-    cap = sizing_equity * MAX_CONFIDENCE_POSITION_VALUE_PCT if sizing_equity > 0 else base
+        equity = 0.0
+    cap = equity * MAX_CONFIDENCE_POSITION_VALUE_PCT if equity > 0 else base
     return round(max(0.0, min(base * mult, cap)), 2)
 
 
 def can_buy_symbol(symbol: str):
+    symbol = symbol.upper()
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and is_locked_today(symbol):
-        return False, f"{symbol} locked until tomorrow"
+        return False, f"{symbol} sold/locked today; rotate to another stock"
     if has_open_order(symbol):
         return False, f"{symbol} existing open order"
     qty, _ = get_position(symbol)
@@ -1255,9 +1276,16 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
 
 
 def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 0.0, reason="AUTO SELL"):
+    symbol = symbol.upper()
     rounded_qty = floor_qty(qty, 6)
     if rounded_qty <= 0:
-        return
+        return False
+
+    allowed, pdt_reason = pdt_tracker_allows_sell(symbol, reason)
+    if not allowed:
+        add_pdt_warning(symbol, pdt_reason)
+        notify(f"⚠️ {pdt_reason}")
+        return False
 
     def submit(q):
         order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
@@ -1300,8 +1328,10 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     trade_events.append(event)
     add_trade_history_event(event)
     update_stock_memory_from_sell(symbol, pnl, pnl_pct)
+    record_day_trade_if_needed(symbol, reason)
     lock_symbol_until_tomorrow(symbol)
     notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
+    return True
 
 
 def close_position(position, reason="MANUAL SELL"):
@@ -1315,7 +1345,9 @@ def close_position(position, reason="MANUAL SELL"):
     if has_open_order(symbol):
         return {"ok": False, "message": f"{symbol} already has open order"}
 
-    market_sell_qty(symbol, qty, entry=entry, price=price, reason=reason)
+    sold = market_sell_qty(symbol, qty, entry=entry, price=price, reason=reason)
+    if not sold:
+        return {"ok": False, "message": f"{reason} blocked or not submitted for {symbol}. Check PDT tracker/open orders.", "symbol": symbol}
     if symbol in state:
         state[symbol]["highest_since_entry"] = None
     return {"ok": True, "message": f"{reason} submitted for {symbol}. {symbol} locked until tomorrow.", "symbol": symbol}
@@ -3018,8 +3050,7 @@ def auto_universe_payload():
     }
 
 
-
-
+@app.get("/weekly-universe")
 def weekly_universe_public():
     return auto_universe_payload()
 
@@ -3043,7 +3074,7 @@ def build_status_payload(bot_name, scans):
     daily_pnl = get_daily_pnl()
     blocked, risk_reason = risk_blocked()
     market_status = get_market_status_payload()
-    locked_symbols = sorted([s for s, d in locked_today.items() if d == today_str()])
+    locked_symbols = sorted(set([s for s, d in locked_today.items() if d == today_str()] + sold_today_lock_symbols()))
 
     return {
         "id": "rebuilt-sniper-live",
@@ -3058,7 +3089,6 @@ def build_status_payload(bot_name, scans):
         "market": market_status,
         "fx": fx_payload(),
         "autoUniverse": auto_universe_payload(),
-        "dynamicMarketScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
         "strictOneCyclePerStockPerDay": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
@@ -3066,6 +3096,7 @@ def build_status_payload(bot_name, scans):
         "profitModeEnabled": PROFIT_MODE_ENABLED,
         "rotationModeEnabled": ROTATION_MODE_ENABLED,
         "pdtAwareModeEnabled": PDT_AWARE_MODE_ENABLED,
+        "pdtTracker": pdt_tracker_payload(),
         "sniperModeEnabled": SNIPER_MODE_ENABLED,
         "confidenceSizingEnabled": CONFIDENCE_SIZING_ENABLED,
         "stockMemoryEnabled": STOCK_MEMORY_ENABLED,
@@ -3082,7 +3113,6 @@ def build_status_payload(bot_name, scans):
         "stallExitEnabled": STALL_EXIT_ENABLED,
         "stallExitAfterMinutes": STALL_EXIT_AFTER_MINUTES,
         "aPlusGateEnabled": A_PLUS_GATE_ENABLED,
-        "strategySettings": current_strategy_settings_payload() if "current_strategy_settings_payload" in globals() else {},
         "aPlusMinConfidence": A_PLUS_MIN_CONFIDENCE,
         "aPlusMinQuality": A_PLUS_MIN_QUALITY,
         "tempBlacklist": temp_blacklist,
@@ -3091,15 +3121,12 @@ def build_status_payload(bot_name, scans):
         "lockedSymbolsToday": locked_symbols,
         "customSymbols": sorted(list(custom_symbols.keys())),
         "maxPositions": MAX_POSITIONS,
-        "positionSettings": current_position_settings_payload() if "current_position_settings_payload" in globals() else {},
         "newPositionNotional": calculate_new_position_notional(),
         "allowedNewPositions": allowed_new_position_count(),
         "universe": list(current_universe),
         "config": {
             "checkInterval": CHECK_INTERVAL,
             "maxPositions": MAX_POSITIONS,
-            "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
-            "fullBuyCashBuffer": FULL_BUY_CASH_BUFFER,
             "targetPositionValuePct": TARGET_POSITION_VALUE_PCT,
             "maxPositionValuePct": MAX_POSITION_VALUE_PCT,
             "stopLoss": STOP_LOSS,
@@ -3153,7 +3180,6 @@ def build_status_payload(bot_name, scans):
                 "optimiserDecision": auto_improve_decision(s["symbol"]),
             } for s in scans
         ],
-        "banking": banking_payload(),
         "logs": [
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
@@ -3164,6 +3190,7 @@ def build_status_payload(bot_name, scans):
             f"ANALYTICS | profit_factor={analytics_payload().get('profitFactor', 0):.2f} | avg_win={analytics_payload().get('averageWin', 0):.2f} | avg_loss={analytics_payload().get('averageLoss', 0):.2f}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
+            f"PDT TRACKER | used={pdt_tracker_payload().get('usedRolling5D', 0)}/{MAX_DAY_TRADES_ROLLING_5D} | remaining={pdt_tracker_payload().get('remainingRolling5D', 0)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f}",
@@ -3184,323 +3211,6 @@ def build_status_payload(bot_name, scans):
 def update_status(bot_name, scans):
     latest_status.clear()
     latest_status.update(build_status_payload(bot_name, scans))
-
-
-
-# ============================================================
-# STRATEGY STRICTNESS / LIVE GATE SETTINGS
-# ============================================================
-
-STRATEGY_SETTINGS_FILE = os.path.join("backend", "state", "strategy_settings.json")
-
-STRATEGY_PRESETS = {
-    "safe": {
-        "label": "Safe",
-        "aPlusMinConfidence": 0.70,
-        "sniperMinConfidence": 0.58,
-        "aPlusMinQuality": 0.026,
-        "sniperMinQuality": 0.020,
-    },
-    "balanced": {
-        "label": "Balanced",
-        "aPlusMinConfidence": 0.62,
-        "sniperMinConfidence": 0.54,
-        "aPlusMinQuality": 0.022,
-        "sniperMinQuality": 0.017,
-    },
-    "aggressive": {
-        "label": "Aggressive",
-        "aPlusMinConfidence": 0.55,
-        "sniperMinConfidence": 0.50,
-        "aPlusMinQuality": 0.018,
-        "sniperMinQuality": 0.014,
-    },
-}
-
-def _strategy_preset_from_level(level: int) -> str:
-    try:
-        level = int(level)
-    except Exception:
-        level = 1
-    if level <= 0:
-        return "safe"
-    if level >= 2:
-        return "aggressive"
-    return "balanced"
-
-
-def _save_strategy_settings(payload: Dict[str, Any]) -> None:
-    try:
-        os.makedirs(os.path.dirname(STRATEGY_SETTINGS_FILE), exist_ok=True)
-        with open(STRATEGY_SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-    except Exception as e:
-        print(f"STRATEGY SETTINGS SAVE ERROR: {e}")
-
-
-def _load_strategy_settings() -> Dict[str, Any]:
-    try:
-        if os.path.exists(STRATEGY_SETTINGS_FILE):
-            with open(STRATEGY_SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except Exception as e:
-        print(f"STRATEGY SETTINGS LOAD ERROR: {e}")
-    return {"level": 0, "preset": "safe"}
-
-
-def apply_strategy_settings(level: int = None, preset: str = None, save: bool = True) -> Dict[str, Any]:
-    global A_PLUS_MIN_CONFIDENCE, SNIPER_MIN_CONFIDENCE, A_PLUS_MIN_QUALITY, SNIPER_MIN_QUALITY
-
-    if preset:
-        preset_key = str(preset).lower().strip()
-    else:
-        preset_key = _strategy_preset_from_level(0 if level is None else int(level))
-
-    if preset_key not in STRATEGY_PRESETS:
-        preset_key = "safe"
-
-    if level is None:
-        level = {"safe": 0, "balanced": 1, "aggressive": 2}.get(preset_key, 0)
-
-    cfg = STRATEGY_PRESETS[preset_key]
-
-    A_PLUS_MIN_CONFIDENCE = float(cfg["aPlusMinConfidence"])
-    SNIPER_MIN_CONFIDENCE = float(cfg["sniperMinConfidence"])
-    A_PLUS_MIN_QUALITY = float(cfg["aPlusMinQuality"])
-    SNIPER_MIN_QUALITY = float(cfg["sniperMinQuality"])
-
-    payload = {
-        "ok": True,
-        "level": int(level),
-        "preset": preset_key,
-        "label": cfg["label"],
-        "aPlusMinConfidence": A_PLUS_MIN_CONFIDENCE,
-        "sniperMinConfidence": SNIPER_MIN_CONFIDENCE,
-        "aPlusMinQuality": A_PLUS_MIN_QUALITY,
-        "sniperMinQuality": SNIPER_MIN_QUALITY,
-        "updatedAt": datetime.now(UTC).isoformat(),
-        "presets": STRATEGY_PRESETS,
-    }
-
-    if save:
-        _save_strategy_settings(payload)
-
-    try:
-        latest_status["strategySettings"] = payload
-        latest_status["aPlusMinConfidence"] = A_PLUS_MIN_CONFIDENCE
-        latest_status["aPlusMinQuality"] = A_PLUS_MIN_QUALITY
-        latest_status["config"]["sniperMinConfidence"] = SNIPER_MIN_CONFIDENCE
-        latest_status["config"]["sniperMinQuality"] = SNIPER_MIN_QUALITY
-        latest_status["lastAction"] = f"Trading strictness set to {cfg['label']}"
-        latest_status["lastActionAt"] = payload["updatedAt"]
-    except Exception:
-        pass
-
-    return payload
-
-
-def current_strategy_settings_payload() -> Dict[str, Any]:
-    saved = _load_strategy_settings()
-    preset_key = str(saved.get("preset") or _strategy_preset_from_level(int(saved.get("level", 0)))).lower()
-    if preset_key not in STRATEGY_PRESETS:
-        preset_key = "safe"
-
-    # Keep runtime values as source of truth after startup has applied saved config.
-    return {
-        "ok": True,
-        "level": int(saved.get("level", {"safe": 0, "balanced": 1, "aggressive": 2}.get(preset_key, 0))),
-        "preset": preset_key,
-        "label": STRATEGY_PRESETS[preset_key]["label"],
-        "aPlusMinConfidence": float(A_PLUS_MIN_CONFIDENCE),
-        "sniperMinConfidence": float(SNIPER_MIN_CONFIDENCE),
-        "aPlusMinQuality": float(A_PLUS_MIN_QUALITY),
-        "sniperMinQuality": float(SNIPER_MIN_QUALITY),
-        "updatedAt": saved.get("updatedAt", ""),
-        "presets": STRATEGY_PRESETS,
-    }
-
-
-@app.get("/strategy-settings")
-def api_get_strategy_settings():
-    return current_strategy_settings_payload()
-
-
-@app.post("/strategy-settings")
-def api_set_strategy_settings(request: Request, payload: dict = Body(...)):
-    verify_api_key(request)
-    level = payload.get("level")
-    preset = payload.get("preset")
-    result = apply_strategy_settings(level=level, preset=preset, save=True)
-    return {**result, "message": f"Trading strictness set to {result['label']}"}
-
-
-try:
-    saved_strategy = _load_strategy_settings()
-    apply_strategy_settings(
-        level=int(saved_strategy.get("level", 0)),
-        preset=saved_strategy.get("preset", "safe"),
-        save=False,
-    )
-except Exception as e:
-    print(f"STRATEGY SETTINGS STARTUP APPLY ERROR: {e}")
-
-
-
-# ============================================================
-# LIVE POSITION LIMIT SETTINGS
-# ============================================================
-
-POSITION_SETTINGS_FILE = os.path.join("backend", "state", "position_settings.json")
-
-def _save_position_settings(payload: Dict[str, Any]) -> None:
-    try:
-        os.makedirs(os.path.dirname(POSITION_SETTINGS_FILE), exist_ok=True)
-        with open(POSITION_SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-    except Exception as e:
-        print(f"POSITION SETTINGS SAVE ERROR: {e}")
-
-
-def _load_position_settings() -> Dict[str, Any]:
-    try:
-        if os.path.exists(POSITION_SETTINGS_FILE):
-            with open(POSITION_SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except Exception as e:
-        print(f"POSITION SETTINGS LOAD ERROR: {e}")
-    return {"maxPositions": int(MAX_POSITIONS)}
-
-
-def apply_position_settings(max_positions: int = None, save: bool = True) -> Dict[str, Any]:
-    global MAX_POSITIONS, STRICT_MAX_POSITIONS
-
-    try:
-        value = int(max_positions if max_positions is not None else MAX_POSITIONS)
-    except Exception:
-        value = int(MAX_POSITIONS)
-
-    value = max(1, min(10, value))
-
-    MAX_POSITIONS = value
-
-    try:
-        STRICT_MAX_POSITIONS = value
-    except Exception:
-        pass
-
-    payload = {
-        "ok": True,
-        "maxPositions": int(MAX_POSITIONS),
-        "min": 1,
-        "max": 10,
-        "updatedAt": datetime.now(UTC).isoformat(),
-    }
-
-    if save:
-        _save_position_settings(payload)
-
-    try:
-        latest_status["positionSettings"] = payload
-        latest_status["maxPositions"] = int(MAX_POSITIONS)
-        latest_status["allowedNewPositions"] = allowed_new_position_count()
-        latest_status["config"]["maxPositions"] = int(MAX_POSITIONS)
-        latest_status["lastAction"] = f"Max positions set to {MAX_POSITIONS}"
-        latest_status["lastActionAt"] = payload["updatedAt"]
-    except Exception:
-        pass
-
-    return payload
-
-
-def current_position_settings_payload() -> Dict[str, Any]:
-    saved = _load_position_settings()
-    return {
-        "ok": True,
-        "maxPositions": int(MAX_POSITIONS),
-        "savedMaxPositions": int(saved.get("maxPositions", MAX_POSITIONS)),
-        "min": 1,
-        "max": 10,
-        "updatedAt": saved.get("updatedAt", ""),
-    }
-
-
-@app.get("/position-settings")
-def api_get_position_settings():
-    return current_position_settings_payload()
-
-
-
-
-@app.post("/buy-size-mode")
-def api_buy_size_mode(payload: dict = Body(...), request: Request = None):
-    if request is not None:
-        verify_api_key(request)
-
-    global FULL_BUY_WHEN_ONE_POSITION, BUY_SIZE_MODE
-
-    mode = str(payload.get("mode", "")).lower().strip()
-    if mode not in ("partial", "full"):
-        raise HTTPException(status_code=400, detail="mode must be partial or full")
-
-    BUY_SIZE_MODE = mode
-    FULL_BUY_WHEN_ONE_POSITION = mode == "full"
-
-    return {
-        "ok": True,
-        "message": f"Buy size mode set to {mode}",
-        "buySizeMode": mode,
-        "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
-        "positionSettings": position_settings_payload() if "position_settings_payload" in globals() else {},
-    }
-
-
-
-@app.get("/buy-size-mode")
-def api_get_buy_size_mode():
-    mode = apply_buy_size_mode(load_buy_size_mode())
-    return {
-        "ok": True,
-        "buySizeMode": mode,
-        "fullBuyWhenOnePosition": mode == "full",
-        "message": f"Buy size mode is {mode}",
-    }
-
-@app.post("/buy-size-mode")
-def api_buy_size_mode(payload: dict = Body(...), request: Request = None):
-    if request is not None:
-        verify_api_key(request)
-
-    mode = str(payload.get("mode", "")).lower().strip()
-    if mode not in ("full", "partial"):
-        raise HTTPException(status_code=400, detail="mode must be full or partial")
-
-    saved_mode = save_buy_size_mode(mode)
-    apply_buy_size_mode(saved_mode)
-
-    return {
-        "ok": True,
-        "message": f"Buy size mode saved as {saved_mode}",
-        "buySizeMode": saved_mode,
-        "fullBuyWhenOnePosition": saved_mode == "full",
-    }
-
-
-@app.post("/position-settings")
-def api_set_position_settings(request: Request, payload: dict = Body(...)):
-    verify_api_key(request)
-    result = apply_position_settings(max_positions=payload.get("maxPositions"), save=True)
-    return {**result, "message": f"Max positions set to {result['maxPositions']}"}
-
-
-try:
-    saved_positions = _load_position_settings()
-    apply_position_settings(max_positions=int(saved_positions.get("maxPositions", MAX_POSITIONS)), save=False)
-except Exception as e:
-    print(f"POSITION SETTINGS STARTUP APPLY ERROR: {e}")
 
 
 # =========================
@@ -3538,14 +3248,18 @@ def root():
     return {"message": "Rebuilt Sniper Profit Bot running", "status": "/status", "paperMode": PAPER}
 
 
+@app.get("/pdt-tracker")
+def pdt_tracker_status():
+    return pdt_tracker_payload()
+
+
+@app.get("/sold-today-locks")
+def sold_today_locks_status():
+    return {"day": today_str(), "symbols": sold_today_lock_symbols()}
+
+
 @app.get("/status")
 def get_status():
-    latest_status["botVersion"] = "v1.1-strict-profit-mode"
-    try:
-        if "merge_manual_picks_into_auto_universe" in globals():
-            return merge_manual_picks_into_auto_universe(latest_status)
-    except Exception as e:
-        print(f"STATUS MANUAL PICK MERGE ERROR: {e}")
     return latest_status
 
 
@@ -3658,8 +3372,7 @@ def backfill_trades_limited(request: Request):
 
 
 
-
-
+@app.post("/refresh-universe")
 def refresh_universe(request: Request):
     verify_api_key(request)
     with bot_lock:
@@ -3693,10 +3406,6 @@ def run_bot_loop():
             with bot_lock:
                 reset_daily_flags_if_needed()
                 cleanup_temp_blacklist()
-                try:
-                    refresh_dynamic_market_candidates_if_needed()
-                except Exception as e:
-                    print(f"DYNAMIC SCANNER LOOP ERROR: {e}")
                 refresh_universe_if_needed()
                 clock = trading_client.get_clock()
 
@@ -3746,1299 +3455,70 @@ def startup_event():
     threading.Thread(target=run_bot_loop, daemon=True).start()
 
 
-
 # =========================
-# V1.0 PRODUCTION STABLE ADDONS
+# BUY SIZE MODE STORAGE
 # =========================
+BUY_SIZE_STATE_FILE = os.path.join("backend", "state", "buy_size_mode.json")
 
-BOT_VERSION = "v1.1-strict-profit-mode"
-BOT_VERSION_NOTES = {
-    "version": BOT_VERSION,
-    "name": "TradeBot v1.0 Production Stable",
-    "sameDayTrading": True,
-    "sellThenLockUntilNextDay": True,
-    "manualUniversePins": True,
-    "weeklyUniverseRefresh": True,
-    "gbpFirstReports": True,
-    "pdtAware": True,
-}
-
-@app.get("/version")
-def version():
-    return BOT_VERSION_NOTES
-
-# ---------- baseline reporting ----------
-BASELINE_FILE = os.path.join("backend", "state", "equity_baseline.json")
-
-def _safe_num(v, default=0.0):
+def load_buy_size_mode() -> str:
     try:
-        return float(v or default)
-    except Exception:
-        return float(default)
-
-def load_equity_baseline() -> float:
-    try:
-        if os.path.exists(BASELINE_FILE):
-            with open(BASELINE_FILE, "r", encoding="utf-8") as f:
-                return float(json.load(f).get("baseline", 0) or 0)
+        if os.path.exists(BUY_SIZE_STATE_FILE):
+            with open(BUY_SIZE_STATE_FILE, "r", encoding="utf-8") as f:
+                mode = str(json.load(f).get("mode", "full")).lower().strip()
+            if mode in ("full", "partial"):
+                return mode
     except Exception as e:
-        print(f"BASELINE LOAD ERROR: {e}")
-    return 0.0
+        print(f"BUY SIZE MODE READ ERROR: {e}", flush=True)
+    mode = str(os.getenv("BUY_SIZE_MODE", "full")).lower().strip()
+    return mode if mode in ("full", "partial") else "full"
 
-def save_equity_baseline(value: float) -> None:
+def save_buy_size_mode(mode: str) -> str:
+    mode = str(mode or "full").lower().strip()
+    if mode not in ("full", "partial"):
+        mode = "full"
     try:
-        os.makedirs(os.path.dirname(BASELINE_FILE), exist_ok=True)
-        with open(BASELINE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"baseline": float(value or 0), "resetAt": datetime.now(UTC).isoformat()}, f, indent=2)
+        os.makedirs(os.path.dirname(BUY_SIZE_STATE_FILE), exist_ok=True)
+        with open(BUY_SIZE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"mode": mode, "savedAt": datetime.now(UTC).isoformat()}, f, indent=2)
     except Exception as e:
-        print(f"BASELINE SAVE ERROR: {e}")
+        print(f"BUY SIZE MODE SAVE ERROR: {e}", flush=True)
+    return mode
 
-@app.post("/reset-baseline")
-def reset_baseline(request: Request):
+def apply_buy_size_mode(mode: str) -> str:
+    global BUY_SIZE_MODE, FULL_BUY_WHEN_ONE_POSITION
+    mode = str(mode or "full").lower().strip()
+    if mode not in ("full", "partial"):
+        mode = "full"
+    BUY_SIZE_MODE = mode
+    FULL_BUY_WHEN_ONE_POSITION = mode == "full"
+    return mode
+
+
+@app.get("/buy-size-mode")
+def api_get_buy_size_mode():
+    mode = apply_buy_size_mode(load_buy_size_mode())
+    return {"ok": True, "buySizeMode": mode, "fullBuyWhenOnePosition": mode == "full"}
+
+
+@app.post("/buy-size-mode")
+def api_buy_size_mode(request: Request, payload: dict = Body(...)):
     verify_api_key(request)
-    try:
-        equity = _safe_num(latest_status.get("account", {}).get("equity", 0))
-        save_equity_baseline(equity)
-        return {"ok": True, "message": f"Baseline reset to ${equity:.2f}", "baseline": equity}
-    except Exception as e:
-        return {"ok": False, "message": str(e)}
-
-@app.get("/baseline")
-def get_baseline():
-    return {"ok": True, "baseline": load_equity_baseline()}
-
-@app.get("/reports")
-def reports():
-    status = latest_status if isinstance(latest_status, dict) else {}
-    account = status.get("account") or {}
-    db = status.get("dbSummary") or {}
-    equity = _safe_num(account.get("equity"))
-    equity_gbp = _safe_num(account.get("equityGbp"))
-    total_withdrawn = _safe_num(globals().get("TOTAL_WITHDRAWN_USD", 0))
-    baseline = load_equity_baseline()
-    total_deposited = baseline if baseline > 0 else _safe_num(globals().get("TOTAL_DEPOSITED_USD", 0))
-    deposit_source = "reset-baseline" if baseline > 0 else "env"
-    if total_deposited <= 0:
-        total_deposited = equity
-        deposit_source = "equity-baseline"
-    total_gain_loss = equity + total_withdrawn - total_deposited
-    closed = status.get("closedTrades") or []
-    timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
-    equity_history = []
-    for i, e in enumerate(timeline if isinstance(timeline, list) else []):
-        if not isinstance(e, dict):
-            continue
-        equity_history.append({
-            "idx": i,
-            "time": e.get("time") or e.get("timestamp") or e.get("t") or "",
-            "symbol": e.get("symbol") or "",
-            "side": e.get("side") or "",
-            "equity": _safe_num(e.get("equity") or e.get("value")),
-            "equityGbp": _safe_num(e.get("equityGbp") or e.get("valueGbp")),
-            "pnl": _safe_num(e.get("pnl")),
-            "pnlGbp": _safe_num(e.get("pnlGbp")),
-            "pnlPct": _safe_num(e.get("pnlPct")),
-            "reason": e.get("reason") or "",
-        })
-    return {
-        "ok": True,
-        "depositSource": deposit_source,
-        "totalDeposited": total_deposited,
-        "totalWithdrawn": total_withdrawn,
-        "currentEquity": equity,
-        "currentEquityGbp": equity_gbp,
-        "totalGainLoss": total_gain_loss,
-        "earnedSinceDeposit": max(total_gain_loss, 0.0),
-        "lostSinceDeposit": abs(min(total_gain_loss, 0.0)),
-        "dayPnl": _safe_num(account.get("pnlDay")),
-        "realisedNet": _safe_num(db.get("totalPnl")),
-        "closedTrades": closed[-200:] if isinstance(closed, list) else [],
-        "equityHistory": equity_history[-500:],
-        "winRate": _safe_num(db.get("winRate")) * 100.0,
-        "totalTrades": int(_safe_num(db.get("totalTrades"))),
-    }
-
-# ---------- manual universe pins ----------
-MANUAL_UNIVERSE_FILE = os.path.join("backend", "state", "manual_universe_picks.json")
-
-def load_manual_universe_picks() -> List[str]:
-    try:
-        if os.path.exists(MANUAL_UNIVERSE_FILE):
-            with open(MANUAL_UNIVERSE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return sorted({str(x).upper().strip() for x in data if str(x).strip()})
-    except Exception as e:
-        print(f"MANUAL UNIVERSE LOAD ERROR: {e}")
-    return []
-
-def save_manual_universe_picks(symbols: List[str]) -> None:
-    try:
-        os.makedirs(os.path.dirname(MANUAL_UNIVERSE_FILE), exist_ok=True)
-        clean = sorted({str(x).upper().strip() for x in symbols if str(x).strip()})
-        with open(MANUAL_UNIVERSE_FILE, "w", encoding="utf-8") as f:
-            json.dump(clean, f, indent=2)
-    except Exception as e:
-        print(f"MANUAL UNIVERSE SAVE ERROR: {e}")
-
-def add_manual_universe_pick(symbol: str) -> List[str]:
-    sym = symbol.upper().strip()
-    picks = load_manual_universe_picks()
-    if sym and sym not in picks:
-        picks.append(sym)
-    save_manual_universe_picks(picks)
-    return load_manual_universe_picks()
-
-def remove_manual_universe_pick(symbol: str) -> List[str]:
-    sym = symbol.upper().strip()
-    picks = [x for x in load_manual_universe_picks() if x != sym]
-    save_manual_universe_picks(picks)
-    return picks
-
-def manual_pick_row(symbol: str) -> Dict[str, Any]:
-    return {"symbol": symbol.upper(), "score": 99.0, "reason": "manual pick | pinned to universe", "manualPick": True, "status": "active"}
-
-def apply_manual_picks_to_current_universe() -> None:
-    try:
-        for sym in load_manual_universe_picks():
-            add_symbol_to_universe(sym, custom=True)
-    except Exception as e:
-        print(f"APPLY MANUAL PICKS ERROR: {e}")
-
-def merge_manual_picks_into_auto_universe(status_obj: Dict[str, Any]) -> Dict[str, Any]:
-    try:
-        picks = load_manual_universe_picks()
-        apply_manual_picks_to_current_universe()
-        status_obj["manualUniversePicks"] = picks
-        au = status_obj.setdefault("autoUniverse", {})
-        rows = au.setdefault("rows", [])
-        active = au.setdefault("activeSymbols", [])
-        existing_rows = {str(r.get("symbol", "")).upper() for r in rows if isinstance(r, dict)}
-        existing_active = {str(x).upper() for x in active}
-        for sym in reversed(picks):
-            if sym not in existing_rows:
-                rows.insert(0, manual_pick_row(sym))
-            if sym not in existing_active:
-                active.insert(0, sym)
-        au["rows"] = rows
-        au["activeSymbols"] = active
-        au["size"] = max(int(au.get("size") or 0), len(active))
-        au["manualPickCount"] = len(picks)
-    except Exception as e:
-        print(f"MERGE MANUAL PICKS ERROR: {e}")
-    return status_obj
-
-@app.get("/manual-universe")
-def api_manual_universe():
-    return {"ok": True, "symbols": load_manual_universe_picks()}
+    mode = str(payload.get("mode", "")).lower().strip()
+    if mode not in ("full", "partial"):
+        raise HTTPException(status_code=400, detail="mode must be full or partial")
+    mode = save_buy_size_mode(mode)
+    apply_buy_size_mode(mode)
+    payload = current_position_settings_payload()
+    return {**payload, "message": f"Buy size mode saved as {mode}"}
 
 
 
-def touch_quick_status(**kwargs):
-    """Small safe status updater used by manual-universe/search buttons.
-    Keeps UI feedback fields current without forcing a full status rebuild.
-    """
-    try:
-        for key, value in kwargs.items():
-            latest_status[key] = value
-        latest_status["quickStatusUpdatedAt"] = datetime.now(UTC).isoformat()
-        return True
-    except Exception as e:
-        print(f"TOUCH QUICK STATUS ERROR: {e}")
-        return False
-
-@app.post("/add-to-universe/{symbol}")
-def add_to_universe(symbol: str, request: Request):
+@app.post("/set-baseline")
+def set_baseline(request: Request, payload: dict = Body(...)):
     verify_api_key(request)
-    sym = symbol.upper().strip()
-    try:
-        picks = add_manual_universe_pick(sym)
-        add_symbol_to_universe(sym, custom=True)
-        latest_status.setdefault("autoUniverse", {})
-        latest_status["autoUniverse"].setdefault("rows", [])
-        latest_status["autoUniverse"].setdefault("activeSymbols", [])
-        merge_manual_picks_into_auto_universe(latest_status)
-        touch_quick_status(lastAction=f"{sym} added and pinned to universe", lastActionAt=datetime.now(UTC).isoformat())
-        return {"ok": True, "message": f"{sym} added and pinned to universe", "symbols": picks, "manualPick": True}
-    except Exception as e:
-        return {"ok": False, "message": f"Could not add {sym}: {e}"}
-
-@app.post("/remove-from-universe/{symbol}")
-def api_remove_from_universe(symbol: str, request: Request):
-    verify_api_key(request)
-    picks = remove_manual_universe_pick(symbol)
-    try:
-        sym = symbol.upper().strip()
-        if sym in current_universe:
-            current_universe.remove(sym)
-        custom_symbols.pop(sym, None)
-    except Exception:
-        pass
-    update_status(BOT_NAME, latest_scans)
-    merge_manual_picks_into_auto_universe(latest_status)
-    return {"ok": True, "message": f"{symbol.upper()} removed from manual picks", "symbols": picks}
-
-# Wrap weekly universe builder so pinned picks survive refreshes and are tradable.
-_ORIGINAL_BUILD_WEEKLY_UNIVERSE = build_weekly_universe
-
-def build_weekly_universe(force=False):
-    result = _ORIGINAL_BUILD_WEEKLY_UNIVERSE(force=force)
-    apply_manual_picks_to_current_universe()
-    try:
-        picks = load_manual_universe_picks()
-        rows = result.setdefault("rows", []) if isinstance(result, dict) else []
-        symbols = result.setdefault("symbols", []) if isinstance(result, dict) else []
-        existing = {str(r.get("symbol", "")).upper() for r in rows if isinstance(r, dict)}
-        for sym in reversed(picks):
-            if sym not in existing:
-                rows.insert(0, manual_pick_row(sym))
-            if sym not in symbols:
-                symbols.insert(0, sym)
-    except Exception as e:
-        print(f"BUILD WEEKLY MANUAL MERGE ERROR: {e}")
-    return result
-
-# ---------- search preview ----------
-SEARCH_PREVIEW_HISTORY: Dict[str, List[Dict[str, Any]]] = {}
-
-def _stock_name_guess(symbol: str) -> str:
-    names = {"AAPL":"Apple","MSFT":"Microsoft","NVDA":"NVIDIA","AMD":"Advanced Micro Devices","AMZN":"Amazon","META":"Meta Platforms","GOOGL":"Alphabet","GOOG":"Alphabet","TSLA":"Tesla","INTC":"Intel","NFLX":"Netflix","CRM":"Salesforce","ORCL":"Oracle","ADBE":"Adobe","PYPL":"PayPal","UBER":"Uber","PLTR":"Palantir","SHOP":"Shopify","SNOW":"Snowflake","NET":"Cloudflare","MDB":"MongoDB","MU":"Micron","LAC":"Lithium Americas","LCID":"Lucid","TTWO":"Take-Two Interactive","EA":"Electronic Arts","RBLX":"Roblox","U":"Unity Software"}
-    return names.get(symbol.upper(), symbol.upper())
-
-def _stock_search_universe() -> List[str]:
-    symbols = []
-    for name in ["current_universe", "SAFE_UNIVERSE", "TECH_UNIVERSE", "AUTO_UNIVERSE", "UNIVERSE"]:
-        val = globals().get(name)
-        if isinstance(val, list):
-            symbols.extend([str(x).upper() for x in val])
-    symbols.extend(load_manual_universe_picks())
-    symbols.extend(["AAPL","MSFT","NVDA","AMD","AMZN","META","GOOGL","GOOG","TSLA","INTC","NFLX","CRM","ORCL","ADBE","PYPL","UBER","PLTR","SHOP","SNOW","NET","MDB","MU","LAC","LCID","AVGO","QCOM","TXN","NOW","DDOG","CRWD","PANW","ZS","TEAM","SQ","COIN","HOOD","RBLX","ROKU","DIS","TTWO","EA","U"])
-    seen = []
-    for s in symbols:
-        s = str(s).upper().strip()
-        if s and s not in seen:
-            seen.append(s)
-    return seen
-
-def _search_fx_rate() -> float:
-    try:
-        return float(get_usd_to_gbp_rate())
-    except Exception:
-        return 0.7403
-
-def _latest_quote_for_symbol(symbol: str) -> Dict[str, Any]:
-    symbol = symbol.upper().strip()
-    quote_price = bid = ask = spread = 0.0
-    try:
-        req = StockLatestQuoteRequest(symbol_or_symbols=[symbol])
-        q = data_client.get_stock_latest_quote(req)
-        quote = q.get(symbol) if isinstance(q, dict) else None
-        if quote:
-            bid = float(getattr(quote, "bid_price", 0) or 0)
-            ask = float(getattr(quote, "ask_price", 0) or 0)
-            quote_price = round((bid + ask) / 2, 4) if bid and ask else round(float(ask or bid or 0), 4)
-            spread = round(ask - bid, 4) if ask and bid else 0.0
-    except Exception as e:
-        print(f"SEARCH QUOTE ERROR {symbol}: {e}")
-    if quote_price <= 0:
-        try:
-            for s in latest_scans:
-                if str(s.get("symbol", "")).upper() == symbol:
-                    quote_price = float(s.get("price") or 0)
-                    break
-        except Exception:
-            pass
-    now = datetime.now(UTC).isoformat()
-    hist = SEARCH_PREVIEW_HISTORY.setdefault(symbol, [])
-    if quote_price > 0:
-        hist.append({"t": now, "value": quote_price})
-        del hist[:-80]
-    prev = hist[0]["value"] if hist else quote_price
-    change = quote_price - prev if quote_price and prev else 0.0
-    change_pct = (change / prev * 100.0) if prev else 0.0
-    fx = _search_fx_rate()
-    return {"symbol": symbol, "name": _stock_name_guess(symbol), "price": quote_price, "priceGbp": round(quote_price * fx, 4), "bid": bid, "ask": ask, "spread": spread, "change": round(change, 4), "changePct": round(change_pct, 4), "history": hist, "inUniverse": symbol in [x.upper() for x in _stock_search_universe()]}
-
-@app.get("/search-stocks")
-def search_stocks(q: str = ""):
-    query = (q or "").strip().upper()
-    if not query:
-        return {"ok": True, "query": q, "results": []}
-    matches = []
-    for sym in _stock_search_universe():
-        name = _stock_name_guess(sym).upper()
-        if query in sym or query in name:
-            matches.append(sym)
-        if len(matches) >= 8:
-            break
-    if re.fullmatch(r"[A-Z]{1,5}", query) and query not in matches:
-        matches.insert(0, query)
-    deduped = []
-    for sym in matches:
-        if sym not in deduped:
-            deduped.append(sym)
-    results = []
-    for sym in deduped[:8]:
-        qd = _latest_quote_for_symbol(sym)
-        if qd.get("price", 0) > 0 or sym == query:
-            results.append(qd)
-    return {"ok": True, "query": q, "results": results}
-
-@app.get("/stock-preview/{symbol}")
-def stock_preview(symbol: str):
-    return {"ok": True, "stock": _latest_quote_for_symbol(symbol)}
-
-
-
-
-# =========================
-# STRICTER PROFIT MODE v1.1
-# =========================
-
-STRICT_PROFIT_MODE = os.getenv("STRICT_PROFIT_MODE", "true").lower() == "true"
-STRICT_STOP_LOSS_PCT = float(os.getenv("STRICT_STOP_LOSS_PCT", "-2.25"))
-STRICT_TAKE_PROFIT_PCT = float(os.getenv("STRICT_TAKE_PROFIT_PCT", "1.25"))
-STRICT_TRAIL_START_PCT = float(os.getenv("STRICT_TRAIL_START_PCT", "1.00"))
-STRICT_TRAIL_DROP_PCT = float(os.getenv("STRICT_TRAIL_DROP_PCT", "0.45"))
-STRICT_MAX_POSITIONS = int(os.getenv("STRICT_MAX_POSITIONS", "6"))
-LOSER_COOLDOWN_DAYS = int(os.getenv("LOSER_COOLDOWN_DAYS", "3"))
-LOSER_COOLDOWN_FILE = os.path.join("backend", "state", "loser_cooldown.json")
-
-def _load_loser_cooldown() -> Dict[str, Any]:
-    try:
-        if os.path.exists(LOSER_COOLDOWN_FILE):
-            with open(LOSER_COOLDOWN_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-    except Exception as e:
-        print(f"LOSER COOLDOWN LOAD ERROR: {e}")
-    return {}
-
-def _save_loser_cooldown(data: Dict[str, Any]) -> None:
-    try:
-        os.makedirs(os.path.dirname(LOSER_COOLDOWN_FILE), exist_ok=True)
-        with open(LOSER_COOLDOWN_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f"LOSER COOLDOWN SAVE ERROR: {e}")
-
-def add_loser_cooldown(symbol: str, pnl_pct: float = 0.0, reason: str = "loss") -> None:
-    try:
-        sym = symbol.upper().strip()
-        until = (datetime.now(UTC) + timedelta(days=LOSER_COOLDOWN_DAYS)).date().isoformat()
-        data = _load_loser_cooldown()
-        data[sym] = {"until": until, "pnlPct": float(pnl_pct or 0), "reason": reason, "createdAt": datetime.now(UTC).isoformat()}
-        _save_loser_cooldown(data)
-        print(f"LOSER COOLDOWN | {sym} blocked until {until} | pnlPct={pnl_pct}")
-    except Exception as e:
-        print(f"ADD LOSER COOLDOWN ERROR: {e}")
-
-def is_loser_cooldown(symbol: str) -> bool:
-    try:
-        sym = symbol.upper().strip()
-        data = _load_loser_cooldown()
-        row = data.get(sym)
-        if not row:
-            return False
-        until = datetime.fromisoformat(row.get("until")).date()
-        if datetime.now(UTC).date() <= until:
-            return True
-        data.pop(sym, None)
-        _save_loser_cooldown(data)
-    except Exception:
-        return False
-    return False
-
-def strict_position_should_sell(symbol: str, entry_price: float, current_price: float, high_price: float = 0.0) -> Dict[str, Any]:
-    try:
-        if not STRICT_PROFIT_MODE:
-            return {"sell": False, "reason": ""}
-        entry = float(entry_price or 0)
-        price = float(current_price or 0)
-        high = float(high_price or price or 0)
-        if entry <= 0 or price <= 0:
-            return {"sell": False, "reason": ""}
-
-        pnl_pct = ((price - entry) / entry) * 100.0
-        high_pct = ((high - entry) / entry) * 100.0
-        drop_from_high_pct = ((price - high) / high) * 100.0 if high > 0 else 0.0
-
-        if pnl_pct <= STRICT_STOP_LOSS_PCT:
-            add_loser_cooldown(symbol, pnl_pct, "strict-stop-loss")
-            return {"sell": True, "reason": f"STRICT STOP LOSS {pnl_pct:.2f}%", "pnlPct": pnl_pct}
-
-        if pnl_pct >= STRICT_TAKE_PROFIT_PCT:
-            return {"sell": True, "reason": f"STRICT TAKE PROFIT {pnl_pct:.2f}%", "pnlPct": pnl_pct}
-
-        if high_pct >= STRICT_TRAIL_START_PCT and drop_from_high_pct <= -abs(STRICT_TRAIL_DROP_PCT):
-            return {"sell": True, "reason": f"STRICT TRAIL DROP {drop_from_high_pct:.2f}%", "pnlPct": pnl_pct}
-    except Exception as e:
-        print(f"STRICT SELL DECISION ERROR {symbol}: {e}")
-    return {"sell": False, "reason": ""}
-
-def strict_can_buy_symbol(symbol: str) -> Dict[str, Any]:
-    try:
-        if STRICT_PROFIT_MODE and is_loser_cooldown(symbol):
-            return {"ok": False, "reason": f"{symbol.upper()} in loser cooldown"}
-    except Exception as e:
-        print(f"STRICT CAN BUY ERROR {symbol}: {e}")
-    return {"ok": True, "reason": ""}
-
-@app.get("/strict-mode")
-def api_strict_mode():
-    return {
-        "ok": True,
-        "version": "v1.1-strict-profit-mode",
-        "strictProfitMode": STRICT_PROFIT_MODE,
-        "stopLossPct": STRICT_STOP_LOSS_PCT,
-        "takeProfitPct": STRICT_TAKE_PROFIT_PCT,
-        "trailStartPct": STRICT_TRAIL_START_PCT,
-        "trailDropPct": STRICT_TRAIL_DROP_PCT,
-        "maxPositions": STRICT_MAX_POSITIONS,
-        "loserCooldownDays": LOSER_COOLDOWN_DAYS,
-        "loserCooldown": _load_loser_cooldown(),
-    }
-
-@app.post("/clear-loser-cooldown")
-def api_clear_loser_cooldown(request: Request):
-    verify_api_key(request)
-    _save_loser_cooldown({})
-    return {"ok": True, "message": "Loser cooldown cleared"}
-
-
-
-
-
-# =========================
-# DYNAMIC MARKET SCANNER v1.0
-# =========================
-DYNAMIC_MARKET_SCANNER_ENABLED = os.getenv("DYNAMIC_MARKET_SCANNER_ENABLED", "true").lower() == "true"
-DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS = int(os.getenv("DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS", "12"))
-DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS = int(os.getenv("DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS", str(60 * 60 * 4)))
-DYNAMIC_MARKET_SCANNER_FILE = os.path.join("backend", "state", "dynamic_market_scanner.json")
-DYNAMIC_MARKET_MIN_PRICE = float(os.getenv("DYNAMIC_MARKET_MIN_PRICE", "3"))
-DYNAMIC_MARKET_MAX_PRICE = float(os.getenv("DYNAMIC_MARKET_MAX_PRICE", "800"))
-DYNAMIC_MARKET_MIN_VOLUME = int(os.getenv("DYNAMIC_MARKET_MIN_VOLUME", "500000"))
-DYNAMIC_MARKET_MAX_SPREAD = float(os.getenv("DYNAMIC_MARKET_MAX_SPREAD", "0.025"))
-DYNAMIC_MARKET_YAHOO_SCREENS = [
-    s.strip() for s in os.getenv("DYNAMIC_MARKET_YAHOO_SCREENS", "day_gainers,most_actives,aggressive_small_caps").split(",") if s.strip()
-]
-
-DYNAMIC_SCANNER_CACHE: Dict[str, Any] = {"updatedAt": "", "symbols": [], "rows": [], "source": "empty", "error": ""}
-
-
-def _load_dynamic_scanner_cache() -> Dict[str, Any]:
-    global DYNAMIC_SCANNER_CACHE
-    try:
-        if os.path.exists(DYNAMIC_MARKET_SCANNER_FILE):
-            with open(DYNAMIC_MARKET_SCANNER_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                DYNAMIC_SCANNER_CACHE = {**DYNAMIC_SCANNER_CACHE, **data}
-    except Exception as e:
-        print(f"DYNAMIC SCANNER LOAD ERROR: {e}")
-    return DYNAMIC_SCANNER_CACHE
-
-
-def _save_dynamic_scanner_cache(data: Dict[str, Any]) -> Dict[str, Any]:
-    global DYNAMIC_SCANNER_CACHE
-    try:
-        os.makedirs(os.path.dirname(DYNAMIC_MARKET_SCANNER_FILE), exist_ok=True)
-        with open(DYNAMIC_MARKET_SCANNER_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-    except Exception as e:
-        print(f"DYNAMIC SCANNER SAVE ERROR: {e}")
-    DYNAMIC_SCANNER_CACHE = {**DYNAMIC_SCANNER_CACHE, **data}
-    return DYNAMIC_SCANNER_CACHE
-
-
-def _dynamic_cache_age_seconds() -> float:
-    data = _load_dynamic_scanner_cache()
-    try:
-        updated = datetime.fromisoformat(str(data.get("updatedAt", "")).replace("Z", "+00:00"))
-        return max(0.0, (datetime.now(UTC) - updated).total_seconds())
-    except Exception:
-        return 999999999.0
-
-
-def _clean_dynamic_symbol(symbol: str) -> str:
-    sym = str(symbol or "").upper().strip()
-    # Keep normal US tickers and class shares such as BRK-B, but reject odd Yahoo suffixes.
-    if not re.fullmatch(r"[A-Z]{1,5}([.-][A-Z])?", sym):
-        return ""
-    return sym.replace(".", "-")
-
-
-def _yahoo_dynamic_screen(screen_id: str, count: int = 50) -> List[Dict[str, Any]]:
-    url = f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds={screen_id}&count={count}"
-    headers = {"User-Agent": "Mozilla/5.0 TradeBot dynamic scanner"}
-    response = requests.get(url, headers=headers, timeout=8)
-    response.raise_for_status()
-    data = response.json()
-    quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
-    return quotes if isinstance(quotes, list) else []
-
-
-def _score_dynamic_quote(q: Dict[str, Any], source: str) -> Optional[Dict[str, Any]]:
-    symbol = _clean_dynamic_symbol(q.get("symbol"))
-    if not symbol or symbol in BLOCKED_WEAK_TICKERS:
-        return None
-
-    exchange = str(q.get("fullExchangeName") or q.get("exchange") or "").upper()
-    quote_type = str(q.get("quoteType") or "").upper()
-    if quote_type and quote_type not in {"EQUITY", "ETF"}:
-        return None
-    if any(bad in exchange for bad in ["PNK", "OTC", "OTHER OTC"]):
-        return None
-
-    price = float(q.get("regularMarketPrice") or q.get("postMarketPrice") or q.get("preMarketPrice") or 0.0)
-    volume = int(float(q.get("regularMarketVolume") or q.get("averageDailyVolume3Month") or 0))
-    change_pct = float(q.get("regularMarketChangePercent") or 0.0)
-    market_cap = float(q.get("marketCap") or 0.0)
-
-    if price < DYNAMIC_MARKET_MIN_PRICE or price > DYNAMIC_MARKET_MAX_PRICE:
-        return None
-    if volume < DYNAMIC_MARKET_MIN_VOLUME:
-        return None
-
-    # Optional live quote spread check using Alpaca. If unavailable, do not reject; just score lower.
-    spread = 0.0
-    spread_ok = True
-    try:
-        aq = get_quote(symbol)
-        spread = float(aq.get("spread") or 0.0)
-        if spread > DYNAMIC_MARKET_MAX_SPREAD:
-            spread_ok = False
-    except Exception:
-        spread = 0.0
-
-    if not spread_ok:
-        return None
-
-    score = 0.0
-    score += max(-8.0, min(12.0, change_pct)) * 1.25
-    score += min(10.0, math.log10(max(volume, 1)) * 1.15)
-    if market_cap > 1_000_000_000:
-        score += 4.0
-    if source == "day_gainers" and change_pct > 0:
-        score += 3.0
-    if source == "most_actives":
-        score += 1.5
-    if spread > 0:
-        score += max(0.0, 3.0 - (spread * 120.0))
-
-    return {
-        "symbol": symbol,
-        "score": round(score, 4),
-        "reason": f"dynamic scanner | {source} | change={change_pct:.2f}% | volume={volume:,}" + (f" | spread={spread:.4f}" if spread else ""),
-        "status": "active",
-        "dynamicPick": True,
-        "source": source,
-        "price": price,
-        "changePct": change_pct,
-        "volume": volume,
-        "marketCap": market_cap,
-        "spread": spread,
-    }
-
-
-def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
-    if not DYNAMIC_MARKET_SCANNER_ENABLED:
-        data = {"enabled": False, "symbols": [], "rows": [], "source": "disabled", "updatedAt": datetime.now(UTC).isoformat(), "error": ""}
-        return _save_dynamic_scanner_cache(data)
-
-    if not force and _dynamic_cache_age_seconds() < DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS:
-        return _load_dynamic_scanner_cache()
-
-    rows_by_symbol: Dict[str, Dict[str, Any]] = {}
-    errors = []
-
-    for screen in DYNAMIC_MARKET_YAHOO_SCREENS:
-        try:
-            for quote in _yahoo_dynamic_screen(screen, count=60):
-                row = _score_dynamic_quote(quote, screen)
-                if not row:
-                    continue
-                prev = rows_by_symbol.get(row["symbol"])
-                if not prev or float(row.get("score") or 0) > float(prev.get("score") or 0):
-                    rows_by_symbol[row["symbol"]] = row
-        except Exception as e:
-            errors.append(f"{screen}: {e}")
-            print(f"DYNAMIC SCANNER SOURCE ERROR {screen}: {e}")
-
-    rows = sorted(rows_by_symbol.values(), key=lambda r: float(r.get("score") or 0), reverse=True)[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]
-
-    # Safe fallback keeps the bot tradable if external screener data is unavailable.
-    if not rows:
-        for i, sym in enumerate(QUALITY_ONLY_UNIVERSE[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]):
-            rows.append({
-                "symbol": sym,
-                "score": round(50 - i, 4),
-                "reason": "dynamic scanner fallback | core quality universe",
-                "status": "active",
-                "dynamicPick": False,
-                "source": "fallback",
-            })
-
-    payload = {
-        "enabled": True,
-        "mode": "dynamic-market-scanner",
-        "updatedAt": datetime.now(UTC).isoformat(),
-        "refreshSeconds": DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS,
-        "maxSymbols": DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS,
-        "source": ",".join(DYNAMIC_MARKET_YAHOO_SCREENS),
-        "symbols": [r["symbol"] for r in rows],
-        "rows": rows,
-        "filters": {
-            "minPrice": DYNAMIC_MARKET_MIN_PRICE,
-            "maxPrice": DYNAMIC_MARKET_MAX_PRICE,
-            "minVolume": DYNAMIC_MARKET_MIN_VOLUME,
-            "maxSpread": DYNAMIC_MARKET_MAX_SPREAD,
-        },
-        "error": " | ".join(errors[-3:]),
-    }
-    return _save_dynamic_scanner_cache(payload)
-
-
-def refresh_dynamic_market_candidates_if_needed() -> Dict[str, Any]:
-    return refresh_dynamic_market_candidates(force=False)
-
-
-def dynamic_market_scanner_payload() -> Dict[str, Any]:
-    data = _load_dynamic_scanner_cache()
-    if not data.get("rows"):
-        data = refresh_dynamic_market_candidates(force=False)
-    return {"enabled": DYNAMIC_MARKET_SCANNER_ENABLED, **data}
-
-
-def dynamic_market_rows() -> List[Dict[str, Any]]:
-    if not DYNAMIC_MARKET_SCANNER_ENABLED:
-        return []
-    return list(dynamic_market_scanner_payload().get("rows") or [])
-
-
-def dynamic_market_symbols() -> List[str]:
-    return [str(r.get("symbol", "")).upper() for r in dynamic_market_rows() if r.get("symbol")]
-
-
-@app.get("/dynamic-market-scanner")
-def api_dynamic_market_scanner():
-    payload = dynamic_market_scanner_payload()
-    return {"ok": True, "dynamicMarketScanner": payload, **payload}
-
-
-@app.post("/dynamic-market-scanner/refresh")
-def api_dynamic_market_scanner_refresh(request: Request):
-    verify_api_key(request)
-    payload = refresh_dynamic_market_candidates(force=True)
-    try:
-        apply_quality_only_universe()
-        update_status(BOT_NAME, latest_scans)
-        latest_status["dynamicMarketScanner"] = payload
-        latest_status["lastAction"] = "Dynamic market scanner refreshed"
-        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
-    except Exception as e:
-        print(f"DYNAMIC SCANNER STATUS UPDATE ERROR: {e}")
-    return {"ok": True, "message": "Dynamic market scanner refreshed", "dynamicMarketScanner": payload, **payload}
-
-
-# =========================
-# QUALITY-ONLY UNIVERSE LOCK v1.3
-# =========================
-
-QUALITY_ONLY_MODE = os.getenv("QUALITY_ONLY_MODE", "true").lower() == "true"
-
-QUALITY_ONLY_UNIVERSE = [
-    "NVDA", "AMD", "MSFT", "AAPL", "META",
-    "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
-    "TSLA", "PLTR", "UBER", "QQQ", "SMH",
-]
-
-BLOCKED_WEAK_TICKERS = {
-    "LAC", "LCID", "PLUG", "SOFI", "SNAP", "NUVB",
-    "RIVN", "F", "AAL", "GIS", "PYPL"
-}
-
-def quality_only_symbols():
-    symbols = []
-
-    # Manual pins always get first priority unless explicitly blocked.
-    try:
-        if "load_manual_universe_picks" in globals() and callable(globals()["load_manual_universe_picks"]):
-            for sym in load_manual_universe_picks():
-                sym = str(sym).upper().strip()
-                if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
-                    symbols.append(sym)
-    except Exception as e:
-        print(f"QUALITY ONLY MANUAL MERGE ERROR: {e}")
-
-    # Dynamic scanner picks are the main discovery layer.
-    try:
-        if DYNAMIC_MARKET_SCANNER_ENABLED:
-            for sym in dynamic_market_symbols():
-                sym = str(sym).upper().strip()
-                if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
-                    symbols.append(sym)
-    except Exception as e:
-        print(f"QUALITY ONLY DYNAMIC MERGE ERROR: {e}")
-
-    # Core quality names are the safety fallback and stable baseline.
-    for sym in QUALITY_ONLY_UNIVERSE:
-        sym = str(sym).upper().strip()
-        if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
-            symbols.append(sym)
-
-    return symbols
-
-def quality_only_rows():
-    rows = []
-    dynamic_by_symbol = {}
-    try:
-        dynamic_by_symbol = {str(r.get("symbol", "")).upper(): r for r in dynamic_market_rows()}
-    except Exception:
-        dynamic_by_symbol = {}
-
-    manual_picks = set()
-    try:
-        manual_picks = {str(s).upper() for s in load_manual_universe_picks()}
-    except Exception:
-        manual_picks = set()
-
-    for i, sym in enumerate(quality_only_symbols()):
-        dyn = dynamic_by_symbol.get(sym)
-        is_manual = sym in manual_picks
-        is_dynamic = bool(dyn)
-        base_score = 100 - (i * 3.0)
-        score = float(dyn.get("score", base_score)) if dyn else base_score
-        reason = dyn.get("reason") if dyn else "core quality universe | weak tickers blocked"
-        if is_manual:
-            reason = "manual pick | pinned to universe" + (f" | {reason}" if reason else "")
-            score = max(score, 99.0)
-        rows.append({
-            "symbol": sym,
-            "score": round(score, 2),
-            "reason": reason,
-            "status": "active",
-            "manualPick": is_manual,
-            "dynamicPick": is_dynamic,
-            "source": dyn.get("source") if dyn else "core-quality",
-            "changePct": dyn.get("changePct") if dyn else None,
-            "volume": dyn.get("volume") if dyn else None,
-            "price": dyn.get("price") if dyn else None,
-        })
-    return rows
-
-def apply_quality_only_universe():
-    global current_universe, SAFE_UNIVERSE, UNIVERSE, AUTO_UNIVERSE_CANDIDATE_POOL
-
-    symbols = quality_only_symbols()
-    rows = quality_only_rows()
-
-    try:
-        current_universe = symbols[:]
-    except Exception:
-        pass
-
-    try:
-        SAFE_UNIVERSE = symbols[:]
-    except Exception:
-        pass
-
-    try:
-        UNIVERSE = symbols[:]
-    except Exception:
-        pass
-
-    try:
-        AUTO_UNIVERSE_CANDIDATE_POOL = symbols[:]
-    except Exception:
-        pass
-
-    try:
-        latest_status["autoUniverse"] = {
-            "enabled": True,
-            "mode": "dynamic-quality-hybrid" if DYNAMIC_MARKET_SCANNER_ENABLED else "quality-only",
-            "size": len(symbols),
-            "activeSymbols": symbols,
-            "rows": rows,
-            "blockedWeakTickers": sorted(list(BLOCKED_WEAK_TICKERS)),
-            "dynamicScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
-            "lastRefresh": datetime.now(UTC).isoformat(),
-            "manualPickCount": len([s for s in symbols if s not in QUALITY_ONLY_UNIVERSE]),
-        }
-        latest_status["lastAction"] = "Quality-only universe applied"
-        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
-    except Exception as e:
-        print(f"QUALITY ONLY STATUS ERROR: {e}")
-
-    return symbols
-
-def is_quality_blocked_symbol(symbol: str) -> bool:
-    sym = str(symbol).upper().strip()
-    if not QUALITY_ONLY_MODE:
-        return False
-    if sym in BLOCKED_WEAK_TICKERS:
-        return True
-    if sym not in quality_only_symbols():
-        return True
-    return False
-
-def quality_buy_check(symbol: str):
-    sym = str(symbol).upper().strip()
-    if is_quality_blocked_symbol(sym):
-        return {
-            "ok": False,
-            "reason": f"{sym} blocked by quality-only universe",
-        }
-    return {"ok": True, "reason": "quality approved"}
-
-# Apply immediately on startup/redeploy.
-try:
-    apply_quality_only_universe()
-except Exception as e:
-    print(f"QUALITY ONLY STARTUP APPLY ERROR: {e}")
-
-@app.get("/quality-universe")
-def api_quality_universe():
-    return {
-        "ok": True,
-        "qualityOnlyMode": QUALITY_ONLY_MODE,
-        "activeSymbols": quality_only_symbols(),
-        "blockedWeakTickers": sorted(list(BLOCKED_WEAK_TICKERS)),
-        "rows": quality_only_rows(),
-    }
-
-@app.post("/apply-quality-universe")
-def api_apply_quality_universe(request: Request):
-    verify_api_key(request)
-    symbols = apply_quality_only_universe()
-    try:
-        update_status(BOT_NAME, latest_scans)
-        apply_quality_only_universe()
-    except Exception as e:
-        print(f"APPLY QUALITY UPDATE_STATUS ERROR: {e}")
-    return {
-        "ok": True,
-        "message": "Quality-only universe applied",
-        "activeSymbols": symbols,
-        "blockedWeakTickers": sorted(list(BLOCKED_WEAK_TICKERS)),
-    }
-
-
-
-
-# =========================
-# FORCE QUALITY UNIVERSE STATUS/UI PATCH
-# =========================
-
-def force_quality_auto_universe_payload():
-    try:
-        if "quality_only_rows" in globals():
-            rows = quality_only_rows()
-        elif "quality_universe_rows" in globals():
-            rows = quality_universe_rows()
-        else:
-            rows = []
-        symbols = [r["symbol"] for r in rows]
-    except Exception:
-        rows = []
-        symbols = []
-
-    if not symbols:
-        symbols = [
-            "NVDA", "AMD", "MSFT", "AAPL", "META",
-            "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
-            "TSLA", "PLTR", "UBER", "QQQ", "SMH",
-        ]
-        rows = [
-            {
-                "symbol": s,
-                "score": round(100 - (i * 3), 2),
-                "reason": "quality-only universe | forced UI sync",
-                "status": "active",
-            }
-            for i, s in enumerate(symbols)
-        ]
-
-    return {
-        "enabled": True,
-        "mode": "dynamic-quality-hybrid" if DYNAMIC_MARKET_SCANNER_ENABLED else "quality-only",
-        "size": len(symbols),
-        "weekStart": datetime.now(UTC).date().isoformat(),
-        "monthStart": datetime.now(UTC).replace(day=1).date().isoformat(),
-        "activeSymbols": symbols,
-        "rows": rows,
-        "lastRefresh": datetime.now(UTC).isoformat(),
-        "candidatePoolSize": len(symbols),
-        "dynamicPickCount": len([r for r in rows if r.get("dynamicPick")]),
-        "manualPickCount": len([r for r in rows if r.get("manualPick")]),
-        "dynamicScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
-        "keepWinners": True,
-    }
-
-@app.get("/weekly-universe")
-def weekly_universe():
-    payload = force_quality_auto_universe_payload()
-    try:
-        latest_status["autoUniverse"] = payload
-    except Exception:
-        pass
-    return {"ok": True, "autoUniverse": payload, **payload}
-
-@app.post("/refresh-universe")
-def refresh_universe(request: Request):
-    """
-    Fast weekly stock refresh route for the dashboard button.
-
-    Important fix:
-    - Do not wait behind the trading bot lock.
-    - Do not run slow scans/trading work here.
-    - Update current_universe + latest_status immediately so /status and /weekly-universe
-      show the refreshed list straight away.
-    """
-    print("BUTTON HIT: refresh-universe", flush=True)
-    verify_api_key(request)
-
-    try:
-        if "refresh_dynamic_market_candidates" in globals():
-            refresh_dynamic_market_candidates(force=True)
-        if "apply_quality_only_universe" in globals():
-            apply_quality_only_universe()
-        elif "apply_quality_universe_to_status" in globals():
-            apply_quality_universe_to_status()
-    except Exception as e:
-        print(f"QUALITY APPLY ERROR: {e}")
-
-    payload = force_quality_auto_universe_payload()
-    symbols = list(dict.fromkeys([str(s).upper().strip() for s in payload.get("activeSymbols", []) if str(s).strip()]))
-
-    try:
-        global current_universe, last_universe_refresh_ts
-        if symbols:
-            current_universe = symbols
-            for sym in current_universe:
-                ensure_symbol_state(sym, custom=sym in custom_symbols)
-        last_universe_refresh_ts = time.time()
-    except Exception as e:
-        print(f"REFRESH UNIVERSE STATE ERROR: {e}")
-
-    try:
-        latest_status["autoUniverse"] = payload
-        latest_status["universe"] = symbols or payload.get("activeSymbols", [])
-        latest_status["lastAction"] = "Quality-only weekly universe refreshed"
-        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
-        latest_status["autoUniverseEnabled"] = True
-        latest_status["dynamicMarketScanner"] = dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {}
-    except Exception as e:
-        print(f"REFRESH UNIVERSE STATUS ERROR: {e}")
-
-    return {
-        "ok": True,
-        "message": "Dynamic market universe refreshed",
-        "autoUniverse": payload,
-        "activeSymbols": symbols or payload.get("activeSymbols", []),
-        "rows": payload.get("rows", []),
-    }
-
-@app.get("/refresh-universe-preview")
-def refresh_universe_preview():
-    print("BUTTON HIT: refresh-universe", flush=True)
-    payload = force_quality_auto_universe_payload()
-    return {
-        "ok": True,
-        "message": "Preview of quality-only universe",
-        "activeSymbols": payload["activeSymbols"],
-        "rows": payload["rows"],
-        "autoUniverse": payload,
-    }
-
-
-
-
-# ============================================================
-# PROFIT BANKING / PERSISTENT TRADING CAP OVERRIDE
-# ============================================================
-
-def trading_cap_file_path() -> str:
-    """Persistent cap file.
-
-    On Render, set TRADING_CAP_FILE to your disk path if your disk is not mounted
-    at /var/data. If /var/data exists, the bot will use it automatically.
-    """
-    env_path = os.getenv("TRADING_CAP_FILE", "").strip()
-    if env_path:
-        return env_path
-    if os.path.isdir("/var/data"):
-        return "/var/data/trading_cap.json"
-    base = os.getenv("RENDER_DISK_PATH", "backend/state")
-    return os.path.join(base, "trading_cap.json")
-
-
-def _default_trading_cap_usd() -> float:
-    try:
-        return float(os.getenv("MAX_TRADING_CAPITAL", str(MAX_TRADING_CAPITAL or 200)) or 200)
-    except Exception:
-        return 200.0
-
-
-def load_trading_cap_setting() -> Dict[str, Any]:
-    path = trading_cap_file_path()
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            value = float(data.get("value") or 0)
-            currency = str(data.get("currency") or "GBP").upper()
-            if value > 0 and currency in ["GBP", "USD"]:
-                return {
-                    "value": value,
-                    "currency": currency,
-                    "source": "saved",
-                    "path": path,
-                    "updatedAt": data.get("updatedAt", ""),
-                }
-    except Exception as e:
-        print(f"TRADING CAP LOAD ERROR: {e}")
-
-    # Backwards-compatible fallback: old env/code cap is USD.
-    return {
-        "value": _default_trading_cap_usd(),
-        "currency": "USD",
-        "source": "env",
-        "path": path,
-        "updatedAt": "",
-    }
-
-
-def save_trading_cap_setting(value: float, currency: str = "GBP") -> Dict[str, Any]:
-    currency = str(currency or "GBP").upper().strip()
-    if currency not in ["GBP", "USD"]:
-        currency = "GBP"
-    value = float(value or 0)
-    if value < 0:
-        value = 0.0
-
-    path = trading_cap_file_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    data = {
-        "value": round(value, 2),
-        "currency": currency,
-        "updatedAt": datetime.now(UTC).isoformat(),
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    return load_trading_cap_setting()
-
-
-def trading_cap_usd() -> float:
-    setting = load_trading_cap_setting()
-    value = float(setting.get("value") or 0.0)
-    currency = str(setting.get("currency") or "USD").upper()
+    value = _safe_num(payload.get("baseline") or payload.get("value"), 0)
     if value <= 0:
-        return 0.0
-    if currency == "GBP":
-        rate = get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP
-        return value / max(rate, 0.0001)
-    return value
+        raise HTTPException(status_code=400, detail="Invalid baseline")
+    save_equity_baseline(value)
+    return {"ok": True, "message": f"Baseline set to ${value:.2f}", "baseline": value}
 
-
-def trading_cap_gbp() -> float:
-    setting = load_trading_cap_setting()
-    value = float(setting.get("value") or 0.0)
-    currency = str(setting.get("currency") or "USD").upper()
-    if value <= 0:
-        return 0.0
-    if currency == "GBP":
-        return value
-    return money_gbp(value)
-
-
-def effective_trading_equity(account_equity: float) -> float:
-    try:
-        equity = float(account_equity or 0)
-    except Exception:
-        equity = 0.0
-
-    cap = trading_cap_usd()
-    return max(0.0, min(equity, cap)) if cap > 0 else max(0.0, equity)
-
-
-def banking_payload():
-    try:
-        account = get_account()
-        equity = float(account.equity)
-    except Exception:
-        equity = 0.0
-
-    setting = load_trading_cap_setting()
-    cap_usd = trading_cap_usd()
-    cap_gbp = trading_cap_gbp()
-
-    effective = max(0.0, min(equity, cap_usd)) if cap_usd > 0 else max(0.0, equity)
-    banked = max(0.0, equity - effective) if cap_usd > 0 else 0.0
-
-    return {
-        "ok": True,
-        "enabled": cap_usd > 0,
-        "maxTradingCapital": cap_usd,
-        "maxTradingCapitalUsd": cap_usd,
-        "maxTradingCapitalGbp": cap_gbp,
-        "tradingCapValue": float(setting.get("value") or 0.0),
-        "tradingCapCurrency": setting.get("currency", "USD"),
-        "tradingCapSource": setting.get("source", "env"),
-        "tradingCapFile": setting.get("path", trading_cap_file_path()),
-        "tradingCapUpdatedAt": setting.get("updatedAt", ""),
-        "accountEquity": equity,
-        "effectiveTradingEquity": effective,
-        "effectiveTradingEquityGbp": money_gbp(effective),
-        "bankedProfitCashBuffer": banked,
-        "bankedProfitCashBufferGbp": money_gbp(banked),
-        "message": "Profit banking active" if cap_usd > 0 else "Profit banking disabled",
-    }
-
-
-@app.get("/banking-status")
-def api_banking_status():
-    return {"ok": True, **banking_payload()}
-
-
-@app.get("/trading-cap")
-def api_get_trading_cap():
-    return {"ok": True, **banking_payload()}
-
-
-@app.post("/trading-cap")
-def api_set_trading_cap(request: Request, payload: dict = Body(...)):
-    verify_api_key(request)
-    try:
-        # Dashboard sends GBP by default, because that is how the user thinks
-        # about the trading cap. Backend converts it to USD internally for Alpaca.
-        value = payload.get("capGbp", payload.get("value", payload.get("cap")))
-        currency = str(payload.get("currency", "GBP")).upper()
-        value = float(value)
-        if value <= 0:
-            return {"ok": False, "message": "Trading cap must be greater than 0"}
-        setting = save_trading_cap_setting(value, currency)
-        payload_out = banking_payload()
-        try:
-            latest_status["banking"] = payload_out
-            latest_status["newPositionNotional"] = calculate_new_position_notional()
-            latest_status["lastAction"] = f"Trading cap saved: {currency} {value:.2f}"
-            latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
-        except Exception:
-            pass
-        return {
-            "ok": True,
-            "message": f"Trading cap saved at {currency} {value:.2f}",
-            "setting": setting,
-            **payload_out,
-        }
-    except Exception as e:
-        return {"ok": False, "message": f"Could not save trading cap: {e}"}
-
-
-
-# =========================
-# BACKTEST / PAPER REPLAY REPORT
-# =========================
-@app.post("/backtest-replay")
-def api_backtest_replay(payload: dict = Body(default={}), request: Request = None):
-    if request is not None:
-        verify_api_key(request)
-
-    try:
-        cap_gbp = float(payload.get("capGbp") or 0.0)
-    except Exception:
-        cap_gbp = 0.0
-
-    try:
-        rate = get_usd_to_gbp_rate()
-    except Exception:
-        rate = FX_FALLBACK_USD_TO_GBP
-
-    cap_usd = cap_gbp / max(rate, 0.0001) if cap_gbp > 0 else 0.0
-
-    try:
-        closed = closed_trades_from_db(10000)
-    except Exception:
-        closed = []
-
-    rows = []
-    equity = cap_gbp if cap_gbp > 0 else 0.0
-    peak = equity
-    max_drawdown = 0.0
-    wins = 0
-    losses = 0
-    total_pnl_gbp = 0.0
-    total_pnl_usd = 0.0
-    by_symbol: Dict[str, Dict[str, Any]] = {}
-
-    for t in closed:
-        try:
-            symbol = str(t.get("symbol", "")).upper()
-            pnl_usd = float(t.get("pnl") or 0.0)
-            pnl_gbp = float(t.get("pnlGbp") or (pnl_usd * rate))
-            if not symbol:
-                continue
-
-            wins += 1 if pnl_usd >= 0 else 0
-            losses += 1 if pnl_usd < 0 else 0
-            total_pnl_usd += pnl_usd
-            total_pnl_gbp += pnl_gbp
-            equity += pnl_gbp
-            peak = max(peak, equity)
-            max_drawdown = max(max_drawdown, peak - equity)
-
-            row = by_symbol.setdefault(symbol, {
-                "symbol": symbol,
-                "trades": 0,
-                "wins": 0,
-                "losses": 0,
-                "pnlUsd": 0.0,
-                "pnlGbp": 0.0,
-                "winRate": 0.0,
-            })
-            row["trades"] += 1
-            row["wins"] += 1 if pnl_usd >= 0 else 0
-            row["losses"] += 1 if pnl_usd < 0 else 0
-            row["pnlUsd"] += pnl_usd
-            row["pnlGbp"] += pnl_gbp
-
-            rows.append({
-                "time": t.get("time") or t.get("timestamp") or "",
-                "symbol": symbol,
-                "pnlUsd": pnl_usd,
-                "pnlGbp": pnl_gbp,
-                "equityGbp": equity,
-            })
-        except Exception:
-            continue
-
-    symbol_rows = []
-    for row in by_symbol.values():
-        row["winRate"] = row["wins"] / max(1, row["trades"])
-        row["pnlUsd"] = round(float(row["pnlUsd"]), 4)
-        row["pnlGbp"] = round(float(row["pnlGbp"]), 4)
-        symbol_rows.append(row)
-
-    symbol_rows.sort(key=lambda r: float(r.get("pnlGbp") or 0.0), reverse=True)
-    best_symbol = symbol_rows[0]["symbol"] if symbol_rows else "—"
-    worst_symbol = symbol_rows[-1]["symbol"] if symbol_rows else "—"
-
-    return {
-        "ok": True,
-        "message": "Backtest / paper replay report complete",
-        "capGbp": cap_gbp,
-        "capUsd": cap_usd,
-        "tradesTested": len(rows),
-        "wins": wins,
-        "losses": losses,
-        "winRate": wins / max(1, wins + losses),
-        "replayPnlUsd": round(total_pnl_usd, 4),
-        "replayPnlGbp": round(total_pnl_gbp, 4),
-        "endingEquityGbp": round(equity, 4),
-        "maxDrawdownGbp": round(max_drawdown, 4),
-        "bestSymbol": best_symbol,
-        "worstSymbol": worst_symbol,
-        "bySymbol": symbol_rows,
-        "equityCurve": rows[-500:],
-        "notes": "Uses matched closed-trade history. It is a reporting replay, not a live trade signal and does not place orders.",
-    }
