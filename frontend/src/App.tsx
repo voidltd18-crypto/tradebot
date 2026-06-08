@@ -59,7 +59,9 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [strategyStrictness, setStrategyStrictness] = useState<number>(0);
   const [strategySaving, setStrategySaving] = useState(false);
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
-  const [positionsSaving, setPositionsSaving] = useState(false);
+  
+  const [buySizeMode, setBuySizeMode] = useState<"full"|"partial">("full");
+const [positionsSaving, setPositionsSaving] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
   const lastFetchAt = useRef(0);
@@ -438,7 +440,37 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
-  async function saveMaxPositions(valueOverride?: number) {
+  
+  async function saveBuySizeMode(mode:"full"|"partial") {
+    try {
+      setMessage(`Saving ${mode === "full" ? "Full Buy" : "Partial Buy"} mode...`);
+      const token = authToken || apiKey || localStorage.getItem("tradebot_auth_token") || localStorage.getItem("dashboard_api_key") || "";
+      const res = await fetch(`${API_URL}/buy-size-mode`, {
+        method: "POST",
+        headers: {
+          ...secureHeaders,
+          "Content-Type": "application/json",
+          "x-api-key": token,
+          "X-Auth-Token": token,
+        },
+        cache: "no-store",
+        body: JSON.stringify({ mode }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) {
+        throw new Error(json?.detail || json?.message || "Could not save buy size mode");
+      }
+      const savedMode = json?.buySizeMode === "partial" ? "partial" : "full";
+      setBuySizeMode(savedMode);
+      setMessage(json?.message || `Buy size mode saved as ${savedMode}.`);
+      await fetchData(true);
+      setTimeout(() => fetchData(true), 1500);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not save buy size mode.");
+    }
+  }
+
+async function saveMaxPositions(valueOverride?: number) {
     if (!token) {
       setMessage("Please login first.");
       return;
@@ -876,6 +908,21 @@ const fetchData = useCallback(async (force = false) => {
         </div>
         <p className="muted">Lower numbers concentrate the bot into fewer holdings. If you already hold more than the new limit, the bot will stop opening new positions until holdings drop below it.</p>
       </Card>
+
+      <Card title="Buy Size Mode">
+        <div className="summary">
+          <div><span>Current mode</span><b>{buySizeMode === "full" ? "Full Buy" : "Partial Buy"}</b></div>
+          <div><span>Partial estimate</span><b>{gbp(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).partialUsd || 0) * rate)} / {usd(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).partialUsd || 0))}</b></div>
+          <div><span>Full estimate</span><b>{gbp(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).fullUsd || 0) * rate)} / {usd(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).fullUsd || 0))}</b></div>
+          <div><span>Capped equity</span><b>{gbp(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).cappedEquityUsd || 0) * rate)} / {usd(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).cappedEquityUsd || 0))}</b></div>
+        </div>
+        <div className="actions">
+          <button className={buySizeMode === "partial" ? "active" : "ghost"} onClick={()=>saveBuySizeMode("partial")}>Partial Buy</button>
+          <button className={buySizeMode === "full" ? "active" : "ghost"} onClick={()=>saveBuySizeMode("full")}>Full Buy</button>
+        </div>
+        <p className="muted">Full Buy uses most available capped capital for one position. Partial Buy splits capital across several smaller positions.</p>
+      </Card>
+
       <Card title="Dynamic Auto Universe" wide>
         <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
         <div className="universe-counts">
