@@ -87,7 +87,8 @@ CASH_BUFFER = 0.50
 # Full-buy mode:
 # When max positions is 1, use nearly all available trading capital/buying power
 # instead of small partial sizing.
-FULL_BUY_WHEN_ONE_POSITION = os.getenv("FULL_BUY_WHEN_ONE_POSITION", "true").lower() == "true"
+BUY_SIZE_MODE = os.getenv("BUY_SIZE_MODE", "full").lower()
+FULL_BUY_WHEN_ONE_POSITION = BUY_SIZE_MODE == "full" or os.getenv("FULL_BUY_WHEN_ONE_POSITION", "true").lower() == "true"
 FULL_BUY_CASH_BUFFER = float(os.getenv("FULL_BUY_CASH_BUFFER", "2.00") or 2.00)
 
 MAX_SPREAD = 0.015
@@ -329,6 +330,116 @@ def verify_api_key(request: Request):
     if key != DASHBOARD_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+
+
+
+# =========================
+# BUY SIZE MODE ROUTES RESTORE
+# =========================
+BUY_SIZE_STATE_DIR = os.path.join("backend", "state")
+BUY_SIZE_STATE_FILE = os.path.join(BUY_SIZE_STATE_DIR, "buy_size_mode.json")
+
+def load_buy_size_mode() -> str:
+    try:
+        if os.path.exists(BUY_SIZE_STATE_FILE):
+            with open(BUY_SIZE_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            mode = str(data.get("mode", "full")).lower().strip()
+            if mode in ("full", "partial"):
+                return mode
+    except Exception as e:
+        print(f"BUY SIZE MODE READ ERROR: {e}", flush=True)
+
+    mode = str(os.getenv("BUY_SIZE_MODE", "full")).lower().strip()
+    return mode if mode in ("full", "partial") else "full"
+
+def save_buy_size_mode(mode: str) -> str:
+    mode = str(mode or "full").lower().strip()
+    if mode not in ("full", "partial"):
+        mode = "full"
+    try:
+        os.makedirs(BUY_SIZE_STATE_DIR, exist_ok=True)
+        with open(BUY_SIZE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"mode": mode}, f, indent=2)
+    except Exception as e:
+        print(f"BUY SIZE MODE SAVE ERROR: {e}", flush=True)
+    return mode
+
+def apply_buy_size_mode(mode: str) -> str:
+    global BUY_SIZE_MODE, FULL_BUY_WHEN_ONE_POSITION
+    mode = str(mode or "full").lower().strip()
+    if mode not in ("full", "partial"):
+        mode = "full"
+    BUY_SIZE_MODE = mode
+    FULL_BUY_WHEN_ONE_POSITION = mode == "full"
+    return mode
+
+def buy_size_preview_payload():
+    try:
+        account = get_account()
+        equity = float(getattr(account, "equity", 0) or 0)
+        buying_power = float(getattr(account, "buying_power", 0) or 0)
+    except Exception:
+        equity = 0.0
+        buying_power = 0.0
+
+    try:
+        max_positions = int(MAX_POSITIONS)
+    except Exception:
+        max_positions = 1
+
+    try:
+        positions = get_positions() if "get_positions" in globals() else []
+        open_positions = len(positions)
+    except Exception:
+        open_positions = 0
+
+    try:
+        capped_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
+    except Exception:
+        capped_equity = equity
+
+    try:
+        cash_buffer = float(CASH_BUFFER)
+    except Exception:
+        cash_buffer = 0.50
+
+    try:
+        full_buffer = float(FULL_BUY_CASH_BUFFER) if "FULL_BUY_CASH_BUFFER" in globals() else 2.00
+    except Exception:
+        full_buffer = 2.00
+
+    partial_usd = max(0.0, min(capped_equity / max(1, max_positions), max(0.0, buying_power - cash_buffer)))
+    full_usd = max(0.0, min(capped_equity, max(0.0, buying_power - full_buffer)))
+
+    def gbp_safe(v):
+        try:
+            return money_gbp(v)
+        except Exception:
+            try:
+                return float(v) * float(get_usd_to_gbp_rate())
+            except Exception:
+                return float(v)
+
+    mode = apply_buy_size_mode(load_buy_size_mode())
+
+    return {
+        "ok": True,
+        "mode": mode,
+        "partialUsd": round(partial_usd, 2),
+        "partialGbp": round(gbp_safe(partial_usd), 2),
+        "fullUsd": round(full_usd, 2),
+        "fullGbp": round(gbp_safe(full_usd), 2),
+        "cappedEquityUsd": round(capped_equity, 2),
+        "cappedEquityGbp": round(gbp_safe(capped_equity), 2),
+        "buyingPowerUsd": round(buying_power, 2),
+        "buyingPowerGbp": round(gbp_safe(buying_power), 2),
+        "maxPositions": max_positions,
+        "openPositions": open_positions,
+        "remainingSlots": max(0, max_positions - open_positions),
+    }
+
+apply_buy_size_mode(load_buy_size_mode())
 
 @app.post("/login")
 def login(payload: dict = Body(...)):
@@ -3382,6 +3493,66 @@ def api_get_position_settings():
     return current_position_settings_payload()
 
 
+
+
+@app.post("/buy-size-mode")
+def api_buy_size_mode(payload: dict = Body(...), request: Request = None):
+    if request is not None:
+        verify_api_key(request)
+
+    global FULL_BUY_WHEN_ONE_POSITION, BUY_SIZE_MODE
+
+    mode = str(payload.get("mode", "")).lower().strip()
+    if mode not in ("partial", "full"):
+        raise HTTPException(status_code=400, detail="mode must be partial or full")
+
+    BUY_SIZE_MODE = mode
+    FULL_BUY_WHEN_ONE_POSITION = mode == "full"
+
+    return {
+        "ok": True,
+        "message": f"Buy size mode set to {mode}",
+        "buySizeMode": mode,
+        "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
+        "positionSettings": position_settings_payload() if "position_settings_payload" in globals() else {},
+    }
+
+
+
+@app.get("/buy-size-preview")
+def api_buy_size_preview():
+    return buy_size_preview_payload()
+
+@app.get("/buy-size-mode")
+def api_get_buy_size_mode():
+    mode = apply_buy_size_mode(load_buy_size_mode())
+    return {
+        "ok": True,
+        "buySizeMode": mode,
+        "fullBuyWhenOnePosition": mode == "full",
+        "preview": buy_size_preview_payload(),
+    }
+
+@app.post("/buy-size-mode")
+def api_buy_size_mode(payload: dict = Body(...), request: Request = None):
+    if request is not None:
+        verify_api_key(request)
+
+    mode = str(payload.get("mode", "")).lower().strip()
+    if mode not in ("full", "partial"):
+        raise HTTPException(status_code=400, detail="mode must be full or partial")
+
+    saved_mode = save_buy_size_mode(mode)
+    apply_buy_size_mode(saved_mode)
+
+    return {
+        "ok": True,
+        "message": f"Buy size mode saved as {saved_mode}",
+        "buySizeMode": saved_mode,
+        "fullBuyWhenOnePosition": saved_mode == "full",
+        "preview": buy_size_preview_payload(),
+    }
+
 @app.post("/position-settings")
 def api_set_position_settings(request: Request, payload: dict = Body(...)):
     verify_api_key(request)
@@ -3660,7 +3831,6 @@ BOT_VERSION_NOTES = {
 def version():
     return BOT_VERSION_NOTES
 
-
 # ---------- baseline reporting ----------
 BASELINE_FILE = os.path.join("backend", "state", "equity_baseline.json")
 
@@ -3676,141 +3846,78 @@ def load_equity_baseline() -> float:
             with open(BASELINE_FILE, "r", encoding="utf-8") as f:
                 return float(json.load(f).get("baseline", 0) or 0)
     except Exception as e:
-        print(f"BASELINE LOAD ERROR: {e}", flush=True)
+        print(f"BASELINE LOAD ERROR: {e}")
     return 0.0
 
 def save_equity_baseline(value: float) -> None:
     try:
         os.makedirs(os.path.dirname(BASELINE_FILE), exist_ok=True)
-        payload = {"baseline": float(value or 0)}
-        try:
-            payload["resetAt"] = datetime.now(UTC).isoformat()
-        except Exception:
-            payload["resetAt"] = ""
         with open(BASELINE_FILE, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
+            json.dump({"baseline": float(value or 0), "resetAt": datetime.now(UTC).isoformat()}, f, indent=2)
     except Exception as e:
-        print(f"BASELINE SAVE ERROR: {e}", flush=True)
+        print(f"BASELINE SAVE ERROR: {e}")
 
-def _reports_current_equity() -> float:
+@app.post("/reset-baseline")
+def reset_baseline(request: Request):
+    verify_api_key(request)
     try:
-        return float(get_account().equity)
-    except Exception:
-        try:
-            return _safe_num(latest_status.get("account", {}).get("equity", 0))
-        except Exception:
-            return 0.0
+        equity = _safe_num(latest_status.get("account", {}).get("equity", 0))
+        save_equity_baseline(equity)
+        return {"ok": True, "message": f"Baseline reset to ${equity:.2f}", "baseline": equity}
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
 
 @app.get("/baseline")
 def get_baseline():
-    baseline = load_equity_baseline()
-    return {
-        "ok": True,
-        "baseline": baseline,
-        "baselineGbp": money_gbp(baseline) if "money_gbp" in globals() else baseline,
-        "source": "saved" if baseline > 0 else "none",
-    }
-
-@app.post("/set-baseline")
-def set_baseline(payload: dict = Body(...), request: Request = None):
-    if request is not None:
-        verify_api_key(request)
-    value = _safe_num(payload.get("baseline") or payload.get("value") or payload.get("amount"), 0)
-    if value <= 0:
-        raise HTTPException(status_code=400, detail="Invalid baseline")
-    save_equity_baseline(value)
-    return {
-        "ok": True,
-        "message": f"Baseline saved at ${value:.2f}",
-        "baseline": value,
-        "baselineGbp": money_gbp(value) if "money_gbp" in globals() else value,
-        "depositSource": "saved",
-    }
-
-@app.post("/reset-baseline")
-def reset_baseline(request: Request = None):
-    if request is not None:
-        verify_api_key(request)
-    equity = _reports_current_equity()
-    save_equity_baseline(equity)
-    return {
-        "ok": True,
-        "message": f"Baseline reset to current equity ${equity:.2f}",
-        "baseline": equity,
-        "baselineGbp": money_gbp(equity) if "money_gbp" in globals() else equity,
-        "depositSource": "saved",
-    }
+    return {"ok": True, "baseline": load_equity_baseline()}
 
 @app.get("/reports")
 def reports():
     status = latest_status if isinstance(latest_status, dict) else {}
     account = status.get("account") or {}
     db = status.get("dbSummary") or {}
-    equity = _reports_current_equity() or _safe_num(account.get("equity"))
+    equity = _safe_num(account.get("equity"))
     equity_gbp = _safe_num(account.get("equityGbp"))
-    if equity_gbp <= 0:
-        equity_gbp = money_gbp(equity) if "money_gbp" in globals() else equity
-
     total_withdrawn = _safe_num(globals().get("TOTAL_WITHDRAWN_USD", 0))
     baseline = load_equity_baseline()
     total_deposited = baseline if baseline > 0 else _safe_num(globals().get("TOTAL_DEPOSITED_USD", 0))
-    deposit_source = "saved" if baseline > 0 else "env"
+    deposit_source = "reset-baseline" if baseline > 0 else "env"
     if total_deposited <= 0:
         total_deposited = equity
         deposit_source = "equity-baseline"
-
     total_gain_loss = equity + total_withdrawn - total_deposited
-
-    try:
-        closed = closed_trades_from_db(1000) if "closed_trades_from_db" in globals() else []
-    except Exception:
-        closed = status.get("closedTrades") or []
-    try:
-        timeline = trades_from_db(1000) if "trades_from_db" in globals() else []
-    except Exception:
-        timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
-
+    closed = status.get("closedTrades") or []
+    timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
     equity_history = []
-    daily = {}
     for i, e in enumerate(timeline if isinstance(timeline, list) else []):
         if not isinstance(e, dict):
             continue
-        raw_time = e.get("time") or e.get("timestamp") or e.get("t") or ""
-        pnl = _safe_num(e.get("pnl"), 0)
-        day = str(raw_time)[:10] if raw_time else f"Session {i+1}"
-        daily[day] = daily.get(day, 0.0) + pnl
-        ev_equity = _safe_num(e.get("equity") or e.get("value"), equity)
         equity_history.append({
             "idx": i,
-            "time": raw_time,
+            "time": e.get("time") or e.get("timestamp") or e.get("t") or "",
             "symbol": e.get("symbol") or "",
             "side": e.get("side") or "",
-            "equity": ev_equity,
-            "equityGbp": _safe_num(e.get("equityGbp") or e.get("valueGbp") or (money_gbp(ev_equity) if "money_gbp" in globals() else ev_equity)),
-            "pnl": pnl,
-            "pnlGbp": _safe_num(e.get("pnlGbp") or (money_gbp(pnl) if "money_gbp" in globals() else pnl)),
+            "equity": _safe_num(e.get("equity") or e.get("value")),
+            "equityGbp": _safe_num(e.get("equityGbp") or e.get("valueGbp")),
+            "pnl": _safe_num(e.get("pnl")),
+            "pnlGbp": _safe_num(e.get("pnlGbp")),
             "pnlPct": _safe_num(e.get("pnlPct")),
             "reason": e.get("reason") or "",
         })
-    daily_pnl = [{"day": k, "pnl": v, "pnlGbp": money_gbp(v) if "money_gbp" in globals() else v} for k, v in sorted(daily.items())]
-
     return {
         "ok": True,
         "depositSource": deposit_source,
         "totalDeposited": total_deposited,
-        "totalDepositedGbp": money_gbp(total_deposited) if "money_gbp" in globals() else total_deposited,
         "totalWithdrawn": total_withdrawn,
         "currentEquity": equity,
         "currentEquityGbp": equity_gbp,
         "totalGainLoss": total_gain_loss,
-        "totalGainLossGbp": money_gbp(total_gain_loss) if "money_gbp" in globals() else total_gain_loss,
         "earnedSinceDeposit": max(total_gain_loss, 0.0),
         "lostSinceDeposit": abs(min(total_gain_loss, 0.0)),
         "dayPnl": _safe_num(account.get("pnlDay")),
         "realisedNet": _safe_num(db.get("totalPnl")),
         "closedTrades": closed[-200:] if isinstance(closed, list) else [],
         "equityHistory": equity_history[-500:],
-        "dailyPnl": daily_pnl,
         "winRate": _safe_num(db.get("winRate")) * 100.0,
         "totalTrades": int(_safe_num(db.get("totalTrades"))),
     }
