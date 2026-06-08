@@ -56,9 +56,12 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [replayCapInput, setReplayCapInput] = useState<string>("");
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
+  const [manualBaselineInput, setManualBaselineInput] = useState<string>("");
+  const [baselineSaving, setBaselineSaving] = useState(false);
   const [strategyStrictness, setStrategyStrictness] = useState<number>(0);
   const [strategySaving, setStrategySaving] = useState(false);
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
+  const [buySizeMode, setBuySizeMode] = useState<"full"|"partial">("full");
   const [positionsSaving, setPositionsSaving] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
@@ -438,7 +441,39 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
-  async function saveMaxPositions(valueOverride?: number) {
+  
+  async function saveBuySizeMode(mode:"full"|"partial") {
+    try {
+      setMessage(`Saving ${mode === "full" ? "Full Buy" : "Partial Buy"} mode...`);
+      const token = authToken || apiKey || localStorage.getItem("tradebot_auth_token") || localStorage.getItem("dashboard_api_key") || "";
+      const res = await fetch(`${API_URL}/buy-size-mode`, {
+        method: "POST",
+        headers: {
+          ...secureHeaders,
+          "Content-Type": "application/json",
+          "x-api-key": token,
+          "X-Auth-Token": token,
+        },
+        cache: "no-store",
+        body: JSON.stringify({ mode }),
+      });
+
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save buy size mode");
+
+      const savedMode = json?.buySizeMode === "partial" ? "partial" : "full";
+      setBuySizeMode(savedMode);
+      setMessage(json?.message || `Buy size mode saved as ${savedMode}.`);
+
+      await fetchData(true);
+      setTimeout(() => fetchData(true), 1500);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not save buy size mode.");
+    }
+  }
+
+
+async function saveMaxPositions(valueOverride?: number) {
     if (!token) {
       setMessage("Please login first.");
       return;
@@ -533,11 +568,100 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
-  async function setManualBaseline() {
-    if (!token) {
-      setMessage("Please login first.");
-      return;
+  
+  async function fetchReports() {
+    try {
+      const res = await fetch(`${API_URL}/reports`, {
+        cache: "no-store",
+        headers: secureHeaders,
+      });
+      const json = await readJson(res);
+      if (json && typeof json === "object") setReports(prev => ({ ...prev, ...json }));
+      return json;
+    } catch (e) {
+      console.error("Reports refresh failed", e);
+      return null;
     }
+  }
+async function setManualBaseline() {
+    try {
+      setBaselineSaving(true);
+      const raw = String(manualBaselineInput || "").trim().replace("£", "").replace("$", "");
+      const value = Number(raw);
+
+      if (!value || value <= 0) {
+        setMessage("Enter a valid baseline amount.");
+        return;
+      }
+
+      const token = authToken || apiKey || localStorage.getItem("tradebot_auth_token") || localStorage.getItem("dashboard_api_key") || "";
+      const res = await fetch(`${API_URL}/set-baseline`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": token,
+          "X-Auth-Token": token,
+        },
+        cache: "no-store",
+        body: JSON.stringify({ baseline: value }),
+      });
+
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save baseline");
+
+      setMessage(json?.message || "Baseline saved.");
+      setReports(prev => ({
+        ...prev,
+        totalDeposited: json.baseline,
+        totalDepositedGbp: json.baselineGbp,
+        depositSource: "saved",
+      }));
+
+      await fetchReports();
+      await fetchData(true);
+      setTimeout(fetchReports, 1500);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not save baseline.");
+    } finally {
+      setBaselineSaving(false);
+    }
+  }
+
+
+
+  async function resetBaselineToCurrentEquity() {
+    try {
+      setBaselineSaving(true);
+      const token = authToken || apiKey || localStorage.getItem("tradebot_auth_token") || localStorage.getItem("dashboard_api_key") || "";
+      const res = await fetch(`${API_URL}/reset-baseline`, {
+        method: "POST",
+        headers: {
+          "x-api-key": token,
+          "X-Auth-Token": token,
+        },
+        cache: "no-store",
+      });
+
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not reset baseline");
+
+      setMessage(json?.message || "Baseline reset.");
+      setReports(prev => ({
+        ...prev,
+        totalDeposited: json.baseline,
+        totalDepositedGbp: json.baselineGbp,
+        depositSource: "saved",
+      }));
+
+      await fetchReports();
+      await fetchData(true);
+      setTimeout(fetchReports, 1500);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not reset baseline.");
+    } finally {
+      setBaselineSaving(false);
+    }
+  }
 
     const gbpValue = Number(manualBaselineInput);
     if (!Number.isFinite(gbpValue) || gbpValue <= 0) {
@@ -700,47 +824,31 @@ const fetchData = useCallback(async (force = false) => {
   return <div className="app">
 
       <style>{`
-        /* EMERGENCY_REPORTS_DARK_FIX */
-        .reports-page,
-        .dark-reports {
+        /* REPORTS_FORCE_DARK_FINAL_FIX */
+        .reports-page {
           background: #070b18 !important;
           color: #eaf1ff !important;
           min-height: 100vh !important;
         }
         .reports-page .card,
-        .dark-reports .card,
-        .reports-page section,
-        .dark-reports section {
+        .reports-page section {
           background: #11182a !important;
           color: #eaf1ff !important;
           border-color: #26324a !important;
         }
         .reports-page input,
-        .dark-reports input,
         .reports-page select,
-        .dark-reports select {
-          background: #070b18 !important;
-          color: #eaf1ff !important;
-          border: 1px solid #26324a !important;
-        }
         .reports-page table,
-        .dark-reports table,
         .reports-page thead,
-        .dark-reports thead,
         .reports-page tbody,
-        .dark-reports tbody,
         .reports-page tr,
-        .dark-reports tr,
         .reports-page td,
-        .dark-reports td,
-        .reports-page th,
-        .dark-reports th {
+        .reports-page th {
           background: #070b18 !important;
           color: #eaf1ff !important;
           border-color: #26324a !important;
         }
-        .reports-page .muted,
-        .dark-reports .muted {
+        .reports-page .muted {
           color: #9aa7bd !important;
         }
       `}</style>
@@ -876,6 +984,21 @@ const fetchData = useCallback(async (force = false) => {
         </div>
         <p className="muted">Lower numbers concentrate the bot into fewer holdings. If you already hold more than the new limit, the bot will stop opening new positions until holdings drop below it.</p>
       </Card>
+
+      <Card title="Buy Size Mode">
+        <div className="summary">
+          <div><span>Current mode</span><b>{buySizeMode === "full" ? "Full Buy" : "Partial Buy"}</b></div>
+          <div><span>Partial estimate</span><b>{gbp(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).partialUsd || 0) * rate)} / {usd(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).partialUsd || 0))}</b></div>
+          <div><span>Full estimate</span><b>{gbp(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).fullUsd || 0) * rate)} / {usd(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).fullUsd || 0))}</b></div>
+          <div><span>Capped equity</span><b>{gbp(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).cappedEquityUsd || 0) * rate)} / {usd(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).cappedEquityUsd || 0))}</b></div>
+        </div>
+        <div className="actions">
+          <button className={buySizeMode === "partial" ? "active" : "ghost"} onClick={()=>saveBuySizeMode("partial")}>Partial Buy</button>
+          <button className={buySizeMode === "full" ? "active" : "ghost"} onClick={()=>saveBuySizeMode("full")}>Full Buy</button>
+        </div>
+        <p className="muted">Full Buy uses most available capped capital for one position. Partial Buy splits capital across several smaller positions.</p>
+      </Card>
+
       <Card title="Dynamic Auto Universe" wide>
         <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
         <div className="universe-counts">
@@ -889,7 +1012,7 @@ const fetchData = useCallback(async (force = false) => {
       </>}
     </main>}
 
-    {tab==="reports" && <main>
+    {tab==="reports" && <main className="reports-page">
       <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
           <input
             className="input"
