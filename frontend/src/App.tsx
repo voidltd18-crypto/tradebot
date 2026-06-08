@@ -56,12 +56,13 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [replayCapInput, setReplayCapInput] = useState<string>("");
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
+  const [manualBaselineInput, setManualBaselineInput] = useState<string>("");
+  const [baselineSaving, setBaselineSaving] = useState(false);
   const [strategyStrictness, setStrategyStrictness] = useState<number>(0);
   const [strategySaving, setStrategySaving] = useState(false);
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
-  
   const [buySizeMode, setBuySizeMode] = useState<"full"|"partial">("full");
-const [positionsSaving, setPositionsSaving] = useState(false);
+  const [positionsSaving, setPositionsSaving] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
   const lastFetchAt = useRef(0);
@@ -205,6 +206,9 @@ const fetchData = useCallback(async (force = false) => {
         const json = statusRes.value;
         if (json && typeof json === "object") {
           setData(prev => ({ ...prev, ...json }));
+          if (json?.positionSettings?.buySizeMode) {
+            setBuySizeMode(json.positionSettings.buySizeMode === "partial" ? "partial" : "full");
+          }
         }
         const nextScans = Array.isArray(json?.scans) ? json.scans : [];
         if (!selectedSymbol && nextScans.length) setSelectedSymbol(nextScans[0].symbol);
@@ -440,37 +444,7 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
-  
-  async function saveBuySizeMode(mode:"full"|"partial") {
-    try {
-      setMessage(`Saving ${mode === "full" ? "Full Buy" : "Partial Buy"} mode...`);
-      const token = authToken || apiKey || localStorage.getItem("tradebot_auth_token") || localStorage.getItem("dashboard_api_key") || "";
-      const res = await fetch(`${API_URL}/buy-size-mode`, {
-        method: "POST",
-        headers: {
-          ...secureHeaders,
-          "Content-Type": "application/json",
-          "x-api-key": token,
-          "X-Auth-Token": token,
-        },
-        cache: "no-store",
-        body: JSON.stringify({ mode }),
-      });
-      const json = await readJson(res);
-      if (!res.ok || json?.ok === false) {
-        throw new Error(json?.detail || json?.message || "Could not save buy size mode");
-      }
-      const savedMode = json?.buySizeMode === "partial" ? "partial" : "full";
-      setBuySizeMode(savedMode);
-      setMessage(json?.message || `Buy size mode saved as ${savedMode}.`);
-      await fetchData(true);
-      setTimeout(() => fetchData(true), 1500);
-    } catch (e:any) {
-      setMessage(e?.message || "Could not save buy size mode.");
-    }
-  }
-
-async function saveMaxPositions(valueOverride?: number) {
+  async function saveMaxPositions(valueOverride?: number) {
     if (!token) {
       setMessage("Please login first.");
       return;
@@ -501,6 +475,36 @@ async function saveMaxPositions(valueOverride?: number) {
     }
   }
 
+
+
+  async function saveBuySizeMode(mode:"full"|"partial") {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+    try {
+      setMessage(`Saving ${mode === "full" ? "Full Buy" : "Partial Buy"} mode...`);
+      const res = await fetch(`${API_URL}/buy-size-mode`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ mode }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save buy size mode");
+      const savedMode = json?.buySizeMode === "partial" ? "partial" : "full";
+      setBuySizeMode(savedMode);
+      setData(prev => ({
+        ...prev,
+        positionSettings: { ...(prev.positionSettings || {}), ...(json.positionSettings || {}), buySizeMode: savedMode, fullBuyWhenOnePosition: savedMode === "full", buySizePreview: json.preview || json.buySizePreview || prev.positionSettings?.buySizePreview },
+        buySizePreview: json.preview || json.buySizePreview || prev.buySizePreview,
+      }));
+      setMessage(json?.message || `Buy size mode saved as ${savedMode}.`);
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not save buy size mode.");
+    }
+  }
   async function refreshDynamicScanner() {
     if (!token) {
       setMessage("Please login first.");
@@ -732,49 +736,20 @@ async function saveMaxPositions(valueOverride?: number) {
   return <div className="app">
 
       <style>{`
-        /* EMERGENCY_REPORTS_DARK_FIX */
-        .reports-page,
-        .dark-reports {
-          background: #070b18 !important;
-          color: #eaf1ff !important;
-          min-height: 100vh !important;
-        }
-        .reports-page .card,
-        .dark-reports .card,
-        .reports-page section,
-        .dark-reports section {
-          background: #11182a !important;
-          color: #eaf1ff !important;
-          border-color: #26324a !important;
-        }
-        .reports-page input,
-        .dark-reports input,
-        .reports-page select,
-        .dark-reports select {
-          background: #070b18 !important;
-          color: #eaf1ff !important;
-          border: 1px solid #26324a !important;
-        }
-        .reports-page table,
-        .dark-reports table,
-        .reports-page thead,
-        .dark-reports thead,
-        .reports-page tbody,
-        .dark-reports tbody,
-        .reports-page tr,
-        .dark-reports tr,
-        .reports-page td,
-        .dark-reports td,
-        .reports-page th,
-        .dark-reports th {
-          background: #070b18 !important;
-          color: #eaf1ff !important;
-          border-color: #26324a !important;
-        }
-        .reports-page .muted,
-        .dark-reports .muted {
-          color: #9aa7bd !important;
-        }
+        /* REPORTS_FINAL_STABLE_DARK */
+        .reports-page { background:#070b18 !important; color:#eaf1ff !important; min-height:100vh !important; }
+        .reports-page .card, .reports-page section { background:#11182a !important; color:#eaf1ff !important; border-color:#26324a !important; }
+        .reports-page input, .reports-page select, .reports-page table, .reports-page thead, .reports-page tbody, .reports-page tr, .reports-page td, .reports-page th { background:#070b18 !important; color:#eaf1ff !important; border-color:#26324a !important; }
+        .reports-page .muted { color:#9aa7bd !important; }
+      `}</style>
+
+
+      <style>{`
+        /* REPORTS_FORCE_DARK_FINAL_SAFE */
+        .reports-page{background:#070b18!important;color:#eaf1ff!important;min-height:100vh!important;}
+        .reports-page .card,.reports-page section{background:#11182a!important;color:#eaf1ff!important;border-color:#26324a!important;}
+        .reports-page input,.reports-page select,.reports-page table,.reports-page td,.reports-page th{background:#070b18!important;color:#eaf1ff!important;border-color:#26324a!important;}
+        .reports-page .muted{color:#9aa7bd!important;}
       `}</style>
 
     <header className="topbar">
@@ -936,7 +911,7 @@ async function saveMaxPositions(valueOverride?: number) {
       </>}
     </main>}
 
-    {tab==="reports" && <main>
+    {tab==="reports" && <main className="reports-page">
       <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
           <input
             className="input"
