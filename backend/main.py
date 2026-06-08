@@ -1,9 +1,9 @@
 import os
+import json
 import secrets
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "200") or 200)
 
 import sqlite3
-import json
 import time
 import math
 import re
@@ -87,8 +87,7 @@ CASH_BUFFER = 0.50
 # Full-buy mode:
 # When max positions is 1, use nearly all available trading capital/buying power
 # instead of small partial sizing.
-BUY_SIZE_MODE = os.getenv("BUY_SIZE_MODE", "full").lower()
-FULL_BUY_WHEN_ONE_POSITION = BUY_SIZE_MODE == "full" or os.getenv("FULL_BUY_WHEN_ONE_POSITION", "true").lower() == "true"
+FULL_BUY_WHEN_ONE_POSITION = os.getenv("FULL_BUY_WHEN_ONE_POSITION", "true").lower() == "true"
 FULL_BUY_CASH_BUFFER = float(os.getenv("FULL_BUY_CASH_BUFFER", "2.00") or 2.00)
 
 MAX_SPREAD = 0.015
@@ -333,6 +332,46 @@ def verify_api_key(request: Request):
 
 
 
+# =========================
+# BUY SIZE MODE STORAGE FINAL
+# =========================
+BUY_SIZE_STATE_DIR = os.path.join("backend", "state")
+BUY_SIZE_STATE_FILE = os.path.join(BUY_SIZE_STATE_DIR, "buy_size_mode.json")
+
+def load_buy_size_mode() -> str:
+    try:
+        if os.path.exists(BUY_SIZE_STATE_FILE):
+            with open(BUY_SIZE_STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            mode = str(data.get("mode", "full")).lower().strip()
+            if mode in ("full", "partial"):
+                return mode
+    except Exception as e:
+        print(f"BUY SIZE MODE READ ERROR: {e}", flush=True)
+    mode = str(os.getenv("BUY_SIZE_MODE", "full")).lower().strip()
+    return mode if mode in ("full", "partial") else "full"
+
+def save_buy_size_mode(mode: str) -> str:
+    mode = str(mode or "full").lower().strip()
+    if mode not in ("full", "partial"):
+        mode = "full"
+    try:
+        os.makedirs(BUY_SIZE_STATE_DIR, exist_ok=True)
+        with open(BUY_SIZE_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"mode": mode}, f, indent=2)
+    except Exception as e:
+        print(f"BUY SIZE MODE SAVE ERROR: {e}", flush=True)
+    return mode
+
+def apply_buy_size_mode(mode: str) -> str:
+    global BUY_SIZE_MODE, FULL_BUY_WHEN_ONE_POSITION
+    mode = str(mode or "full").lower().strip()
+    if mode not in ("full", "partial"):
+        mode = "full"
+    BUY_SIZE_MODE = mode
+    FULL_BUY_WHEN_ONE_POSITION = mode == "full"
+    return mode
+
 def buy_size_preview_payload():
     try:
         account = get_account()
@@ -348,76 +387,47 @@ def buy_size_preview_payload():
         max_positions = 1
 
     try:
-        open_positions = len(get_positions())
+        positions = get_positions() if "get_positions" in globals() else []
+        open_positions = len(positions)
     except Exception:
-        try:
-            open_positions = len(get_all_positions())
-        except Exception:
-            open_positions = 0
+        open_positions = 0
 
     try:
         capped_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
     except Exception:
         capped_equity = equity
 
-    try:
-        cash_buffer = float(CASH_BUFFER)
-    except Exception:
-        cash_buffer = 0.50
+    cash_buffer = float(CASH_BUFFER) if "CASH_BUFFER" in globals() else 0.50
+    full_buffer = float(FULL_BUY_CASH_BUFFER) if "FULL_BUY_CASH_BUFFER" in globals() else 2.00
 
-    try:
-        full_buffer = float(FULL_BUY_CASH_BUFFER) if "FULL_BUY_CASH_BUFFER" in globals() else 2.00
-    except Exception:
-        full_buffer = 2.00
+    partial_usd = max(0.0, min(capped_equity / max(1, max_positions), max(0.0, buying_power - cash_buffer)))
+    full_usd = max(0.0, min(capped_equity, max(0.0, buying_power - full_buffer)))
 
-    usable_partial_cash = max(0.0, buying_power - cash_buffer)
-    usable_full_cash = max(0.0, buying_power - full_buffer)
-
-    partial_by_slots = capped_equity / max(1, max_positions)
-    partial_usd = max(0.0, min(partial_by_slots, usable_partial_cash))
-    full_usd = max(0.0, min(capped_equity, usable_full_cash))
-
-    try:
-        partial_gbp = money_gbp(partial_usd)
-        full_gbp = money_gbp(full_usd)
-        capped_gbp = money_gbp(capped_equity)
-        buying_power_gbp = money_gbp(buying_power)
-    except Exception:
-        partial_gbp = partial_usd
-        full_gbp = full_usd
-        capped_gbp = capped_equity
-        buying_power_gbp = buying_power
-
-    mode = "full" if (FULL_BUY_WHEN_ONE_POSITION if "FULL_BUY_WHEN_ONE_POSITION" in globals() else True) else "partial"
-    if "load_buy_size_mode" in globals():
+    def gbp_safe(v):
         try:
-            mode = load_buy_size_mode()
+            return money_gbp(v)
         except Exception:
-            pass
+            return v
+
+    mode = apply_buy_size_mode(load_buy_size_mode())
 
     return {
         "ok": True,
         "mode": mode,
         "partialUsd": round(partial_usd, 2),
-        "partialGbp": round(partial_gbp, 2),
+        "partialGbp": round(gbp_safe(partial_usd), 2),
         "fullUsd": round(full_usd, 2),
-        "fullGbp": round(full_gbp, 2),
+        "fullGbp": round(gbp_safe(full_usd), 2),
         "cappedEquityUsd": round(capped_equity, 2),
-        "cappedEquityGbp": round(capped_gbp, 2),
+        "cappedEquityGbp": round(gbp_safe(capped_equity), 2),
         "buyingPowerUsd": round(buying_power, 2),
-        "buyingPowerGbp": round(buying_power_gbp, 2),
+        "buyingPowerGbp": round(gbp_safe(buying_power), 2),
         "maxPositions": max_positions,
         "openPositions": open_positions,
         "remainingSlots": max(0, max_positions - open_positions),
-        "cashBufferUsd": cash_buffer,
-        "fullBuyCashBufferUsd": full_buffer,
     }
 
-
-
-@app.get("/buy-size-preview")
-def api_buy_size_preview():
-    return buy_size_preview_payload()
+apply_buy_size_mode(load_buy_size_mode())
 
 @app.post("/login")
 def login(payload: dict = Body(...)):
@@ -3473,26 +3483,35 @@ def api_get_position_settings():
 
 
 
+@app.get("/buy-size-preview")
+def api_buy_size_preview():
+    return buy_size_preview_payload()
+
+@app.get("/buy-size-mode")
+def api_get_buy_size_mode():
+    mode = apply_buy_size_mode(load_buy_size_mode())
+    return {
+        "ok": True,
+        "buySizeMode": mode,
+        "fullBuyWhenOnePosition": mode == "full",
+        "preview": buy_size_preview_payload(),
+    }
+
 @app.post("/buy-size-mode")
 def api_buy_size_mode(payload: dict = Body(...), request: Request = None):
     if request is not None:
         verify_api_key(request)
-
-    global FULL_BUY_WHEN_ONE_POSITION, BUY_SIZE_MODE
-
     mode = str(payload.get("mode", "")).lower().strip()
-    if mode not in ("partial", "full"):
-        raise HTTPException(status_code=400, detail="mode must be partial or full")
-
-    BUY_SIZE_MODE = mode
-    FULL_BUY_WHEN_ONE_POSITION = mode == "full"
-
+    if mode not in ("full", "partial"):
+        raise HTTPException(status_code=400, detail="mode must be full or partial")
+    saved_mode = save_buy_size_mode(mode)
+    apply_buy_size_mode(saved_mode)
     return {
         "ok": True,
-        "message": f"Buy size mode set to {mode}",
-        "buySizeMode": mode,
-        "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
-        "positionSettings": position_settings_payload() if "position_settings_payload" in globals() else {},
+        "message": f"Buy size mode saved as {saved_mode}",
+        "buySizeMode": saved_mode,
+        "fullBuyWhenOnePosition": saved_mode == "full",
+        "preview": buy_size_preview_payload(),
     }
 
 @app.post("/position-settings")
