@@ -87,8 +87,10 @@ CASH_BUFFER = 0.50
 # Full-buy mode:
 # When max positions is 1, use nearly all available trading capital/buying power
 # instead of small partial sizing.
-FULL_BUY_WHEN_ONE_POSITION = os.getenv("FULL_BUY_WHEN_ONE_POSITION", "true").lower() == "true"
+FULL_BUY_WHEN_ONE_POSITION = os.getenv("FULL_BUY_WHEN_ONE_POSITION", "false").lower() == "true"
 FULL_BUY_CASH_BUFFER = float(os.getenv("FULL_BUY_CASH_BUFFER", "2.00") or 2.00)
+# Defensive mode: never risk the whole account on one ticker unless explicitly raised.
+ONE_POSITION_MAX_EQUITY_PCT = float(os.getenv("ONE_POSITION_MAX_EQUITY_PCT", "0.45") or 0.45)
 
 MAX_SPREAD = 0.015
 PREFER_SPREAD_UNDER = 0.006
@@ -919,6 +921,70 @@ def stock_memory_payload():
     return items
 
 
+
+# =========================
+# DEFENSIVE MARKET FILTERS
+# =========================
+DEFENSIVE_MARKET_FILTER_ENABLED = os.getenv("DEFENSIVE_MARKET_FILTER_ENABLED", "true").lower() == "true"
+DEFENSIVE_MARKET_SYMBOL = os.getenv("DEFENSIVE_MARKET_SYMBOL", "QQQ").upper()
+DEFENSIVE_MARKET_LOOKBACK_POINTS = int(os.getenv("DEFENSIVE_MARKET_LOOKBACK_POINTS", "5") or 5)
+DEFENSIVE_MIN_MARKET_MOMENTUM = float(os.getenv("DEFENSIVE_MIN_MARKET_MOMENTUM", "-0.003") or -0.003)
+BOUNCE_CONFIRMATION_ENABLED = os.getenv("BOUNCE_CONFIRMATION_ENABLED", "true").lower() == "true"
+BOUNCE_LOOKBACK_POINTS = int(os.getenv("BOUNCE_LOOKBACK_POINTS", "3") or 3)
+BOUNCE_MIN_RECOVERY_PCT = float(os.getenv("BOUNCE_MIN_RECOVERY_PCT", "0.0015") or 0.0015)
+
+
+def market_trend_allows_buy():
+    """Simple QQQ/SPY trend filter using the bot's own recent price ticks.
+    It blocks new buys on weak broad-market momentum days, but does not block exits.
+    """
+    if not DEFENSIVE_MARKET_FILTER_ENABLED:
+        return True, "market filter off"
+
+    sym = DEFENSIVE_MARKET_SYMBOL
+    try:
+        ensure_symbol_state(sym)
+        quote = get_quote(sym)
+        price = float(quote.get("mid") or 0.0)
+        curve = state[sym].setdefault("price_curve", [])
+        if price > 0:
+            curve.append({"t": now_chart_time(), "value": price})
+            del curve[:-180]
+
+        if len(curve) < DEFENSIVE_MARKET_LOOKBACK_POINTS:
+            return True, "market filter warming up"
+
+        old = float(curve[-DEFENSIVE_MARKET_LOOKBACK_POINTS]["value"] or 0.0)
+        momentum = 0.0 if old <= 0 else (price / old) - 1.0
+        if momentum < DEFENSIVE_MIN_MARKET_MOMENTUM:
+            return False, f"{sym} trend weak {momentum:.4f}"
+        return True, f"{sym} trend ok {momentum:.4f}"
+    except Exception as e:
+        # Fail open so a temporary quote issue does not freeze the bot.
+        return True, f"market filter unavailable: {e}"
+
+
+def bounce_confirmation(curve, price: float):
+    """Requires price to be lifting from a recent low before buying a dip.
+    This reduces falling-knife buys where pullback keeps accelerating downward.
+    """
+    if not BOUNCE_CONFIRMATION_ENABLED:
+        return True, "bounce confirmation off"
+    try:
+        if len(curve) < max(BOUNCE_LOOKBACK_POINTS, 2):
+            return False, "bounce warming up"
+        recent = [float(x.get("value") or 0.0) for x in curve[-BOUNCE_LOOKBACK_POINTS:] if float(x.get("value") or 0.0) > 0]
+        if len(recent) < max(BOUNCE_LOOKBACK_POINTS, 2):
+            return False, "not enough bounce data"
+        recent_low = min(recent)
+        recovery = 0.0 if recent_low <= 0 else (float(price) / recent_low) - 1.0
+        last_tick_up = recent[-1] >= recent[-2]
+        if recovery >= BOUNCE_MIN_RECOVERY_PCT and last_tick_up:
+            return True, f"bounce confirmed {recovery:.4f}"
+        return False, f"no bounce yet {recovery:.4f}"
+    except Exception as e:
+        return False, f"bounce check error: {e}"
+
 # =========================
 # SIGNALS
 # =========================
@@ -1009,8 +1075,12 @@ def compute_scan(symbol: str):
 
     buy_trigger = ref * BUY_DIP
     locked = is_locked_today(symbol)
+    market_ok, market_reason = market_trend_allows_buy()
+    bounce_ok, bounce_reason = bounce_confirmation(curve, price)
     ready_to_buy = (
         not locked and
+        market_ok and
+        bounce_ok and
         price <= buy_trigger and
         spread <= MAX_SPREAD and
         MIN_PULLBACK <= pullback <= MAX_PULLBACK and
@@ -1050,6 +1120,10 @@ def compute_scan(symbol: str):
         "sniper_reason": sniper_reason,
         "a_plus_pass": aplus_ok,
         "a_plus_reason": aplus_reason,
+        "market_filter_pass": market_ok,
+        "market_filter_reason": market_reason,
+        "bounce_pass": bounce_ok,
+        "bounce_reason": bounce_reason,
     }
 
 
@@ -1102,9 +1176,12 @@ def calculate_new_position_notional():
 
     # Full-buy mode for one-position trading.
     # Uses nearly all available capped trading capital/buying power, leaving a small buffer.
-    if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
+    if int(MAX_POSITIONS) <= 1:
         usable_cash = max(0.0, buying_power - FULL_BUY_CASH_BUFFER)
-        return round(max(0.0, min(sizing_equity, usable_cash)), 2)
+        one_position_cap = sizing_equity * max(0.05, min(ONE_POSITION_MAX_EQUITY_PCT, 1.0))
+        if FULL_BUY_WHEN_ONE_POSITION:
+            return round(max(0.0, min(one_position_cap, usable_cash)), 2)
+        return round(max(0.0, min(one_position_cap, usable_cash)), 2)
 
     target_value = sizing_equity * TARGET_POSITION_VALUE_PCT
     max_value = sizing_equity * MAX_POSITION_VALUE_PCT
@@ -1115,10 +1192,7 @@ def calculate_new_position_notional():
 def confidence_notional(scan):
     base = calculate_new_position_notional()
 
-    # In one-position full-buy mode, do not downsize by confidence.
-    # The entry gates still control trade quality; this only changes allocation size.
-    if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
-        return base
+    # Defensive update: even in one-position mode, keep confidence sizing active.
 
     if not CONFIDENCE_SIZING_ENABLED:
         return base
@@ -1135,6 +1209,12 @@ def confidence_notional(scan):
 
 
 def can_buy_symbol(symbol: str):
+    strict = strict_can_buy_symbol(symbol) if "strict_can_buy_symbol" in globals() else {"ok": True, "reason": ""}
+    if not strict.get("ok", True):
+        return False, strict.get("reason", f"{symbol} blocked by strict mode")
+    quality = quality_buy_check(symbol) if "quality_buy_check" in globals() else {"ok": True, "reason": ""}
+    if not quality.get("ok", True):
+        return False, quality.get("reason", f"{symbol} blocked by quality filter")
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and is_locked_today(symbol):
         return False, f"{symbol} locked until tomorrow"
     if has_open_order(symbol):
@@ -1478,6 +1558,19 @@ def manage_money_mode_positions():
         highest = p["highest"]
 
         if price <= 0 or entry <= 0 or qty <= DUST_THRESHOLD:
+            continue
+
+        strict_sell = strict_position_should_sell(symbol, entry, price, highest) if "strict_position_should_sell" in globals() else {"sell": False}
+        if strict_sell.get("sell"):
+            try:
+                allow_hard = "STOP" in str(strict_sell.get("reason", "")).upper()
+                if pdt_aware_should_avoid_sell(symbol, str(strict_sell.get("reason", "STRICT MODE SELL")), p["pnlPct"], allow_hard_stop=allow_hard):
+                    continue
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason=strict_sell.get("reason", "STRICT MODE SELL"))
+                state[symbol]["highest_since_entry"] = None
+                print(f"STRICT MODE SELL {qty:.6f} {symbol} | {strict_sell.get('reason')}")
+            except Exception as e:
+                print(f"STRICT SELL ERROR {symbol}: {e}")
             continue
 
         fast_stop, fast_stop_reason = should_fast_stop(p)
@@ -3049,6 +3142,10 @@ def build_status_payload(bot_name, scans):
             "maxPositions": MAX_POSITIONS,
             "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
             "fullBuyCashBuffer": FULL_BUY_CASH_BUFFER,
+            "onePositionMaxEquityPct": ONE_POSITION_MAX_EQUITY_PCT,
+            "defensiveMarketFilterEnabled": DEFENSIVE_MARKET_FILTER_ENABLED,
+            "defensiveMarketSymbol": DEFENSIVE_MARKET_SYMBOL,
+            "bounceConfirmationEnabled": BOUNCE_CONFIRMATION_ENABLED,
             "targetPositionValuePct": TARGET_POSITION_VALUE_PCT,
             "maxPositionValuePct": MAX_POSITION_VALUE_PCT,
             "stopLoss": STOP_LOSS,
@@ -3099,6 +3196,10 @@ def build_status_payload(bot_name, scans):
                 "sniperReason": s.get("sniper_reason", ""),
                 "aPlusPass": bool(s.get("a_plus_pass", False)),
                 "aPlusReason": s.get("a_plus_reason", ""),
+                "marketFilterPass": bool(s.get("market_filter_pass", True)),
+                "marketFilterReason": s.get("market_filter_reason", ""),
+                "bouncePass": bool(s.get("bounce_pass", True)),
+                "bounceReason": s.get("bounce_reason", ""),
                 "optimiserDecision": auto_improve_decision(s["symbol"]),
             } for s in scans
         ],
@@ -3114,6 +3215,7 @@ def build_status_payload(bot_name, scans):
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
+            f"DEFENSIVE | market_filter={DEFENSIVE_MARKET_FILTER_ENABLED} {DEFENSIVE_MARKET_SYMBOL} | bounce={BOUNCE_CONFIRMATION_ENABLED} | one_position_cap={ONE_POSITION_MAX_EQUITY_PCT*100:.0f}%",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f}",
             f"POSITIONS | {len(positions)}",
@@ -4105,7 +4207,7 @@ def api_clear_loser_cooldown(request: Request):
 # =========================
 DYNAMIC_MARKET_SCANNER_ENABLED = os.getenv("DYNAMIC_MARKET_SCANNER_ENABLED", "true").lower() == "true"
 DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS = int(os.getenv("DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS", "12"))
-DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS = int(os.getenv("DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS", str(60 * 60 * 4)))
+DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS = int(os.getenv("DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS", str(60 * 45)))
 DYNAMIC_MARKET_SCANNER_FILE = os.path.join("backend", "state", "dynamic_market_scanner.json")
 DYNAMIC_MARKET_MIN_PRICE = float(os.getenv("DYNAMIC_MARKET_MIN_PRICE", "3"))
 DYNAMIC_MARKET_MAX_PRICE = float(os.getenv("DYNAMIC_MARKET_MAX_PRICE", "800"))
