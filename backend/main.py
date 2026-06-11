@@ -271,8 +271,10 @@ AUTO_UNIVERSE_MAX_PRICE = 800.00
 AUTO_UNIVERSE_MAX_SPREAD = 0.020
 AUTO_UNIVERSE_CANDIDATE_POOL = [
     "NVDA", "AMD", "MSFT", "AAPL", "META",
-    "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
-    "TSLA", "PLTR", "UBER", "QQQ", "SMH",
+    "AMZN", "GOOGL", "AVGO", "NFLX", "TSLA",
+    "PLTR", "UBER", "QQQ", "SMH", "XLK",
+    "CRWD", "PANW", "NOW", "ADBE", "CRM",
+    "MU", "QCOM", "SHOP", "COIN", "HOOD",
 ]
 
 # =========================
@@ -1156,6 +1158,9 @@ def compute_scan(symbol: str):
     confidence, confidence_label = calculate_confidence(temp)
     sniper_ok, sniper_reason = sniper_passes({**temp, "ready_to_buy": ready_to_buy, "confidence": confidence})
     aplus_ok, aplus_reason = a_plus_gate({**temp, "confidence": confidence})
+
+    if score < DYNAMIC_MARKET_MIN_SCORE:
+        return None
 
     return {
         "symbol": symbol,
@@ -4408,12 +4413,14 @@ def api_clear_loser_cooldown(request: Request):
 # =========================
 DYNAMIC_MARKET_SCANNER_ENABLED = os.getenv("DYNAMIC_MARKET_SCANNER_ENABLED", "true").lower() == "true"
 DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS = int(os.getenv("DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS", "12"))
-DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS = int(os.getenv("DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS", str(60 * 45)))
+DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS = int(os.getenv("DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS", str(60 * 30)))
 DYNAMIC_MARKET_SCANNER_FILE = os.path.join("backend", "state", "dynamic_market_scanner.json")
 DYNAMIC_MARKET_MIN_PRICE = float(os.getenv("DYNAMIC_MARKET_MIN_PRICE", "3"))
 DYNAMIC_MARKET_MAX_PRICE = float(os.getenv("DYNAMIC_MARKET_MAX_PRICE", "800"))
-DYNAMIC_MARKET_MIN_VOLUME = int(os.getenv("DYNAMIC_MARKET_MIN_VOLUME", "500000"))
-DYNAMIC_MARKET_MAX_SPREAD = float(os.getenv("DYNAMIC_MARKET_MAX_SPREAD", "0.025"))
+DYNAMIC_MARKET_MIN_VOLUME = int(os.getenv("DYNAMIC_MARKET_MIN_VOLUME", "750000"))
+DYNAMIC_MARKET_MAX_SPREAD = float(os.getenv("DYNAMIC_MARKET_MAX_SPREAD", "0.020"))
+DYNAMIC_MARKET_MIN_CHANGE_PCT = float(os.getenv("DYNAMIC_MARKET_MIN_CHANGE_PCT", "0.75"))
+DYNAMIC_MARKET_MIN_SCORE = float(os.getenv("DYNAMIC_MARKET_MIN_SCORE", "15.0"))
 DYNAMIC_MARKET_YAHOO_SCREENS = [
     s.strip() for s in os.getenv("DYNAMIC_MARKET_YAHOO_SCREENS", "day_gainers,most_actives,aggressive_small_caps").split(",") if s.strip()
 ]
@@ -4493,6 +4500,11 @@ def _score_dynamic_quote(q: Dict[str, Any], source: str) -> Optional[Dict[str, A
     if price < DYNAMIC_MARKET_MIN_PRICE or price > DYNAMIC_MARKET_MAX_PRICE:
         return None
     if volume < DYNAMIC_MARKET_MIN_VOLUME:
+        return None
+
+    # Quality upgrade: do not allow flat/negative most-active names into the sniper universe.
+    # Bad weeks usually came from slow or weak tickers passing because they were merely active.
+    if change_pct < DYNAMIC_MARKET_MIN_CHANGE_PCT:
         return None
 
     # Optional live quote spread check using Alpaca. If unavailable, do not reject; just score lower.
@@ -4588,6 +4600,8 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
             "maxPrice": DYNAMIC_MARKET_MAX_PRICE,
             "minVolume": DYNAMIC_MARKET_MIN_VOLUME,
             "maxSpread": DYNAMIC_MARKET_MAX_SPREAD,
+            "minChangePct": DYNAMIC_MARKET_MIN_CHANGE_PCT,
+            "minScore": DYNAMIC_MARKET_MIN_SCORE,
         },
         "error": " | ".join(errors[-3:]),
     }
@@ -4643,14 +4657,20 @@ def api_dynamic_market_scanner_refresh(request: Request):
 QUALITY_ONLY_MODE = os.getenv("QUALITY_ONLY_MODE", "true").lower() == "true"
 
 QUALITY_ONLY_UNIVERSE = [
+    # Core high-liquidity quality / momentum universe.
+    # Keeps the bot away from slow defensive names and low-quality meme/weak tickers.
     "NVDA", "AMD", "MSFT", "AAPL", "META",
-    "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
-    "TSLA", "PLTR", "UBER", "QQQ", "SMH",
+    "AMZN", "GOOGL", "AVGO", "NFLX", "TSLA",
+    "PLTR", "UBER", "QQQ", "SMH", "XLK",
+    "CRWD", "PANW", "NOW", "ADBE", "CRM",
+    "MU", "QCOM", "SHOP", "COIN", "HOOD",
 ]
 
 BLOCKED_WEAK_TICKERS = {
+    # Repeated poor/slow performers for this sniper-style bot.
     "LAC", "LCID", "PLUG", "SOFI", "SNAP", "NUVB",
-    "RIVN", "F", "AAL", "GIS", "PYPL"
+    "RIVN", "F", "AAL", "GIS", "PYPL", "INTC", "KO",
+    "T", "VZ", "WBA", "PARA", "NIO", "XPEV", "OPEN",
 }
 
 def quality_only_symbols():

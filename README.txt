@@ -1,28 +1,18 @@
-Persistent Memory Safe Patch
-============================
+TradeBot Scanner Quality Safe Patch
 
-This package does NOT remove unrelated features.
-It only patches backend persistence so redeploys/restarts can restore:
-- Recent trades panel
-- locked_today / one-cycle-per-stock-per-day lockouts
-- partial profit flags
-- temporary loser blacklist
-- custom symbols
-- trade database location
+Safe patch only. Nothing unrelated removed.
 
-New backend endpoints:
-- GET  /persistence-status
-- POST /save-runtime-state
+What changed:
+- Keeps persistent memory /var/data support intact.
+- Dynamic scanner refresh default: 30 minutes.
+- Dynamic scanner now rejects flat/negative movers by default.
+- Dynamic scanner requires stronger volume, tighter spread, and minimum score.
+- Quality universe now focuses on liquid momentum/quality names.
+- Slow/weak names that recently caused poor trades are blocked for this strategy: GIS, INTC, KO, RIVN, LCID, SNAP, etc.
+- Existing dashboard, banking, reports, manual buttons, persistence, and routes are left in place.
 
-Important Render setup:
-For persistence across redeploys, attach a Render Persistent Disk and mount it at:
-/var/data
+Upload contents to GitHub:
+backend/main.py
+frontend/src/App.tsx
 
-Or set one of these env vars:
-- SQLITE_DB_FILE=/var/data/trades.db
-- RENDER_DISK_PATH=/var/data
-
-Without a Render disk, the code still saves state, but local app storage may be wiped on redeploy.
-
-Deploy:
-Upload/replace backend/main.py. Frontend App.tsx is included unchanged for convenience.
+Render should redeploy automatically.
