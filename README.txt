@@ -1,27 +1,28 @@
-Defensive Profit Safe Patch
+Persistent Memory Safe Patch
+============================
 
 This package does NOT remove unrelated features.
-It preserves the existing dashboard/frontend and only patches backend trading/risk behaviour.
+It only patches backend persistence so redeploys/restarts can restore:
+- Recent trades panel
+- locked_today / one-cycle-per-stock-per-day lockouts
+- partial profit flags
+- temporary loser blacklist
+- custom symbols
+- trade database location
 
-Changed in backend/main.py only:
-1. Strict mode is now connected to the live sell flow.
-2. Loser cooldown and quality-only blocked tickers are now checked before buys.
-3. One-position mode is capped by ONE_POSITION_MAX_EQUITY_PCT, default 45%.
-4. Confidence sizing remains active even in one-position mode.
-5. Dynamic market scanner default refresh is 45 minutes instead of 4 hours.
-6. New defensive market filter uses QQQ momentum before new buys.
-7. New bounce confirmation reduces falling-knife dip buys.
-8. Status payload now exposes the new defensive settings/reasons.
+New backend endpoints:
+- GET  /persistence-status
+- POST /save-runtime-state
 
-Unchanged:
-- Login/auth routes
-- Dashboard UI file App.tsx
-- Manual buy/sell routes
-- Banking/trading cap routes
-- Backfill/reporting routes
-- Baseline/report routes
-- Manual universe routes
-- Existing analytics/stock memory/SQLite code
+Important Render setup:
+For persistence across redeploys, attach a Render Persistent Disk and mount it at:
+/var/data
 
-Deploy method:
-Extract this zip and upload the contents to GitHub, replacing matching files.
+Or set one of these env vars:
+- SQLITE_DB_FILE=/var/data/trades.db
+- RENDER_DISK_PATH=/var/data
+
+Without a Render disk, the code still saves state, but local app storage may be wiped on redeploy.
+
+Deploy:
+Upload/replace backend/main.py. Frontend App.tsx is included unchanged for convenience.

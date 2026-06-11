@@ -218,8 +218,26 @@ MEMORY_GOOD_MULTIPLIER = 1.15
 
 
 # SQLite persistent trade memory
+def persistent_state_dir() -> str:
+    """Best-effort persistent state folder.
+
+    On Render, mount a Persistent Disk at /var/data or set RENDER_DISK_PATH / SQLITE_DB_FILE.
+    If no persistent disk exists, the bot still works but state may reset on redeploy.
+    """
+    env_dir = os.getenv("RENDER_DISK_PATH", "").strip()
+    if env_dir:
+        return env_dir
+    if os.path.isdir("/var/data"):
+        return "/var/data"
+    return os.path.join("backend", "state")
+
+
+def persistent_state_file(filename: str) -> str:
+    return os.path.join(persistent_state_dir(), filename)
+
+
 SQLITE_ENABLED = True
-SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "trades.db")
+SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", persistent_state_file("trades.db"))
 BACKFILL_ORDER_LIMIT = 500
 BACKFILL_CHUNK_SIZE = 500
 BACKFILL_MAX_PAGES = 50
@@ -402,10 +420,31 @@ def safe_save_json(path: str, data):
 
 
 def load_persistent_state():
-    global trade_history, stock_memory, temp_blacklist
+    global trade_history, stock_memory, temp_blacklist, trade_events, locked_today, partial_profit_taken, custom_symbols
+
+    # Keep older JSON fallback support, but prefer SQLite bot_state / trades DB
+    # because JSON in the app folder can be wiped on Render redeploys.
     trade_history = safe_load_json(TRADE_HISTORY_FILE, [])
     stock_memory = safe_load_json(STOCK_MEMORY_FILE, {})
     temp_blacklist = safe_load_json(TEMP_BLACKLIST_FILE, {})
+
+    try:
+        locked_today = load_bot_state_value("locked_today", locked_today)
+        partial_profit_taken = load_bot_state_value("partial_profit_taken", partial_profit_taken)
+        temp_blacklist = load_bot_state_value("temp_blacklist", temp_blacklist)
+        custom_symbols = load_bot_state_value("custom_symbols", custom_symbols)
+
+        saved_recent = load_bot_state_value("trade_events", [])
+        db_recent = rebuild_recent_trade_events_from_db(50)
+        trade_events = db_recent if db_recent else (saved_recent if isinstance(saved_recent, list) else [])
+
+        print(
+            f"PERSISTENCE RESTORED | recent_trades={len(trade_events)} | "
+            f"locked_today={len(locked_today)} | partials={len(partial_profit_taken)} | "
+            f"db={SQLITE_DB_FILE}"
+        )
+    except Exception as e:
+        print(f"PERSISTENCE RESTORE ERROR: {e}")
 
 
 def save_trade_history():
@@ -436,6 +475,10 @@ def cleanup_temp_blacklist():
 
     if changed:
         save_temp_blacklist()
+        try:
+            save_bot_state_value("temp_blacklist", temp_blacklist)
+        except Exception:
+            pass
 
 
 def is_temp_blacklisted(symbol: str):
@@ -461,6 +504,10 @@ def add_temp_blacklist(symbol: str, reason: str):
         "until": until.isoformat(),
     }
     save_temp_blacklist()
+    try:
+        save_bot_state_value("temp_blacklist", temp_blacklist)
+    except Exception:
+        pass
     print(f"BLACKLIST | {symbol} | {reason} until {until.isoformat()}")
 
 
@@ -547,13 +594,23 @@ def reset_daily_flags_if_needed():
     global starting_equity_today, starting_equity_day
 
     today = today_str()
+    state_changed = False
     for symbol, day in list(locked_today.items()):
         if day != today:
             del locked_today[symbol]
+            state_changed = True
 
     for symbol, day in list(partial_profit_taken.items()):
         if day != today:
             del partial_profit_taken[symbol]
+            state_changed = True
+
+    if state_changed:
+        try:
+            save_bot_state_value("locked_today", locked_today)
+            save_bot_state_value("partial_profit_taken", partial_profit_taken)
+        except Exception:
+            pass
 
     if starting_equity_day != today:
         try:
@@ -571,6 +628,10 @@ def reset_daily_flags_if_needed():
 def lock_symbol_until_tomorrow(symbol: str):
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY:
         locked_today[symbol] = today_str()
+        try:
+            save_bot_state_value("locked_today", locked_today)
+        except Exception:
+            pass
 
 
 def is_locked_today(symbol: str):
@@ -1280,6 +1341,10 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
     }
     trade_events.append(event)
     add_trade_history_event(event)
+    try:
+        save_bot_state_value("trade_events", trade_events[-100:])
+    except Exception:
+        pass
     notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
 
 
@@ -1330,6 +1395,10 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     add_trade_history_event(event)
     update_stock_memory_from_sell(symbol, pnl, pnl_pct)
     lock_symbol_until_tomorrow(symbol)
+    try:
+        save_bot_state_value("trade_events", trade_events[-100:])
+    except Exception:
+        pass
     notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
 
 
@@ -1388,6 +1457,10 @@ def has_taken_partial_profit(symbol: str):
 
 def mark_partial_profit_taken(symbol: str):
     partial_profit_taken[symbol.upper()] = today_str()
+    try:
+        save_bot_state_value("partial_profit_taken", partial_profit_taken)
+    except Exception:
+        pass
 
 
 def sell_notional_ok(qty: float, price: float):
@@ -1713,6 +1786,12 @@ def buy_custom_symbol(symbol: str):
 # SQLITE PERSISTENT STORAGE
 # =========================
 def db_connect():
+    try:
+        db_dir = os.path.dirname(SQLITE_DB_FILE)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+    except Exception:
+        pass
     conn = sqlite3.connect(SQLITE_DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
@@ -1793,6 +1872,16 @@ def init_db():
 
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS weekly_universe (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             week_start TEXT NOT NULL,
@@ -1816,6 +1905,81 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+
+def save_bot_state_value(key: str, value: Any) -> None:
+    """Persist small runtime state that would otherwise disappear on redeploy."""
+    if not SQLITE_ENABLED:
+        return
+    try:
+        init_db()
+        os.makedirs(os.path.dirname(SQLITE_DB_FILE), exist_ok=True)
+        conn = db_connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO bot_state (key, value, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            (str(key), json.dumps(value), datetime.now(UTC).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"BOT STATE SAVE ERROR {key}: {e}")
+
+
+def load_bot_state_value(key: str, fallback: Any):
+    if not SQLITE_ENABLED:
+        return fallback
+    try:
+        init_db()
+        conn = db_connect()
+        row = conn.execute("SELECT value FROM bot_state WHERE key = ?", (str(key),)).fetchone()
+        conn.close()
+        if row:
+            return json.loads(row["value"])
+    except Exception as e:
+        print(f"BOT STATE LOAD ERROR {key}: {e}")
+    return fallback
+
+
+def persist_runtime_state() -> None:
+    """Save the important in-memory controls so deploys/restarts do not wipe bot memory."""
+    try:
+        save_bot_state_value("locked_today", locked_today)
+        save_bot_state_value("partial_profit_taken", partial_profit_taken)
+        save_bot_state_value("temp_blacklist", temp_blacklist)
+        save_bot_state_value("trade_events", trade_events[-100:])
+        save_bot_state_value("custom_symbols", custom_symbols)
+    except Exception as e:
+        print(f"PERSIST RUNTIME STATE ERROR: {e}")
+
+
+def rebuild_recent_trade_events_from_db(limit: int = 50) -> List[Dict[str, Any]]:
+    try:
+        rows = trades_from_db(max(limit, 1000))
+        recent = []
+        for t in rows[-limit:]:
+            if str(t.get("side", "")).upper() not in ["BUY", "SELL"]:
+                continue
+            recent.append({
+                "day": t.get("day") or "",
+                "time": t.get("time") or "",
+                "side": str(t.get("side") or "").upper(),
+                "symbol": str(t.get("symbol") or "").upper(),
+                "qty": float(t.get("qty") or 0.0),
+                "amount": float(t.get("amount") or 0.0),
+                "amountGbp": float(t.get("amountGbp") or 0.0),
+                "reason": t.get("reason") or "RESTORED FROM DB",
+                "pnl": float(t.get("pnl") or 0.0),
+                "pnlGbp": float(t.get("pnlGbp") or 0.0),
+                "pnlPct": float(t.get("pnlPct") or 0.0),
+            })
+        return recent
+    except Exception as e:
+        print(f"RECENT TRADES RESTORE ERROR: {e}")
+        return []
 
 
 def save_trade_to_db(event: Dict[str, Any], source: str = "bot"):
@@ -1993,6 +2157,41 @@ def db_summary_payload():
         "totalPnl": total_pnl,
         "totalPnlGbp": total_pnl_gbp,
     }
+
+
+def persistence_payload():
+    try:
+        db_path = SQLITE_DB_FILE
+        db_exists = os.path.exists(db_path)
+        db_size = os.path.getsize(db_path) if db_exists else 0
+        using_render_disk = os.path.abspath(db_path).startswith("/var/data")
+        return {
+            "enabled": SQLITE_ENABLED,
+            "dbFile": db_path,
+            "dbExists": db_exists,
+            "dbSizeBytes": db_size,
+            "stateDir": persistent_state_dir(),
+            "usingRenderDisk": using_render_disk,
+            "recentTradesRestored": len(trade_events),
+            "lockedTodayCount": len(locked_today),
+            "partialProfitCount": len(partial_profit_taken),
+            "tempBlacklistCount": len(temp_blacklist),
+            "message": "Persistent disk active" if using_render_disk else "State saves to local app storage unless a Render disk is mounted or SQLITE_DB_FILE is set",
+        }
+    except Exception as e:
+        return {"enabled": SQLITE_ENABLED, "error": str(e)}
+
+
+@app.get("/persistence-status")
+def api_persistence_status():
+    return {"ok": True, **persistence_payload()}
+
+
+@app.post("/save-runtime-state")
+def api_save_runtime_state(request: Request):
+    verify_api_key(request)
+    persist_runtime_state()
+    return {"ok": True, "message": "Runtime state saved", **persistence_payload()}
 
 
 def parse_order_timestamp(order):
@@ -3204,11 +3403,13 @@ def build_status_payload(bot_name, scans):
             } for s in scans
         ],
         "banking": banking_payload(),
+        "persistence": persistence_payload() if "persistence_payload" in globals() else {},
         "logs": [
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
             f"FX | USDGBP={get_usd_to_gbp_rate():.4f} | source={fx_cache.get('source', 'fallback')}",
             f"DB | sqlite={SQLITE_ENABLED} | raw_trades={db_summary_payload().get('totalTrades', 0)} | closed={closed_trade_summary_payload().get('closedTrades', 0)} | pnl_gbp={closed_trade_summary_payload().get('totalPnlGbp', 0):.2f}",
+            f"PERSISTENCE | db={SQLITE_DB_FILE} | recent={len(trade_events)} | locked={len(locked_today)} | partials={len(partial_profit_taken)}",
             f"BACKFILL | chunk={BACKFILL_CHUNK_SIZE} | max_pages={BACKFILL_MAX_PAGES}",
             f"OPTIMIZER | enabled={PROFIT_OPTIMIZER_ENABLED} | today_realised={today_realised_pnl():.2f} | block={profit_guardrail_status()[1] or 'none'}",
             f"ANALYTICS | profit_factor={analytics_payload().get('profitFactor', 0):.2f} | avg_win={analytics_payload().get('averageWin', 0):.2f} | avg_loss={analytics_payload().get('averageLoss', 0):.2f}",
