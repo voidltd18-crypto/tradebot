@@ -62,6 +62,7 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [strategySaving, setStrategySaving] = useState(false);
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
   const [buySizeMode, setBuySizeMode] = useState<"full"|"partial">("full");
+  const [muskModeSaving, setMuskModeSaving] = useState(false);
   const [positionsSaving, setPositionsSaving] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
@@ -89,6 +90,8 @@ const [banking, setBanking] = useState<AnyObj>({});
   const dynamicScanner = data?.dynamicMarketScanner || data?.autoUniverse?.dynamicScanner || {};
   const dynamicRows = Array.isArray(dynamicScanner?.rows) ? dynamicScanner.rows : [];
   const dynamicPickCount = Number(data?.autoUniverse?.dynamicPickCount || dynamicRows.length || 0);
+  const muskMode = data?.muskMode || data?.autoUniverse?.muskMode || {};
+  const muskModeOn = Boolean(muskMode?.enabled);
   const strategySettings = data?.strategySettings || {};
   const positionSettings = data?.positionSettings || {};
   const strictnessLabels = ["Safe", "Balanced", "Aggressive"];
@@ -505,6 +508,40 @@ const fetchData = useCallback(async (force = false) => {
       setMessage(e?.message || "Could not save buy size mode.");
     }
   }
+  async function saveMuskMode(enabled:boolean) {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+    setMuskModeSaving(true);
+    setMessage(enabled ? "Switching Musk Mode ON..." : "Switching Musk Mode OFF...");
+    try {
+      const res = await fetch(`${API_URL}/musk-mode`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ enabled }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save Musk Mode");
+      setData(prev => ({
+        ...prev,
+        muskMode: json,
+        autoUniverse: json?.autoUniverse?.activeSymbols || json?.autoUniverse?.rows ? json.autoUniverse : prev.autoUniverse,
+        universe: json?.activeSymbols || json?.autoUniverse?.activeSymbols || prev.universe,
+        lastAction: json?.message || (enabled ? "Musk Mode ON" : "Musk Mode OFF"),
+        lastActionAt: new Date().toISOString(),
+      }));
+      setMessage(json?.message || (enabled ? "Musk Mode ON." : "Musk Mode OFF."));
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not save Musk Mode.");
+    } finally {
+      setMuskModeSaving(false);
+    }
+  }
+
+
   async function refreshDynamicScanner() {
     if (!token) {
       setMessage("Please login first.");
@@ -799,10 +836,23 @@ const fetchData = useCallback(async (force = false) => {
         <div><span>Next buy</span><b>{usd(data?.newPositionNotional)}</b></div>
         <div><span>Win rate</span><b>{pct((data?.dbSummary?.winRate || 0) * 100)}</b></div>
         <div><span>Dynamic universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
+        <div><span>Musk Mode</span><b className={muskModeOn ? "gain" : ""}>{muskModeOn ? "ON" : "OFF"}</b></div>
         <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
       </div></Card>
 
       {!simpleView && <> 
+
+      <Card title="Musk Mode">
+        <div className="summary">
+          <div><span>Status</span><b className={muskModeOn ? "gain" : ""}>{muskModeOn ? "ON" : "OFF"}</b></div>
+          <div><span>Focus list</span><b>{(muskMode?.activeSymbols || []).join(", ") || "TSLA focus"}</b></div>
+        </div>
+        <div className="actions">
+          <button className={muskModeOn ? "active" : "ghost"} onClick={()=>saveMuskMode(true)} disabled={muskModeSaving}>Musk Mode ON</button>
+          <button className={!muskModeOn ? "active" : "ghost"} onClick={()=>saveMuskMode(false)} disabled={muskModeSaving}>Musk Mode OFF</button>
+        </div>
+        <p className="muted">Focuses the universe on TSLA and related liquid tech names. SpaceX, xAI and X/Twitter are private, so the bot does not use fake tickers. Normal confidence, bounce, market filter and risk checks still apply.</p>
+      </Card>
 
       <Card title="Dynamic Market Scanner" wide>
         <div className="summary">
@@ -902,6 +952,7 @@ const fetchData = useCallback(async (force = false) => {
         <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
         <div className="universe-counts">
           <div><span>Total in universe</span><b>{data?.autoUniverse?.rows?.length || 0}</b></div>
+          <div><span>Mode</span><b>{data?.autoUniverse?.mode || (muskModeOn ? "musk-focus" : "quality")}</b></div>
           <div><span>Active symbols</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}</b></div>
           <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
           <div><span>Dynamic picks</span><b>{data?.autoUniverse?.dynamicPickCount || dynamicPickCount}</b></div>
