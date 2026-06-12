@@ -1,15 +1,10 @@
-Musk Mode Safe Patch
+Musk Mode hotfix package
 
-Upload the contents of this zip to GitHub, replacing the current files.
-
-Includes:
-- Backend Musk Mode endpoint: GET/POST /musk-mode
-- Frontend Musk Mode ON/OFF card
-- Universe focuses on TSLA + related liquid tech names when enabled
-- Keeps normal confidence, bounce, market filter, PDT, partial/full buy, and risk checks
-- Keeps recent-trade restore fix
-- Keeps /status snapshot fix for dictionary changed size during iteration
+Fixes:
+- MUSK MODE SAVE ERROR: name 'save_bot_state_value' is not defined
+- Musk Mode now persists to SQLite bot_state and /var/data/musk_mode.json fallback
+- Musk Mode overrides the old weekly universe immediately while ON
+- Keeps partial/full buy, trade restore, status snapshot fix, and scanner score fix
 
 Notes:
-- SpaceX, xAI, and X/Twitter are private, so no fake ticker is used.
-- PYPL stays out if weak-ticker blocking excludes it.
+- SpaceX/xAI/X are private, so Musk Mode focuses on publicly tradable TSLA + liquid related tech names.

@@ -1377,6 +1377,18 @@ def should_stall_exit(position: Dict[str, Any]):
 def refresh_universe_if_needed(force=False):
     global current_universe, last_universe_refresh_ts
 
+    # Musk Mode must override the old weekly universe immediately; otherwise
+    # the loop can keep scanning yesterday's saved stock-memory universe.
+    try:
+        if "musk_mode_enabled" in globals() and musk_mode_enabled() and "apply_quality_only_universe" in globals():
+            apply_quality_only_universe()
+            for s in current_universe:
+                ensure_symbol_state(s, custom=s in custom_symbols)
+            last_universe_refresh_ts = time.time()
+            return
+    except Exception as e:
+        print(f"MUSK MODE UNIVERSE APPLY ERROR: {e}")
+
     if AUTO_UNIVERSE_ENABLED:
         try:
             result = build_weekly_universe(force=force)
@@ -1621,6 +1633,12 @@ def buy_custom_symbol(symbol: str):
 # SQLITE PERSISTENT STORAGE
 # =========================
 def db_connect():
+    try:
+        db_dir = os.path.dirname(SQLITE_DB_FILE)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+    except Exception:
+        pass
     conn = sqlite3.connect(SQLITE_DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
@@ -1701,6 +1719,15 @@ def init_db():
 
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS weekly_universe (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             week_start TEXT NOT NULL,
@@ -1726,6 +1753,42 @@ def init_db():
     conn.close()
 
 
+
+
+def save_bot_state_value(key: str, value: Any) -> None:
+    """Persist small runtime settings/state to SQLite so redeploys do not wipe them."""
+    if not SQLITE_ENABLED:
+        return
+    try:
+        init_db()
+        conn = db_connect()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO bot_state (key, value, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            (str(key), json.dumps(value), datetime.now(UTC).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"BOT STATE SAVE ERROR {key}: {e}")
+
+
+def load_bot_state_value(key: str, fallback: Any):
+    """Load small runtime settings/state from SQLite."""
+    if not SQLITE_ENABLED:
+        return fallback
+    try:
+        init_db()
+        conn = db_connect()
+        row = conn.execute("SELECT value FROM bot_state WHERE key = ?", (str(key),)).fetchone()
+        conn.close()
+        if row:
+            return json.loads(row["value"])
+    except Exception as e:
+        print(f"BOT STATE LOAD ERROR {key}: {e}")
+    return fallback
 
 
 def rebuild_recent_trade_events_from_db(limit: int = 50) -> List[Dict[str, Any]]:
@@ -4435,13 +4498,25 @@ MUSK_MODE_UNIVERSE = [
 MUSK_PRIVATE_NOTES = ["SpaceX is private", "xAI is private", "X/Twitter is private"]
 
 
+MUSK_MODE_FILE = persistent_state_file("musk_mode.json") if "persistent_state_file" in globals() else os.path.join("backend", "state", "musk_mode.json")
+
+
 def musk_mode_enabled() -> bool:
     try:
-        saved = load_bot_state_value("musk_mode_enabled", None)
-        if isinstance(saved, bool):
-            return saved
-        if isinstance(saved, str):
-            return saved.lower() == "true"
+        if "load_bot_state_value" in globals():
+            saved = load_bot_state_value("musk_mode_enabled", None)
+            if isinstance(saved, bool):
+                return saved
+            if isinstance(saved, str):
+                return saved.lower() == "true"
+    except Exception:
+        pass
+    try:
+        if os.path.exists(MUSK_MODE_FILE):
+            with open(MUSK_MODE_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f).get("enabled")
+            if isinstance(saved, bool):
+                return saved
     except Exception:
         pass
     return bool(MUSK_MODE_ENV_DEFAULT)
@@ -4449,10 +4524,22 @@ def musk_mode_enabled() -> bool:
 
 def save_musk_mode_enabled(enabled: bool) -> bool:
     enabled = bool(enabled)
+    saved_ok = False
     try:
-        save_bot_state_value("musk_mode_enabled", enabled)
+        if "save_bot_state_value" in globals():
+            save_bot_state_value("musk_mode_enabled", enabled)
+            saved_ok = True
     except Exception as e:
-        print(f"MUSK MODE SAVE ERROR: {e}")
+        print(f"MUSK MODE DB SAVE ERROR: {e}")
+    try:
+        os.makedirs(os.path.dirname(MUSK_MODE_FILE), exist_ok=True)
+        with open(MUSK_MODE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"enabled": enabled, "updatedAt": datetime.now(UTC).isoformat()}, f, indent=2)
+        saved_ok = True
+    except Exception as e:
+        print(f"MUSK MODE FILE SAVE ERROR: {e}")
+    if not saved_ok:
+        print("MUSK MODE SAVE WARNING: could not persist setting")
     return enabled
 
 
