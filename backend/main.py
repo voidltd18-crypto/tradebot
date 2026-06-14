@@ -3139,7 +3139,11 @@ def build_status_payload(bot_name, scans):
         "mode": "SNIPER_CONFIDENCE_MEMORY_TIMELINE_GBP",
         "market": market_status,
         "fx": fx_payload(),
-        "autoUniverse": auto_universe_payload(),
+        # IMPORTANT: /status must show the same live universe that /weekly-universe and
+        # /refresh-universe use. The older auto_universe_payload() reads historical
+        # stock-memory rankings from SQLite, which made the dashboard look stuck on
+        # INTC/RIVN/KO even when Musk Mode or Dynamic Scanner had changed symbols.
+        "autoUniverse": force_quality_auto_universe_payload() if "force_quality_auto_universe_payload" in globals() else auto_universe_payload(),
         "dynamicMarketScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
         "muskMode": musk_mode_payload() if "musk_mode_payload" in globals() else {"enabled": False},
         "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
