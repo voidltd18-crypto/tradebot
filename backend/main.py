@@ -1209,6 +1209,18 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     if rounded_qty <= 0:
         return
 
+    try:
+        if "spacex_hold_blocks_sell" in globals() and spacex_hold_blocks_sell(symbol, reason):
+            msg = f"SPCX HOLD BLOCKED SELL | {symbol} | reason={reason}"
+            print(msg)
+            try:
+                notify(f"🛡️ {msg}")
+            except Exception:
+                pass
+            return
+    except Exception as e:
+        print(f"SPCX HOLD CHECK ERROR {symbol}: {e}")
+
     def submit(q):
         order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
         trading_client.submit_order(order)
@@ -3130,6 +3142,7 @@ def build_status_payload(bot_name, scans):
         "autoUniverse": auto_universe_payload(),
         "dynamicMarketScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
         "muskMode": musk_mode_payload() if "musk_mode_payload" in globals() else {"enabled": False},
+        "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
         "strictOneCyclePerStockPerDay": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
@@ -4490,6 +4503,7 @@ BLOCKED_WEAK_TICKERS = {
 MUSK_MODE_ENV_DEFAULT = os.getenv("MUSK_MODE_ENABLED", "false").lower() == "true"
 MUSK_MODE_UNIVERSE = [
     "TSLA",  # Tesla - main Musk stock
+    "SPCX",  # SpaceX proxy/ticker used by the bot when available
     "NVDA",  # AI / autonomy / robotics sympathy
     "AMD",
     "QCOM",
@@ -4551,8 +4565,106 @@ def musk_mode_payload() -> Dict[str, Any]:
         "activeSymbols": active,
         "configuredSymbols": MUSK_MODE_UNIVERSE,
         "privateNotes": MUSK_PRIVATE_NOTES,
+        "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
         "mode": "musk-focus" if enabled else "off",
-        "message": "Musk Mode ON: focusing universe on TSLA and related liquid tech names" if enabled else "Musk Mode OFF",
+        "message": "Musk Mode ON: focusing universe on TSLA/SPCX and related liquid tech names" if enabled else "Musk Mode OFF",
+    }
+
+
+# =========================
+# SPACEX / SPCX HOLD UNTIL MANUAL RELEASE
+# =========================
+SPACEX_HOLD_ENV_DEFAULT = os.getenv("SPACEX_HOLD_UNTIL_MANUAL", "false").lower() == "true"
+SPACEX_HOLD_SYMBOLS = [s.strip().upper() for s in os.getenv("SPACEX_HOLD_SYMBOLS", "SPCX").split(",") if s.strip()]
+SPACEX_HOLD_FILE = persistent_state_file("spacex_hold.json") if "persistent_state_file" in globals() else os.path.join("backend", "state", "spacex_hold.json")
+SPACEX_HOLD_ALLOWED_REASONS = ["MANUAL", "EMERGENCY"]
+
+
+def spacex_hold_enabled() -> bool:
+    try:
+        if "load_bot_state_value" in globals():
+            saved = load_bot_state_value("spacex_hold_enabled", None)
+            if isinstance(saved, bool):
+                return saved
+            if isinstance(saved, str):
+                return saved.lower() == "true"
+    except Exception:
+        pass
+    try:
+        if os.path.exists(SPACEX_HOLD_FILE):
+            with open(SPACEX_HOLD_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f).get("enabled")
+            if isinstance(saved, bool):
+                return saved
+    except Exception:
+        pass
+    return bool(SPACEX_HOLD_ENV_DEFAULT)
+
+
+def save_spacex_hold_enabled(enabled: bool) -> bool:
+    enabled = bool(enabled)
+    saved_ok = False
+    try:
+        if "save_bot_state_value" in globals():
+            save_bot_state_value("spacex_hold_enabled", enabled)
+            saved_ok = True
+    except Exception as e:
+        print(f"SPACEX HOLD DB SAVE ERROR: {e}")
+    try:
+        os.makedirs(os.path.dirname(SPACEX_HOLD_FILE), exist_ok=True)
+        with open(SPACEX_HOLD_FILE, "w", encoding="utf-8") as f:
+            json.dump({"enabled": enabled, "symbols": SPACEX_HOLD_SYMBOLS, "updatedAt": datetime.now(UTC).isoformat()}, f, indent=2)
+        saved_ok = True
+    except Exception as e:
+        print(f"SPACEX HOLD FILE SAVE ERROR: {e}")
+    if not saved_ok:
+        print("SPACEX HOLD SAVE WARNING: could not persist setting")
+    return enabled
+
+
+def spacex_hold_payload() -> Dict[str, Any]:
+    enabled = spacex_hold_enabled()
+    return {
+        "enabled": enabled,
+        "symbols": SPACEX_HOLD_SYMBOLS,
+        "mode": "hold-until-manual" if enabled else "off",
+        "allowedSellReasons": SPACEX_HOLD_ALLOWED_REASONS,
+        "message": "SPCX hold ON: auto sells/rotation/stall/trailing/partial exits are blocked until manual release" if enabled else "SPCX hold OFF",
+    }
+
+
+def spacex_hold_blocks_sell(symbol: str, reason: str = "") -> bool:
+    sym = str(symbol or "").upper().strip()
+    if not spacex_hold_enabled() or sym not in SPACEX_HOLD_SYMBOLS:
+        return False
+    upper_reason = str(reason or "").upper()
+    # Manual sell and emergency sell remain allowed so the user is never trapped.
+    if any(term in upper_reason for term in SPACEX_HOLD_ALLOWED_REASONS):
+        return False
+    return True
+
+
+@app.get("/spacex-hold")
+def api_get_spacex_hold():
+    return {"ok": True, **spacex_hold_payload()}
+
+
+@app.post("/spacex-hold")
+def api_set_spacex_hold(request: Request, payload: dict = Body(...)):
+    verify_api_key(request)
+    enabled = bool(payload.get("enabled"))
+    save_spacex_hold_enabled(enabled)
+    try:
+        latest_status["spaceXHold"] = spacex_hold_payload()
+        latest_status.setdefault("muskMode", musk_mode_payload())
+        latest_status["lastAction"] = "SPCX hold ON" if enabled else "SPCX hold OFF"
+        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
+    except Exception as e:
+        print(f"SPACEX HOLD STATUS UPDATE ERROR: {e}")
+    return {
+        "ok": True,
+        "message": "SPCX hold ON - auto sells blocked until you turn hold off or manually sell" if enabled else "SPCX hold OFF - normal auto sell rules restored",
+        **spacex_hold_payload(),
     }
 
 
@@ -4669,6 +4781,7 @@ def apply_quality_only_universe():
             "enabled": True,
             "mode": "musk-focus" if musk_mode_enabled() else ("dynamic-quality-hybrid" if DYNAMIC_MARKET_SCANNER_ENABLED else "quality-only"),
             "muskMode": musk_mode_payload(),
+            "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
             "size": len(symbols),
             "activeSymbols": symbols,
             "rows": rows,
@@ -4715,6 +4828,7 @@ def api_quality_universe():
         "ok": True,
         "qualityOnlyMode": QUALITY_ONLY_MODE,
         "muskMode": musk_mode_payload(),
+        "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
         "activeSymbols": quality_only_symbols(),
         "blockedWeakTickers": sorted(list(BLOCKED_WEAK_TICKERS)),
         "rows": quality_only_rows(),
@@ -4734,6 +4848,7 @@ def api_set_musk_mode(request: Request, payload: dict = Body(...)):
     try:
         update_status(BOT_NAME, latest_scans)
         latest_status["muskMode"] = musk_mode_payload()
+        latest_status["spaceXHold"] = spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False}
         latest_status["lastAction"] = "Musk Mode ON" if enabled else "Musk Mode OFF"
         latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
     except Exception as e:
