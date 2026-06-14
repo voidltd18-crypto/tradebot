@@ -63,6 +63,7 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
   const [buySizeMode, setBuySizeMode] = useState<"full"|"partial">("full");
   const [muskModeSaving, setMuskModeSaving] = useState(false);
+  const [spacexHoldSaving, setSpacexHoldSaving] = useState(false);
   const [positionsSaving, setPositionsSaving] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
@@ -92,6 +93,8 @@ const [banking, setBanking] = useState<AnyObj>({});
   const dynamicPickCount = Number(data?.autoUniverse?.dynamicPickCount || dynamicRows.length || 0);
   const muskMode = data?.muskMode || data?.autoUniverse?.muskMode || {};
   const muskModeOn = Boolean(muskMode?.enabled);
+  const spaceXHold = data?.spaceXHold || data?.autoUniverse?.spaceXHold || muskMode?.spaceXHold || {};
+  const spaceXHoldOn = Boolean(spaceXHold?.enabled);
   const strategySettings = data?.strategySettings || {};
   const positionSettings = data?.positionSettings || {};
   const strictnessLabels = ["Safe", "Balanced", "Aggressive"];
@@ -541,6 +544,37 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
+  async function saveSpaceXHold(enabled:boolean) {
+    if (!token) {
+      setMessage("Please login first.");
+      return;
+    }
+    setSpacexHoldSaving(true);
+    setMessage(enabled ? "Switching SPCX hold ON..." : "Switching SPCX hold OFF...");
+    try {
+      const res = await fetch(`${API_URL}/spacex-hold`, {
+        method: "POST",
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        cache: "no-store",
+        body: JSON.stringify({ enabled }),
+      });
+      const json = await readJson(res);
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save SPCX hold");
+      setData(prev => ({
+        ...prev,
+        spaceXHold: json,
+        lastAction: json?.message || (enabled ? "SPCX hold ON" : "SPCX hold OFF"),
+        lastActionAt: new Date().toISOString(),
+      }));
+      setMessage(json?.message || (enabled ? "SPCX hold ON." : "SPCX hold OFF."));
+      await fetchData(true);
+    } catch (e:any) {
+      setMessage(e?.message || "Could not save SPCX hold.");
+    } finally {
+      setSpacexHoldSaving(false);
+    }
+  }
+
 
   async function refreshDynamicScanner() {
     if (!token) {
@@ -837,6 +871,7 @@ const fetchData = useCallback(async (force = false) => {
         <div><span>Win rate</span><b>{pct((data?.dbSummary?.winRate || 0) * 100)}</b></div>
         <div><span>Dynamic universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
         <div><span>Musk Mode</span><b className={muskModeOn ? "gain" : ""}>{muskModeOn ? "ON" : "OFF"}</b></div>
+        <div><span>SPCX Hold</span><b className={spaceXHoldOn ? "gain" : ""}>{spaceXHoldOn ? "ON" : "OFF"}</b></div>
         <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
       </div></Card>
 
@@ -851,7 +886,15 @@ const fetchData = useCallback(async (force = false) => {
           <button className={muskModeOn ? "active" : "ghost"} onClick={()=>saveMuskMode(true)} disabled={muskModeSaving}>Musk Mode ON</button>
           <button className={!muskModeOn ? "active" : "ghost"} onClick={()=>saveMuskMode(false)} disabled={muskModeSaving}>Musk Mode OFF</button>
         </div>
-        <p className="muted">Focuses the universe on TSLA and related liquid tech names. SpaceX, xAI and X/Twitter are private, so the bot does not use fake tickers. Normal confidence, bounce, market filter and risk checks still apply.</p>
+        <div className="summary">
+          <div><span>SPCX Hold</span><b className={spaceXHoldOn ? "gain" : ""}>{spaceXHoldOn ? "ON" : "OFF"}</b></div>
+          <div><span>Held symbols</span><b>{(spaceXHold?.symbols || ["SPCX"]).join(", ")}</b></div>
+        </div>
+        <div className="actions">
+          <button className={spaceXHoldOn ? "active" : "ghost"} onClick={()=>saveSpaceXHold(true)} disabled={spacexHoldSaving}>Hold SPCX ON</button>
+          <button className={!spaceXHoldOn ? "active" : "ghost"} onClick={()=>saveSpaceXHold(false)} disabled={spacexHoldSaving}>Hold SPCX OFF</button>
+        </div>
+        <p className="muted">Musk Mode focuses the universe on TSLA/SPCX and related liquid tech names. SPCX Hold blocks automatic partial profit, trailing profit, stall, stop/rotation sells for SPCX until you turn hold off or use manual/emergency sell.</p>
       </Card>
 
       <Card title="Dynamic Market Scanner" wide>
