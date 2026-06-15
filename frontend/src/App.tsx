@@ -550,7 +550,7 @@ const fetchData = useCallback(async (force = false) => {
       return;
     }
     setSpacexHoldSaving(true);
-    setMessage(enabled ? "Switching SPCX hold ON..." : "Switching SPCX hold OFF...");
+    setMessage(enabled ? "Switching Musk hold ON..." : "Switching Musk hold OFF...");
     try {
       const res = await fetch(`${API_URL}/spacex-hold`, {
         method: "POST",
@@ -559,17 +559,17 @@ const fetchData = useCallback(async (force = false) => {
         body: JSON.stringify({ enabled }),
       });
       const json = await readJson(res);
-      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save SPCX hold");
+      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save Musk hold");
       setData(prev => ({
         ...prev,
         spaceXHold: json,
-        lastAction: json?.message || (enabled ? "SPCX hold ON" : "SPCX hold OFF"),
+        lastAction: json?.message || (enabled ? "Musk hold ON" : "Musk hold OFF"),
         lastActionAt: new Date().toISOString(),
       }));
-      setMessage(json?.message || (enabled ? "SPCX hold ON." : "SPCX hold OFF."));
+      setMessage(json?.message || (enabled ? "Musk hold ON." : "Musk hold OFF."));
       await fetchData(true);
     } catch (e:any) {
-      setMessage(e?.message || "Could not save SPCX hold.");
+      setMessage(e?.message || "Could not save Musk hold.");
     } finally {
       setSpacexHoldSaving(false);
     }
@@ -871,7 +871,7 @@ const fetchData = useCallback(async (force = false) => {
         <div><span>Win rate</span><b>{pct((data?.dbSummary?.winRate || 0) * 100)}</b></div>
         <div><span>Dynamic universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
         <div><span>Musk Mode</span><b className={muskModeOn ? "gain" : ""}>{muskModeOn ? "ON" : "OFF"}</b></div>
-        <div><span>SPCX Hold</span><b className={spaceXHoldOn ? "gain" : ""}>{spaceXHoldOn ? "ON" : "OFF"}</b></div>
+        <div><span>Musk Hold</span><b className={spaceXHoldOn ? "gain" : ""}>{spaceXHoldOn ? "ON" : "OFF"}</b></div>
         <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
       </div></Card>
 
@@ -887,14 +887,14 @@ const fetchData = useCallback(async (force = false) => {
           <button className={!muskModeOn ? "active" : "ghost"} onClick={()=>saveMuskMode(false)} disabled={muskModeSaving}>Musk Mode OFF</button>
         </div>
         <div className="summary">
-          <div><span>SPCX Hold</span><b className={spaceXHoldOn ? "gain" : ""}>{spaceXHoldOn ? "ON" : "OFF"}</b></div>
-          <div><span>Held symbols</span><b>{(spaceXHold?.symbols || ["SPCX"]).join(", ")}</b></div>
+          <div><span>Musk Hold</span><b className={spaceXHoldOn ? "gain" : ""}>{spaceXHoldOn ? "ON" : "OFF"}</b></div>
+          <div><span>Held symbols</span><b>{(spaceXHold?.symbols || muskMode?.activeSymbols || ["SPCX"]).join(", ")}</b></div>
         </div>
         <div className="actions">
-          <button className={spaceXHoldOn ? "active" : "ghost"} onClick={()=>saveSpaceXHold(true)} disabled={spacexHoldSaving}>Hold SPCX ON</button>
-          <button className={!spaceXHoldOn ? "active" : "ghost"} onClick={()=>saveSpaceXHold(false)} disabled={spacexHoldSaving}>Hold SPCX OFF</button>
+          <button className={spaceXHoldOn ? "active" : "ghost"} onClick={()=>saveSpaceXHold(true)} disabled={spacexHoldSaving}>Hold Musk Stocks ON</button>
+          <button className={!spaceXHoldOn ? "active" : "ghost"} onClick={()=>saveSpaceXHold(false)} disabled={spacexHoldSaving}>Hold Musk Stocks OFF</button>
         </div>
-        <p className="muted">Musk Mode focuses the universe on TSLA/SPCX and related liquid tech names. SPCX Hold blocks automatic partial profit, trailing profit, stall, stop/rotation sells for SPCX until you turn hold off or use manual/emergency sell.</p>
+        <p className="muted">Musk Mode focuses the universe on TSLA/SPCX and related liquid tech names. Musk Hold blocks automatic partial profit, trailing profit, stall, stop/rotation sells for every Musk Mode symbol until you turn hold off or use manual/emergency sell.</p>
       </Card>
 
       <Card title="Dynamic Market Scanner" wide>
