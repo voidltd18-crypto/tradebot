@@ -1244,7 +1244,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
 
     try:
         if "spacex_hold_blocks_sell" in globals() and spacex_hold_blocks_sell(symbol, reason):
-            msg = f"SPCX HOLD BLOCKED SELL | {symbol} | reason={reason}"
+            msg = f"MUSK HOLD BLOCKED SELL | {symbol} | reason={reason}"
             print(msg)
             try:
                 notify(f"🛡️ {msg}")
@@ -1252,7 +1252,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
                 pass
             return
     except Exception as e:
-        print(f"SPCX HOLD CHECK ERROR {symbol}: {e}")
+        print(f"MUSK HOLD CHECK ERROR {symbol}: {e}")
 
     def submit(q):
         order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
@@ -3862,7 +3862,7 @@ def startup_event():
         if "musk_mode_enabled" in globals():
             print(f"MUSK MODE RESTORED | enabled={musk_mode_enabled()}")
         if "spacex_hold_enabled" in globals():
-            print(f"SPCX HOLD RESTORED | enabled={spacex_hold_enabled()}")
+            print(f"MUSK HOLD RESTORED | enabled={spacex_hold_enabled()}")
         try:
             update_status(BOT_NAME, latest_scans)
         except Exception as e:
@@ -4665,7 +4665,9 @@ def musk_mode_payload() -> Dict[str, Any]:
 # SPACEX / SPCX HOLD UNTIL MANUAL RELEASE
 # =========================
 SPACEX_HOLD_ENV_DEFAULT = os.getenv("SPACEX_HOLD_UNTIL_MANUAL", "false").lower() == "true"
-SPACEX_HOLD_SYMBOLS = [s.strip().upper() for s in os.getenv("SPACEX_HOLD_SYMBOLS", "SPCX").split(",") if s.strip()]
+# Backwards-compatible name, but this now holds every Musk Mode symbol, not only SPCX.
+DEFAULT_MUSK_HOLD_SYMBOLS = ",".join(MUSK_MODE_UNIVERSE)
+SPACEX_HOLD_SYMBOLS = [s.strip().upper() for s in os.getenv("SPACEX_HOLD_SYMBOLS", DEFAULT_MUSK_HOLD_SYMBOLS).split(",") if s.strip()]
 SPACEX_HOLD_FILE = persistent_state_file("spacex_hold.json") if "persistent_state_file" in globals() else os.path.join("backend", "state", "spacex_hold.json")
 SPACEX_HOLD_ALLOWED_REASONS = ["MANUAL", "EMERGENCY"]
 
@@ -4719,7 +4721,7 @@ def spacex_hold_payload() -> Dict[str, Any]:
         "symbols": SPACEX_HOLD_SYMBOLS,
         "mode": "hold-until-manual" if enabled else "off",
         "allowedSellReasons": SPACEX_HOLD_ALLOWED_REASONS,
-        "message": "SPCX hold ON: auto sells/rotation/stall/trailing/partial exits are blocked until manual release" if enabled else "SPCX hold OFF",
+        "message": "Musk hold ON: auto sells/rotation/stall/trailing/partial exits are blocked for all Musk Mode symbols until manual release" if enabled else "Musk hold OFF",
     }
 
 
@@ -4747,7 +4749,7 @@ def api_set_spacex_hold(request: Request, payload: dict = Body(...)):
     try:
         latest_status["spaceXHold"] = spacex_hold_payload()
         latest_status.setdefault("muskMode", musk_mode_payload())
-        latest_status["lastAction"] = "SPCX hold ON" if enabled else "SPCX hold OFF"
+        latest_status["lastAction"] = "Musk hold ON" if enabled else "Musk hold OFF"
         latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
     except Exception as e:
         print(f"SPACEX HOLD STATUS UPDATE ERROR: {e}")
