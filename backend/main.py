@@ -218,7 +218,7 @@ MEMORY_GOOD_MULTIPLIER = 1.15
 
 # SQLite persistent trade memory
 SQLITE_ENABLED = True
-SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "trades.db")
+SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "/var/data/trades.db" if os.path.isdir("/var/data") else "trades.db")
 BACKFILL_ORDER_LIMIT = 500
 BACKFILL_CHUNK_SIZE = 500
 BACKFILL_MAX_PAGES = 50
@@ -401,10 +401,34 @@ def safe_save_json(path: str, data):
 
 
 def load_persistent_state():
-    global trade_history, stock_memory, temp_blacklist
+    global trade_history, stock_memory, temp_blacklist, trade_events, locked_today, partial_profit_taken, custom_symbols
+
+    # JSON fallback keeps older installs working, but SQLite bot_state/trades DB is
+    # the source of truth on Render because the app folder can be wiped on deploy.
     trade_history = safe_load_json(TRADE_HISTORY_FILE, [])
     stock_memory = safe_load_json(STOCK_MEMORY_FILE, {})
     temp_blacklist = safe_load_json(TEMP_BLACKLIST_FILE, {})
+
+    try:
+        locked_today = load_bot_state_value("locked_today", locked_today)
+        partial_profit_taken = load_bot_state_value("partial_profit_taken", partial_profit_taken)
+        temp_blacklist = load_bot_state_value("temp_blacklist", temp_blacklist)
+        custom_symbols = load_bot_state_value("custom_symbols", custom_symbols)
+
+        saved_recent = load_bot_state_value("trade_events", [])
+        db_recent = rebuild_recent_trade_events_from_db(50)
+        trade_events = db_recent if db_recent else (saved_recent if isinstance(saved_recent, list) else [])
+
+        for sym in list(custom_symbols.keys()):
+            add_symbol_to_universe(sym, custom=True)
+
+        print(
+            f"PERSISTENCE RESTORED | recent_trades={len(trade_events)} | "
+            f"locked_today={len(locked_today)} | partials={len(partial_profit_taken)} | "
+            f"custom={len(custom_symbols)} | db={SQLITE_DB_FILE}"
+        )
+    except Exception as e:
+        print(f"PERSISTENCE RESTORE ERROR: {e}")
 
 
 def save_trade_history():
@@ -435,6 +459,7 @@ def cleanup_temp_blacklist():
 
     if changed:
         save_temp_blacklist()
+        persist_runtime_state()
 
 
 def is_temp_blacklisted(symbol: str):
@@ -540,6 +565,10 @@ def add_symbol_to_universe(symbol: str, custom=False):
     ensure_symbol_state(symbol, custom=custom)
     if custom:
         custom_symbols[symbol] = True
+        try:
+            persist_runtime_state()
+        except Exception:
+            pass
 
 
 def reset_daily_flags_if_needed():
@@ -559,10 +588,12 @@ def reset_daily_flags_if_needed():
             account = get_account()
             starting_equity_today = float(account.equity)
             starting_equity_day = today
-            trade_events.clear()
+            # Keep recent trade activity restored from SQLite across daily resets.
+            # Daily counters already filter by day, so clearing this here hides history.
             alpaca_rejection_events.clear()
             pdt_warning_events.clear()
             equity_curve.clear()
+            persist_runtime_state()
         except Exception:
             pass
 
@@ -570,6 +601,7 @@ def reset_daily_flags_if_needed():
 def lock_symbol_until_tomorrow(symbol: str):
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY:
         locked_today[symbol] = today_str()
+        persist_runtime_state()
 
 
 def is_locked_today(symbol: str):
@@ -1200,6 +1232,7 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
         "pnlGbp": 0.0,
     }
     trade_events.append(event)
+    persist_runtime_state()
     add_trade_history_event(event)
     notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
 
@@ -1260,9 +1293,11 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
         "pnlPct": round(pnl_pct, 4),
     }
     trade_events.append(event)
+    persist_runtime_state()
     add_trade_history_event(event)
     update_stock_memory_from_sell(symbol, pnl, pnl_pct)
     lock_symbol_until_tomorrow(symbol)
+    persist_runtime_state()
     notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
 
 
@@ -1321,6 +1356,7 @@ def has_taken_partial_profit(symbol: str):
 
 def mark_partial_profit_taken(symbol: str):
     partial_profit_taken[symbol.upper()] = today_str()
+    persist_runtime_state()
 
 
 def sell_notional_ok(qty: float, price: float):
@@ -1856,6 +1892,38 @@ def ensure_recent_trades_restored(limit: int = 50) -> int:
     except Exception as e:
         print(f"ENSURE RECENT TRADES RESTORE ERROR: {e}")
         return len(trade_events)
+
+
+def persist_runtime_state() -> None:
+    """Save important in-memory controls so deploys/restarts do not wipe bot memory."""
+    try:
+        save_bot_state_value("locked_today", locked_today)
+        save_bot_state_value("partial_profit_taken", partial_profit_taken)
+        save_bot_state_value("temp_blacklist", temp_blacklist)
+        save_bot_state_value("trade_events", trade_events[-100:])
+        save_bot_state_value("custom_symbols", custom_symbols)
+    except Exception as e:
+        print(f"PERSIST RUNTIME STATE ERROR: {e}")
+
+
+def persistence_payload() -> Dict[str, Any]:
+    try:
+        db_exists = os.path.exists(SQLITE_DB_FILE)
+        return {
+            "enabled": bool(SQLITE_ENABLED),
+            "dbFile": SQLITE_DB_FILE,
+            "dbExists": bool(db_exists),
+            "dbSizeBytes": os.path.getsize(SQLITE_DB_FILE) if db_exists else 0,
+            "stateDir": os.path.dirname(SQLITE_DB_FILE) or ".",
+            "usingRenderDisk": str(SQLITE_DB_FILE).startswith("/var/data"),
+            "recentTradesRestored": len(trade_events),
+            "lockedTodayCount": len(locked_today),
+            "partialProfitCount": len(partial_profit_taken),
+            "tempBlacklistCount": len(temp_blacklist),
+            "message": "Persistent disk active" if str(SQLITE_DB_FILE).startswith("/var/data") else "SQLite active",
+        }
+    except Exception as e:
+        return {"enabled": bool(SQLITE_ENABLED), "dbFile": SQLITE_DB_FILE, "error": str(e)}
 
 
 def save_trade_to_db(event: Dict[str, Any], source: str = "bot"):
@@ -3081,22 +3149,29 @@ def build_weekly_universe(force=False):
 
 
 def auto_universe_payload():
-    active = get_weekly_universe_from_db()
-
-    # If DB has not been populated yet but stock memory exists, show live preview.
-    if not active:
-        preview = universe_rows_from_stock_memory()[:AUTO_UNIVERSE_SIZE]
-        active = preview
+    # Dashboard should show the live active universe, not just historical ranking rows.
+    live_symbols = list(dict.fromkeys([str(s).upper() for s in current_universe]))
+    db_rows = get_weekly_universe_from_db()
+    row_by_symbol = {str(r.get("symbol", "")).upper(): r for r in db_rows if isinstance(r, dict)}
+    rows = []
+    for i, sym in enumerate(live_symbols):
+        row = dict(row_by_symbol.get(sym, {}))
+        row.setdefault("symbol", sym)
+        row.setdefault("score", max(0, 100 - i))
+        row.setdefault("reason", "live active universe")
+        row.setdefault("status", "active")
+        rows.append(row)
 
     return {
         "enabled": AUTO_UNIVERSE_ENABLED,
-        "size": AUTO_UNIVERSE_SIZE,
+        "size": len(live_symbols),
         "weekStart": week_start_str(),
-        "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe),
-        "rows": active,
+        "activeSymbols": live_symbols,
+        "rows": rows,
         "lastRefresh": get_last_universe_refresh(),
         "candidatePoolSize": len(AUTO_UNIVERSE_CANDIDATE_POOL),
         "keepWinners": True,
+        "source": "live_current_universe",
     }
 
 
@@ -3139,11 +3214,7 @@ def build_status_payload(bot_name, scans):
         "mode": "SNIPER_CONFIDENCE_MEMORY_TIMELINE_GBP",
         "market": market_status,
         "fx": fx_payload(),
-        # IMPORTANT: /status must show the same live universe that /weekly-universe and
-        # /refresh-universe use. The older auto_universe_payload() reads historical
-        # stock-memory rankings from SQLite, which made the dashboard look stuck on
-        # INTC/RIVN/KO even when Musk Mode or Dynamic Scanner had changed symbols.
-        "autoUniverse": force_quality_auto_universe_payload() if "force_quality_auto_universe_payload" in globals() else auto_universe_payload(),
+        "autoUniverse": auto_universe_payload(),
         "dynamicMarketScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
         "muskMode": musk_mode_payload() if "musk_mode_payload" in globals() else {"enabled": False},
         "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
@@ -3242,11 +3313,13 @@ def build_status_payload(bot_name, scans):
             } for s in scans
         ],
         "banking": banking_payload(),
+        "persistence": persistence_payload() if "persistence_payload" in globals() else {},
         "logs": [
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
             f"FX | USDGBP={get_usd_to_gbp_rate():.4f} | source={fx_cache.get('source', 'fallback')}",
             f"DB | sqlite={SQLITE_ENABLED} | raw_trades={db_summary_payload().get('totalTrades', 0)} | closed={closed_trade_summary_payload().get('closedTrades', 0)} | pnl_gbp={closed_trade_summary_payload().get('totalPnlGbp', 0):.2f}",
+            f"PERSISTENCE | db={SQLITE_DB_FILE} | recent={len(trade_events)} | locked={len(locked_today)} | partials={len(partial_profit_taken)}",
             f"BACKFILL | chunk={BACKFILL_CHUNK_SIZE} | max_pages={BACKFILL_MAX_PAGES}",
             f"OPTIMIZER | enabled={PROFIT_OPTIMIZER_ENABLED} | today_realised={today_realised_pnl():.2f} | block={profit_guardrail_status()[1] or 'none'}",
             f"ANALYTICS | profit_factor={analytics_payload().get('profitFactor', 0):.2f} | avg_win={analytics_payload().get('averageWin', 0):.2f} | avg_loss={analytics_payload().get('averageLoss', 0):.2f}",
@@ -3783,6 +3856,19 @@ def startup_event():
     global bot_thread_started
     if bot_thread_started:
         return
+    try:
+        init_db()
+        load_persistent_state()
+        if "musk_mode_enabled" in globals():
+            print(f"MUSK MODE RESTORED | enabled={musk_mode_enabled()}")
+        if "spacex_hold_enabled" in globals():
+            print(f"SPCX HOLD RESTORED | enabled={spacex_hold_enabled()}")
+        try:
+            update_status(BOT_NAME, latest_scans)
+        except Exception as e:
+            print(f"STARTUP STATUS BUILD WARNING: {e}")
+    except Exception as e:
+        print(f"STARTUP RESTORE ERROR: {e}")
     bot_thread_started = True
     threading.Thread(target=run_bot_loop, daemon=True).start()
 
