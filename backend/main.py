@@ -10,6 +10,7 @@ import math
 import re
 import threading
 from datetime import datetime, UTC, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Optional
 
 import requests
@@ -17,7 +18,7 @@ from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
@@ -84,6 +85,12 @@ MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
 MIN_ORDER_NOTIONAL = 1.00
 CASH_BUFFER = 0.50
+
+# Extended-hours trading. Alpaca requires extended-hours orders to be LIMIT orders
+# with time_in_force=DAY and extended_hours=True.
+ALLOW_EXTENDED_HOURS = os.getenv("ALLOW_EXTENDED_HOURS", "true").lower() == "true"
+EXTENDED_ORDER_SLIPPAGE_PCT = float(os.getenv("EXTENDED_ORDER_SLIPPAGE_PCT", "0.003") or 0.003)
+ET_ZONE = ZoneInfo("America/New_York")
 
 # Full-buy mode:
 # When max positions is 1, use nearly all available trading capital/buying power
@@ -708,18 +715,70 @@ def get_equity():
     return float(get_account().equity)
 
 
+def now_et():
+    return datetime.now(ET_ZONE)
+
+
+def is_extended_hours_time(dt=None):
+    """True during Alpaca's extended stock sessions: 04:00-09:30 and 16:00-20:00 ET, weekdays."""
+    if not ALLOW_EXTENDED_HOURS:
+        return False
+    dt = dt or now_et()
+    if dt.weekday() >= 5:
+        return False
+    minutes = dt.hour * 60 + dt.minute
+    pre_open = 4 * 60 <= minutes < 9 * 60 + 30
+    after_hours = 16 * 60 <= minutes < 20 * 60
+    return pre_open or after_hours
+
+
+def is_trading_session_open(clock=None):
+    try:
+        clock = clock or trading_client.get_clock()
+        if bool(clock.is_open):
+            return True
+    except Exception:
+        pass
+    return is_extended_hours_time()
+
+
+def use_extended_order(clock=None):
+    try:
+        clock = clock or trading_client.get_clock()
+        return ALLOW_EXTENDED_HOURS and (not bool(clock.is_open)) and is_extended_hours_time()
+    except Exception:
+        return ALLOW_EXTENDED_HOURS and is_extended_hours_time()
+
+
 def get_market_status_payload():
     try:
         clock = trading_client.get_clock()
+        extended_open = use_extended_order(clock)
+        session_open = bool(clock.is_open) or extended_open
+        label = "OPEN" if bool(clock.is_open) else ("EXTENDED OPEN" if extended_open else "CLOSED")
         return {
-            "isOpen": bool(clock.is_open),
+            "isOpen": bool(session_open),
+            "regularOpen": bool(clock.is_open),
+            "extendedOpen": bool(extended_open),
+            "allowExtendedHours": bool(ALLOW_EXTENDED_HOURS),
             "timestamp": str(clock.timestamp),
             "nextOpen": str(clock.next_open),
             "nextClose": str(clock.next_close),
-            "label": "OPEN" if clock.is_open else "CLOSED",
+            "label": label,
         }
     except Exception as e:
-        return {"isOpen": False, "label": "UNKNOWN", "error": str(e), "timestamp": "", "nextOpen": "", "nextClose": ""}
+        extended_open = is_extended_hours_time()
+        return {
+            "isOpen": bool(extended_open),
+            "regularOpen": False,
+            "extendedOpen": bool(extended_open),
+            "allowExtendedHours": bool(ALLOW_EXTENDED_HOURS),
+            "label": "EXTENDED OPEN" if extended_open else "UNKNOWN",
+            "error": str(e),
+            "timestamp": "",
+            "nextOpen": "",
+            "nextClose": "",
+        }
 
 
 def get_quote(symbol: str):
@@ -1220,7 +1279,19 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
 
 
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
-    order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+    if use_extended_order():
+        quote = get_quote(symbol)
+        limit_price = round(float(quote["ask"]) * (1.0 + EXTENDED_ORDER_SLIPPAGE_PCT), 2)
+        order = LimitOrderRequest(
+            symbol=symbol,
+            notional=round(notional_amount, 2),
+            limit_price=limit_price,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            extended_hours=True,
+        )
+    else:
+        order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
     trading_client.submit_order(order)
     event = {
         "day": today_str(),
@@ -1257,7 +1328,19 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
         print(f"MUSK HOLD CHECK ERROR {symbol}: {e}")
 
     def submit(q):
-        order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
+        if use_extended_order():
+            quote = get_quote(symbol)
+            limit_price = round(float(quote["bid"]) * (1.0 - EXTENDED_ORDER_SLIPPAGE_PCT), 2)
+            order = LimitOrderRequest(
+                symbol=symbol,
+                qty=q,
+                limit_price=limit_price,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                extended_hours=True,
+            )
+        else:
+            order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
         trading_client.submit_order(order)
 
     try:
@@ -1663,7 +1746,7 @@ def buy_custom_symbol(symbol: str):
     symbol = symbol.upper().strip()
     if not symbol or not symbol.replace(".", "").replace("-", "").isalnum():
         return {"ok": False, "message": "Invalid ticker"}
-    if CUSTOM_BUY_REQUIRES_MARKET_OPEN and not trading_client.get_clock().is_open:
+    if CUSTOM_BUY_REQUIRES_MARKET_OPEN and not is_trading_session_open():
         return {"ok": False, "message": "Market closed"}
     can_buy, reason = can_buy_symbol(symbol)
     if not can_buy:
@@ -3706,7 +3789,7 @@ def manual_override_off(request: Request):
 def manual_buy(request: Request):
     verify_api_key(request)
     with bot_lock:
-        if not trading_client.get_clock().is_open:
+        if not is_trading_session_open():
             return {"ok": False, "message": "Market closed"}
         result = money_mode_buy(latest_scans, manual=True)
         update_status(BOT_NAME, latest_scans)
@@ -3816,7 +3899,7 @@ def run_bot_loop():
                 refresh_universe_if_needed()
                 clock = trading_client.get_clock()
 
-                if not clock.is_open:
+                if not is_trading_session_open(clock):
                     print("Market closed. Waiting...")
                     update_status(BOT_NAME, latest_scans)
                     time.sleep(CHECK_INTERVAL)
