@@ -1559,7 +1559,7 @@ def pick_money_mode_stocks(scans):
         if not aplus_ok:
             print(f"A+ SKIP {symbol} | {aplus_reason}")
             continue
-        if not scan["ready_to_buy"]:
+        if not scan["ready_to_buy"] and not musk_mode_enabled():
             continue
         candidates.append(scan)
     candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
