@@ -1171,8 +1171,9 @@ def risk_blocked():
             return True, opt_reason
 
     pnl = get_daily_pnl()
-    if pnl <= MAX_DAILY_LOSS:
-        return True, f"Max daily loss hit: {pnl:.2f}"
+    daily_loss_limit = -abs(float(MAX_DAILY_LOSS))
+    if pnl <= daily_loss_limit:
+        return True, f"Max daily loss hit: {pnl:.2f} / limit {daily_loss_limit:.2f}"
     if daily_trade_count() >= MAX_TRADES_PER_DAY:
         return True, "Max trades per day reached"
     return False, ""
