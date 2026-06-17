@@ -3459,7 +3459,7 @@ STRATEGY_PRESETS = {
         "aPlusMinConfidence": 0.40,
         "sniperMinConfidence": 0.40,
         "aPlusMinQuality": 0.005,
-        "sniperMinQuality": 0.014,
+        "sniperMinQuality": 0.005,
     },
 }
 
