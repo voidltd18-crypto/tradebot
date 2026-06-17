@@ -1043,8 +1043,15 @@ def sniper_passes(scan: Dict[str, Any]):
         return False, f"quality too low {scan['quality_score']:.4f}"
     if scan["spread"] > SNIPER_MAX_SPREAD:
         return False, f"spread too wide {scan['spread']:.4f}"
+    # Musk Mode override:
+    # keep confidence, quality, spread and momentum gates,
+    # but do not block Musk-focused entries purely because pullback is 0.0000.
     if scan["pullback"] < SNIPER_MIN_PULLBACK or scan["pullback"] > SNIPER_MAX_PULLBACK:
-        return False, f"pullback outside sniper range {scan['pullback']:.4f}"
+        try:
+            if not musk_mode_enabled():
+                return False, f"pullback outside sniper range {scan['pullback']:.4f}"
+        except Exception:
+            return False, f"pullback outside sniper range {scan['pullback']:.4f}"
     if scan["short_momentum"] < SNIPER_MIN_MOMENTUM:
         return False, f"momentum too weak {scan['short_momentum']:.4f}"
     return True, f"{label} confidence {confidence:.2f}"
