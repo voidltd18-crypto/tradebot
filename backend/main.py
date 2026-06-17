@@ -3458,7 +3458,7 @@ STRATEGY_PRESETS = {
         "label": "Aggressive",
         "aPlusMinConfidence": 0.40,
         "sniperMinConfidence": 0.40,
-        "aPlusMinQuality": 0.018,
+        "aPlusMinQuality": 0.005,
         "sniperMinQuality": 0.014,
     },
 }
