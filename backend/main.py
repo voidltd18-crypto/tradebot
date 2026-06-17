@@ -189,8 +189,8 @@ CONFIDENCE_SIZING_ENABLED = True
 STOCK_MEMORY_ENABLED = True
 TRADE_TIMELINE_ENABLED = True
 
-SNIPER_MIN_CONFIDENCE = 0.40
-SNIPER_MIN_QUALITY = 0.005
+SNIPER_MIN_CONFIDENCE = 0.58
+SNIPER_MIN_QUALITY = 0.020
 SNIPER_MAX_SPREAD = 0.012
 SNIPER_MIN_PULLBACK = 0.0015
 SNIPER_MAX_PULLBACK = 0.035
@@ -199,7 +199,7 @@ SNIPER_MIN_MOMENTUM = -0.003
 # A+ trade quality gate
 A_PLUS_GATE_ENABLED = True
 A_PLUS_MIN_CONFIDENCE = 0.70
-A_PLUS_MIN_QUALITY = 0.005
+A_PLUS_MIN_QUALITY = 0.026
 A_PLUS_MAX_SPREAD = 0.010
 A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM = True
 A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY = True
@@ -1043,15 +1043,8 @@ def sniper_passes(scan: Dict[str, Any]):
         return False, f"quality too low {scan['quality_score']:.4f}"
     if scan["spread"] > SNIPER_MAX_SPREAD:
         return False, f"spread too wide {scan['spread']:.4f}"
-    # Musk Mode override:
-    # keep confidence, quality, spread and momentum gates,
-    # but do not block Musk-focused entries purely because pullback is 0.0000.
     if scan["pullback"] < SNIPER_MIN_PULLBACK or scan["pullback"] > SNIPER_MAX_PULLBACK:
-        try:
-            if not musk_mode_enabled():
-                return False, f"pullback outside sniper range {scan['pullback']:.4f}"
-        except Exception:
-            return False, f"pullback outside sniper range {scan['pullback']:.4f}"
+        return False, f"pullback outside sniper range {scan['pullback']:.4f}"
     if scan["short_momentum"] < SNIPER_MIN_MOMENTUM:
         return False, f"momentum too weak {scan['short_momentum']:.4f}"
     return True, f"{label} confidence {confidence:.2f}"
@@ -1566,7 +1559,7 @@ def pick_money_mode_stocks(scans):
         if not aplus_ok:
             print(f"A+ SKIP {symbol} | {aplus_reason}")
             continue
-        if not scan["ready_to_buy"] and not musk_mode_enabled():
+        if not scan["ready_to_buy"]:
             continue
         candidates.append(scan)
     candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
@@ -1724,8 +1717,15 @@ def money_mode_buy(scans, manual=False):
 
     bought = 0
     messages = []
+
+    # Snapshot the number of slots at the start of this buy cycle.
+    # This prevents a second buy being submitted before Alpaca has updated
+    # open positions after the first order.
+    allowed_slots = max(0, allowed_new_position_count())
+    buy_limit_this_loop = max(0, min(int(MAX_NEW_BUYS_PER_LOOP), int(allowed_slots)))
+
     for c in picks:
-        if bought >= MAX_NEW_BUYS_PER_LOOP:
+        if bought >= buy_limit_this_loop:
             break
         symbol = c["symbol"]
         can_buy, reason = can_buy_symbol(symbol)
@@ -1744,6 +1744,11 @@ def money_mode_buy(scans, manual=False):
             state[symbol]["highest_since_entry"] = c["price"]
             messages.append(f"{reason} ${notional:.2f} {symbol} confidence={confidence:.2f}")
             bought += 1
+
+            # Stop immediately once the pre-calculated slot allowance is used.
+            # This is especially important when Max Positions = 1.
+            if bought >= buy_limit_this_loop:
+                break
         except Exception as e:
             messages.append(f"BUY ERROR {symbol}: {e}")
     return " | ".join(messages)
@@ -3463,10 +3468,10 @@ STRATEGY_PRESETS = {
     },
     "aggressive": {
         "label": "Aggressive",
-        "aPlusMinConfidence": 0.40,
-        "sniperMinConfidence": 0.40,
-        "aPlusMinQuality": 0.005,
-        "sniperMinQuality": 0.005,
+        "aPlusMinConfidence": 0.55,
+        "sniperMinConfidence": 0.50,
+        "aPlusMinQuality": 0.018,
+        "sniperMinQuality": 0.014,
     },
 }
 
