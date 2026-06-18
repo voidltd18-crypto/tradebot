@@ -865,28 +865,7 @@ const fetchData = useCallback(async (force = false) => {
         .reports-page input, .reports-page select, .reports-page table, .reports-page thead, .reports-page tbody, .reports-page tr, .reports-page td, .reports-page th { background:#070b18 !important; color:#eaf1ff !important; border-color:#26324a !important; }
         .reports-page .muted { color:#9aa7bd !important; }
       `}
-.top-focus-panel {
-  border-color: rgba(250, 204, 21, 0.55) !important;
-  background: linear-gradient(135deg, rgba(250, 204, 21, 0.14), rgba(15, 23, 42, 0.92)) !important;
-}
-.top-focus-symbol {
-  font-size: 34px;
-  font-weight: 900;
-  line-height: 1.05;
-  margin-top: 8px;
-  color: #ffffff;
-}
-.top-focus-meta {
-  margin-top: 8px;
-  color: #cbd5e1;
-  font-size: 14px;
-}
-.top-focus-next {
-  margin-top: 10px;
-  color: #facc15;
-  font-size: 13px;
-  font-weight: 800;
-}
+
 
 </style>
 
