@@ -1182,28 +1182,84 @@ def allowed_new_position_count():
     return max(0, MAX_POSITIONS - len(get_all_positions()))
 
 
+def current_open_position_value_usd() -> float:
+    """Total current open position value used against the trading cap."""
+    try:
+        return max(0.0, sum(float(p.get("marketValue") or 0.0) for p in get_all_positions()))
+    except Exception:
+        return 0.0
+
+
+def remaining_trading_cap_usd(account_equity: float = None, buying_power: float = None) -> float:
+    """Remaining cap available for NEW buys after existing positions.
+
+    This is the key cap enforcement fix: the old sizing used the full capped
+    equity for each new buy, so if buying power was high the next order could
+    use more than the remaining cap. New buys must only use:
+        cap/effective equity - current open positions - cash buffer
+    """
+    try:
+        if account_equity is None or buying_power is None:
+            account = get_account()
+            account_equity = float(account.equity)
+            buying_power = float(account.buying_power)
+        else:
+            account_equity = float(account_equity or 0.0)
+            buying_power = float(buying_power or 0.0)
+    except Exception:
+        account_equity = 0.0
+        buying_power = 0.0
+
+    capped_equity = effective_trading_equity(account_equity) if "effective_trading_equity" in globals() else account_equity
+    open_value = current_open_position_value_usd()
+    cap_remaining = max(0.0, capped_equity - open_value)
+    cash_remaining = max(0.0, buying_power)
+    return max(0.0, min(cap_remaining, cash_remaining))
+
+
+def cap_safe_order_notional(requested_notional: float) -> float:
+    """Final safety clamp before submitting a BUY to Alpaca."""
+    try:
+        account = get_account()
+        equity = float(account.equity)
+        buying_power = float(account.buying_power)
+    except Exception:
+        return 0.0
+
+    remaining = remaining_trading_cap_usd(equity, buying_power)
+    if remaining <= 0:
+        return 0.0
+    try:
+        requested = float(requested_notional or 0.0)
+    except Exception:
+        requested = 0.0
+    return round(max(0.0, min(requested, remaining)), 2)
+
+
 def calculate_new_position_notional():
     account = get_account()
     equity = float(account.equity)
     buying_power = float(account.buying_power)
 
-    # Profit banking cap now controls sizing. If account equity grows above
-    # the saved cap, new trade sizes are calculated from the capped amount,
-    # not full account equity.
-    sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
+    # Cap enforcement must use remaining capped buying capacity, not the full
+    # capped equity every time. This prevents the bot spending above the saved
+    # cap when it already has open positions.
+    remaining_cap = remaining_trading_cap_usd(equity, buying_power)
 
-    # Full-buy mode means the next new position uses nearly all available capped
-    # trading capital/buying power, leaving a small buffer. Do not restrict this
-    # to MAX_POSITIONS <= 1, because the dashboard Full Buy button is a sizing
-    # mode, not only a one-position mode.
+    if remaining_cap <= 0:
+        return 0.0
+
+    # Full-buy mode uses the remaining cap for the next position, leaving the
+    # small configured cash buffer.
     if FULL_BUY_WHEN_ONE_POSITION:
         usable_cash = max(0.0, buying_power - FULL_BUY_CASH_BUFFER)
-        return round(max(0.0, min(sizing_equity, usable_cash)), 2)
+        return round(max(0.0, min(remaining_cap, usable_cash)), 2)
 
+    sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
     target_value = sizing_equity * TARGET_POSITION_VALUE_PCT
     max_value = sizing_equity * MAX_POSITION_VALUE_PCT
     usable_cash = max(0.0, buying_power - CASH_BUFFER)
-    return round(max(0.0, min(target_value, max_value, usable_cash)), 2)
+    return round(max(0.0, min(target_value, max_value, usable_cash, remaining_cap)), 2)
 
 
 def confidence_notional(scan):
@@ -1279,6 +1335,13 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
 
 
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
+    # Final cap safety check immediately before any Alpaca BUY order.
+    # If the cap is unavailable or already used by open positions, block the buy.
+    safe_notional = cap_safe_order_notional(notional_amount) if "cap_safe_order_notional" in globals() else float(notional_amount or 0.0)
+    if safe_notional < MIN_ORDER_NOTIONAL:
+        raise ValueError(f"BUY BLOCKED | Trading cap remaining too small: ${safe_notional:.2f}")
+    notional_amount = safe_notional
+
     if use_extended_order():
         quote = get_quote(symbol)
         limit_price = round(float(quote["ask"]) * (1.0 + EXTENDED_ORDER_SLIPPAGE_PCT), 2)
@@ -1541,72 +1604,17 @@ def refresh_universe_if_needed(force=False):
     print(f"UNIVERSE REFRESHED: {', '.join(current_universe)}")
 
 
-FOCUS_ROTATION_SECONDS = int(os.getenv("FOCUS_ROTATION_SECONDS", str(60 * 45)))
-FOCUS_REPEAT_PENALTY = float(os.getenv("FOCUS_REPEAT_PENALTY", "0.12") or 0.12)
-
-
-def _focus_state():
-    try:
-        return load_bot_state_value("top_focus_state", {"symbol": "", "updatedAt": 0})
-    except Exception:
-        return {"symbol": "", "updatedAt": 0}
-
-
-def _save_focus_state(symbol: str):
-    try:
-        save_bot_state_value("top_focus_state", {
-            "symbol": str(symbol or "").upper(),
-            "updatedAt": time.time(),
-        })
-    except Exception:
-        pass
-
-
 def focus_queue(scans):
-    """
-    Return the best BUYABLE focus queue.
-
-    Important:
-    - This no longer shows weak universe winners as Top Focus.
-    - It only includes stocks that can actually pass the bot's buy gates.
-    - If the same symbol has been Top Focus for too long, it gets a small
-      temporary penalty so the banner can rotate to the next strong setup.
-    """
     candidates = []
-    saved_focus = _focus_state()
-    last_symbol = str(saved_focus.get("symbol") or "").upper()
-    last_updated = float(saved_focus.get("updatedAt") or 0)
-    stale_same_focus = last_symbol and (time.time() - last_updated) < FOCUS_ROTATION_SECONDS
-
     for scan in scans:
         try:
             symbol = str(scan.get("symbol", "")).upper().strip()
             if not symbol:
                 continue
-
             can_buy, _ = can_buy_symbol(symbol)
             if not can_buy:
                 continue
-
-            sniper_ok, _ = sniper_passes(scan)
-            aplus_ok, _ = a_plus_gate(scan)
-
-            # Top Focus should mean "next likely buy", not just highest ranked.
-            if not sniper_ok or not aplus_ok:
-                continue
-
-            # Normal mode still requires the actual ready-to-buy trigger.
-            # Musk Mode keeps its looser behaviour, but still must pass gates.
-            if not bool(scan.get("ready_to_buy", False)) and not musk_mode_enabled():
-                continue
-
-            adjusted_confidence = float(scan.get("confidence", 0.0) or 0.0)
-            if stale_same_focus and symbol == last_symbol:
-                adjusted_confidence = max(0.0, adjusted_confidence - FOCUS_REPEAT_PENALTY)
-
-            row = dict(scan)
-            row["_focus_adjusted_confidence"] = adjusted_confidence
-            candidates.append(row)
+            candidates.append(scan)
         except Exception:
             continue
 
@@ -1614,20 +1622,12 @@ def focus_queue(scans):
         key=lambda x: (
             bool(x.get("a_plus_pass", False)),
             bool(x.get("sniper_pass", False)),
-            float(x.get("_focus_adjusted_confidence", x.get("confidence", 0.0)) or 0.0),
-            float(x.get("quality_score", 0.0) or 0.0),
-            -float(x.get("spread", 1.0) or 1.0),
+            float(x.get("confidence", 0.0)),
+            float(x.get("quality_score", 0.0)),
+            -float(x.get("spread", 1.0)),
         ),
         reverse=True,
     )
-
-    if candidates:
-        top_symbol = str(candidates[0].get("symbol", "")).upper()
-        if top_symbol and top_symbol != last_symbol:
-            _save_focus_state(top_symbol)
-        elif top_symbol and not last_symbol:
-            _save_focus_state(top_symbol)
-
     return candidates
 
 
@@ -1639,7 +1639,6 @@ def top_focus_payload(scans):
             "symbol": s.get("symbol", ""),
             "price": float(s.get("price", 0.0) or 0.0),
             "confidence": float(s.get("confidence", 0.0) or 0.0),
-            "adjustedConfidence": float(s.get("_focus_adjusted_confidence", s.get("confidence", 0.0)) or 0.0),
             "qualityScore": float(s.get("quality_score", 0.0) or 0.0),
             "spread": float(s.get("spread", 0.0) or 0.0),
             "sniperPass": bool(s.get("sniper_pass", False)),
@@ -1651,7 +1650,7 @@ def top_focus_payload(scans):
         "enabled": True,
         "top": top,
         "queue": rows,
-        "message": f"Current buyable focus: {top['symbol']}" if top else "No buyable focus candidate ready",
+        "message": f"Current focus: {top['symbol']}" if top else "No focus candidate ready",
     }
 
 
@@ -1676,8 +1675,7 @@ def pick_money_mode_stocks(scans):
         if not scan["ready_to_buy"] and not musk_mode_enabled():
             continue
         candidates.append(scan)
-    focus_order = {s.get("symbol"): i for i, s in enumerate(focus_queue(candidates))}
-    candidates.sort(key=lambda x: focus_order.get(x.get("symbol"), 999999))
+    candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
     return candidates
 
 
@@ -5423,6 +5421,8 @@ def banking_payload():
     cap_gbp = trading_cap_gbp()
 
     effective = max(0.0, min(equity, cap_usd)) if cap_usd > 0 else max(0.0, equity)
+    open_value = current_open_position_value_usd() if "current_open_position_value_usd" in globals() else 0.0
+    remaining_cap = remaining_trading_cap_usd(equity, float(getattr(account, "buying_power", 0) or 0)) if "remaining_trading_cap_usd" in globals() else max(0.0, effective - open_value)
     banked = max(0.0, equity - effective) if cap_usd > 0 else 0.0
 
     return {
@@ -5439,6 +5439,10 @@ def banking_payload():
         "accountEquity": equity,
         "effectiveTradingEquity": effective,
         "effectiveTradingEquityGbp": money_gbp(effective),
+        "openPositionValueUsd": open_value,
+        "openPositionValueGbp": money_gbp(open_value),
+        "remainingTradingCapUsd": remaining_cap,
+        "remainingTradingCapGbp": money_gbp(remaining_cap),
         "bankedProfitCashBuffer": banked,
         "bankedProfitCashBufferGbp": money_gbp(banked),
         "message": "Profit banking active" if cap_usd > 0 else "Profit banking disabled",
@@ -5715,7 +5719,7 @@ def _compat_buy_preview():
         max_positions = 1
 
     try:
-        positions = get_positions() if "get_positions" in globals() else []
+        positions = get_all_positions() if "get_all_positions" in globals() else []
         open_positions = len(positions)
     except Exception:
         open_positions = 0
@@ -5724,6 +5728,16 @@ def _compat_buy_preview():
         capped_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
     except Exception:
         capped_equity = equity
+
+    try:
+        open_position_value = current_open_position_value_usd() if "current_open_position_value_usd" in globals() else 0.0
+    except Exception:
+        open_position_value = 0.0
+
+    try:
+        cap_remaining = remaining_trading_cap_usd(equity, buying_power) if "remaining_trading_cap_usd" in globals() else max(0.0, capped_equity - open_position_value)
+    except Exception:
+        cap_remaining = max(0.0, capped_equity - open_position_value)
 
     try:
         cash_buffer = float(globals().get("CASH_BUFFER", 0.50))
@@ -5741,8 +5755,8 @@ def _compat_buy_preview():
         partial_usd = 0.0
         full_usd = 0.0
     else:
-        partial_usd = max(0.0, min(capped_equity / max(1, max_positions), max(0.0, buying_power - cash_buffer)))
-        full_usd = max(0.0, min(capped_equity, max(0.0, buying_power - full_buffer)))
+        partial_usd = max(0.0, min(cap_remaining / max(1, remaining_slots), max(0.0, buying_power - cash_buffer)))
+        full_usd = max(0.0, min(cap_remaining, max(0.0, buying_power - full_buffer)))
 
     mode = _compat_load_buy_mode()
 
@@ -5755,6 +5769,10 @@ def _compat_buy_preview():
         "fullGbp": round(_compat_gbp(full_usd), 2),
         "cappedEquityUsd": round(capped_equity, 2),
         "cappedEquityGbp": round(_compat_gbp(capped_equity), 2),
+        "openPositionValueUsd": round(open_position_value, 2),
+        "openPositionValueGbp": round(_compat_gbp(open_position_value), 2),
+        "remainingTradingCapUsd": round(cap_remaining, 2),
+        "remainingTradingCapGbp": round(_compat_gbp(cap_remaining), 2),
         "buyingPowerUsd": round(buying_power, 2),
         "buyingPowerGbp": round(_compat_gbp(buying_power), 2),
         "maxPositions": max_positions,
