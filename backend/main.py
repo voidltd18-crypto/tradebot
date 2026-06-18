@@ -5559,12 +5559,20 @@ def _compat_buy_preview():
 
     cap_usd = trading_cap_usd() if "trading_cap_usd" in globals() else 0.0
 
-    # If Alpaca/account values are briefly unavailable during page refresh,
-    # keep showing the saved cap instead of flashing £0.00.
-    if equity <= 0 and cap_usd > 0:
-        capped_equity = cap_usd
+    # Saved/display cap must NEVER become £0 just because:
+    # - Alpaca briefly fails during refresh, or
+    # - open positions have already used the cap.
+    #
+    # Buy sizing still uses remaining_cap below.
+    if cap_usd > 0:
+        display_capped_equity = cap_usd
+        if equity > 0:
+            capped_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else min(equity, cap_usd)
+        else:
+            capped_equity = cap_usd
     else:
         capped_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
+        display_capped_equity = capped_equity
 
     open_value = _open_position_value_usd() if "_open_position_value_usd" in globals() else 0.0
     remaining_cap = max(0.0, capped_equity - open_value)
@@ -5597,8 +5605,9 @@ def _compat_buy_preview():
         "partialGbp": round(_compat_gbp(partial_usd), 2),
         "fullUsd": round(full_usd, 2),
         "fullGbp": round(_compat_gbp(full_usd), 2),
-        "cappedEquityUsd": round(capped_equity, 2),
-        "cappedEquityGbp": round(_compat_gbp(capped_equity), 2),
+        # This is the saved cap shown in the UI, not the remaining amount.
+        "cappedEquityUsd": round(display_capped_equity, 2),
+        "cappedEquityGbp": round(_compat_gbp(display_capped_equity), 2),
         "remainingCapUsd": round(remaining_cap, 2),
         "remainingCapGbp": round(_compat_gbp(remaining_cap), 2),
         "openPositionValueUsd": round(open_value, 2),
