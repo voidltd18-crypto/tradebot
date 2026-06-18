@@ -1541,17 +1541,72 @@ def refresh_universe_if_needed(force=False):
     print(f"UNIVERSE REFRESHED: {', '.join(current_universe)}")
 
 
+FOCUS_ROTATION_SECONDS = int(os.getenv("FOCUS_ROTATION_SECONDS", str(60 * 45)))
+FOCUS_REPEAT_PENALTY = float(os.getenv("FOCUS_REPEAT_PENALTY", "0.12") or 0.12)
+
+
+def _focus_state():
+    try:
+        return load_bot_state_value("top_focus_state", {"symbol": "", "updatedAt": 0})
+    except Exception:
+        return {"symbol": "", "updatedAt": 0}
+
+
+def _save_focus_state(symbol: str):
+    try:
+        save_bot_state_value("top_focus_state", {
+            "symbol": str(symbol or "").upper(),
+            "updatedAt": time.time(),
+        })
+    except Exception:
+        pass
+
+
 def focus_queue(scans):
+    """
+    Return the best BUYABLE focus queue.
+
+    Important:
+    - This no longer shows weak universe winners as Top Focus.
+    - It only includes stocks that can actually pass the bot's buy gates.
+    - If the same symbol has been Top Focus for too long, it gets a small
+      temporary penalty so the banner can rotate to the next strong setup.
+    """
     candidates = []
+    saved_focus = _focus_state()
+    last_symbol = str(saved_focus.get("symbol") or "").upper()
+    last_updated = float(saved_focus.get("updatedAt") or 0)
+    stale_same_focus = last_symbol and (time.time() - last_updated) < FOCUS_ROTATION_SECONDS
+
     for scan in scans:
         try:
             symbol = str(scan.get("symbol", "")).upper().strip()
             if not symbol:
                 continue
+
             can_buy, _ = can_buy_symbol(symbol)
             if not can_buy:
                 continue
-            candidates.append(scan)
+
+            sniper_ok, _ = sniper_passes(scan)
+            aplus_ok, _ = a_plus_gate(scan)
+
+            # Top Focus should mean "next likely buy", not just highest ranked.
+            if not sniper_ok or not aplus_ok:
+                continue
+
+            # Normal mode still requires the actual ready-to-buy trigger.
+            # Musk Mode keeps its looser behaviour, but still must pass gates.
+            if not bool(scan.get("ready_to_buy", False)) and not musk_mode_enabled():
+                continue
+
+            adjusted_confidence = float(scan.get("confidence", 0.0) or 0.0)
+            if stale_same_focus and symbol == last_symbol:
+                adjusted_confidence = max(0.0, adjusted_confidence - FOCUS_REPEAT_PENALTY)
+
+            row = dict(scan)
+            row["_focus_adjusted_confidence"] = adjusted_confidence
+            candidates.append(row)
         except Exception:
             continue
 
@@ -1559,12 +1614,20 @@ def focus_queue(scans):
         key=lambda x: (
             bool(x.get("a_plus_pass", False)),
             bool(x.get("sniper_pass", False)),
-            float(x.get("confidence", 0.0)),
-            float(x.get("quality_score", 0.0)),
-            -float(x.get("spread", 1.0)),
+            float(x.get("_focus_adjusted_confidence", x.get("confidence", 0.0)) or 0.0),
+            float(x.get("quality_score", 0.0) or 0.0),
+            -float(x.get("spread", 1.0) or 1.0),
         ),
         reverse=True,
     )
+
+    if candidates:
+        top_symbol = str(candidates[0].get("symbol", "")).upper()
+        if top_symbol and top_symbol != last_symbol:
+            _save_focus_state(top_symbol)
+        elif top_symbol and not last_symbol:
+            _save_focus_state(top_symbol)
+
     return candidates
 
 
@@ -1576,6 +1639,7 @@ def top_focus_payload(scans):
             "symbol": s.get("symbol", ""),
             "price": float(s.get("price", 0.0) or 0.0),
             "confidence": float(s.get("confidence", 0.0) or 0.0),
+            "adjustedConfidence": float(s.get("_focus_adjusted_confidence", s.get("confidence", 0.0)) or 0.0),
             "qualityScore": float(s.get("quality_score", 0.0) or 0.0),
             "spread": float(s.get("spread", 0.0) or 0.0),
             "sniperPass": bool(s.get("sniper_pass", False)),
@@ -1587,7 +1651,7 @@ def top_focus_payload(scans):
         "enabled": True,
         "top": top,
         "queue": rows,
-        "message": f"Current focus: {top['symbol']}" if top else "No focus candidate ready",
+        "message": f"Current buyable focus: {top['symbol']}" if top else "No buyable focus candidate ready",
     }
 
 
@@ -1612,7 +1676,8 @@ def pick_money_mode_stocks(scans):
         if not scan["ready_to_buy"] and not musk_mode_enabled():
             continue
         candidates.append(scan)
-    candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
+    focus_order = {s.get("symbol"): i for i, s in enumerate(focus_queue(candidates))}
+    candidates.sort(key=lambda x: focus_order.get(x.get("symbol"), 999999))
     return candidates
 
 
