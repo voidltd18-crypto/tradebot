@@ -2,59 +2,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
-
-const pct = (value: any) => `${((Number(value) || 0) * 100).toFixed(2)}%`;
-
-const getTopFocus = (status: any) => {
-  const tf = status?.topFocus;
-  if (tf?.top) return tf.top;
-
-  const scans = Array.isArray(status?.scans) ? status.scans : [];
-  const candidates = scans
-    .filter((s: any) => !s?.lockedToday && !s?.qty && (s?.sniperPass || s?.aPlusPass))
-    .sort((a: any, b: any) => {
-      const ar = (a?.aPlusPass ? 1000 : 0) + (a?.sniperPass ? 500 : 0) + (Number(a?.confidence) || 0) * 100 + (Number(a?.qualityScore) || 0);
-      const br = (b?.aPlusPass ? 1000 : 0) + (b?.sniperPass ? 500 : 0) + (Number(b?.confidence) || 0) * 100 + (Number(b?.qualityScore) || 0);
-      return br - ar;
-    });
-
-  return candidates[0] || null;
-};
-
-const TopFocusCard = ({ status }: { status: any }) => {
-  const top = getTopFocus(status);
-  const queue = Array.isArray(status?.topFocus?.queue) ? status.topFocus.queue.slice(1, 4) : [];
-
-  if (!top) {
-    return (
-      <div className="rounded-2xl border border-slate-700 bg-slate-900/70 p-4 shadow">
-        <div className="text-xs uppercase tracking-wide text-slate-400">🏆 Top Focus</div>
-        <div className="mt-1 text-xl font-bold text-white">No focus candidate ready</div>
-        <div className="text-sm text-slate-400">Waiting for the next usable sniper setup.</div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="rounded-2xl border border-yellow-500/50 bg-yellow-500/10 p-4 shadow">
-      <div className="text-xs uppercase tracking-wide text-yellow-300">🏆 Top Focus</div>
-      <div className="mt-1 flex flex-wrap items-end gap-3">
-        <div className="text-3xl font-extrabold text-white">{top.symbol}</div>
-        <div className="text-lg font-bold text-yellow-200">{pct(top.confidence)}</div>
-      </div>
-      <div className="mt-1 text-sm text-slate-300">
-        Quality {(Number(top.qualityScore) || 0).toFixed(4)}
-        {top.price ? ` • Price $${Number(top.price).toFixed(2)}` : ""}
-      </div>
-      {queue.length > 0 && (
-        <div className="mt-2 text-xs text-slate-400">
-          Next: {queue.map((q: any) => q.symbol).join(" → ")}
-        </div>
-      )}
-    </div>
-  );
-};
-
 const API_URL = import.meta.env.VITE_API_BASE || "https://tradebot-0myo.onrender.com";
 const BOT_VERSION = "v1.1-strict-profit-mode";
 type AnyObj = Record<string, any>;
@@ -960,9 +907,7 @@ const fetchData = useCallback(async (force = false) => {
         <div className="actions"><button className="purple" onClick={refreshDynamicScanner}>Refresh Dynamic Market</button></div>
         <p className="muted">This searches market movers/active stocks first, applies price/volume/spread filters, then merges the best candidates with your manual pinned stocks and core safety list.</p>
         {dynamicScanner?.error && <p className="notice danger-text">Scanner warning: {dynamicScanner.error}</p>}
-        <div className="scan-grid">
-      <TopFocusCard status={status} />
-{dynamicRows.slice(0,12).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>Score {Number(r.score || 0).toFixed(2)}</strong></div><p>{r.reason || "dynamic candidate"}</p><small>{r.price ? `Price ${usd(r.price)} · ` : ""}{r.changePct !== undefined ? `Change ${pct(r.changePct)} · ` : ""}{r.volume ? `Volume ${Number(r.volume).toLocaleString()}` : ""}</small></article>)}</div>
+        <div className="scan-grid">{dynamicRows.slice(0,12).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>Score {Number(r.score || 0).toFixed(2)}</strong></div><p>{r.reason || "dynamic candidate"}</p><small>{r.price ? `Price ${usd(r.price)} · ` : ""}{r.changePct !== undefined ? `Change ${pct(r.changePct)} · ` : ""}{r.volume ? `Volume ${Number(r.volume).toLocaleString()}` : ""}</small></article>)}</div>
       </Card>
 
       <Card title="Profit Banking / Trading Cap">
