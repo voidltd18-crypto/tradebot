@@ -2,6 +2,58 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
+
+function topFocusPercent(value: any) {
+  return `${((Number(value) || 0) * 100).toFixed(2)}%`;
+}
+
+function getTopFocusCandidate(status: any) {
+  const top = status?.topFocus?.top;
+  if (top?.symbol) return top;
+
+  const rows = Array.isArray(status?.autoUniverse?.rows) ? status.autoUniverse.rows : [];
+  if (rows.length) {
+    const sorted = [...rows].sort((a: any, b: any) => (Number(b?.score) || 0) - (Number(a?.score) || 0));
+    return sorted[0] || null;
+  }
+
+  return null;
+}
+
+function TopFocusCard({ status }: { status: any }) {
+  const top = getTopFocusCandidate(status);
+  const queue = Array.isArray(status?.topFocus?.queue) ? status.topFocus.queue : [];
+  const fallbackRows = Array.isArray(status?.autoUniverse?.rows) ? [...status.autoUniverse.rows].sort((a: any, b: any) => (Number(b?.score) || 0) - (Number(a?.score) || 0)) : [];
+  const nextRows = queue.length ? queue.slice(1, 5) : fallbackRows.slice(1, 5);
+
+  if (!top?.symbol) {
+    return (
+      <div className="panel top-focus-panel">
+        <h3>🏆 Top Focus Stock</h3>
+        <div className="muted">No focus candidate ready yet.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="panel top-focus-panel">
+      <h3>🏆 Top Focus Stock</h3>
+      <div className="top-focus-symbol">{top.symbol}</div>
+      <div className="top-focus-meta">
+        {top.confidence !== undefined ? <>Confidence <b>{topFocusPercent(top.confidence)}</b></> : <>Score <b>{Number(top.score || 0).toFixed(2)}</b></>}
+        {top.qualityScore !== undefined ? <> · Quality <b>{Number(top.qualityScore || 0).toFixed(4)}</b></> : null}
+        {top.price ? <> · Price <b>${Number(top.price || 0).toFixed(2)}</b></> : null}
+      </div>
+      {nextRows.length > 0 && (
+        <div className="top-focus-next">
+          Next: {nextRows.map((r: any) => r.symbol).filter(Boolean).join(" → ")}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
 const API_URL = import.meta.env.VITE_API_BASE || "https://tradebot-0myo.onrender.com";
 const BOT_VERSION = "v1.1-strict-profit-mode";
 type AnyObj = Record<string, any>;
@@ -812,7 +864,31 @@ const fetchData = useCallback(async (force = false) => {
         .reports-page .card, .reports-page section { background:#11182a !important; color:#eaf1ff !important; border-color:#26324a !important; }
         .reports-page input, .reports-page select, .reports-page table, .reports-page thead, .reports-page tbody, .reports-page tr, .reports-page td, .reports-page th { background:#070b18 !important; color:#eaf1ff !important; border-color:#26324a !important; }
         .reports-page .muted { color:#9aa7bd !important; }
-      `}</style>
+      `}
+.top-focus-panel {
+  border-color: rgba(250, 204, 21, 0.55) !important;
+  background: linear-gradient(135deg, rgba(250, 204, 21, 0.14), rgba(15, 23, 42, 0.92)) !important;
+}
+.top-focus-symbol {
+  font-size: 34px;
+  font-weight: 900;
+  line-height: 1.05;
+  margin-top: 8px;
+  color: #ffffff;
+}
+.top-focus-meta {
+  margin-top: 8px;
+  color: #cbd5e1;
+  font-size: 14px;
+}
+.top-focus-next {
+  margin-top: 10px;
+  color: #facc15;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+</style>
 
 
       <style>{`
@@ -984,7 +1060,9 @@ const fetchData = useCallback(async (force = false) => {
           <div><span>Full estimate</span><b>{gbp(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).fullUsd || 0) * rate)} / {usd(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).fullUsd || 0))}</b></div>
           <div><span>Capped equity</span><b>{gbp(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).cappedEquityUsd || 0) * rate)} / {usd(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).cappedEquityUsd || 0))}</b></div>
         </div>
-        <div className="actions">
+        <TopFocusCard status={status} />
+
+<div className="actions">
           <button className={buySizeMode === "partial" ? "active" : "ghost"} onClick={()=>saveBuySizeMode("partial")}>Partial Buy</button>
           <button className={buySizeMode === "full" ? "active" : "ghost"} onClick={()=>saveBuySizeMode("full")}>Full Buy</button>
         </div>
