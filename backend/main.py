@@ -1542,6 +1542,69 @@ def refresh_universe_if_needed(force=False):
     print(f"UNIVERSE REFRESHED: {', '.join(current_universe)}")
 
 
+def focus_queue(scans):
+    """
+    Rank the best next trade candidates.
+
+    Works in Musk Mode and normal mode because it uses the current scans/universe.
+    Already-used/held/locked symbols are skipped by can_buy_symbol().
+    """
+    candidates = []
+
+    for scan in scans:
+        try:
+            symbol = str(scan.get("symbol", "")).upper().strip()
+            if not symbol:
+                continue
+
+            can_buy, _ = can_buy_symbol(symbol)
+            if not can_buy:
+                continue
+
+            candidates.append(scan)
+        except Exception:
+            continue
+
+    candidates.sort(
+        key=lambda x: (
+            bool(x.get("a_plus_pass", False)),
+            bool(x.get("sniper_pass", False)),
+            float(x.get("confidence", 0.0)),
+            float(x.get("quality_score", 0.0)),
+            -float(x.get("spread", 1.0)),
+        ),
+        reverse=True,
+    )
+
+    return candidates
+
+
+def top_focus_payload(scans):
+    queue = focus_queue(scans)
+    rows = []
+
+    for s in queue[:10]:
+        rows.append({
+            "symbol": s.get("symbol", ""),
+            "price": float(s.get("price", 0.0) or 0.0),
+            "confidence": float(s.get("confidence", 0.0) or 0.0),
+            "qualityScore": float(s.get("quality_score", 0.0) or 0.0),
+            "spread": float(s.get("spread", 0.0) or 0.0),
+            "sniperPass": bool(s.get("sniper_pass", False)),
+            "aPlusPass": bool(s.get("a_plus_pass", False)),
+            "reason": s.get("a_plus_reason") or s.get("sniper_reason") or "",
+        })
+
+    top = rows[0] if rows else None
+
+    return {
+        "enabled": True,
+        "top": top,
+        "queue": rows,
+        "message": f"Current focus: {top['symbol']}" if top else "No focus candidate ready",
+    }
+
+
 def pick_money_mode_stocks(scans):
     candidates = []
     for scan in scans:
@@ -1563,7 +1626,8 @@ def pick_money_mode_stocks(scans):
         if not scan["ready_to_buy"]:
             continue
         candidates.append(scan)
-    candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
+    focus_order = {s.get("symbol"): i for i, s in enumerate(focus_queue(candidates))}
+    candidates.sort(key=lambda x: focus_order.get(x.get("symbol"), 999999))
     return candidates
 
 
@@ -3313,6 +3377,7 @@ def build_status_payload(bot_name, scans):
         "market": market_status,
         "fx": fx_payload(),
         "autoUniverse": auto_universe_payload(),
+        "topFocus": top_focus_payload(scans) if "top_focus_payload" in globals() else {},
         "dynamicMarketScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
         "muskMode": musk_mode_payload() if "musk_mode_payload" in globals() else {"enabled": False},
         "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
@@ -3421,6 +3486,7 @@ def build_status_payload(bot_name, scans):
             f"BACKFILL | chunk={BACKFILL_CHUNK_SIZE} | max_pages={BACKFILL_MAX_PAGES}",
             f"OPTIMIZER | enabled={PROFIT_OPTIMIZER_ENABLED} | today_realised={today_realised_pnl():.2f} | block={profit_guardrail_status()[1] or 'none'}",
             f"ANALYTICS | profit_factor={analytics_payload().get('profitFactor', 0):.2f} | avg_win={analytics_payload().get('averageWin', 0):.2f} | avg_loss={analytics_payload().get('averageLoss', 0):.2f}",
+            f"FOCUS | {top_focus_payload(scans).get('message', 'No focus candidate ready') if 'top_focus_payload' in globals() else 'off'}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
