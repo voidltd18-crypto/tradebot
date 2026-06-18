@@ -7,11 +7,11 @@ function topFocusPercent(value: any) {
   return `${((Number(value) || 0) * 100).toFixed(2)}%`;
 }
 
-function getTopFocusCandidate(status: any) {
-  const top = status?.topFocus?.top;
+function getTopFocusCandidate(data: any) {
+  const top = data?.topFocus?.top;
   if (top?.symbol) return top;
 
-  const rows = Array.isArray(status?.autoUniverse?.rows) ? status.autoUniverse.rows : [];
+  const rows = Array.isArray(data?.autoUniverse?.rows) ? data.autoUniverse.rows : [];
   if (rows.length) {
     const sorted = [...rows].sort((a: any, b: any) => (Number(b?.score) || 0) - (Number(a?.score) || 0));
     return sorted[0] || null;
@@ -20,39 +20,37 @@ function getTopFocusCandidate(status: any) {
   return null;
 }
 
-function TopFocusCard({ status }: { status: any }) {
-  const top = getTopFocusCandidate(status);
-  const queue = Array.isArray(status?.topFocus?.queue) ? status.topFocus.queue : [];
-  const fallbackRows = Array.isArray(status?.autoUniverse?.rows) ? [...status.autoUniverse.rows].sort((a: any, b: any) => (Number(b?.score) || 0) - (Number(a?.score) || 0)) : [];
+function TopFocusCard({ data }: { data: any }) {
+  const top = getTopFocusCandidate(data);
+  const queue = Array.isArray(data?.topFocus?.queue) ? data.topFocus.queue : [];
+  const fallbackRows = Array.isArray(data?.autoUniverse?.rows)
+    ? [...data.autoUniverse.rows].sort((a: any, b: any) => (Number(b?.score) || 0) - (Number(a?.score) || 0))
+    : [];
   const nextRows = queue.length ? queue.slice(1, 5) : fallbackRows.slice(1, 5);
 
-  if (!top?.symbol) {
-    return (
-      <div className="panel top-focus-panel">
-        <h3>🏆 Top Focus Stock</h3>
-        <div className="muted">No focus candidate ready yet.</div>
-      </div>
-    );
-  }
-
   return (
-    <div className="panel top-focus-panel">
-      <h3>🏆 Top Focus Stock</h3>
-      <div className="top-focus-symbol">{top.symbol}</div>
-      <div className="top-focus-meta">
-        {top.confidence !== undefined ? <>Confidence <b>{topFocusPercent(top.confidence)}</b></> : <>Score <b>{Number(top.score || 0).toFixed(2)}</b></>}
-        {top.qualityScore !== undefined ? <> · Quality <b>{Number(top.qualityScore || 0).toFixed(4)}</b></> : null}
-        {top.price ? <> · Price <b>${Number(top.price || 0).toFixed(2)}</b></> : null}
-      </div>
-      {nextRows.length > 0 && (
-        <div className="top-focus-next">
-          Next: {nextRows.map((r: any) => r.symbol).filter(Boolean).join(" → ")}
-        </div>
+    <section className="panel" style={{ marginBottom: 18, borderColor: "rgba(250, 204, 21, 0.55)", background: "linear-gradient(135deg, rgba(250, 204, 21, 0.12), rgba(15, 23, 42, 0.92))" }}>
+      <h2 style={{ margin: 0 }}>🏆 Top Focus Stock</h2>
+      {top?.symbol ? (
+        <>
+          <div style={{ fontSize: 36, fontWeight: 900, marginTop: 8 }}>{top.symbol}</div>
+          <div className="muted" style={{ marginTop: 6 }}>
+            {top.confidence !== undefined ? <>Confidence <b>{topFocusPercent(top.confidence)}</b></> : <>Score <b>{Number(top.score || 0).toFixed(2)}</b></>}
+            {top.qualityScore !== undefined ? <> · Quality <b>{Number(top.qualityScore || 0).toFixed(4)}</b></> : null}
+            {top.price ? <> · Price <b>${Number(top.price || 0).toFixed(2)}</b></> : null}
+          </div>
+          {nextRows.length > 0 && (
+            <div style={{ marginTop: 10, color: "#facc15", fontWeight: 800 }}>
+              Next: {nextRows.map((r: any) => r.symbol).filter(Boolean).join(" → ")}
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="muted" style={{ marginTop: 8 }}>No focus candidate ready yet.</div>
       )}
-    </div>
+    </section>
   );
 }
-
 
 const API_URL = import.meta.env.VITE_API_BASE || "https://tradebot-0myo.onrender.com";
 const BOT_VERSION = "v1.1-strict-profit-mode";
@@ -864,10 +862,7 @@ const fetchData = useCallback(async (force = false) => {
         .reports-page .card, .reports-page section { background:#11182a !important; color:#eaf1ff !important; border-color:#26324a !important; }
         .reports-page input, .reports-page select, .reports-page table, .reports-page thead, .reports-page tbody, .reports-page tr, .reports-page td, .reports-page th { background:#070b18 !important; color:#eaf1ff !important; border-color:#26324a !important; }
         .reports-page .muted { color:#9aa7bd !important; }
-      `}
-
-
-</style>
+      `}</style>
 
 
       <style>{`
@@ -894,6 +889,8 @@ const fetchData = useCallback(async (force = false) => {
         </button>
       </div>
     </header>
+
+    <TopFocusCard data={data} />
 
     <section className="stats">
       <Stat label="Equity" value={gbp(Number(data?.account?.equity || 0) * rate)} sub={usd(data?.account?.equity)} />
@@ -1039,9 +1036,7 @@ const fetchData = useCallback(async (force = false) => {
           <div><span>Full estimate</span><b>{gbp(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).fullUsd || 0) * rate)} / {usd(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).fullUsd || 0))}</b></div>
           <div><span>Capped equity</span><b>{gbp(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).cappedEquityUsd || 0) * rate)} / {usd(Number((data.buySizePreview || data.positionSettings?.buySizePreview || {}).cappedEquityUsd || 0))}</b></div>
         </div>
-        <TopFocusCard status={status} />
-
-<div className="actions">
+        <div className="actions">
           <button className={buySizeMode === "partial" ? "active" : "ghost"} onClick={()=>saveBuySizeMode("partial")}>Partial Buy</button>
           <button className={buySizeMode === "full" ? "active" : "ghost"} onClick={()=>saveBuySizeMode("full")}>Full Buy</button>
         </div>

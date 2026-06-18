@@ -113,7 +113,7 @@ STOP_LOSS = 0.982
 TRAIL_START = 1.012
 TRAIL_GIVEBACK = 0.993
 
-MAX_DAILY_LOSS = 1000000.00
+MAX_DAILY_LOSS = -8.00
 MAX_TRADES_PER_DAY = 12
 DUST_THRESHOLD = 0.1
 
@@ -159,9 +159,9 @@ ANALYTICS_ENABLED = True
 AUTO_IMPROVE_ENABLED = True
 
 DAILY_PROFIT_TARGET = 4.00
-DAILY_LOSS_LIMIT_OPTIMIZER = -1000000.00
+DAILY_LOSS_LIMIT_OPTIMIZER = -4.00
 PAUSE_BUYS_AFTER_DAILY_TARGET = True
-PAUSE_BUYS_AFTER_DAILY_LOSS = False
+PAUSE_BUYS_AFTER_DAILY_LOSS = True
 
 OPTIMIZED_STOP_LOSS = 0.985
 OPTIMIZED_TRAIL_START = 1.020
@@ -189,8 +189,8 @@ CONFIDENCE_SIZING_ENABLED = True
 STOCK_MEMORY_ENABLED = True
 TRADE_TIMELINE_ENABLED = True
 
-SNIPER_MIN_CONFIDENCE = 0.58
-SNIPER_MIN_QUALITY = 0.020
+SNIPER_MIN_CONFIDENCE = 0.40
+SNIPER_MIN_QUALITY = 0.005
 SNIPER_MAX_SPREAD = 0.012
 SNIPER_MIN_PULLBACK = 0.0015
 SNIPER_MAX_PULLBACK = 0.035
@@ -199,7 +199,7 @@ SNIPER_MIN_MOMENTUM = -0.003
 # A+ trade quality gate
 A_PLUS_GATE_ENABLED = True
 A_PLUS_MIN_CONFIDENCE = 0.70
-A_PLUS_MIN_QUALITY = 0.026
+A_PLUS_MIN_QUALITY = 0.005
 A_PLUS_MAX_SPREAD = 0.010
 A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM = True
 A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY = True
@@ -1171,9 +1171,8 @@ def risk_blocked():
             return True, opt_reason
 
     pnl = get_daily_pnl()
-    daily_loss_limit = -abs(float(MAX_DAILY_LOSS))
-    if pnl <= daily_loss_limit:
-        return True, f"Max daily loss hit: {pnl:.2f} / limit {daily_loss_limit:.2f}"
+    if pnl <= MAX_DAILY_LOSS:
+        return True, f"Max daily loss hit: {pnl:.2f}"
     if daily_trade_count() >= MAX_TRADES_PER_DAY:
         return True, "Max trades per day reached"
     return False, ""
@@ -1543,24 +1542,15 @@ def refresh_universe_if_needed(force=False):
 
 
 def focus_queue(scans):
-    """
-    Rank the best next trade candidates.
-
-    Works in Musk Mode and normal mode because it uses the current scans/universe.
-    Already-used/held/locked symbols are skipped by can_buy_symbol().
-    """
     candidates = []
-
     for scan in scans:
         try:
             symbol = str(scan.get("symbol", "")).upper().strip()
             if not symbol:
                 continue
-
             can_buy, _ = can_buy_symbol(symbol)
             if not can_buy:
                 continue
-
             candidates.append(scan)
         except Exception:
             continue
@@ -1575,14 +1565,12 @@ def focus_queue(scans):
         ),
         reverse=True,
     )
-
     return candidates
 
 
 def top_focus_payload(scans):
     queue = focus_queue(scans)
     rows = []
-
     for s in queue[:10]:
         rows.append({
             "symbol": s.get("symbol", ""),
@@ -1594,9 +1582,7 @@ def top_focus_payload(scans):
             "aPlusPass": bool(s.get("a_plus_pass", False)),
             "reason": s.get("a_plus_reason") or s.get("sniper_reason") or "",
         })
-
     top = rows[0] if rows else None
-
     return {
         "enabled": True,
         "top": top,
@@ -1623,11 +1609,10 @@ def pick_money_mode_stocks(scans):
         if not aplus_ok:
             print(f"A+ SKIP {symbol} | {aplus_reason}")
             continue
-        if not scan["ready_to_buy"]:
+        if not scan["ready_to_buy"] and not musk_mode_enabled():
             continue
         candidates.append(scan)
-    focus_order = {s.get("symbol"): i for i, s in enumerate(focus_queue(candidates))}
-    candidates.sort(key=lambda x: focus_order.get(x.get("symbol"), 999999))
+    candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
     return candidates
 
 
@@ -1782,15 +1767,8 @@ def money_mode_buy(scans, manual=False):
 
     bought = 0
     messages = []
-
-    # Snapshot the number of slots at the start of this buy cycle.
-    # This prevents a second buy being submitted before Alpaca has updated
-    # open positions after the first order.
-    allowed_slots = max(0, allowed_new_position_count())
-    buy_limit_this_loop = max(0, min(int(MAX_NEW_BUYS_PER_LOOP), int(allowed_slots)))
-
     for c in picks:
-        if bought >= buy_limit_this_loop:
+        if bought >= MAX_NEW_BUYS_PER_LOOP:
             break
         symbol = c["symbol"]
         can_buy, reason = can_buy_symbol(symbol)
@@ -1809,11 +1787,6 @@ def money_mode_buy(scans, manual=False):
             state[symbol]["highest_since_entry"] = c["price"]
             messages.append(f"{reason} ${notional:.2f} {symbol} confidence={confidence:.2f}")
             bought += 1
-
-            # Stop immediately once the pre-calculated slot allowance is used.
-            # This is especially important when Max Positions = 1.
-            if bought >= buy_limit_this_loop:
-                break
         except Exception as e:
             messages.append(f"BUY ERROR {symbol}: {e}")
     return " | ".join(messages)
@@ -3486,7 +3459,6 @@ def build_status_payload(bot_name, scans):
             f"BACKFILL | chunk={BACKFILL_CHUNK_SIZE} | max_pages={BACKFILL_MAX_PAGES}",
             f"OPTIMIZER | enabled={PROFIT_OPTIMIZER_ENABLED} | today_realised={today_realised_pnl():.2f} | block={profit_guardrail_status()[1] or 'none'}",
             f"ANALYTICS | profit_factor={analytics_payload().get('profitFactor', 0):.2f} | avg_win={analytics_payload().get('averageWin', 0):.2f} | avg_loss={analytics_payload().get('averageLoss', 0):.2f}",
-            f"FOCUS | {top_focus_payload(scans).get('message', 'No focus candidate ready') if 'top_focus_payload' in globals() else 'off'}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
@@ -3535,10 +3507,10 @@ STRATEGY_PRESETS = {
     },
     "aggressive": {
         "label": "Aggressive",
-        "aPlusMinConfidence": 0.55,
-        "sniperMinConfidence": 0.50,
-        "aPlusMinQuality": 0.018,
-        "sniperMinQuality": 0.014,
+        "aPlusMinConfidence": 0.40,
+        "sniperMinConfidence": 0.40,
+        "aPlusMinQuality": 0.005,
+        "sniperMinQuality": 0.005,
     },
 }
 
