@@ -10,7 +10,6 @@ import math
 import re
 import threading
 from datetime import datetime, UTC, timedelta
-from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Optional
 
 import requests
@@ -18,7 +17,7 @@ from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
@@ -85,12 +84,6 @@ MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
 MIN_ORDER_NOTIONAL = 1.00
 CASH_BUFFER = 0.50
-
-# Extended-hours trading. Alpaca requires extended-hours orders to be LIMIT orders
-# with time_in_force=DAY and extended_hours=True.
-ALLOW_EXTENDED_HOURS = os.getenv("ALLOW_EXTENDED_HOURS", "true").lower() == "true"
-EXTENDED_ORDER_SLIPPAGE_PCT = float(os.getenv("EXTENDED_ORDER_SLIPPAGE_PCT", "0.003") or 0.003)
-ET_ZONE = ZoneInfo("America/New_York")
 
 # Full-buy mode:
 # When max positions is 1, use nearly all available trading capital/buying power
@@ -189,8 +182,8 @@ CONFIDENCE_SIZING_ENABLED = True
 STOCK_MEMORY_ENABLED = True
 TRADE_TIMELINE_ENABLED = True
 
-SNIPER_MIN_CONFIDENCE = 0.40
-SNIPER_MIN_QUALITY = 0.005
+SNIPER_MIN_CONFIDENCE = 0.58
+SNIPER_MIN_QUALITY = 0.020
 SNIPER_MAX_SPREAD = 0.012
 SNIPER_MIN_PULLBACK = 0.0015
 SNIPER_MAX_PULLBACK = 0.035
@@ -199,7 +192,7 @@ SNIPER_MIN_MOMENTUM = -0.003
 # A+ trade quality gate
 A_PLUS_GATE_ENABLED = True
 A_PLUS_MIN_CONFIDENCE = 0.70
-A_PLUS_MIN_QUALITY = 0.005
+A_PLUS_MIN_QUALITY = 0.026
 A_PLUS_MAX_SPREAD = 0.010
 A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM = True
 A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY = True
@@ -715,70 +708,18 @@ def get_equity():
     return float(get_account().equity)
 
 
-def now_et():
-    return datetime.now(ET_ZONE)
-
-
-def is_extended_hours_time(dt=None):
-    """True during Alpaca's extended stock sessions: 04:00-09:30 and 16:00-20:00 ET, weekdays."""
-    if not ALLOW_EXTENDED_HOURS:
-        return False
-    dt = dt or now_et()
-    if dt.weekday() >= 5:
-        return False
-    minutes = dt.hour * 60 + dt.minute
-    pre_open = 4 * 60 <= minutes < 9 * 60 + 30
-    after_hours = 16 * 60 <= minutes < 20 * 60
-    return pre_open or after_hours
-
-
-def is_trading_session_open(clock=None):
-    try:
-        clock = clock or trading_client.get_clock()
-        if bool(clock.is_open):
-            return True
-    except Exception:
-        pass
-    return is_extended_hours_time()
-
-
-def use_extended_order(clock=None):
-    try:
-        clock = clock or trading_client.get_clock()
-        return ALLOW_EXTENDED_HOURS and (not bool(clock.is_open)) and is_extended_hours_time()
-    except Exception:
-        return ALLOW_EXTENDED_HOURS and is_extended_hours_time()
-
-
 def get_market_status_payload():
     try:
         clock = trading_client.get_clock()
-        extended_open = use_extended_order(clock)
-        session_open = bool(clock.is_open) or extended_open
-        label = "OPEN" if bool(clock.is_open) else ("EXTENDED OPEN" if extended_open else "CLOSED")
         return {
-            "isOpen": bool(session_open),
-            "regularOpen": bool(clock.is_open),
-            "extendedOpen": bool(extended_open),
-            "allowExtendedHours": bool(ALLOW_EXTENDED_HOURS),
+            "isOpen": bool(clock.is_open),
             "timestamp": str(clock.timestamp),
             "nextOpen": str(clock.next_open),
             "nextClose": str(clock.next_close),
-            "label": label,
+            "label": "OPEN" if clock.is_open else "CLOSED",
         }
     except Exception as e:
-        extended_open = is_extended_hours_time()
-        return {
-            "isOpen": bool(extended_open),
-            "regularOpen": False,
-            "extendedOpen": bool(extended_open),
-            "allowExtendedHours": bool(ALLOW_EXTENDED_HOURS),
-            "label": "EXTENDED OPEN" if extended_open else "UNKNOWN",
-            "error": str(e),
-            "timestamp": "",
-            "nextOpen": "",
-            "nextClose": "",
-        }
+        return {"isOpen": False, "label": "UNKNOWN", "error": str(e), "timestamp": "", "nextOpen": "", "nextClose": ""}
 
 
 def get_quote(symbol: str):
@@ -1182,92 +1123,32 @@ def allowed_new_position_count():
     return max(0, MAX_POSITIONS - len(get_all_positions()))
 
 
-def current_open_position_value_usd() -> float:
-    """Total current open position value used against the trading cap."""
-    try:
-        return max(0.0, sum(float(p.get("marketValue") or 0.0) for p in get_all_positions()))
-    except Exception:
-        return 0.0
-
-
-def remaining_trading_cap_usd(account_equity: float = None, buying_power: float = None) -> float:
-    """Remaining cap available for NEW buys after existing positions.
-
-    This is the key cap enforcement fix: the old sizing used the full capped
-    equity for each new buy, so if buying power was high the next order could
-    use more than the remaining cap. New buys must only use:
-        cap/effective equity - current open positions - cash buffer
-    """
-    try:
-        if account_equity is None or buying_power is None:
-            account = get_account()
-            account_equity = float(account.equity)
-            buying_power = float(account.buying_power)
-        else:
-            account_equity = float(account_equity or 0.0)
-            buying_power = float(buying_power or 0.0)
-    except Exception:
-        account_equity = 0.0
-        buying_power = 0.0
-
-    capped_equity = effective_trading_equity(account_equity) if "effective_trading_equity" in globals() else account_equity
-    open_value = current_open_position_value_usd()
-    cap_remaining = max(0.0, capped_equity - open_value)
-    cash_remaining = max(0.0, buying_power)
-    return max(0.0, min(cap_remaining, cash_remaining))
-
-
-def cap_safe_order_notional(requested_notional: float) -> float:
-    """Final safety clamp before submitting a BUY to Alpaca."""
-    try:
-        account = get_account()
-        equity = float(account.equity)
-        buying_power = float(account.buying_power)
-    except Exception:
-        return 0.0
-
-    remaining = remaining_trading_cap_usd(equity, buying_power)
-    if remaining <= 0:
-        return 0.0
-    try:
-        requested = float(requested_notional or 0.0)
-    except Exception:
-        requested = 0.0
-    return round(max(0.0, min(requested, remaining)), 2)
-
-
 def calculate_new_position_notional():
     account = get_account()
     equity = float(account.equity)
     buying_power = float(account.buying_power)
 
-    # Cap enforcement must use remaining capped buying capacity, not the full
-    # capped equity every time. This prevents the bot spending above the saved
-    # cap when it already has open positions.
-    remaining_cap = remaining_trading_cap_usd(equity, buying_power)
+    # Cap left for NEW buys = saved trading cap minus current open position value.
+    cap_left = remaining_trading_cap_usd(equity) if "remaining_trading_cap_usd" in globals() else equity
 
-    if remaining_cap <= 0:
+    if cap_left <= 0:
         return 0.0
 
-    # Full-buy mode uses the remaining cap for the next position, leaving the
-    # small configured cash buffer.
     if FULL_BUY_WHEN_ONE_POSITION:
         usable_cash = max(0.0, buying_power - FULL_BUY_CASH_BUFFER)
-        return round(max(0.0, min(remaining_cap, usable_cash)), 2)
+        return round(max(0.0, min(cap_left, usable_cash)), 2)
 
-    sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
-    target_value = sizing_equity * TARGET_POSITION_VALUE_PCT
-    max_value = sizing_equity * MAX_POSITION_VALUE_PCT
+    target_value = cap_left * TARGET_POSITION_VALUE_PCT
+    max_value = cap_left * MAX_POSITION_VALUE_PCT
     usable_cash = max(0.0, buying_power - CASH_BUFFER)
-    return round(max(0.0, min(target_value, max_value, usable_cash, remaining_cap)), 2)
-
+    return round(max(0.0, min(target_value, max_value, usable_cash)), 2)
 
 def confidence_notional(scan):
     base = calculate_new_position_notional()
 
-    # In full-buy mode, do not downsize by confidence. The entry gates still
-    # control trade quality; this only changes allocation size.
-    if FULL_BUY_WHEN_ONE_POSITION:
+    # In one-position full-buy mode, do not downsize by confidence.
+    # The entry gates still control trade quality; this only changes allocation size.
+    if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
         return base
 
     if not CONFIDENCE_SIZING_ENABLED:
@@ -1335,26 +1216,7 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
 
 
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
-    # Final cap safety check immediately before any Alpaca BUY order.
-    # If the cap is unavailable or already used by open positions, block the buy.
-    safe_notional = cap_safe_order_notional(notional_amount) if "cap_safe_order_notional" in globals() else float(notional_amount or 0.0)
-    if safe_notional < MIN_ORDER_NOTIONAL:
-        raise ValueError(f"BUY BLOCKED | Trading cap remaining too small: ${safe_notional:.2f}")
-    notional_amount = safe_notional
-
-    if use_extended_order():
-        quote = get_quote(symbol)
-        limit_price = round(float(quote["ask"]) * (1.0 + EXTENDED_ORDER_SLIPPAGE_PCT), 2)
-        order = LimitOrderRequest(
-            symbol=symbol,
-            notional=round(notional_amount, 2),
-            limit_price=limit_price,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-            extended_hours=True,
-        )
-    else:
-        order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+    order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
     trading_client.submit_order(order)
     event = {
         "day": today_str(),
@@ -1391,19 +1253,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
         print(f"MUSK HOLD CHECK ERROR {symbol}: {e}")
 
     def submit(q):
-        if use_extended_order():
-            quote = get_quote(symbol)
-            limit_price = round(float(quote["bid"]) * (1.0 - EXTENDED_ORDER_SLIPPAGE_PCT), 2)
-            order = LimitOrderRequest(
-                symbol=symbol,
-                qty=q,
-                limit_price=limit_price,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.DAY,
-                extended_hours=True,
-            )
-        else:
-            order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
+        order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
         trading_client.submit_order(order)
 
     try:
@@ -1604,56 +1454,6 @@ def refresh_universe_if_needed(force=False):
     print(f"UNIVERSE REFRESHED: {', '.join(current_universe)}")
 
 
-def focus_queue(scans):
-    candidates = []
-    for scan in scans:
-        try:
-            symbol = str(scan.get("symbol", "")).upper().strip()
-            if not symbol:
-                continue
-            can_buy, _ = can_buy_symbol(symbol)
-            if not can_buy:
-                continue
-            candidates.append(scan)
-        except Exception:
-            continue
-
-    candidates.sort(
-        key=lambda x: (
-            bool(x.get("a_plus_pass", False)),
-            bool(x.get("sniper_pass", False)),
-            float(x.get("confidence", 0.0)),
-            float(x.get("quality_score", 0.0)),
-            -float(x.get("spread", 1.0)),
-        ),
-        reverse=True,
-    )
-    return candidates
-
-
-def top_focus_payload(scans):
-    queue = focus_queue(scans)
-    rows = []
-    for s in queue[:10]:
-        rows.append({
-            "symbol": s.get("symbol", ""),
-            "price": float(s.get("price", 0.0) or 0.0),
-            "confidence": float(s.get("confidence", 0.0) or 0.0),
-            "qualityScore": float(s.get("quality_score", 0.0) or 0.0),
-            "spread": float(s.get("spread", 0.0) or 0.0),
-            "sniperPass": bool(s.get("sniper_pass", False)),
-            "aPlusPass": bool(s.get("a_plus_pass", False)),
-            "reason": s.get("a_plus_reason") or s.get("sniper_reason") or "",
-        })
-    top = rows[0] if rows else None
-    return {
-        "enabled": True,
-        "top": top,
-        "queue": rows,
-        "message": f"Current focus: {top['symbol']}" if top else "No focus candidate ready",
-    }
-
-
 def pick_money_mode_stocks(scans):
     candidates = []
     for scan in scans:
@@ -1672,7 +1472,7 @@ def pick_money_mode_stocks(scans):
         if not aplus_ok:
             print(f"A+ SKIP {symbol} | {aplus_reason}")
             continue
-        if not scan["ready_to_buy"] and not musk_mode_enabled():
+        if not scan["ready_to_buy"]:
             continue
         candidates.append(scan)
     candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
@@ -1859,7 +1659,7 @@ def buy_custom_symbol(symbol: str):
     symbol = symbol.upper().strip()
     if not symbol or not symbol.replace(".", "").replace("-", "").isalnum():
         return {"ok": False, "message": "Invalid ticker"}
-    if CUSTOM_BUY_REQUIRES_MARKET_OPEN and not is_trading_session_open():
+    if CUSTOM_BUY_REQUIRES_MARKET_OPEN and not trading_client.get_clock().is_open:
         return {"ok": False, "message": "Market closed"}
     can_buy, reason = can_buy_symbol(symbol)
     if not can_buy:
@@ -3413,7 +3213,6 @@ def build_status_payload(bot_name, scans):
         "market": market_status,
         "fx": fx_payload(),
         "autoUniverse": auto_universe_payload(),
-        "topFocus": top_focus_payload(scans) if "top_focus_payload" in globals() else {},
         "dynamicMarketScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
         "muskMode": musk_mode_payload() if "musk_mode_payload" in globals() else {"enabled": False},
         "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
@@ -3570,10 +3369,10 @@ STRATEGY_PRESETS = {
     },
     "aggressive": {
         "label": "Aggressive",
-        "aPlusMinConfidence": 0.40,
-        "sniperMinConfidence": 0.40,
-        "aPlusMinQuality": 0.005,
-        "sniperMinQuality": 0.005,
+        "aPlusMinConfidence": 0.55,
+        "sniperMinConfidence": 0.50,
+        "aPlusMinQuality": 0.018,
+        "sniperMinQuality": 0.014,
     },
 }
 
@@ -3903,7 +3702,7 @@ def manual_override_off(request: Request):
 def manual_buy(request: Request):
     verify_api_key(request)
     with bot_lock:
-        if not is_trading_session_open():
+        if not trading_client.get_clock().is_open:
             return {"ok": False, "message": "Market closed"}
         result = money_mode_buy(latest_scans, manual=True)
         update_status(BOT_NAME, latest_scans)
@@ -4013,7 +3812,7 @@ def run_bot_loop():
                 refresh_universe_if_needed()
                 clock = trading_client.get_clock()
 
-                if not is_trading_session_open(clock):
+                if not clock.is_open:
                     print("Market closed. Waiting...")
                     update_status(BOT_NAME, latest_scans)
                     time.sleep(CHECK_INTERVAL)
@@ -5421,8 +5220,8 @@ def banking_payload():
     cap_gbp = trading_cap_gbp()
 
     effective = max(0.0, min(equity, cap_usd)) if cap_usd > 0 else max(0.0, equity)
-    open_value = current_open_position_value_usd() if "current_open_position_value_usd" in globals() else 0.0
-    remaining_cap = remaining_trading_cap_usd(equity, float(getattr(account, "buying_power", 0) or 0)) if "remaining_trading_cap_usd" in globals() else max(0.0, effective - open_value)
+    open_position_value = _open_position_value_usd() if "_open_position_value_usd" in globals() else 0.0
+    remaining_cap = max(0.0, effective - open_position_value)
     banked = max(0.0, equity - effective) if cap_usd > 0 else 0.0
 
     return {
@@ -5439,8 +5238,8 @@ def banking_payload():
         "accountEquity": equity,
         "effectiveTradingEquity": effective,
         "effectiveTradingEquityGbp": money_gbp(effective),
-        "openPositionValueUsd": open_value,
-        "openPositionValueGbp": money_gbp(open_value),
+        "openPositionValueUsd": open_position_value,
+        "openPositionValueGbp": money_gbp(open_position_value),
         "remainingTradingCapUsd": remaining_cap,
         "remainingTradingCapGbp": money_gbp(remaining_cap),
         "bankedProfitCashBuffer": banked,
@@ -5646,11 +5445,46 @@ def _compat_gbp(usd):
             return float(usd or 0) * 0.78
 
 def _compat_account_equity():
+    """Return account equity/buying power with safe fallbacks for page refresh."""
     try:
         a = get_account()
-        return float(getattr(a, "equity", 0) or 0), float(getattr(a, "buying_power", 0) or 0)
+        equity = float(getattr(a, "equity", 0) or 0)
+        buying_power = float(getattr(a, "buying_power", 0) or 0)
+        if equity > 0 or buying_power > 0:
+            return equity, buying_power
     except Exception:
-        return 0.0, 0.0
+        pass
+
+    try:
+        acct = latest_status.get("account", {}) if isinstance(latest_status, dict) else {}
+        equity = float(acct.get("equity", 0) or 0)
+        buying_power = float(acct.get("buyingPower", 0) or acct.get("buying_power", 0) or 0)
+        if equity > 0 or buying_power > 0:
+            return equity, buying_power
+    except Exception:
+        pass
+
+    return 0.0, 0.0
+
+
+def _open_position_value_usd():
+    try:
+        return sum(float(p.get("marketValue", 0) or 0) for p in get_all_positions())
+    except Exception:
+        return 0.0
+
+
+def remaining_trading_cap_usd(account_equity: float = None) -> float:
+    try:
+        if account_equity is None:
+            account_equity, _ = _compat_account_equity()
+        cap = trading_cap_usd() if "trading_cap_usd" in globals() else 0.0
+        if cap <= 0:
+            return max(0.0, float(account_equity or 0))
+        effective = max(0.0, min(float(account_equity or 0), cap))
+        return max(0.0, effective - _open_position_value_usd())
+    except Exception:
+        return 0.0
 
 def _compat_baseline_value():
     data = _compat_read(_COMPAT_BASELINE_FILE, {})
@@ -5719,25 +5553,21 @@ def _compat_buy_preview():
         max_positions = 1
 
     try:
-        positions = get_all_positions() if "get_all_positions" in globals() else []
-        open_positions = len(positions)
+        open_positions = len(get_all_positions())
     except Exception:
         open_positions = 0
 
-    try:
+    cap_usd = trading_cap_usd() if "trading_cap_usd" in globals() else 0.0
+
+    # If Alpaca/account values are briefly unavailable during page refresh,
+    # keep showing the saved cap instead of flashing £0.00.
+    if equity <= 0 and cap_usd > 0:
+        capped_equity = cap_usd
+    else:
         capped_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
-    except Exception:
-        capped_equity = equity
 
-    try:
-        open_position_value = current_open_position_value_usd() if "current_open_position_value_usd" in globals() else 0.0
-    except Exception:
-        open_position_value = 0.0
-
-    try:
-        cap_remaining = remaining_trading_cap_usd(equity, buying_power) if "remaining_trading_cap_usd" in globals() else max(0.0, capped_equity - open_position_value)
-    except Exception:
-        cap_remaining = max(0.0, capped_equity - open_position_value)
+    open_value = _open_position_value_usd() if "_open_position_value_usd" in globals() else 0.0
+    remaining_cap = max(0.0, capped_equity - open_value)
 
     try:
         cash_buffer = float(globals().get("CASH_BUFFER", 0.50))
@@ -5751,12 +5581,12 @@ def _compat_buy_preview():
 
     remaining_slots = max(0, max_positions - open_positions)
 
-    if remaining_slots <= 0:
+    if remaining_slots <= 0 or remaining_cap <= 0:
         partial_usd = 0.0
         full_usd = 0.0
     else:
-        partial_usd = max(0.0, min(cap_remaining / max(1, remaining_slots), max(0.0, buying_power - cash_buffer)))
-        full_usd = max(0.0, min(cap_remaining, max(0.0, buying_power - full_buffer)))
+        partial_usd = max(0.0, min(remaining_cap / max(1, remaining_slots), max(0.0, buying_power - cash_buffer)))
+        full_usd = max(0.0, min(remaining_cap, max(0.0, buying_power - full_buffer)))
 
     mode = _compat_load_buy_mode()
 
@@ -5769,10 +5599,10 @@ def _compat_buy_preview():
         "fullGbp": round(_compat_gbp(full_usd), 2),
         "cappedEquityUsd": round(capped_equity, 2),
         "cappedEquityGbp": round(_compat_gbp(capped_equity), 2),
-        "openPositionValueUsd": round(open_position_value, 2),
-        "openPositionValueGbp": round(_compat_gbp(open_position_value), 2),
-        "remainingTradingCapUsd": round(cap_remaining, 2),
-        "remainingTradingCapGbp": round(_compat_gbp(cap_remaining), 2),
+        "remainingCapUsd": round(remaining_cap, 2),
+        "remainingCapGbp": round(_compat_gbp(remaining_cap), 2),
+        "openPositionValueUsd": round(open_value, 2),
+        "openPositionValueGbp": round(_compat_gbp(open_value), 2),
         "buyingPowerUsd": round(buying_power, 2),
         "buyingPowerGbp": round(_compat_gbp(buying_power), 2),
         "maxPositions": max_positions,
