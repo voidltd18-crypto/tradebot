@@ -2040,6 +2040,7 @@ def trades_from_db(limit: int = 1000):
                 "id": r["id"],
                 "alpacaOrderId": r["alpaca_order_id"],
                 "timestamp": r["timestamp"],
+                "date": r["day"],
                 "day": r["day"],
                 "time": r["time"],
                 "symbol": r["symbol"],
@@ -2214,11 +2215,15 @@ def closed_trades_from_db(limit: int = 1000):
     try:
         init_db()
         conn = db_connect()
+        # Pull the latest closed trades, not the oldest ones from the table.
         rows = conn.execute("""
-            SELECT * FROM closed_trades
-            ORDER BY timestamp ASC
-            LIMIT ?
-        """, (limit,)).fetchall()
+            SELECT * FROM (
+                SELECT * FROM closed_trades
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+            )
+            ORDER BY timestamp ASC, id ASC
+        """, (int(limit),)).fetchall()
         conn.close()
 
         return [
@@ -4017,8 +4022,19 @@ def reports():
         total_deposited = equity
         deposit_source = "equity-baseline"
     total_gain_loss = equity + total_withdrawn - total_deposited
-    closed = status.get("closedTrades") or []
-    timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
+    # Do not rely on latest_status here. latest_status can be stale after a redeploy,
+    # so reports should read the persistent SQLite tables directly every time.
+    closed = []
+    try:
+        closed = closed_trades_from_db(1000)
+        if not closed and SQLITE_ENABLED:
+            rebuild_closed_trades_from_orders()
+            closed = closed_trades_from_db(1000)
+    except Exception as e:
+        print(f"REPORTS CLOSED TRADES DB LOAD ERROR: {e}")
+        closed = status.get("closedTrades") or []
+
+    timeline = trades_from_db(1000) if SQLITE_ENABLED else (status.get("tradeTimeline") or status.get("equityCurve") or [])
     equity_history = []
     for i, e in enumerate(timeline if isinstance(timeline, list) else []):
         if not isinstance(e, dict):
@@ -4945,14 +4961,10 @@ def apply_quality_only_universe():
             "size": len(symbols),
             "activeSymbols": symbols,
             "rows": rows,
-            "finalRows": rows,
             "blockedWeakTickers": sorted(list(BLOCKED_WEAK_TICKERS)),
             "dynamicScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
-            "liveScannerRows": dynamic_market_rows() if "dynamic_market_rows" in globals() else [],
-            "memoryRows": stock_memory_universe_rows() if "stock_memory_universe_rows" in globals() else [],
             "lastRefresh": datetime.now(UTC).isoformat(),
-            "manualPickCount": len([r for r in rows if r.get("manualPick")]),
-            "dynamicPickCount": len([r for r in rows if r.get("dynamicPick")]),
+            "manualPickCount": len([s for s in symbols if s not in QUALITY_ONLY_UNIVERSE]),
         }
         latest_status["lastAction"] = "Quality-only universe applied"
         latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
@@ -5049,40 +5061,17 @@ def api_apply_quality_universe(request: Request):
 # FORCE QUALITY UNIVERSE STATUS/UI PATCH
 # =========================
 
-def stock_memory_universe_rows(limit: int = 40):
-    """Dashboard-only stock-memory rows.
-
-    These are historical closed-trade performance picks. They must be kept
-    separate from the live Yahoo market scanner so the UI can clearly show
-    where every symbol came from.
-    """
-    try:
-        rows = universe_rows_from_stock_memory()
-    except Exception as e:
-        print(f"STOCK MEMORY UNIVERSE ROWS ERROR: {e}")
-        rows = []
-
-    cleaned = []
-    for r in rows[:limit]:
-        row = dict(r)
-        row["memoryPick"] = True
-        row.setdefault("source", "stock-memory")
-        row.setdefault("status", "watch")
-        cleaned.append(row)
-    return cleaned
-
-
 def force_quality_auto_universe_payload():
     try:
         if "quality_only_rows" in globals():
-            final_rows = quality_only_rows()
+            rows = quality_only_rows()
         elif "quality_universe_rows" in globals():
-            final_rows = quality_universe_rows()
+            rows = quality_universe_rows()
         else:
-            final_rows = []
-        symbols = [str(r.get("symbol", "")).upper() for r in final_rows if r.get("symbol")]
+            rows = []
+        symbols = [r["symbol"] for r in rows]
     except Exception:
-        final_rows = []
+        rows = []
         symbols = []
 
     if not symbols:
@@ -5091,24 +5080,15 @@ def force_quality_auto_universe_payload():
             "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
             "TSLA", "PLTR", "UBER", "QQQ", "SMH",
         ]
-        final_rows = [
+        rows = [
             {
                 "symbol": s,
                 "score": round(100 - (i * 3), 2),
                 "reason": "quality-only universe | forced UI sync",
                 "status": "active",
-                "source": "fallback-core-quality",
             }
             for i, s in enumerate(symbols)
         ]
-
-    scanner = dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {}
-    scanner_rows = list(scanner.get("rows") or [])
-    memory_rows = stock_memory_universe_rows() if "stock_memory_universe_rows" in globals() else []
-
-    manual_count = len([r for r in final_rows if r.get("manualPick")])
-    dynamic_count = len([r for r in final_rows if r.get("dynamicPick")])
-    memory_count = len(memory_rows)
 
     return {
         "enabled": True,
@@ -5117,28 +5097,14 @@ def force_quality_auto_universe_payload():
         "size": len(symbols),
         "weekStart": datetime.now(UTC).date().isoformat(),
         "monthStart": datetime.now(UTC).replace(day=1).date().isoformat(),
-
-        # Final tradable universe: this is what the bot is allowed to buy/manage.
         "activeSymbols": symbols,
-        "rows": final_rows,
-        "finalRows": final_rows,
-
-        # Separate source panels for the dashboard.
-        "liveScannerRows": scanner_rows,
-        "memoryRows": memory_rows,
-        "dynamicScanner": scanner,
-
+        "rows": rows,
         "lastRefresh": datetime.now(UTC).isoformat(),
         "candidatePoolSize": len(symbols),
-        "dynamicPickCount": dynamic_count,
-        "manualPickCount": manual_count,
-        "memoryPickCount": memory_count,
+        "dynamicPickCount": len([r for r in rows if r.get("dynamicPick")]),
+        "manualPickCount": len([r for r in rows if r.get("manualPick")]),
+        "dynamicScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
         "keepWinners": True,
-        "sourceExplanation": {
-            "liveScannerRows": "Current Yahoo market movers / most active / small-cap scanner output.",
-            "memoryRows": "Historical closed-trade stock performance memory. Not automatically the live scanner.",
-            "finalRows": "The final merged universe the bot can trade after filters, manual pins and core quality fallback.",
-        },
     }
 
 @app.get("/weekly-universe")
