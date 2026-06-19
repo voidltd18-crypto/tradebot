@@ -1073,16 +1073,27 @@ const fetchData = useCallback(async (force = false) => {
         <p className="muted">Full Buy uses most available capped capital for one position. Partial Buy splits capital across several smaller positions.</p>
       </Card>
 
-      <Card title="Dynamic Auto Universe" wide>
-        <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
+      <Card title="Universe Sources" wide>
+        <p className="muted">This is now split properly: live scanner picks are current market movers, stock memory is historical performance, and final bot universe is what the bot can actually trade.</p>
         <div className="universe-counts">
-          <div><span>Total in universe</span><b>{data?.autoUniverse?.rows?.length || 0}</b></div>
+          <div><span>Final universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}</b></div>
           <div><span>Mode</span><b>{data?.autoUniverse?.mode || (muskModeOn ? "musk-focus" : "quality")}</b></div>
-          <div><span>Active symbols</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}</b></div>
+          <div><span>Live scanner picks</span><b>{(data?.autoUniverse?.liveScannerRows || data?.dynamicMarketScanner?.rows || []).length}</b></div>
+          <div><span>Stock memory picks</span><b>{(data?.autoUniverse?.memoryRows || []).length}</b></div>
           <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
-          <div><span>Dynamic picks</span><b>{data?.autoUniverse?.dynamicPickCount || dynamicPickCount}</b></div>
         </div>
-        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : r.dynamicPick ? "Dynamic ⚡" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "dynamic candidate"}</p></article>)}</div>
+
+        <h3>Live Scanner Picks</h3>
+        <p className="muted">Pulled from Yahoo market movers / most active / small-cap screens, then filtered by price, volume and spread.</p>
+        <div className="scan-grid">{(data?.autoUniverse?.liveScannerRows || data?.dynamicMarketScanner?.rows || []).slice(0,20).map((r:AnyObj) => <article className="scan" key={`live-${r.symbol}`}><div><b>{r.symbol}</b><strong>Live ⚡ {Number(r.score || 0).toFixed(2)}</strong></div><p>{r.reason || "live market scanner candidate"}</p></article>)}{!(data?.autoUniverse?.liveScannerRows || data?.dynamicMarketScanner?.rows || []).length && <p className="muted">No live scanner rows yet. Press Dynamic Market Refresh.</p>}</div>
+
+        <h3>Stock Memory Picks</h3>
+        <p className="muted">Pulled from closed-trade history. These are not the live scanner; they show where the bot has historically performed well or badly.</p>
+        <div className="scan-grid">{(data?.autoUniverse?.memoryRows || []).slice(0,20).map((r:AnyObj) => <article className="scan" key={`memory-${r.symbol}`}><div><b>{r.symbol}</b><strong>Memory 🧠 {Number(r.score || 0).toFixed(2)}</strong></div><p>{r.reason || "stock memory performance"}</p></article>)}{!(data?.autoUniverse?.memoryRows || []).length && <p className="muted">No stock memory rows yet.</p>}</div>
+
+        <h3>Final Bot Universe</h3>
+        <p className="muted">This is the final merged list the backend is actually allowed to trade after manual pins, live scanner, Musk Mode and quality fallback rules.</p>
+        <div className="scan-grid">{(data?.autoUniverse?.finalRows || data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={`final-${r.symbol}`}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : r.dynamicPick ? "Live ⚡" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "final tradable universe"}</p></article>)}</div>
       </Card>
       </>}
     </main>}
