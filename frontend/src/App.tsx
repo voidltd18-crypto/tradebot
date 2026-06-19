@@ -1123,8 +1123,30 @@ const fetchData = useCallback(async (force = false) => {
         <p className="muted">Full Buy uses most available capped capital for one position. Partial Buy splits capital across several smaller positions.</p>
       </Card>
 
-      <Card title="Dynamic Auto Universe" wide>
-        <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
+      <Card title="Live Scanner Picks" wide>
+        <p className="muted">Fresh candidates from the live market scanner. These are current market movers, not old trade-memory scores.</p>
+        <div className="universe-counts">
+          <div><span>Scanner picks</span><b>{dynamicRows.length || 0}</b></div>
+          <div><span>Source</span><b>{dynamicScanner?.source || "scanner"}</b></div>
+          <div><span>Updated</span><b>{fmtDate(dynamicScanner?.updatedAt)}</b></div>
+          <div><span>Error</span><b>{dynamicScanner?.error ? "Yes" : "No"}</b></div>
+        </div>
+        <div className="scan-grid">{dynamicRows.slice(0,40).map((r:AnyObj) => <article className="scan" key={`live-${r.symbol}`}><div><b>{r.symbol}</b><strong>{r.dynamicPick ? "Live ⚡" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "live scanner candidate"}</p></article>)}</div>
+      </Card>
+
+      <Card title="Stock Memory Picks" wide>
+        <p className="muted">Historical winners/losers rebuilt from closed trades. This should influence trust, but it is not the live scanner.</p>
+        <div className="universe-counts">
+          <div><span>Memory stocks</span><b>{data?.stockMemory?.length || 0}</b></div>
+          <div><span>Closed trades</span><b>{data?.dbSummary?.closedTrades || data?.analytics?.closedTrades || 0}</b></div>
+          <div><span>Win rate</span><b>{pct((data?.dbSummary?.winRate || data?.analytics?.winRate || 0) * 100)}</b></div>
+          <div><span>Total PnL</span><b>{gbp(data?.dbSummary?.totalPnlGbp || data?.analytics?.totalPnlGbp || 0)}</b></div>
+        </div>
+        <div className="scan-grid">{(data?.stockMemory || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={`memory-${r.symbol}`}><div><b>{r.symbol}</b><strong>{r.trust || "Memory"}</strong></div><p>{`trades=${r.trades || 0} | winRate=${pct(Number(r.winRate || 0) * 100)} | avgPnL=${usd(r.avgPnl || 0)} | totalPnL=${usd(r.totalPnl || 0)}`}</p></article>)}</div>
+      </Card>
+
+      <Card title="Final Bot Universe" wide>
+        <p className="muted">The actual symbols the bot is allowed to scan/trade after live scanner, memory, quality filters, Musk Mode, and manual pins are merged.</p>
         <div className="universe-counts">
           <div><span>Total in universe</span><b>{data?.autoUniverse?.rows?.length || 0}</b></div>
           <div><span>Mode</span><b>{data?.autoUniverse?.mode || (muskModeOn ? "musk-focus" : "quality")}</b></div>
@@ -1132,7 +1154,7 @@ const fetchData = useCallback(async (force = false) => {
           <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
           <div><span>Dynamic picks</span><b>{data?.autoUniverse?.dynamicPickCount || dynamicPickCount}</b></div>
         </div>
-        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : r.dynamicPick ? "Dynamic ⚡" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "dynamic candidate"}</p></article>)}</div>
+        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={`final-${r.symbol}`}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : r.dynamicPick ? "Dynamic ⚡" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "final bot universe"}</p></article>)}</div>
       </Card>
       </>}
     </main>}
