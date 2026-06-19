@@ -2027,11 +2027,16 @@ def trades_from_db(limit: int = 1000):
     try:
         init_db()
         conn = db_connect()
+        # Pull the latest raw trades, not the oldest rows in the DB.
+        # Then return them oldest->newest for timeline charts.
         rows = conn.execute("""
-            SELECT * FROM trades
-            ORDER BY timestamp ASC
-            LIMIT ?
-        """, (limit,)).fetchall()
+            SELECT * FROM (
+                SELECT * FROM trades
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+            )
+            ORDER BY timestamp ASC, id ASC
+        """, (int(limit),)).fetchall()
         conn.close()
 
         items = []
@@ -2372,6 +2377,51 @@ def closed_trade_summary_payload():
         "totalPnl": total_pnl,
         "totalPnlGbp": total_pnl_gbp,
     }
+
+
+
+def trade_db_range_summary():
+    """Small reports/debug payload showing whether the DB has recent months."""
+    if not SQLITE_ENABLED:
+        return {"enabled": False}
+    try:
+        init_db()
+        conn = db_connect()
+        raw = conn.execute("""
+            SELECT COUNT(*) AS c, MIN(timestamp) AS oldest, MAX(timestamp) AS newest
+            FROM trades
+        """).fetchone()
+        closed = conn.execute("""
+            SELECT COUNT(*) AS c, MIN(timestamp) AS oldest, MAX(timestamp) AS newest
+            FROM closed_trades
+        """).fetchone()
+        recent_raw = conn.execute("""
+            SELECT day, time, symbol, side, qty, price, source
+            FROM trades
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 10
+        """).fetchall()
+        recent_closed = conn.execute("""
+            SELECT day, time, symbol, qty, entry_price, exit_price, pnl, pnl_pct
+            FROM closed_trades
+            ORDER BY timestamp DESC, id DESC
+            LIMIT 10
+        """).fetchall()
+        conn.close()
+        return {
+            "enabled": True,
+            "dbFile": SQLITE_DB_FILE,
+            "rawTrades": int(raw["c"] or 0),
+            "rawOldest": raw["oldest"] or "",
+            "rawNewest": raw["newest"] or "",
+            "closedTrades": int(closed["c"] or 0),
+            "closedOldest": closed["oldest"] or "",
+            "closedNewest": closed["newest"] or "",
+            "recentRaw": [dict(r) for r in recent_raw],
+            "recentClosed": [dict(r) for r in recent_closed],
+        }
+    except Exception as e:
+        return {"enabled": SQLITE_ENABLED, "dbFile": SQLITE_DB_FILE, "error": str(e)}
 
 
 def stock_memory_from_closed_trades():
@@ -3685,6 +3735,12 @@ except Exception as e:
 def api_market_status():
     return {"ok": True, "market": get_market_status_payload()}
 
+@app.get("/debug-trade-db")
+def debug_trade_db(request: Request):
+    verify_api_key(request)
+    return {"ok": True, **trade_db_range_summary()}
+
+
 @app.get("/debug-orders")
 def debug_orders():
     try:
@@ -3862,6 +3918,21 @@ def backfill_trades(request: Request):
         result = backfill_trades_from_alpaca_full()
         update_status(BOT_NAME, latest_scans)
         return result
+
+
+@app.post("/backfill-trades-full-range")
+def backfill_trades_full_range(request: Request, payload: dict = Body(default={})):
+    """Backfill helper for missing months.
+
+    Uses the same full pagination as Backfill Trades, then returns DB date ranges
+    so we can immediately see whether recent months arrived in SQLite.
+    """
+    verify_api_key(request)
+    with bot_lock:
+        result = backfill_trades_from_alpaca_full()
+        ranges = trade_db_range_summary() if "trade_db_range_summary" in globals() else {}
+        update_status(BOT_NAME, latest_scans)
+        return {**result, "tradeDbSummary": ranges}
 
 
 # =========================
@@ -4063,10 +4134,16 @@ def reports():
         "lostSinceDeposit": abs(min(total_gain_loss, 0.0)),
         "dayPnl": _safe_num(account.get("pnlDay")),
         "realisedNet": _safe_num(db.get("totalPnl")),
-        "closedTrades": closed[-200:] if isinstance(closed, list) else [],
+        # Reports page wants newest trades first and must not lose recent months.
+        "closedTrades": sorted(
+            closed if isinstance(closed, list) else [],
+            key=lambda x: str(x.get("timestamp") or x.get("day") or ""),
+            reverse=True,
+        )[:500],
         "equityHistory": equity_history[-500:],
-        "winRate": _safe_num(db.get("winRate")) * 100.0,
-        "totalTrades": int(_safe_num(db.get("totalTrades"))),
+        "winRate": _safe_num((closed_trade_summary_payload() or {}).get("winRate")) * 100.0,
+        "totalTrades": int(_safe_num((db_summary_payload() or {}).get("totalTrades"))),
+        "tradeDbSummary": trade_db_range_summary() if "trade_db_range_summary" in globals() else {},
     }
 
 # ---------- manual universe pins ----------
