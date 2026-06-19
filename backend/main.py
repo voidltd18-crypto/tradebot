@@ -2027,16 +2027,11 @@ def trades_from_db(limit: int = 1000):
     try:
         init_db()
         conn = db_connect()
-        # Pull the latest raw trades, not the oldest rows in the DB.
-        # Then return them oldest->newest for timeline charts.
         rows = conn.execute("""
-            SELECT * FROM (
-                SELECT * FROM trades
-                ORDER BY timestamp DESC, id DESC
-                LIMIT ?
-            )
-            ORDER BY timestamp ASC, id ASC
-        """, (int(limit),)).fetchall()
+            SELECT * FROM trades
+            ORDER BY timestamp ASC
+            LIMIT ?
+        """, (limit,)).fetchall()
         conn.close()
 
         items = []
@@ -2045,7 +2040,6 @@ def trades_from_db(limit: int = 1000):
                 "id": r["id"],
                 "alpacaOrderId": r["alpaca_order_id"],
                 "timestamp": r["timestamp"],
-                "date": r["day"],
                 "day": r["day"],
                 "time": r["time"],
                 "symbol": r["symbol"],
@@ -2220,15 +2214,11 @@ def closed_trades_from_db(limit: int = 1000):
     try:
         init_db()
         conn = db_connect()
-        # Pull the latest closed trades, not the oldest ones from the table.
         rows = conn.execute("""
-            SELECT * FROM (
-                SELECT * FROM closed_trades
-                ORDER BY timestamp DESC, id DESC
-                LIMIT ?
-            )
-            ORDER BY timestamp ASC, id ASC
-        """, (int(limit),)).fetchall()
+            SELECT * FROM closed_trades
+            ORDER BY timestamp ASC
+            LIMIT ?
+        """, (limit,)).fetchall()
         conn.close()
 
         return [
@@ -2377,51 +2367,6 @@ def closed_trade_summary_payload():
         "totalPnl": total_pnl,
         "totalPnlGbp": total_pnl_gbp,
     }
-
-
-
-def trade_db_range_summary():
-    """Small reports/debug payload showing whether the DB has recent months."""
-    if not SQLITE_ENABLED:
-        return {"enabled": False}
-    try:
-        init_db()
-        conn = db_connect()
-        raw = conn.execute("""
-            SELECT COUNT(*) AS c, MIN(timestamp) AS oldest, MAX(timestamp) AS newest
-            FROM trades
-        """).fetchone()
-        closed = conn.execute("""
-            SELECT COUNT(*) AS c, MIN(timestamp) AS oldest, MAX(timestamp) AS newest
-            FROM closed_trades
-        """).fetchone()
-        recent_raw = conn.execute("""
-            SELECT day, time, symbol, side, qty, price, source
-            FROM trades
-            ORDER BY timestamp DESC, id DESC
-            LIMIT 10
-        """).fetchall()
-        recent_closed = conn.execute("""
-            SELECT day, time, symbol, qty, entry_price, exit_price, pnl, pnl_pct
-            FROM closed_trades
-            ORDER BY timestamp DESC, id DESC
-            LIMIT 10
-        """).fetchall()
-        conn.close()
-        return {
-            "enabled": True,
-            "dbFile": SQLITE_DB_FILE,
-            "rawTrades": int(raw["c"] or 0),
-            "rawOldest": raw["oldest"] or "",
-            "rawNewest": raw["newest"] or "",
-            "closedTrades": int(closed["c"] or 0),
-            "closedOldest": closed["oldest"] or "",
-            "closedNewest": closed["newest"] or "",
-            "recentRaw": [dict(r) for r in recent_raw],
-            "recentClosed": [dict(r) for r in recent_closed],
-        }
-    except Exception as e:
-        return {"enabled": SQLITE_ENABLED, "dbFile": SQLITE_DB_FILE, "error": str(e)}
 
 
 def stock_memory_from_closed_trades():
@@ -3735,12 +3680,6 @@ except Exception as e:
 def api_market_status():
     return {"ok": True, "market": get_market_status_payload()}
 
-@app.get("/debug-trade-db")
-def debug_trade_db(request: Request):
-    verify_api_key(request)
-    return {"ok": True, **trade_db_range_summary()}
-
-
 @app.get("/debug-orders")
 def debug_orders():
     try:
@@ -3920,21 +3859,6 @@ def backfill_trades(request: Request):
         return result
 
 
-@app.post("/backfill-trades-full-range")
-def backfill_trades_full_range(request: Request, payload: dict = Body(default={})):
-    """Backfill helper for missing months.
-
-    Uses the same full pagination as Backfill Trades, then returns DB date ranges
-    so we can immediately see whether recent months arrived in SQLite.
-    """
-    verify_api_key(request)
-    with bot_lock:
-        result = backfill_trades_from_alpaca_full()
-        ranges = trade_db_range_summary() if "trade_db_range_summary" in globals() else {}
-        update_status(BOT_NAME, latest_scans)
-        return {**result, "tradeDbSummary": ranges}
-
-
 # =========================
 # LOOP
 # =========================
@@ -4093,19 +4017,8 @@ def reports():
         total_deposited = equity
         deposit_source = "equity-baseline"
     total_gain_loss = equity + total_withdrawn - total_deposited
-    # Do not rely on latest_status here. latest_status can be stale after a redeploy,
-    # so reports should read the persistent SQLite tables directly every time.
-    closed = []
-    try:
-        closed = closed_trades_from_db(1000)
-        if not closed and SQLITE_ENABLED:
-            rebuild_closed_trades_from_orders()
-            closed = closed_trades_from_db(1000)
-    except Exception as e:
-        print(f"REPORTS CLOSED TRADES DB LOAD ERROR: {e}")
-        closed = status.get("closedTrades") or []
-
-    timeline = trades_from_db(1000) if SQLITE_ENABLED else (status.get("tradeTimeline") or status.get("equityCurve") or [])
+    closed = status.get("closedTrades") or []
+    timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
     equity_history = []
     for i, e in enumerate(timeline if isinstance(timeline, list) else []):
         if not isinstance(e, dict):
@@ -4134,16 +4047,10 @@ def reports():
         "lostSinceDeposit": abs(min(total_gain_loss, 0.0)),
         "dayPnl": _safe_num(account.get("pnlDay")),
         "realisedNet": _safe_num(db.get("totalPnl")),
-        # Reports page wants newest trades first and must not lose recent months.
-        "closedTrades": sorted(
-            closed if isinstance(closed, list) else [],
-            key=lambda x: str(x.get("timestamp") or x.get("day") or ""),
-            reverse=True,
-        )[:500],
+        "closedTrades": closed[-200:] if isinstance(closed, list) else [],
         "equityHistory": equity_history[-500:],
-        "winRate": _safe_num((closed_trade_summary_payload() or {}).get("winRate")) * 100.0,
-        "totalTrades": int(_safe_num((db_summary_payload() or {}).get("totalTrades"))),
-        "tradeDbSummary": trade_db_range_summary() if "trade_db_range_summary" in globals() else {},
+        "winRate": _safe_num(db.get("winRate")) * 100.0,
+        "totalTrades": int(_safe_num(db.get("totalTrades"))),
     }
 
 # ---------- manual universe pins ----------
@@ -5038,10 +4945,14 @@ def apply_quality_only_universe():
             "size": len(symbols),
             "activeSymbols": symbols,
             "rows": rows,
+            "finalRows": rows,
             "blockedWeakTickers": sorted(list(BLOCKED_WEAK_TICKERS)),
             "dynamicScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
+            "liveScannerRows": dynamic_market_rows() if "dynamic_market_rows" in globals() else [],
+            "memoryRows": stock_memory_universe_rows() if "stock_memory_universe_rows" in globals() else [],
             "lastRefresh": datetime.now(UTC).isoformat(),
-            "manualPickCount": len([s for s in symbols if s not in QUALITY_ONLY_UNIVERSE]),
+            "manualPickCount": len([r for r in rows if r.get("manualPick")]),
+            "dynamicPickCount": len([r for r in rows if r.get("dynamicPick")]),
         }
         latest_status["lastAction"] = "Quality-only universe applied"
         latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
@@ -5138,17 +5049,40 @@ def api_apply_quality_universe(request: Request):
 # FORCE QUALITY UNIVERSE STATUS/UI PATCH
 # =========================
 
+def stock_memory_universe_rows(limit: int = 40):
+    """Dashboard-only stock-memory rows.
+
+    These are historical closed-trade performance picks. They must be kept
+    separate from the live Yahoo market scanner so the UI can clearly show
+    where every symbol came from.
+    """
+    try:
+        rows = universe_rows_from_stock_memory()
+    except Exception as e:
+        print(f"STOCK MEMORY UNIVERSE ROWS ERROR: {e}")
+        rows = []
+
+    cleaned = []
+    for r in rows[:limit]:
+        row = dict(r)
+        row["memoryPick"] = True
+        row.setdefault("source", "stock-memory")
+        row.setdefault("status", "watch")
+        cleaned.append(row)
+    return cleaned
+
+
 def force_quality_auto_universe_payload():
     try:
         if "quality_only_rows" in globals():
-            rows = quality_only_rows()
+            final_rows = quality_only_rows()
         elif "quality_universe_rows" in globals():
-            rows = quality_universe_rows()
+            final_rows = quality_universe_rows()
         else:
-            rows = []
-        symbols = [r["symbol"] for r in rows]
+            final_rows = []
+        symbols = [str(r.get("symbol", "")).upper() for r in final_rows if r.get("symbol")]
     except Exception:
-        rows = []
+        final_rows = []
         symbols = []
 
     if not symbols:
@@ -5157,15 +5091,24 @@ def force_quality_auto_universe_payload():
             "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
             "TSLA", "PLTR", "UBER", "QQQ", "SMH",
         ]
-        rows = [
+        final_rows = [
             {
                 "symbol": s,
                 "score": round(100 - (i * 3), 2),
                 "reason": "quality-only universe | forced UI sync",
                 "status": "active",
+                "source": "fallback-core-quality",
             }
             for i, s in enumerate(symbols)
         ]
+
+    scanner = dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {}
+    scanner_rows = list(scanner.get("rows") or [])
+    memory_rows = stock_memory_universe_rows() if "stock_memory_universe_rows" in globals() else []
+
+    manual_count = len([r for r in final_rows if r.get("manualPick")])
+    dynamic_count = len([r for r in final_rows if r.get("dynamicPick")])
+    memory_count = len(memory_rows)
 
     return {
         "enabled": True,
@@ -5174,14 +5117,28 @@ def force_quality_auto_universe_payload():
         "size": len(symbols),
         "weekStart": datetime.now(UTC).date().isoformat(),
         "monthStart": datetime.now(UTC).replace(day=1).date().isoformat(),
+
+        # Final tradable universe: this is what the bot is allowed to buy/manage.
         "activeSymbols": symbols,
-        "rows": rows,
+        "rows": final_rows,
+        "finalRows": final_rows,
+
+        # Separate source panels for the dashboard.
+        "liveScannerRows": scanner_rows,
+        "memoryRows": memory_rows,
+        "dynamicScanner": scanner,
+
         "lastRefresh": datetime.now(UTC).isoformat(),
         "candidatePoolSize": len(symbols),
-        "dynamicPickCount": len([r for r in rows if r.get("dynamicPick")]),
-        "manualPickCount": len([r for r in rows if r.get("manualPick")]),
-        "dynamicScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
+        "dynamicPickCount": dynamic_count,
+        "manualPickCount": manual_count,
+        "memoryPickCount": memory_count,
         "keepWinners": True,
+        "sourceExplanation": {
+            "liveScannerRows": "Current Yahoo market movers / most active / small-cap scanner output.",
+            "memoryRows": "Historical closed-trade stock performance memory. Not automatically the live scanner.",
+            "finalRows": "The final merged universe the bot can trade after filters, manual pins and core quality fallback.",
+        },
     }
 
 @app.get("/weekly-universe")
@@ -5819,150 +5776,4 @@ def compat_post_buy_size_mode(payload: dict = Body(...), request: Request = None
         "fullBuyWhenOnePosition": saved == "full",
         "preview": preview,
         "positionSettings": current_position_settings_payload() if "current_position_settings_payload" in globals() else {"buySizeMode": saved, "buySizePreview": preview},
-    }
-
-
-# ============================================================
-# HOTFIX: STOP FINAL UNIVERSE FALLING BACK TO OLD STOCK MEMORY
-# ============================================================
-# Problem fixed:
-# - The dashboard split showed Live Scanner / Stock Memory / Final Universe,
-#   but the backend could still rebuild Final Bot Universe from old weekly
-#   stock-memory rows such as INTC/RIVN/KO/LAC/SOFI.
-# - In quality/dynamic mode the bot should trade from:
-#   manual pins -> Musk Mode if enabled -> live dynamic scanner -> core quality fallback.
-# - Stock Memory must remain visible as a report only, not the source of truth.
-
-_ORIGINAL_AUTO_UNIVERSE_PAYLOAD_BEFORE_DYNAMIC_HOTFIX = globals().get("auto_universe_payload")
-_ORIGINAL_REFRESH_UNIVERSE_IF_NEEDED_BEFORE_DYNAMIC_HOTFIX = globals().get("refresh_universe_if_needed")
-
-
-def live_final_universe_payload() -> Dict[str, Any]:
-    """Final universe used by /status and the dashboard.
-
-    This deliberately ignores weekly_universe DB rows because those rows can be
-    stale stock-memory rankings. The final universe is rebuilt from the live
-    dynamic/quality path every time so old INTC/RIVN/KO/etc memory lists cannot
-    take control of trading again.
-    """
-    try:
-        rows = quality_only_rows() if "quality_only_rows" in globals() else []
-        symbols = [str(r.get("symbol", "")).upper().strip() for r in rows if r.get("symbol")]
-        symbols = list(dict.fromkeys([s for s in symbols if s]))
-
-        dynamic_rows = dynamic_market_rows() if "dynamic_market_rows" in globals() else []
-        dynamic_symbols = [str(r.get("symbol", "")).upper().strip() for r in dynamic_rows if r.get("symbol")]
-        memory_rows = stock_memory_from_closed_trades() if "stock_memory_from_closed_trades" in globals() else []
-        manual_picks = load_manual_universe_picks() if "load_manual_universe_picks" in globals() else []
-
-        return {
-            "enabled": True,
-            "mode": "musk-focus" if ("musk_mode_enabled" in globals() and musk_mode_enabled()) else ("dynamic-quality-hybrid" if DYNAMIC_MARKET_SCANNER_ENABLED else "quality-only"),
-            "source": "live_dynamic_quality_not_stock_memory",
-            "size": len(symbols),
-            "activeSymbols": symbols,
-            "rows": rows,
-            "lastRefresh": datetime.now(UTC).isoformat(),
-            "manualPickCount": len(manual_picks),
-            "dynamicPickCount": len([r for r in rows if r.get("dynamicPick")]),
-            "stockMemoryPickCount": len(memory_rows),
-            "blockedWeakTickers": sorted(list(BLOCKED_WEAK_TICKERS)) if "BLOCKED_WEAK_TICKERS" in globals() else [],
-            "dynamicScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
-            "muskMode": musk_mode_payload() if "musk_mode_payload" in globals() else {"enabled": False},
-            "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
-            "note": "Final Bot Universe is now live scanner/quality based. Stock Memory is display-only.",
-            "debug": {
-                "liveScannerSymbols": dynamic_symbols,
-                "manualPicks": manual_picks,
-            },
-        }
-    except Exception as e:
-        print(f"LIVE FINAL UNIVERSE PAYLOAD ERROR: {e}")
-        # Safe fallback only; never use old weekly memory rows here.
-        symbols = list(dict.fromkeys([s for s in globals().get("QUALITY_ONLY_UNIVERSE", SAFE_UNIVERSE) if s not in globals().get("BLOCKED_WEAK_TICKERS", set())]))
-        return {
-            "enabled": True,
-            "mode": "quality-only-fallback",
-            "source": "fallback_core_quality_not_stock_memory",
-            "size": len(symbols),
-            "activeSymbols": symbols,
-            "rows": [{"symbol": s, "score": max(0, 100 - i * 3), "reason": "core quality fallback", "status": "active"} for i, s in enumerate(symbols)],
-            "error": str(e),
-        }
-
-
-def auto_universe_payload():
-    return live_final_universe_payload()
-
-
-def weekly_universe_public():
-    return live_final_universe_payload()
-
-
-def refresh_universe_if_needed(force=False):
-    """Keep the actual trading universe synced to live dynamic/quality picks.
-
-    This replaces the older weekly stock-memory rotation while quality mode is on.
-    """
-    global current_universe, last_universe_refresh_ts
-
-    try:
-        now = time.time()
-        if not force and (now - float(last_universe_refresh_ts or 0)) < UNIVERSE_REFRESH_SECONDS:
-            return
-
-        try:
-            if "refresh_dynamic_market_candidates" in globals():
-                refresh_dynamic_market_candidates(force=bool(force))
-        except Exception as e:
-            print(f"DYNAMIC REFRESH INSIDE UNIVERSE HOTFIX ERROR: {e}")
-
-        if "apply_quality_only_universe" in globals():
-            symbols = apply_quality_only_universe()
-        else:
-            symbols = list(dict.fromkeys(SAFE_UNIVERSE + list(custom_symbols.keys())))
-
-        current_universe = list(dict.fromkeys([str(s).upper().strip() for s in symbols if str(s).strip()]))
-        for s in current_universe:
-            ensure_symbol_state(s, custom=s in custom_symbols)
-        last_universe_refresh_ts = now
-        print(f"LIVE FINAL UNIVERSE HOTFIX | {', '.join(current_universe)}")
-    except Exception as e:
-        print(f"LIVE FINAL UNIVERSE HOTFIX ERROR: {e}")
-        if callable(_ORIGINAL_REFRESH_UNIVERSE_IF_NEEDED_BEFORE_DYNAMIC_HOTFIX):
-            return _ORIGINAL_REFRESH_UNIVERSE_IF_NEEDED_BEFORE_DYNAMIC_HOTFIX(force=force)
-
-
-@app.get("/final-universe")
-def api_final_universe():
-    return {"ok": True, "autoUniverse": live_final_universe_payload(), **live_final_universe_payload()}
-
-
-@app.post("/clear-weekly-memory-universe")
-def api_clear_weekly_memory_universe(request: Request):
-    """Optional maintenance button/API to clear stale weekly memory universe rows."""
-    verify_api_key(request)
-    deleted = 0
-    try:
-        if SQLITE_ENABLED:
-            init_db()
-            conn = db_connect()
-            cur = conn.execute("UPDATE weekly_universe SET status='removed' WHERE status='active'")
-            deleted = int(cur.rowcount or 0)
-            conn.commit()
-            conn.close()
-    except Exception as e:
-        return {"ok": False, "message": f"Could not clear stale weekly universe: {e}"}
-
-    try:
-        refresh_dynamic_market_candidates(force=True)
-        apply_quality_only_universe()
-        update_status(BOT_NAME, latest_scans)
-    except Exception as e:
-        print(f"CLEAR WEEKLY MEMORY UNIVERSE STATUS ERROR: {e}")
-
-    return {
-        "ok": True,
-        "message": f"Cleared {deleted} stale weekly stock-memory universe rows and rebuilt final universe from live scanner/quality picks.",
-        "autoUniverse": live_final_universe_payload(),
     }

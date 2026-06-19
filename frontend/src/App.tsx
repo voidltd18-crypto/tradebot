@@ -62,14 +62,6 @@ const usd = (n:any) => `$${Number(n || 0).toFixed(2)}`;
 const gbp = (n:any) => `£${Number(n || 0).toFixed(2)}`;
 const pct = (n:any) => `${Number(n || 0).toFixed(2)}%`;
 const tone = (n:any) => Number(n || 0) >= 0 ? "gain" : "loss";
-const fmtDate = (t:any) => {
-  const raw = String(t?.date || t?.day || t?.timestamp || "");
-  if (!raw) return "—";
-  const dayOnly = raw.slice(0, 10);
-  const m = dayOnly.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (m) return `${m[3]}/${m[2]}/${m[1]}`;
-  return dayOnly || raw;
-};
 
 function Card({ title, children, wide=false }: {title?: string; children: React.ReactNode; wide?: boolean}) {
   return <section className={`card ${wide ? "wide" : ""}`}>{title && <h2>{title}</h2>}{children}</section>;
@@ -116,8 +108,6 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [replayResult, setReplayResult] = useState<AnyObj | null>(null);
   const [manualBaselineInput, setManualBaselineInput] = useState<string>("");
   const [baselineSaving, setBaselineSaving] = useState(false);
-  const [maintenanceLoading, setMaintenanceLoading] = useState<"backfill"|"rebuild"|"">("");
-  const [maintenanceResult, setMaintenanceResult] = useState<AnyObj | null>(null);
   const [strategyStrictness, setStrategyStrictness] = useState<number>(0);
   const [strategySaving, setStrategySaving] = useState(false);
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
@@ -689,46 +679,6 @@ const fetchData = useCallback(async (force = false) => {
     }
   }
 
-  async function runTradeMaintenance(kind: "backfill"|"rebuild") {
-    if (!token) {
-      setMessage("Please login first.");
-      return;
-    }
-
-    const endpoint = kind === "backfill" ? "/backfill-trades" : "/rebuild-closed-trades";
-    const label = kind === "backfill" ? "Backfill Trades" : "Rebuild Closed Trades";
-
-    setMaintenanceLoading(kind);
-    setMaintenanceResult(null);
-    setMessage(`${label} started. This can take a little while on Render...`);
-
-    const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), kind === "backfill" ? 120000 : 90000);
-
-    try {
-      const res = await fetch(`${API_URL}${endpoint}`, {
-        method: "POST",
-        headers: secureHeaders,
-        cache: "no-store",
-        signal: controller.signal,
-      });
-      const json = await readJson(res);
-      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || `${label} failed`);
-      setMaintenanceResult({ ...json, action: label, finishedAt: new Date().toISOString() });
-      setMessage(json?.message || `${label} complete.`);
-      await fetchData(true);
-    } catch (e:any) {
-      const msg = e?.name === "AbortError"
-        ? `${label} is still processing on Render. Refresh Reports in a minute.`
-        : (e?.message || `${label} failed.`);
-      setMaintenanceResult({ ok: false, action: label, message: msg, finishedAt: new Date().toISOString() });
-      setMessage(msg);
-    } finally {
-      window.clearTimeout(timeout);
-      setMaintenanceLoading("");
-    }
-  }
-
   async function runBacktestReplay() {
     if (!token) {
       setMessage("Please login first.");
@@ -1123,52 +1073,33 @@ const fetchData = useCallback(async (force = false) => {
         <p className="muted">Full Buy uses most available capped capital for one position. Partial Buy splits capital across several smaller positions.</p>
       </Card>
 
-      <Card title="Live Scanner Picks" wide>
-        <p className="muted">Fresh candidates from the live market scanner. These are current market movers, not old trade-memory scores.</p>
+      <Card title="Universe Sources" wide>
+        <p className="muted">This is now split properly: live scanner picks are current market movers, stock memory is historical performance, and final bot universe is what the bot can actually trade.</p>
         <div className="universe-counts">
-          <div><span>Scanner picks</span><b>{dynamicRows.length || 0}</b></div>
-          <div><span>Source</span><b>{dynamicScanner?.source || "scanner"}</b></div>
-          <div><span>Updated</span><b>{fmtDate(dynamicScanner?.updatedAt)}</b></div>
-          <div><span>Error</span><b>{dynamicScanner?.error ? "Yes" : "No"}</b></div>
-        </div>
-        <div className="scan-grid">{dynamicRows.slice(0,40).map((r:AnyObj) => <article className="scan" key={`live-${r.symbol}`}><div><b>{r.symbol}</b><strong>{r.dynamicPick ? "Live ⚡" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "live scanner candidate"}</p></article>)}</div>
-      </Card>
-
-      <Card title="Stock Memory Picks" wide>
-        <p className="muted">Historical winners/losers rebuilt from closed trades. This should influence trust, but it is not the live scanner.</p>
-        <div className="universe-counts">
-          <div><span>Memory stocks</span><b>{data?.stockMemory?.length || 0}</b></div>
-          <div><span>Closed trades</span><b>{data?.dbSummary?.closedTrades || data?.analytics?.closedTrades || 0}</b></div>
-          <div><span>Win rate</span><b>{pct((data?.dbSummary?.winRate || data?.analytics?.winRate || 0) * 100)}</b></div>
-          <div><span>Total PnL</span><b>{gbp(data?.dbSummary?.totalPnlGbp || data?.analytics?.totalPnlGbp || 0)}</b></div>
-        </div>
-        <div className="scan-grid">{(data?.stockMemory || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={`memory-${r.symbol}`}><div><b>{r.symbol}</b><strong>{r.trust || "Memory"}</strong></div><p>{`trades=${r.trades || 0} | winRate=${pct(Number(r.winRate || 0) * 100)} | avgPnL=${usd(r.avgPnl || 0)} | totalPnL=${usd(r.totalPnl || 0)}`}</p></article>)}</div>
-      </Card>
-
-      <Card title="Final Bot Universe" wide>
-        <p className="muted">The actual symbols the bot is allowed to scan/trade after live scanner, memory, quality filters, Musk Mode, and manual pins are merged.</p>
-        <div className="universe-counts">
-          <div><span>Total in universe</span><b>{data?.autoUniverse?.rows?.length || 0}</b></div>
+          <div><span>Final universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}</b></div>
           <div><span>Mode</span><b>{data?.autoUniverse?.mode || (muskModeOn ? "musk-focus" : "quality")}</b></div>
-          <div><span>Active symbols</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}</b></div>
+          <div><span>Live scanner picks</span><b>{(data?.autoUniverse?.liveScannerRows || data?.dynamicMarketScanner?.rows || []).length}</b></div>
+          <div><span>Stock memory picks</span><b>{(data?.autoUniverse?.memoryRows || []).length}</b></div>
           <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
-          <div><span>Dynamic picks</span><b>{data?.autoUniverse?.dynamicPickCount || dynamicPickCount}</b></div>
         </div>
-        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={`final-${r.symbol}`}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : r.dynamicPick ? "Dynamic ⚡" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "final bot universe"}</p></article>)}</div>
+
+        <h3>Live Scanner Picks</h3>
+        <p className="muted">Pulled from Yahoo market movers / most active / small-cap screens, then filtered by price, volume and spread.</p>
+        <div className="scan-grid">{(data?.autoUniverse?.liveScannerRows || data?.dynamicMarketScanner?.rows || []).slice(0,20).map((r:AnyObj) => <article className="scan" key={`live-${r.symbol}`}><div><b>{r.symbol}</b><strong>Live ⚡ {Number(r.score || 0).toFixed(2)}</strong></div><p>{r.reason || "live market scanner candidate"}</p></article>)}{!(data?.autoUniverse?.liveScannerRows || data?.dynamicMarketScanner?.rows || []).length && <p className="muted">No live scanner rows yet. Press Dynamic Market Refresh.</p>}</div>
+
+        <h3>Stock Memory Picks</h3>
+        <p className="muted">Pulled from closed-trade history. These are not the live scanner; they show where the bot has historically performed well or badly.</p>
+        <div className="scan-grid">{(data?.autoUniverse?.memoryRows || []).slice(0,20).map((r:AnyObj) => <article className="scan" key={`memory-${r.symbol}`}><div><b>{r.symbol}</b><strong>Memory 🧠 {Number(r.score || 0).toFixed(2)}</strong></div><p>{r.reason || "stock memory performance"}</p></article>)}{!(data?.autoUniverse?.memoryRows || []).length && <p className="muted">No stock memory rows yet.</p>}</div>
+
+        <h3>Final Bot Universe</h3>
+        <p className="muted">This is the final merged list the backend is actually allowed to trade after manual pins, live scanner, Musk Mode and quality fallback rules.</p>
+        <div className="scan-grid">{(data?.autoUniverse?.finalRows || data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={`final-${r.symbol}`}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : r.dynamicPick ? "Live ⚡" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "final tradable universe"}</p></article>)}</div>
       </Card>
       </>}
     </main>}
 
     {tab==="reports" && <main className="reports-page">
-      <div className="actions report-actions">
-        <button onClick={() => fetchData(true)}>Refresh Reports</button>
-        <button onClick={() => runTradeMaintenance("backfill")} disabled={maintenanceLoading !== ""}>
-          {maintenanceLoading === "backfill" ? "Backfilling..." : "Backfill Trades"}
-        </button>
-        <button onClick={() => runTradeMaintenance("rebuild")} disabled={maintenanceLoading !== ""}>
-          {maintenanceLoading === "rebuild" ? "Rebuilding..." : "Rebuild Closed Trades"}
-        </button>
-        <button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
+      <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
           <input
             className="input"
             placeholder="Baseline £ e.g. 989.86"
@@ -1178,16 +1109,6 @@ const fetchData = useCallback(async (force = false) => {
           <button onClick={setManualBaseline} disabled={baselineSaving}>
             {baselineSaving ? "Saving..." : "Set Manual Baseline"}
           </button></div>
-      {maintenanceResult && <Card title="Trade Maintenance Result" wide>
-        <p className={maintenanceResult.ok === false ? "loss" : "gain"}><b>{maintenanceResult.action || "Maintenance"}</b> · {maintenanceResult.message || "Complete"}</p>
-        <div className="summary">
-          {maintenanceResult.ordersFetched !== undefined && <div><span>Orders fetched</span><b>{maintenanceResult.ordersFetched}</b></div>}
-          {maintenanceResult.imported !== undefined && <div><span>Imported</span><b>{maintenanceResult.imported}</b></div>}
-          {maintenanceResult.skipped !== undefined && <div><span>Skipped</span><b>{maintenanceResult.skipped}</b></div>}
-          {maintenanceResult.matchedClosedTrades !== undefined && <div><span>Matched closed trades</span><b>{maintenanceResult.matchedClosedTrades}</b></div>}
-          {maintenanceResult.unmatchedSells !== undefined && <div><span>Unmatched sells</span><b>{maintenanceResult.unmatchedSells}</b></div>}
-        </div>
-      </Card>}
       <section className="stats">
         <Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={`${usd(totalDeposited)} · ${reports.depositSource ? `Source: ${reports.depositSource}` : ""}`} />
         <Stat label="Earned Since Deposit" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)} />
@@ -1216,7 +1137,7 @@ const fetchData = useCallback(async (force = false) => {
         {replayResult?.notes && <p className="notice">{replayResult.notes}</p>}
         {Array.isArray(replayResult?.bySymbol) && replayResult.bySymbol.length > 0 && <div className="table-wrap"><table><thead><tr><th>Symbol</th><th>Trades</th><th>Win rate</th><th>PnL</th></tr></thead><tbody>{replayResult.bySymbol.slice(0,12).map((r:AnyObj)=><tr key={r.symbol}><td>{r.symbol}</td><td>{r.trades}</td><td>{pct(Number(r.winRate || 0) * 100)}</td><td className={tone(r.pnlGbp)}>{gbp(r.pnlGbp)} / {usd(r.pnlUsd)}</td></tr>)}</tbody></table></div>}
       </Card>
-      <Card title="Closed Trade History"><div className="table-wrap"><table><thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th></tr></thead><tbody>{closedTrades.slice(-120).reverse().map((t:AnyObj,i:number)=><tr key={i}><td>{fmtDate(t)}</td><td>{t.time || "—"}</td><td>{t.symbol}</td><td>{usd(t.entryPrice)}</td><td>{usd(t.exitPrice)}</td><td>{Number(t.qty || 0).toFixed(4)}</td><td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td><td className={tone(t.pnl)}>{pct(t.pnlPct)}</td></tr>)}{!closedTrades.length && <tr><td colSpan={8}>No matched closed trades yet. Use Backfill Trades, then Rebuild Closed Trades.</td></tr>}</tbody></table></div></Card>
+      <Card title="Closed Trade History"><div className="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th></tr></thead><tbody>{closedTrades.slice(-80).reverse().map((t:AnyObj,i:number)=><tr key={i}><td>{t.time || "—"}</td><td>{t.symbol}</td><td>{usd(t.entryPrice)}</td><td>{usd(t.exitPrice)}</td><td>{Number(t.qty || 0).toFixed(4)}</td><td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td><td className={tone(t.pnl)}>{pct(t.pnlPct)}</td></tr>)}{!closedTrades.length && <tr><td colSpan={7}>No matched closed trades yet.</td></tr>}</tbody></table></div></Card>
     </main>}
 
     {tab==="positions" && <Card title="All Positions — Best to Worst"><p className="muted">Sorted by PnL %, strongest winners glow green and weakest positions glow orange/red.</p><div className="position-list">{positions.map((p:AnyObj)=><article className="position" key={p.symbol} style={positionGlowStyle(p)}><div><h3>{p.symbol}</h3><p>Qty {Number(p.qty || 0).toFixed(4)} · Entry {usd(p.entry)} · Price {usd(p.price)}</p><p>Value <b>{gbp(p.marketValueGbp ?? p.marketValue * rate)}</b> / {usd(p.marketValue)}</p></div><div className="position-side"><b className={tone(p.pnl)}>PnL {gbp(p.pnlGbp ?? p.pnl * rate)} / {usd(p.pnl)} / {pct(p.pnlPct)}</b><span>{p.trailingActive ? `Trailing floor ${usd(p.trailFloor)}` : `Trail starts ${usd(p.trailStartPrice)}`}</span><button className="danger" onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button></div></article>)}{!positions.length && <p className="muted">No open positions.</p>}</div></Card>}
