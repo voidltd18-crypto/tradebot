@@ -709,17 +709,54 @@ def get_equity():
 
 
 def get_market_status_payload():
+    """Live Alpaca market/session status for the dashboard.
+
+    Alpaca's clock only exposes normal market open/closed. The dashboard also
+    needs a human label for pre-market and after-hours, so we derive that from
+    the current US/Eastern time. This is display-only; trade execution still
+    uses Alpaca's official is_open flag unless a specific route allows otherwise.
+    """
     try:
         clock = trading_client.get_clock()
+        now_utc = datetime.now(UTC)
+        try:
+            from zoneinfo import ZoneInfo
+            now_et = now_utc.astimezone(ZoneInfo("America/New_York"))
+        except Exception:
+            now_et = now_utc - timedelta(hours=4)
+
+        minutes = int(now_et.hour) * 60 + int(now_et.minute)
+        weekday = int(now_et.weekday())
+        is_weekday = weekday < 5
+        is_open = bool(clock.is_open)
+
+        if is_open:
+            label = "OPEN"
+            session = "regular"
+        elif is_weekday and (4 * 60) <= minutes < (9 * 60 + 30):
+            label = "PRE-MARKET"
+            session = "pre_market"
+        elif is_weekday and (16 * 60) <= minutes < (20 * 60):
+            label = "AFTER-HOURS"
+            session = "after_hours"
+        else:
+            label = "CLOSED"
+            session = "closed"
+
         return {
-            "isOpen": bool(clock.is_open),
+            "isOpen": is_open,
+            "isExtendedHours": session in {"pre_market", "after_hours"},
+            "session": session,
             "timestamp": str(clock.timestamp),
+            "serverTimeUtc": now_utc.isoformat(),
+            "marketTimeEt": now_et.isoformat(),
             "nextOpen": str(clock.next_open),
             "nextClose": str(clock.next_close),
-            "label": "OPEN" if clock.is_open else "CLOSED",
+            "label": label,
+            "preMarketLabel": "PRE-MARKET" if session == "pre_market" else "",
         }
     except Exception as e:
-        return {"isOpen": False, "label": "UNKNOWN", "error": str(e), "timestamp": "", "nextOpen": "", "nextClose": ""}
+        return {"isOpen": False, "isExtendedHours": False, "session": "unknown", "label": "UNKNOWN", "error": str(e), "timestamp": "", "nextOpen": "", "nextClose": ""}
 
 
 def get_quote(symbol: str):
@@ -1126,6 +1163,14 @@ def allowed_new_position_count():
 
 
 def calculate_new_position_notional():
+    # Keep the live sizing engine synced with the dashboard toggle even after
+    # Render restarts or when /status is called before /buy-size-mode.
+    try:
+        if "_compat_load_buy_mode" in globals():
+            globals()["FULL_BUY_WHEN_ONE_POSITION"] = _compat_load_buy_mode() == "full"
+    except Exception:
+        pass
+
     account = get_account()
     equity = float(account.equity)
     buying_power = float(account.buying_power)
@@ -3579,10 +3624,29 @@ def apply_position_settings(max_positions: int = None, save: bool = True) -> Dic
 
 def current_position_settings_payload() -> Dict[str, Any]:
     saved = _load_position_settings()
+    mode = "full"
+    preview = {}
+    try:
+        if "_compat_load_buy_mode" in globals():
+            mode = _compat_load_buy_mode()
+        else:
+            mode = "full" if FULL_BUY_WHEN_ONE_POSITION else "partial"
+    except Exception:
+        mode = "full" if FULL_BUY_WHEN_ONE_POSITION else "partial"
+
+    try:
+        if "_compat_buy_preview" in globals():
+            preview = _compat_buy_preview()
+    except Exception as e:
+        preview = {"ok": False, "error": str(e)}
+
     return {
         "ok": True,
         "maxPositions": int(MAX_POSITIONS),
         "savedMaxPositions": int(saved.get("maxPositions", MAX_POSITIONS)),
+        "buySizeMode": mode,
+        "fullBuyWhenOnePosition": mode == "full",
+        "buySizePreview": preview,
         "min": 1,
         "max": 10,
         "updatedAt": saved.get("updatedAt", ""),
@@ -3611,6 +3675,10 @@ except Exception as e:
 # =========================
 # ROUTES
 # =========================
+
+@app.get("/market-status")
+def api_market_status():
+    return {"ok": True, "market": get_market_status_payload()}
 
 @app.get("/debug-orders")
 def debug_orders():
@@ -4416,9 +4484,9 @@ def _score_dynamic_quote(q: Dict[str, Any], source: str) -> Optional[Dict[str, A
     if any(bad in exchange for bad in ["PNK", "OTC", "OTHER OTC"]):
         return None
 
-    price = float(q.get("regularMarketPrice") or q.get("postMarketPrice") or q.get("preMarketPrice") or 0.0)
-    volume = int(float(q.get("regularMarketVolume") or q.get("averageDailyVolume3Month") or 0))
-    change_pct = float(q.get("regularMarketChangePercent") or 0.0)
+    price = float(q.get("regularMarketPrice") or q.get("postMarketPrice") or q.get("preMarketPrice") or q.get("regularMarketPreviousClose") or 0.0)
+    volume = int(float(q.get("regularMarketVolume") or q.get("preMarketVolume") or q.get("postMarketVolume") or q.get("averageDailyVolume3Month") or 0))
+    change_pct = float(q.get("regularMarketChangePercent") or q.get("preMarketChangePercent") or q.get("postMarketChangePercent") or 0.0)
     market_cap = float(q.get("marketCap") or 0.0)
 
     if price < DYNAMIC_MARKET_MIN_PRICE or price > DYNAMIC_MARKET_MAX_PRICE:
@@ -5642,10 +5710,20 @@ def compat_post_buy_size_mode(payload: dict = Body(...), request: Request = None
     if mode not in ("full", "partial"):
         raise HTTPException(status_code=400, detail="mode must be full or partial")
     saved = _compat_save_buy_mode(mode)
+    preview = _compat_buy_preview()
+    try:
+        latest_status["positionSettings"] = current_position_settings_payload() if "current_position_settings_payload" in globals() else {}
+        latest_status["buySizePreview"] = preview
+        latest_status["newPositionNotional"] = calculate_new_position_notional()
+        latest_status["lastAction"] = f"Buy size mode saved as {saved}"
+        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
+    except Exception:
+        pass
     return {
         "ok": True,
         "message": f"Buy size mode saved as {saved}",
         "buySizeMode": saved,
         "fullBuyWhenOnePosition": saved == "full",
-        "preview": _compat_buy_preview(),
+        "preview": preview,
+        "positionSettings": current_position_settings_payload() if "current_position_settings_payload" in globals() else {"buySizeMode": saved, "buySizePreview": preview},
     }

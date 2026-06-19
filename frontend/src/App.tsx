@@ -250,10 +250,12 @@ const fetchData = useCallback(async (force = false) => {
     lastFetchAt.current = now;
     const seq = ++fetchSeq.current;
     try {
-      const [statusRes, reportRes, bankingRes] = await Promise.allSettled([
+      const [statusRes, reportRes, bankingRes, marketRes, buySizeRes] = await Promise.allSettled([
         fetch(`${API_URL}/status`, { cache: "no-store", headers: secureHeaders }).then(readJson),
         fetch(`${API_URL}/reports`, { cache: "no-store", headers: secureHeaders }).then(readJson),
         fetch(`${API_URL}/banking-status`, { cache: "no-store", headers: secureHeaders }).then(readJson),
+        fetch(`${API_URL}/market-status`, { cache: "no-store", headers: secureHeaders }).then(readJson),
+        fetch(`${API_URL}/buy-size-mode`, { cache: "no-store", headers: secureHeaders }).then(readJson),
       ]);
 
       if (seq !== fetchSeq.current) return;
@@ -276,6 +278,25 @@ const fetchData = useCallback(async (force = false) => {
 
       if (bankingRes.status === "fulfilled" && bankingRes.value) {
         setBanking(bankingRes.value || {});
+      }
+
+      if (marketRes.status === "fulfilled" && marketRes.value?.market) {
+        setData(prev => ({ ...prev, market: marketRes.value.market }));
+      }
+
+      if (buySizeRes.status === "fulfilled" && buySizeRes.value) {
+        const mode = buySizeRes.value.buySizeMode === "partial" ? "partial" : "full";
+        setBuySizeMode(mode);
+        setData(prev => ({
+          ...prev,
+          buySizePreview: buySizeRes.value.preview || prev.buySizePreview,
+          positionSettings: {
+            ...(prev.positionSettings || {}),
+            buySizeMode: mode,
+            fullBuyWhenOnePosition: mode === "full",
+            buySizePreview: buySizeRes.value.preview || prev.positionSettings?.buySizePreview,
+          },
+        }));
       }
 
       setStatus("Connected");
@@ -877,7 +898,7 @@ const fetchData = useCallback(async (force = false) => {
       <div><p className="eyebrow">Rebuilt Sniper Profit Bot</p><h1>TradeBot</h1></div>
       <div className="pills">
         <span className="pill ok">{status}</span>
-        <span className={`pill ${data?.market?.isOpen ? "ok" : "warn"}`}>Market {data?.market?.label || "UNKNOWN"}</span>
+        <span className={`pill ${data?.market?.isOpen ? "ok" : data?.market?.isExtendedHours ? "ok" : "warn"}`}>Market {data?.market?.label || "UNKNOWN"}</span>
         <span className={`pill ${data?.botEnabled ? "ok" : "bad"}`}>Bot {data?.botEnabled ? "ON" : "OFF"}</span>
         <span className="pill">{data?.paperMode ? "PAPER" : "LIVE"}</span>
         <button
@@ -909,6 +930,15 @@ const fetchData = useCallback(async (force = false) => {
 
     {tab==="overview" && <main className="grid two">
       {simpleView && <Card title="Simple View" wide><p className="muted">Showing only the essentials. Switch to Advanced View for scanner, universe, reports and logs, or Admin View for settings.</p></Card>}
+      <Card title="Market Session" wide>
+        <div className="summary">
+          <div><span>Status</span><b className={data?.market?.isOpen || data?.market?.isExtendedHours ? "gain" : ""}>{data?.market?.label || "UNKNOWN"}</b></div>
+          <div><span>Session</span><b>{String(data?.market?.session || "unknown").replace("_", " ")}</b></div>
+          <div><span>Next open</span><b>{data?.market?.nextOpen ? new Date(data.market.nextOpen).toLocaleString() : "—"}</b></div>
+          <div><span>Next close</span><b>{data?.market?.nextClose ? new Date(data.market.nextClose).toLocaleString() : "—"}</b></div>
+        </div>
+        <p className="muted">Pre-market and after-hours are shown separately. Auto buys still follow the backend trade rules.</p>
+      </Card>
       <Card title="Controls"><div className="actions">
         <button onClick={() => fetchData(true)}>Refresh Data</button>
         <button onClick={() => action("/manual-buy")}>Money Buy</button>
