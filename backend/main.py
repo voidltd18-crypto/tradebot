@@ -5820,3 +5820,149 @@ def compat_post_buy_size_mode(payload: dict = Body(...), request: Request = None
         "preview": preview,
         "positionSettings": current_position_settings_payload() if "current_position_settings_payload" in globals() else {"buySizeMode": saved, "buySizePreview": preview},
     }
+
+
+# ============================================================
+# HOTFIX: STOP FINAL UNIVERSE FALLING BACK TO OLD STOCK MEMORY
+# ============================================================
+# Problem fixed:
+# - The dashboard split showed Live Scanner / Stock Memory / Final Universe,
+#   but the backend could still rebuild Final Bot Universe from old weekly
+#   stock-memory rows such as INTC/RIVN/KO/LAC/SOFI.
+# - In quality/dynamic mode the bot should trade from:
+#   manual pins -> Musk Mode if enabled -> live dynamic scanner -> core quality fallback.
+# - Stock Memory must remain visible as a report only, not the source of truth.
+
+_ORIGINAL_AUTO_UNIVERSE_PAYLOAD_BEFORE_DYNAMIC_HOTFIX = globals().get("auto_universe_payload")
+_ORIGINAL_REFRESH_UNIVERSE_IF_NEEDED_BEFORE_DYNAMIC_HOTFIX = globals().get("refresh_universe_if_needed")
+
+
+def live_final_universe_payload() -> Dict[str, Any]:
+    """Final universe used by /status and the dashboard.
+
+    This deliberately ignores weekly_universe DB rows because those rows can be
+    stale stock-memory rankings. The final universe is rebuilt from the live
+    dynamic/quality path every time so old INTC/RIVN/KO/etc memory lists cannot
+    take control of trading again.
+    """
+    try:
+        rows = quality_only_rows() if "quality_only_rows" in globals() else []
+        symbols = [str(r.get("symbol", "")).upper().strip() for r in rows if r.get("symbol")]
+        symbols = list(dict.fromkeys([s for s in symbols if s]))
+
+        dynamic_rows = dynamic_market_rows() if "dynamic_market_rows" in globals() else []
+        dynamic_symbols = [str(r.get("symbol", "")).upper().strip() for r in dynamic_rows if r.get("symbol")]
+        memory_rows = stock_memory_from_closed_trades() if "stock_memory_from_closed_trades" in globals() else []
+        manual_picks = load_manual_universe_picks() if "load_manual_universe_picks" in globals() else []
+
+        return {
+            "enabled": True,
+            "mode": "musk-focus" if ("musk_mode_enabled" in globals() and musk_mode_enabled()) else ("dynamic-quality-hybrid" if DYNAMIC_MARKET_SCANNER_ENABLED else "quality-only"),
+            "source": "live_dynamic_quality_not_stock_memory",
+            "size": len(symbols),
+            "activeSymbols": symbols,
+            "rows": rows,
+            "lastRefresh": datetime.now(UTC).isoformat(),
+            "manualPickCount": len(manual_picks),
+            "dynamicPickCount": len([r for r in rows if r.get("dynamicPick")]),
+            "stockMemoryPickCount": len(memory_rows),
+            "blockedWeakTickers": sorted(list(BLOCKED_WEAK_TICKERS)) if "BLOCKED_WEAK_TICKERS" in globals() else [],
+            "dynamicScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
+            "muskMode": musk_mode_payload() if "musk_mode_payload" in globals() else {"enabled": False},
+            "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
+            "note": "Final Bot Universe is now live scanner/quality based. Stock Memory is display-only.",
+            "debug": {
+                "liveScannerSymbols": dynamic_symbols,
+                "manualPicks": manual_picks,
+            },
+        }
+    except Exception as e:
+        print(f"LIVE FINAL UNIVERSE PAYLOAD ERROR: {e}")
+        # Safe fallback only; never use old weekly memory rows here.
+        symbols = list(dict.fromkeys([s for s in globals().get("QUALITY_ONLY_UNIVERSE", SAFE_UNIVERSE) if s not in globals().get("BLOCKED_WEAK_TICKERS", set())]))
+        return {
+            "enabled": True,
+            "mode": "quality-only-fallback",
+            "source": "fallback_core_quality_not_stock_memory",
+            "size": len(symbols),
+            "activeSymbols": symbols,
+            "rows": [{"symbol": s, "score": max(0, 100 - i * 3), "reason": "core quality fallback", "status": "active"} for i, s in enumerate(symbols)],
+            "error": str(e),
+        }
+
+
+def auto_universe_payload():
+    return live_final_universe_payload()
+
+
+def weekly_universe_public():
+    return live_final_universe_payload()
+
+
+def refresh_universe_if_needed(force=False):
+    """Keep the actual trading universe synced to live dynamic/quality picks.
+
+    This replaces the older weekly stock-memory rotation while quality mode is on.
+    """
+    global current_universe, last_universe_refresh_ts
+
+    try:
+        now = time.time()
+        if not force and (now - float(last_universe_refresh_ts or 0)) < UNIVERSE_REFRESH_SECONDS:
+            return
+
+        try:
+            if "refresh_dynamic_market_candidates" in globals():
+                refresh_dynamic_market_candidates(force=bool(force))
+        except Exception as e:
+            print(f"DYNAMIC REFRESH INSIDE UNIVERSE HOTFIX ERROR: {e}")
+
+        if "apply_quality_only_universe" in globals():
+            symbols = apply_quality_only_universe()
+        else:
+            symbols = list(dict.fromkeys(SAFE_UNIVERSE + list(custom_symbols.keys())))
+
+        current_universe = list(dict.fromkeys([str(s).upper().strip() for s in symbols if str(s).strip()]))
+        for s in current_universe:
+            ensure_symbol_state(s, custom=s in custom_symbols)
+        last_universe_refresh_ts = now
+        print(f"LIVE FINAL UNIVERSE HOTFIX | {', '.join(current_universe)}")
+    except Exception as e:
+        print(f"LIVE FINAL UNIVERSE HOTFIX ERROR: {e}")
+        if callable(_ORIGINAL_REFRESH_UNIVERSE_IF_NEEDED_BEFORE_DYNAMIC_HOTFIX):
+            return _ORIGINAL_REFRESH_UNIVERSE_IF_NEEDED_BEFORE_DYNAMIC_HOTFIX(force=force)
+
+
+@app.get("/final-universe")
+def api_final_universe():
+    return {"ok": True, "autoUniverse": live_final_universe_payload(), **live_final_universe_payload()}
+
+
+@app.post("/clear-weekly-memory-universe")
+def api_clear_weekly_memory_universe(request: Request):
+    """Optional maintenance button/API to clear stale weekly memory universe rows."""
+    verify_api_key(request)
+    deleted = 0
+    try:
+        if SQLITE_ENABLED:
+            init_db()
+            conn = db_connect()
+            cur = conn.execute("UPDATE weekly_universe SET status='removed' WHERE status='active'")
+            deleted = int(cur.rowcount or 0)
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        return {"ok": False, "message": f"Could not clear stale weekly universe: {e}"}
+
+    try:
+        refresh_dynamic_market_candidates(force=True)
+        apply_quality_only_universe()
+        update_status(BOT_NAME, latest_scans)
+    except Exception as e:
+        print(f"CLEAR WEEKLY MEMORY UNIVERSE STATUS ERROR: {e}")
+
+    return {
+        "ok": True,
+        "message": f"Cleared {deleted} stale weekly stock-memory universe rows and rebuilt final universe from live scanner/quality picks.",
+        "autoUniverse": live_final_universe_payload(),
+    }
