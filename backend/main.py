@@ -17,7 +17,7 @@ from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
@@ -1262,91 +1262,24 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
     return False
 
 
-
-def is_trade_session_open_for_buy():
-    """Allow buys in regular, pre-market, and after-hours sessions."""
-    try:
-        market = get_market_status_payload()
-        return market.get("session") in {"regular", "pre_market", "after_hours"}, market
-    except Exception as e:
-        return False, {"session": "unknown", "label": "UNKNOWN", "error": str(e)}
-
-
-def round_limit_price(price: float):
-    """Alpaca limit prices need sensible decimal places."""
-    try:
-        price = float(price)
-        if price >= 1:
-            return round(price, 2)
-        return round(price, 4)
-    except Exception:
-        return price
-
-
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
-    """Submit a buy order.
-
-    Regular market: normal market notional order.
-    Pre-market / after-hours: Alpaca requires an extended-hours limit order,
-    so we convert the notional into a qty using the current ask price.
-    """
-    symbol = str(symbol).upper().strip()
-    notional_amount = round(float(notional_amount or 0.0), 2)
-
-    tradable_session, market = is_trade_session_open_for_buy()
-    session = market.get("session", "unknown")
-
-    if not tradable_session:
-        raise RuntimeError(f"Market closed: {session}")
-
-    estimated_amount = notional_amount
-
-    if session in {"pre_market", "after_hours"}:
-        quote = get_quote(symbol)
-        # Buy limit slightly above ask to improve the chance of filling,
-        # but still avoids an uncontrolled market order in extended hours.
-        limit_price = round_limit_price(float(quote["ask"]) * 1.005)
-        qty = floor_qty(notional_amount / max(limit_price, 0.0001), 6)
-
-        if qty <= 0 or (qty * limit_price) < MIN_ORDER_NOTIONAL:
-            raise RuntimeError(f"Extended-hours order too small for {symbol}")
-
-        order = LimitOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-            limit_price=limit_price,
-            extended_hours=True,
-        )
-        trading_client.submit_order(order)
-        estimated_amount = round(qty * limit_price, 2)
-        order_note = f"{reason} EXTENDED HOURS LIMIT BUY"
-    else:
-        order = MarketOrderRequest(
-            symbol=symbol,
-            notional=notional_amount,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-        )
-        trading_client.submit_order(order)
-        order_note = reason
-
+    order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+    trading_client.submit_order(order)
     event = {
         "day": today_str(),
         "time": now_time(),
         "side": "BUY",
         "symbol": symbol,
-        "amount": round(estimated_amount, 2),
-        "amountGbp": round(money_gbp(estimated_amount), 2),
-        "reason": order_note,
+        "amount": round(notional_amount, 2),
+        "amountGbp": round(money_gbp(notional_amount), 2),
+        "reason": reason,
         "pnl": 0.0,
         "pnlGbp": 0.0,
     }
     trade_events.append(event)
     persist_runtime_state()
     add_trade_history_event(event)
-    notify(f"🟢 {order_note}: ${round(estimated_amount, 2)} {symbol}")
+    notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
 
 
 def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 0.0, reason="AUTO SELL"):
@@ -3124,18 +3057,23 @@ def universe_rows_from_stock_memory():
         total_pnl = float(m.get("totalPnl") or 0.0)
         trust = str(m.get("trust") or "NEW")
 
-        # Balanced score: rewards enough history, high win-rate, positive average PnL,
-        # and good total PnL. Penalises weak performers.
+        # Profit-led score: prioritise stocks that actually grow the account.
+        # Old scoring over-rewarded tiny 100% win-rate samples. This version
+        # keeps win-rate/trade-count as useful signals, but makes realised PnL
+        # the main driver of the ranking.
         score = 0.0
-        score += min(trades, 20) * 0.6
-        score += win_rate * 12.0
-        score += avg_pnl * 3.0
-        score += max(-10.0, min(10.0, total_pnl)) * 0.5
+        score += min(trades, 20) * 0.50
+        score += win_rate * 5.0
+        score += avg_pnl * 1.0
+        score += max(-100.0, min(100.0, total_pnl)) * 2.0
+
+        if total_pnl <= 0:
+            score -= 5.0
 
         if trust.upper() == "GOOD":
-            score += 5.0
+            score += 1.0
         elif trust.upper() == "BAD":
-            score -= 8.0
+            score -= 10.0
 
         reason = (
             f"trust {trust} | trades={trades} | "
@@ -3844,30 +3782,11 @@ def manual_override_off(request: Request):
 def manual_buy(request: Request):
     verify_api_key(request)
     with bot_lock:
-        tradable_session, market = is_trade_session_open_for_buy()
-        session = market.get("session", "unknown")
-
-        if not tradable_session:
-            return {"ok": False, "message": f"Market closed: {session}"}
-
-        # In pre-market/after-hours the background loop may not have recent scans yet,
-        # so build a fresh lightweight scan set before trying Money Buy.
-        scans_for_buy = list(latest_scans)
-        if session in {"pre_market", "after_hours"} and not scans_for_buy:
-            fresh_scans = []
-            for symbol in current_universe:
-                try:
-                    fresh_scans.append(compute_scan(symbol))
-                except Exception as e:
-                    print(f"PREMARKET MANUAL SCAN ERROR {symbol}: {e}")
-            if fresh_scans:
-                latest_scans.clear()
-                latest_scans.extend(fresh_scans)
-                scans_for_buy = fresh_scans
-
-        result = money_mode_buy(scans_for_buy, manual=True)
+        if not trading_client.get_clock().is_open:
+            return {"ok": False, "message": "Market closed"}
+        result = money_mode_buy(latest_scans, manual=True)
         update_status(BOT_NAME, latest_scans)
-        return {"ok": True, "message": result, "session": session}
+        return {"ok": True, "message": result}
 
 
 @app.post("/custom-buy/{symbol}")
@@ -3973,12 +3892,10 @@ def run_bot_loop():
                 refresh_universe_if_needed()
                 clock = trading_client.get_clock()
 
-                market = get_market_status_payload()
-                session = market.get("session", "unknown")
-
-                if session not in {"regular", "pre_market", "after_hours"}:
+                if not clock.is_open:
                     print("Market closed. Waiting...")
                     update_status(BOT_NAME, latest_scans)
+                    time.sleep(CHECK_INTERVAL)
                     continue
 
                 scans = []
