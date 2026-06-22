@@ -17,7 +17,7 @@ from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
@@ -1262,24 +1262,91 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
     return False
 
 
+
+def is_trade_session_open_for_buy():
+    """Allow buys in regular, pre-market, and after-hours sessions."""
+    try:
+        market = get_market_status_payload()
+        return market.get("session") in {"regular", "pre_market", "after_hours"}, market
+    except Exception as e:
+        return False, {"session": "unknown", "label": "UNKNOWN", "error": str(e)}
+
+
+def round_limit_price(price: float):
+    """Alpaca limit prices need sensible decimal places."""
+    try:
+        price = float(price)
+        if price >= 1:
+            return round(price, 2)
+        return round(price, 4)
+    except Exception:
+        return price
+
+
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
-    order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
-    trading_client.submit_order(order)
+    """Submit a buy order.
+
+    Regular market: normal market notional order.
+    Pre-market / after-hours: Alpaca requires an extended-hours limit order,
+    so we convert the notional into a qty using the current ask price.
+    """
+    symbol = str(symbol).upper().strip()
+    notional_amount = round(float(notional_amount or 0.0), 2)
+
+    tradable_session, market = is_trade_session_open_for_buy()
+    session = market.get("session", "unknown")
+
+    if not tradable_session:
+        raise RuntimeError(f"Market closed: {session}")
+
+    estimated_amount = notional_amount
+
+    if session in {"pre_market", "after_hours"}:
+        quote = get_quote(symbol)
+        # Buy limit slightly above ask to improve the chance of filling,
+        # but still avoids an uncontrolled market order in extended hours.
+        limit_price = round_limit_price(float(quote["ask"]) * 1.005)
+        qty = floor_qty(notional_amount / max(limit_price, 0.0001), 6)
+
+        if qty <= 0 or (qty * limit_price) < MIN_ORDER_NOTIONAL:
+            raise RuntimeError(f"Extended-hours order too small for {symbol}")
+
+        order = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            limit_price=limit_price,
+            extended_hours=True,
+        )
+        trading_client.submit_order(order)
+        estimated_amount = round(qty * limit_price, 2)
+        order_note = f"{reason} EXTENDED HOURS LIMIT BUY"
+    else:
+        order = MarketOrderRequest(
+            symbol=symbol,
+            notional=notional_amount,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+        )
+        trading_client.submit_order(order)
+        order_note = reason
+
     event = {
         "day": today_str(),
         "time": now_time(),
         "side": "BUY",
         "symbol": symbol,
-        "amount": round(notional_amount, 2),
-        "amountGbp": round(money_gbp(notional_amount), 2),
-        "reason": reason,
+        "amount": round(estimated_amount, 2),
+        "amountGbp": round(money_gbp(estimated_amount), 2),
+        "reason": order_note,
         "pnl": 0.0,
         "pnlGbp": 0.0,
     }
     trade_events.append(event)
     persist_runtime_state()
     add_trade_history_event(event)
-    notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
+    notify(f"🟢 {order_note}: ${round(estimated_amount, 2)} {symbol}")
 
 
 def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 0.0, reason="AUTO SELL"):
@@ -2040,6 +2107,7 @@ def trades_from_db(limit: int = 1000):
                 "id": r["id"],
                 "alpacaOrderId": r["alpaca_order_id"],
                 "timestamp": r["timestamp"],
+                "date": r["day"],
                 "day": r["day"],
                 "time": r["time"],
                 "symbol": r["symbol"],
@@ -2214,11 +2282,15 @@ def closed_trades_from_db(limit: int = 1000):
     try:
         init_db()
         conn = db_connect()
+        # Pull the latest closed trades, not the oldest ones from the table.
         rows = conn.execute("""
-            SELECT * FROM closed_trades
-            ORDER BY timestamp ASC
-            LIMIT ?
-        """, (limit,)).fetchall()
+            SELECT * FROM (
+                SELECT * FROM closed_trades
+                ORDER BY timestamp DESC, id DESC
+                LIMIT ?
+            )
+            ORDER BY timestamp ASC, id ASC
+        """, (int(limit),)).fetchall()
         conn.close()
 
         return [
@@ -3772,11 +3844,30 @@ def manual_override_off(request: Request):
 def manual_buy(request: Request):
     verify_api_key(request)
     with bot_lock:
-        if not trading_client.get_clock().is_open:
-            return {"ok": False, "message": "Market closed"}
-        result = money_mode_buy(latest_scans, manual=True)
+        tradable_session, market = is_trade_session_open_for_buy()
+        session = market.get("session", "unknown")
+
+        if not tradable_session:
+            return {"ok": False, "message": f"Market closed: {session}"}
+
+        # In pre-market/after-hours the background loop may not have recent scans yet,
+        # so build a fresh lightweight scan set before trying Money Buy.
+        scans_for_buy = list(latest_scans)
+        if session in {"pre_market", "after_hours"} and not scans_for_buy:
+            fresh_scans = []
+            for symbol in current_universe:
+                try:
+                    fresh_scans.append(compute_scan(symbol))
+                except Exception as e:
+                    print(f"PREMARKET MANUAL SCAN ERROR {symbol}: {e}")
+            if fresh_scans:
+                latest_scans.clear()
+                latest_scans.extend(fresh_scans)
+                scans_for_buy = fresh_scans
+
+        result = money_mode_buy(scans_for_buy, manual=True)
         update_status(BOT_NAME, latest_scans)
-        return {"ok": True, "message": result}
+        return {"ok": True, "message": result, "session": session}
 
 
 @app.post("/custom-buy/{symbol}")
@@ -3882,10 +3973,12 @@ def run_bot_loop():
                 refresh_universe_if_needed()
                 clock = trading_client.get_clock()
 
-                if not clock.is_open:
+                market = get_market_status_payload()
+                session = market.get("session", "unknown")
+
+                if session not in {"regular", "pre_market", "after_hours"}:
                     print("Market closed. Waiting...")
                     update_status(BOT_NAME, latest_scans)
-                    time.sleep(CHECK_INTERVAL)
                     continue
 
                 scans = []
@@ -4017,8 +4110,19 @@ def reports():
         total_deposited = equity
         deposit_source = "equity-baseline"
     total_gain_loss = equity + total_withdrawn - total_deposited
-    closed = status.get("closedTrades") or []
-    timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
+    # Do not rely on latest_status here. latest_status can be stale after a redeploy,
+    # so reports should read the persistent SQLite tables directly every time.
+    closed = []
+    try:
+        closed = closed_trades_from_db(1000)
+        if not closed and SQLITE_ENABLED:
+            rebuild_closed_trades_from_orders()
+            closed = closed_trades_from_db(1000)
+    except Exception as e:
+        print(f"REPORTS CLOSED TRADES DB LOAD ERROR: {e}")
+        closed = status.get("closedTrades") or []
+
+    timeline = trades_from_db(1000) if SQLITE_ENABLED else (status.get("tradeTimeline") or status.get("equityCurve") or [])
     equity_history = []
     for i, e in enumerate(timeline if isinstance(timeline, list) else []):
         if not isinstance(e, dict):
@@ -4945,14 +5049,10 @@ def apply_quality_only_universe():
             "size": len(symbols),
             "activeSymbols": symbols,
             "rows": rows,
-            "finalRows": rows,
             "blockedWeakTickers": sorted(list(BLOCKED_WEAK_TICKERS)),
             "dynamicScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
-            "liveScannerRows": dynamic_market_rows() if "dynamic_market_rows" in globals() else [],
-            "memoryRows": stock_memory_universe_rows() if "stock_memory_universe_rows" in globals() else [],
             "lastRefresh": datetime.now(UTC).isoformat(),
-            "manualPickCount": len([r for r in rows if r.get("manualPick")]),
-            "dynamicPickCount": len([r for r in rows if r.get("dynamicPick")]),
+            "manualPickCount": len([s for s in symbols if s not in QUALITY_ONLY_UNIVERSE]),
         }
         latest_status["lastAction"] = "Quality-only universe applied"
         latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
@@ -5049,40 +5149,17 @@ def api_apply_quality_universe(request: Request):
 # FORCE QUALITY UNIVERSE STATUS/UI PATCH
 # =========================
 
-def stock_memory_universe_rows(limit: int = 40):
-    """Dashboard-only stock-memory rows.
-
-    These are historical closed-trade performance picks. They must be kept
-    separate from the live Yahoo market scanner so the UI can clearly show
-    where every symbol came from.
-    """
-    try:
-        rows = universe_rows_from_stock_memory()
-    except Exception as e:
-        print(f"STOCK MEMORY UNIVERSE ROWS ERROR: {e}")
-        rows = []
-
-    cleaned = []
-    for r in rows[:limit]:
-        row = dict(r)
-        row["memoryPick"] = True
-        row.setdefault("source", "stock-memory")
-        row.setdefault("status", "watch")
-        cleaned.append(row)
-    return cleaned
-
-
 def force_quality_auto_universe_payload():
     try:
         if "quality_only_rows" in globals():
-            final_rows = quality_only_rows()
+            rows = quality_only_rows()
         elif "quality_universe_rows" in globals():
-            final_rows = quality_universe_rows()
+            rows = quality_universe_rows()
         else:
-            final_rows = []
-        symbols = [str(r.get("symbol", "")).upper() for r in final_rows if r.get("symbol")]
+            rows = []
+        symbols = [r["symbol"] for r in rows]
     except Exception:
-        final_rows = []
+        rows = []
         symbols = []
 
     if not symbols:
@@ -5091,24 +5168,15 @@ def force_quality_auto_universe_payload():
             "AMZN", "GOOGL", "GOOG", "AVGO", "NFLX",
             "TSLA", "PLTR", "UBER", "QQQ", "SMH",
         ]
-        final_rows = [
+        rows = [
             {
                 "symbol": s,
                 "score": round(100 - (i * 3), 2),
                 "reason": "quality-only universe | forced UI sync",
                 "status": "active",
-                "source": "fallback-core-quality",
             }
             for i, s in enumerate(symbols)
         ]
-
-    scanner = dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {}
-    scanner_rows = list(scanner.get("rows") or [])
-    memory_rows = stock_memory_universe_rows() if "stock_memory_universe_rows" in globals() else []
-
-    manual_count = len([r for r in final_rows if r.get("manualPick")])
-    dynamic_count = len([r for r in final_rows if r.get("dynamicPick")])
-    memory_count = len(memory_rows)
 
     return {
         "enabled": True,
@@ -5117,28 +5185,14 @@ def force_quality_auto_universe_payload():
         "size": len(symbols),
         "weekStart": datetime.now(UTC).date().isoformat(),
         "monthStart": datetime.now(UTC).replace(day=1).date().isoformat(),
-
-        # Final tradable universe: this is what the bot is allowed to buy/manage.
         "activeSymbols": symbols,
-        "rows": final_rows,
-        "finalRows": final_rows,
-
-        # Separate source panels for the dashboard.
-        "liveScannerRows": scanner_rows,
-        "memoryRows": memory_rows,
-        "dynamicScanner": scanner,
-
+        "rows": rows,
         "lastRefresh": datetime.now(UTC).isoformat(),
         "candidatePoolSize": len(symbols),
-        "dynamicPickCount": dynamic_count,
-        "manualPickCount": manual_count,
-        "memoryPickCount": memory_count,
+        "dynamicPickCount": len([r for r in rows if r.get("dynamicPick")]),
+        "manualPickCount": len([r for r in rows if r.get("manualPick")]),
+        "dynamicScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
         "keepWinners": True,
-        "sourceExplanation": {
-            "liveScannerRows": "Current Yahoo market movers / most active / small-cap scanner output.",
-            "memoryRows": "Historical closed-trade stock performance memory. Not automatically the live scanner.",
-            "finalRows": "The final merged universe the bot can trade after filters, manual pins and core quality fallback.",
-        },
     }
 
 @app.get("/weekly-universe")
