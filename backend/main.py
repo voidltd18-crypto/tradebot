@@ -3715,11 +3715,8 @@ def reports():
         total_deposited = equity
         deposit_source = "equity-baseline"
     total_gain_loss = equity + total_withdrawn - total_deposited
-    # Read reports directly from SQLite so the Reports page updates immediately
-    # after Backfill Past Trades / Rebuild Closed Trades, even before the next bot loop.
-    closed = closed_trades_from_db(10000) if SQLITE_ENABLED else (status.get("closedTrades") or [])
-    raw_trades = trades_from_db(1000) if SQLITE_ENABLED else (status.get("trades") or [])
-    timeline = raw_trades or status.get("tradeTimeline") or status.get("equityCurve") or []
+    closed = status.get("closedTrades") or []
+    timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
     equity_history = []
     for i, e in enumerate(timeline if isinstance(timeline, list) else []):
         if not isinstance(e, dict):
@@ -3748,8 +3745,7 @@ def reports():
         "lostSinceDeposit": abs(min(total_gain_loss, 0.0)),
         "dayPnl": _safe_num(account.get("pnlDay")),
         "realisedNet": _safe_num(db.get("totalPnl")),
-        "closedTrades": closed[-500:] if isinstance(closed, list) else [],
-        "rawTrades": raw_trades[-500:] if isinstance(raw_trades, list) else [],
+        "closedTrades": closed[-200:] if isinstance(closed, list) else [],
         "equityHistory": equity_history[-500:],
         "winRate": _safe_num(db.get("winRate")) * 100.0,
         "totalTrades": int(_safe_num(db.get("totalTrades"))),
