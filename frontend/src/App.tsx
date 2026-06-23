@@ -2,56 +2,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Area, AreaChart, Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
-
-function topFocusPercent(value: any) {
-  return `${((Number(value) || 0) * 100).toFixed(2)}%`;
-}
-
-function getTopFocusCandidate(data: any) {
-  const top = data?.topFocus?.top;
-  if (top?.symbol) return top;
-
-  const rows = Array.isArray(data?.autoUniverse?.rows) ? data.autoUniverse.rows : [];
-  if (rows.length) {
-    const sorted = [...rows].sort((a: any, b: any) => (Number(b?.score) || 0) - (Number(a?.score) || 0));
-    return sorted[0] || null;
-  }
-
-  return null;
-}
-
-function TopFocusCard({ data }: { data: any }) {
-  const top = getTopFocusCandidate(data);
-  const queue = Array.isArray(data?.topFocus?.queue) ? data.topFocus.queue : [];
-  const fallbackRows = Array.isArray(data?.autoUniverse?.rows)
-    ? [...data.autoUniverse.rows].sort((a: any, b: any) => (Number(b?.score) || 0) - (Number(a?.score) || 0))
-    : [];
-  const nextRows = queue.length ? queue.slice(1, 5) : fallbackRows.slice(1, 5);
-
-  return (
-    <section className="panel" style={{ marginBottom: 18, borderColor: "rgba(250, 204, 21, 0.55)", background: "linear-gradient(135deg, rgba(250, 204, 21, 0.12), rgba(15, 23, 42, 0.92))" }}>
-      <h2 style={{ margin: 0 }}>🏆 Top Focus Stock</h2>
-      {top?.symbol ? (
-        <>
-          <div style={{ fontSize: 36, fontWeight: 900, marginTop: 8 }}>{top.symbol}</div>
-          <div className="muted" style={{ marginTop: 6 }}>
-            {top.confidence !== undefined ? <>Confidence <b>{topFocusPercent(top.confidence)}</b></> : <>Score <b>{Number(top.score || 0).toFixed(2)}</b></>}
-            {top.qualityScore !== undefined ? <> · Quality <b>{Number(top.qualityScore || 0).toFixed(4)}</b></> : null}
-            {top.price ? <> · Price <b>${Number(top.price || 0).toFixed(2)}</b></> : null}
-          </div>
-          {nextRows.length > 0 && (
-            <div style={{ marginTop: 10, color: "#facc15", fontWeight: 800 }}>
-              Next: {nextRows.map((r: any) => r.symbol).filter(Boolean).join(" → ")}
-            </div>
-          )}
-        </>
-      ) : (
-        <div className="muted" style={{ marginTop: 8 }}>No focus candidate ready yet.</div>
-      )}
-    </section>
-  );
-}
-
 const API_URL = import.meta.env.VITE_API_BASE || "https://tradebot-0myo.onrender.com";
 const BOT_VERSION = "v1.1-strict-profit-mode";
 type AnyObj = Record<string, any>;
@@ -112,8 +62,6 @@ const [banking, setBanking] = useState<AnyObj>({});
   const [strategySaving, setStrategySaving] = useState(false);
   const [maxPositionsInput, setMaxPositionsInput] = useState<number>(6);
   const [buySizeMode, setBuySizeMode] = useState<"full"|"partial">("full");
-  const [muskModeSaving, setMuskModeSaving] = useState(false);
-  const [spacexHoldSaving, setSpacexHoldSaving] = useState(false);
   const [positionsSaving, setPositionsSaving] = useState(false);
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
@@ -141,10 +89,6 @@ const [banking, setBanking] = useState<AnyObj>({});
   const dynamicScanner = data?.dynamicMarketScanner || data?.autoUniverse?.dynamicScanner || {};
   const dynamicRows = Array.isArray(dynamicScanner?.rows) ? dynamicScanner.rows : [];
   const dynamicPickCount = Number(data?.autoUniverse?.dynamicPickCount || dynamicRows.length || 0);
-  const muskMode = data?.muskMode || data?.autoUniverse?.muskMode || {};
-  const muskModeOn = Boolean(muskMode?.enabled);
-  const spaceXHold = data?.spaceXHold || data?.autoUniverse?.spaceXHold || muskMode?.spaceXHold || {};
-  const spaceXHoldOn = Boolean(spaceXHold?.enabled);
   const strategySettings = data?.strategySettings || {};
   const positionSettings = data?.positionSettings || {};
   const strictnessLabels = ["Safe", "Balanced", "Aggressive"];
@@ -250,12 +194,10 @@ const fetchData = useCallback(async (force = false) => {
     lastFetchAt.current = now;
     const seq = ++fetchSeq.current;
     try {
-      const [statusRes, reportRes, bankingRes, marketRes, buySizeRes] = await Promise.allSettled([
+      const [statusRes, reportRes, bankingRes] = await Promise.allSettled([
         fetch(`${API_URL}/status`, { cache: "no-store", headers: secureHeaders }).then(readJson),
         fetch(`${API_URL}/reports`, { cache: "no-store", headers: secureHeaders }).then(readJson),
         fetch(`${API_URL}/banking-status`, { cache: "no-store", headers: secureHeaders }).then(readJson),
-        fetch(`${API_URL}/market-status`, { cache: "no-store", headers: secureHeaders }).then(readJson),
-        fetch(`${API_URL}/buy-size-mode`, { cache: "no-store", headers: secureHeaders }).then(readJson),
       ]);
 
       if (seq !== fetchSeq.current) return;
@@ -278,25 +220,6 @@ const fetchData = useCallback(async (force = false) => {
 
       if (bankingRes.status === "fulfilled" && bankingRes.value) {
         setBanking(bankingRes.value || {});
-      }
-
-      if (marketRes.status === "fulfilled" && marketRes.value?.market) {
-        setData(prev => ({ ...prev, market: marketRes.value.market }));
-      }
-
-      if (buySizeRes.status === "fulfilled" && buySizeRes.value) {
-        const mode = buySizeRes.value.buySizeMode === "partial" ? "partial" : "full";
-        setBuySizeMode(mode);
-        setData(prev => ({
-          ...prev,
-          buySizePreview: buySizeRes.value.preview || prev.buySizePreview,
-          positionSettings: {
-            ...(prev.positionSettings || {}),
-            buySizeMode: mode,
-            fullBuyWhenOnePosition: mode === "full",
-            buySizePreview: buySizeRes.value.preview || prev.positionSettings?.buySizePreview,
-          },
-        }));
       }
 
       setStatus("Connected");
@@ -393,11 +316,10 @@ const fetchData = useCallback(async (force = false) => {
     if (optimistic) setData(optimistic);
 
     const isWeeklyRefresh = endpoint === "/refresh-universe";
-    setMessage(isWeeklyRefresh ? "Dynamic market refresh sent. Updating universe..." : isTradeMaintenance ? `${endpoint} started. This can take 1-3 minutes on Render...` : `Sent ${endpoint}. Updating dashboard...`);
+    setMessage(isWeeklyRefresh ? "Dynamic market refresh sent. Updating universe..." : `Sent ${endpoint}. Updating dashboard...`);
 
     const controller = new AbortController();
-    const isTradeMaintenance = endpoint === "/backfill-trades" || endpoint === "/rebuild-closed-trades";
-    const timeout = setTimeout(() => controller.abort(), isWeeklyRefresh ? 12000 : isTradeMaintenance ? 180000 : 30000);
+    const timeout = setTimeout(() => controller.abort(), isWeeklyRefresh ? 12000 : 30000);
 
     try {
       const res = await fetch(`${API_URL}${endpoint}`, {
@@ -583,71 +505,6 @@ const fetchData = useCallback(async (force = false) => {
       setMessage(e?.message || "Could not save buy size mode.");
     }
   }
-  async function saveMuskMode(enabled:boolean) {
-    if (!token) {
-      setMessage("Please login first.");
-      return;
-    }
-    setMuskModeSaving(true);
-    setMessage(enabled ? "Switching Musk Mode ON..." : "Switching Musk Mode OFF...");
-    try {
-      const res = await fetch(`${API_URL}/musk-mode`, {
-        method: "POST",
-        headers: { ...secureHeaders, "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({ enabled }),
-      });
-      const json = await readJson(res);
-      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save Musk Mode");
-      setData(prev => ({
-        ...prev,
-        muskMode: json,
-        autoUniverse: json?.autoUniverse?.activeSymbols || json?.autoUniverse?.rows ? json.autoUniverse : prev.autoUniverse,
-        universe: json?.activeSymbols || json?.autoUniverse?.activeSymbols || prev.universe,
-        lastAction: json?.message || (enabled ? "Musk Mode ON" : "Musk Mode OFF"),
-        lastActionAt: new Date().toISOString(),
-      }));
-      setMessage(json?.message || (enabled ? "Musk Mode ON." : "Musk Mode OFF."));
-      await fetchData(true);
-    } catch (e:any) {
-      setMessage(e?.message || "Could not save Musk Mode.");
-    } finally {
-      setMuskModeSaving(false);
-    }
-  }
-
-  async function saveSpaceXHold(enabled:boolean) {
-    if (!token) {
-      setMessage("Please login first.");
-      return;
-    }
-    setSpacexHoldSaving(true);
-    setMessage(enabled ? "Switching Musk hold ON..." : "Switching Musk hold OFF...");
-    try {
-      const res = await fetch(`${API_URL}/spacex-hold`, {
-        method: "POST",
-        headers: { ...secureHeaders, "Content-Type": "application/json" },
-        cache: "no-store",
-        body: JSON.stringify({ enabled }),
-      });
-      const json = await readJson(res);
-      if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not save Musk hold");
-      setData(prev => ({
-        ...prev,
-        spaceXHold: json,
-        lastAction: json?.message || (enabled ? "Musk hold ON" : "Musk hold OFF"),
-        lastActionAt: new Date().toISOString(),
-      }));
-      setMessage(json?.message || (enabled ? "Musk hold ON." : "Musk hold OFF."));
-      await fetchData(true);
-    } catch (e:any) {
-      setMessage(e?.message || "Could not save Musk hold.");
-    } finally {
-      setSpacexHoldSaving(false);
-    }
-  }
-
-
   async function refreshDynamicScanner() {
     if (!token) {
       setMessage("Please login first.");
@@ -899,7 +756,7 @@ const fetchData = useCallback(async (force = false) => {
       <div><p className="eyebrow">Rebuilt Sniper Profit Bot</p><h1>TradeBot</h1></div>
       <div className="pills">
         <span className="pill ok">{status}</span>
-        <span className={`pill ${data?.market?.isOpen ? "ok" : data?.market?.isExtendedHours ? "ok" : "warn"}`}>Market {data?.market?.label || "UNKNOWN"}</span>
+        <span className={`pill ${data?.market?.isOpen ? "ok" : "warn"}`}>Market {data?.market?.label || "UNKNOWN"}</span>
         <span className={`pill ${data?.botEnabled ? "ok" : "bad"}`}>Bot {data?.botEnabled ? "ON" : "OFF"}</span>
         <span className="pill">{data?.paperMode ? "PAPER" : "LIVE"}</span>
         <button
@@ -911,8 +768,6 @@ const fetchData = useCallback(async (force = false) => {
         </button>
       </div>
     </header>
-
-    <TopFocusCard data={data} />
 
     <section className="stats">
       <Stat label="Equity" value={gbp(Number(data?.account?.equity || 0) * rate)} sub={usd(data?.account?.equity)} />
@@ -931,15 +786,6 @@ const fetchData = useCallback(async (force = false) => {
 
     {tab==="overview" && <main className="grid two">
       {simpleView && <Card title="Simple View" wide><p className="muted">Showing only the essentials. Switch to Advanced View for scanner, universe, reports and logs, or Admin View for settings.</p></Card>}
-      <Card title="Market Session" wide>
-        <div className="summary">
-          <div><span>Status</span><b className={data?.market?.isOpen || data?.market?.isExtendedHours ? "gain" : ""}>{data?.market?.label || "UNKNOWN"}</b></div>
-          <div><span>Session</span><b>{String(data?.market?.session || "unknown").replace("_", " ")}</b></div>
-          <div><span>Next open</span><b>{data?.market?.nextOpen ? new Date(data.market.nextOpen).toLocaleString() : "—"}</b></div>
-          <div><span>Next close</span><b>{data?.market?.nextClose ? new Date(data.market.nextClose).toLocaleString() : "—"}</b></div>
-        </div>
-        <p className="muted">Pre-market and after-hours are shown separately. Auto buys still follow the backend trade rules.</p>
-      </Card>
       <Card title="Controls"><div className="actions">
         <button onClick={() => fetchData(true)}>Refresh Data</button>
         <button onClick={() => action("/manual-buy")}>Money Buy</button>
@@ -953,32 +799,10 @@ const fetchData = useCallback(async (force = false) => {
         <div><span>Next buy</span><b>{usd(data?.newPositionNotional)}</b></div>
         <div><span>Win rate</span><b>{pct((data?.dbSummary?.winRate || 0) * 100)}</b></div>
         <div><span>Dynamic universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}/{data?.autoUniverse?.size || 0}</b></div>
-        <div><span>Musk Mode</span><b className={muskModeOn ? "gain" : ""}>{muskModeOn ? "ON" : "OFF"}</b></div>
-        <div><span>Musk Hold</span><b className={spaceXHoldOn ? "gain" : ""}>{spaceXHoldOn ? "ON" : "OFF"}</b></div>
         <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
       </div></Card>
 
       {!simpleView && <> 
-
-      <Card title="Musk Mode">
-        <div className="summary">
-          <div><span>Status</span><b className={muskModeOn ? "gain" : ""}>{muskModeOn ? "ON" : "OFF"}</b></div>
-          <div><span>Focus list</span><b>{(muskMode?.activeSymbols || []).join(", ") || "TSLA focus"}</b></div>
-        </div>
-        <div className="actions">
-          <button className={muskModeOn ? "active" : "ghost"} onClick={()=>saveMuskMode(true)} disabled={muskModeSaving}>Musk Mode ON</button>
-          <button className={!muskModeOn ? "active" : "ghost"} onClick={()=>saveMuskMode(false)} disabled={muskModeSaving}>Musk Mode OFF</button>
-        </div>
-        <div className="summary">
-          <div><span>Musk Hold</span><b className={spaceXHoldOn ? "gain" : ""}>{spaceXHoldOn ? "ON" : "OFF"}</b></div>
-          <div><span>Held symbols</span><b>{(spaceXHold?.symbols || muskMode?.activeSymbols || ["SPCX"]).join(", ")}</b></div>
-        </div>
-        <div className="actions">
-          <button className={spaceXHoldOn ? "active" : "ghost"} onClick={()=>saveSpaceXHold(true)} disabled={spacexHoldSaving}>Hold Musk Stocks ON</button>
-          <button className={!spaceXHoldOn ? "active" : "ghost"} onClick={()=>saveSpaceXHold(false)} disabled={spacexHoldSaving}>Hold Musk Stocks OFF</button>
-        </div>
-        <p className="muted">Musk Mode focuses the universe on TSLA/SPCX and related liquid tech names. Musk Hold blocks automatic partial profit, trailing profit, stall, stop/rotation sells for every Musk Mode symbol until you turn hold off or use manual/emergency sell.</p>
-      </Card>
 
       <Card title="Dynamic Market Scanner" wide>
         <div className="summary">
@@ -1074,37 +898,21 @@ const fetchData = useCallback(async (force = false) => {
         <p className="muted">Full Buy uses most available capped capital for one position. Partial Buy splits capital across several smaller positions.</p>
       </Card>
 
-      <Card title="Universe Sources" wide>
-        <p className="muted">This is now split properly: live scanner picks are current market movers, stock memory is historical performance, and final bot universe is what the bot can actually trade.</p>
+      <Card title="Dynamic Auto Universe" wide>
+        <p className="muted">The bot discovers strong market movers, filters out weak/junk tickers, and keeps manual picks pinned.</p>
         <div className="universe-counts">
-          <div><span>Final universe</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}</b></div>
-          <div><span>Mode</span><b>{data?.autoUniverse?.mode || (muskModeOn ? "musk-focus" : "quality")}</b></div>
-          <div><span>Live scanner picks</span><b>{(data?.autoUniverse?.liveScannerRows || data?.dynamicMarketScanner?.rows || []).length}</b></div>
-          <div><span>Stock memory picks</span><b>{(data?.autoUniverse?.memoryRows || []).length}</b></div>
+          <div><span>Total in universe</span><b>{data?.autoUniverse?.rows?.length || 0}</b></div>
+          <div><span>Active symbols</span><b>{data?.autoUniverse?.activeSymbols?.length || 0}</b></div>
           <div><span>Manual picks</span><b>{data?.autoUniverse?.manualPickCount || data?.manualUniversePicks?.length || 0}</b></div>
+          <div><span>Dynamic picks</span><b>{data?.autoUniverse?.dynamicPickCount || dynamicPickCount}</b></div>
         </div>
-
-        <h3>Live Scanner Picks</h3>
-        <p className="muted">Pulled from Yahoo market movers / most active / small-cap screens, then filtered by price, volume and spread.</p>
-        <div className="scan-grid">{(data?.autoUniverse?.liveScannerRows || data?.dynamicMarketScanner?.rows || []).slice(0,20).map((r:AnyObj) => <article className="scan" key={`live-${r.symbol}`}><div><b>{r.symbol}</b><strong>Live ⚡ {Number(r.score || 0).toFixed(2)}</strong></div><p>{r.reason || "live market scanner candidate"}</p></article>)}{!(data?.autoUniverse?.liveScannerRows || data?.dynamicMarketScanner?.rows || []).length && <p className="muted">No live scanner rows yet. Press Dynamic Market Refresh.</p>}</div>
-
-        <h3>Stock Memory Picks</h3>
-        <p className="muted">Pulled from closed-trade history. These are not the live scanner; they show where the bot has historically performed well or badly.</p>
-        <div className="scan-grid">{(data?.autoUniverse?.memoryRows || []).slice(0,20).map((r:AnyObj) => <article className="scan" key={`memory-${r.symbol}`}><div><b>{r.symbol}</b><strong>Memory 🧠 {Number(r.score || 0).toFixed(2)}</strong></div><p>{r.reason || "stock memory performance"}</p></article>)}{!(data?.autoUniverse?.memoryRows || []).length && <p className="muted">No stock memory rows yet.</p>}</div>
-
-        <h3>Final Bot Universe</h3>
-        <p className="muted">This is the final merged list the backend is actually allowed to trade after manual pins, live scanner, Musk Mode and quality fallback rules.</p>
-        <div className="scan-grid">{(data?.autoUniverse?.finalRows || data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={`final-${r.symbol}`}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : r.dynamicPick ? "Live ⚡" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "final tradable universe"}</p></article>)}</div>
+        <div className="scan-grid">{(data?.autoUniverse?.rows || []).slice(0,40).map((r:AnyObj) => <article className="scan" key={r.symbol}><div><b>{r.symbol}</b><strong>{r.manualPick ? "Manual ⭐" : r.dynamicPick ? "Dynamic ⚡" : `Score ${Number(r.score || 0).toFixed(2)}`}</strong></div><p>{r.reason || "dynamic candidate"}</p></article>)}</div>
       </Card>
       </>}
     </main>}
 
     {tab==="reports" && <main className="reports-page">
-      <div className="actions report-actions">
-          <button onClick={() => fetchData(true)}>Refresh Reports</button>
-          <button onClick={() => action("/backfill-trades")}>Backfill Trades</button>
-          <button onClick={() => action("/rebuild-closed-trades")}>Rebuild Closed Trades</button>
-          <button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
+      <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
           <input
             className="input"
             placeholder="Baseline £ e.g. 989.86"
