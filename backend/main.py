@@ -1968,9 +1968,11 @@ def closed_trades_from_db(limit: int = 1000):
     try:
         init_db()
         conn = db_connect()
+        # Newest first. The old 08/06 build used ASC + LIMIT, which could show
+        # only the oldest saved trades and hide May/June trades once the DB grew.
         rows = conn.execute("""
             SELECT * FROM closed_trades
-            ORDER BY timestamp ASC
+            ORDER BY timestamp DESC
             LIMIT ?
         """, (limit,)).fetchall()
         conn.close()
@@ -3534,8 +3536,10 @@ def emergency_sell(request: Request):
 @app.post("/rebuild-closed-trades")
 def rebuild_closed_trades(request: Request):
     verify_api_key(request)
+    print("REBUILD CLOSED TRADES BUTTON HIT")
     with bot_lock:
         result = rebuild_closed_trades_from_orders()
+        print(f"REBUILD CLOSED TRADES RESULT: {result}")
         update_status(BOT_NAME, latest_scans)
         return result
 
@@ -3715,8 +3719,17 @@ def reports():
         total_deposited = equity
         deposit_source = "equity-baseline"
     total_gain_loss = equity + total_withdrawn - total_deposited
-    closed = status.get("closedTrades") or []
-    timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
+    # Read reports directly from SQLite so the page updates immediately after
+    # backfill/rebuild instead of relying on possibly stale latest_status.
+    try:
+        closed = closed_trades_from_db(500)
+    except Exception as e:
+        print(f"REPORTS CLOSED TRADE DB READ ERROR: {e}")
+        closed = status.get("closedTrades") or []
+    try:
+        timeline = trades_from_db(1000)
+    except Exception:
+        timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
     equity_history = []
     for i, e in enumerate(timeline if isinstance(timeline, list) else []):
         if not isinstance(e, dict):
@@ -3745,7 +3758,8 @@ def reports():
         "lostSinceDeposit": abs(min(total_gain_loss, 0.0)),
         "dayPnl": _safe_num(account.get("pnlDay")),
         "realisedNet": _safe_num(db.get("totalPnl")),
-        "closedTrades": closed[-200:] if isinstance(closed, list) else [],
+        # Already newest-first from DB. Return the latest 200 directly.
+        "closedTrades": closed[:200] if isinstance(closed, list) else [],
         "equityHistory": equity_history[-500:],
         "winRate": _safe_num(db.get("winRate")) * 100.0,
         "totalTrades": int(_safe_num(db.get("totalTrades"))),
