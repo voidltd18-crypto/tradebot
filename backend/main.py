@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import copy
 import secrets
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "200") or 200)
 
@@ -106,7 +105,7 @@ STOP_LOSS = 0.982
 TRAIL_START = 1.012
 TRAIL_GIVEBACK = 0.993
 
-MAX_DAILY_LOSS = 1000000
+MAX_DAILY_LOSS = -8.00
 MAX_TRADES_PER_DAY = 12
 DUST_THRESHOLD = 0.1
 
@@ -218,7 +217,7 @@ MEMORY_GOOD_MULTIPLIER = 1.15
 
 # SQLite persistent trade memory
 SQLITE_ENABLED = True
-SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "/var/data/trades.db" if os.path.isdir("/var/data") else "trades.db")
+SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "trades.db")
 BACKFILL_ORDER_LIMIT = 500
 BACKFILL_CHUNK_SIZE = 500
 BACKFILL_MAX_PAGES = 50
@@ -401,34 +400,10 @@ def safe_save_json(path: str, data):
 
 
 def load_persistent_state():
-    global trade_history, stock_memory, temp_blacklist, trade_events, locked_today, partial_profit_taken, custom_symbols
-
-    # JSON fallback keeps older installs working, but SQLite bot_state/trades DB is
-    # the source of truth on Render because the app folder can be wiped on deploy.
+    global trade_history, stock_memory, temp_blacklist
     trade_history = safe_load_json(TRADE_HISTORY_FILE, [])
     stock_memory = safe_load_json(STOCK_MEMORY_FILE, {})
     temp_blacklist = safe_load_json(TEMP_BLACKLIST_FILE, {})
-
-    try:
-        locked_today = load_bot_state_value("locked_today", locked_today)
-        partial_profit_taken = load_bot_state_value("partial_profit_taken", partial_profit_taken)
-        temp_blacklist = load_bot_state_value("temp_blacklist", temp_blacklist)
-        custom_symbols = load_bot_state_value("custom_symbols", custom_symbols)
-
-        saved_recent = load_bot_state_value("trade_events", [])
-        db_recent = rebuild_recent_trade_events_from_db(50)
-        trade_events = db_recent if db_recent else (saved_recent if isinstance(saved_recent, list) else [])
-
-        for sym in list(custom_symbols.keys()):
-            add_symbol_to_universe(sym, custom=True)
-
-        print(
-            f"PERSISTENCE RESTORED | recent_trades={len(trade_events)} | "
-            f"locked_today={len(locked_today)} | partials={len(partial_profit_taken)} | "
-            f"custom={len(custom_symbols)} | db={SQLITE_DB_FILE}"
-        )
-    except Exception as e:
-        print(f"PERSISTENCE RESTORE ERROR: {e}")
 
 
 def save_trade_history():
@@ -459,7 +434,6 @@ def cleanup_temp_blacklist():
 
     if changed:
         save_temp_blacklist()
-        persist_runtime_state()
 
 
 def is_temp_blacklisted(symbol: str):
@@ -565,10 +539,6 @@ def add_symbol_to_universe(symbol: str, custom=False):
     ensure_symbol_state(symbol, custom=custom)
     if custom:
         custom_symbols[symbol] = True
-        try:
-            persist_runtime_state()
-        except Exception:
-            pass
 
 
 def reset_daily_flags_if_needed():
@@ -588,12 +558,10 @@ def reset_daily_flags_if_needed():
             account = get_account()
             starting_equity_today = float(account.equity)
             starting_equity_day = today
-            # Keep recent trade activity restored from SQLite across daily resets.
-            # Daily counters already filter by day, so clearing this here hides history.
+            trade_events.clear()
             alpaca_rejection_events.clear()
             pdt_warning_events.clear()
             equity_curve.clear()
-            persist_runtime_state()
         except Exception:
             pass
 
@@ -601,7 +569,6 @@ def reset_daily_flags_if_needed():
 def lock_symbol_until_tomorrow(symbol: str):
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY:
         locked_today[symbol] = today_str()
-        persist_runtime_state()
 
 
 def is_locked_today(symbol: str):
@@ -722,12 +689,6 @@ def get_market_status_payload():
         return {"isOpen": False, "label": "UNKNOWN", "error": str(e), "timestamp": "", "nextOpen": "", "nextClose": ""}
 
 
-
-@app.get("/market-status")
-def api_market_status():
-    return get_market_status_payload()
-
-
 def get_quote(symbol: str):
     req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
     quote = data_client.get_stock_latest_quote(req)[symbol]
@@ -751,7 +712,7 @@ def get_position(symbol: str):
 def get_open_orders(symbol=None):
     try:
         request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-        orders = fetch_all_orders_paginated()
+        orders = trading_client.get_orders(filter=request)
         if symbol is None:
             return orders
         return [order for order in orders if str(order.symbol).upper() == symbol.upper()]
@@ -1118,12 +1079,10 @@ def risk_blocked():
             return True, opt_reason
 
     pnl = get_daily_pnl()
-    if MAX_DAILY_LOSS > 0 and pnl <= -abs(MAX_DAILY_LOSS):
+    if pnl <= MAX_DAILY_LOSS:
         return True, f"Max daily loss hit: {pnl:.2f}"
-
     if daily_trade_count() >= MAX_TRADES_PER_DAY:
         return True, "Max trades per day reached"
-
     return False, ""
 
 
@@ -1136,20 +1095,22 @@ def calculate_new_position_notional():
     equity = float(account.equity)
     buying_power = float(account.buying_power)
 
-    # Cap left for NEW buys = saved trading cap minus current open position value.
-    cap_left = remaining_trading_cap_usd(equity) if "remaining_trading_cap_usd" in globals() else equity
+    # Profit banking cap now controls sizing. If account equity grows above
+    # the saved cap, new trade sizes are calculated from the capped amount,
+    # not full account equity.
+    sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
 
-    if cap_left <= 0:
-        return 0.0
-
-    if FULL_BUY_WHEN_ONE_POSITION:
+    # Full-buy mode for one-position trading.
+    # Uses nearly all available capped trading capital/buying power, leaving a small buffer.
+    if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
         usable_cash = max(0.0, buying_power - FULL_BUY_CASH_BUFFER)
-        return round(max(0.0, min(cap_left, usable_cash)), 2)
+        return round(max(0.0, min(sizing_equity, usable_cash)), 2)
 
-    target_value = cap_left * TARGET_POSITION_VALUE_PCT
-    max_value = cap_left * MAX_POSITION_VALUE_PCT
+    target_value = sizing_equity * TARGET_POSITION_VALUE_PCT
+    max_value = sizing_equity * MAX_POSITION_VALUE_PCT
     usable_cash = max(0.0, buying_power - CASH_BUFFER)
     return round(max(0.0, min(target_value, max_value, usable_cash)), 2)
+
 
 def confidence_notional(scan):
     base = calculate_new_position_notional()
@@ -1238,7 +1199,6 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
         "pnlGbp": 0.0,
     }
     trade_events.append(event)
-    persist_runtime_state()
     add_trade_history_event(event)
     notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
 
@@ -1247,18 +1207,6 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     rounded_qty = floor_qty(qty, 6)
     if rounded_qty <= 0:
         return
-
-    try:
-        if "spacex_hold_blocks_sell" in globals() and spacex_hold_blocks_sell(symbol, reason):
-            msg = f"MUSK HOLD BLOCKED SELL | {symbol} | reason={reason}"
-            print(msg)
-            try:
-                notify(f"🛡️ {msg}")
-            except Exception:
-                pass
-            return
-    except Exception as e:
-        print(f"MUSK HOLD CHECK ERROR {symbol}: {e}")
 
     def submit(q):
         order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
@@ -1299,11 +1247,9 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
         "pnlPct": round(pnl_pct, 4),
     }
     trade_events.append(event)
-    persist_runtime_state()
     add_trade_history_event(event)
     update_stock_memory_from_sell(symbol, pnl, pnl_pct)
     lock_symbol_until_tomorrow(symbol)
-    persist_runtime_state()
     notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
 
 
@@ -1362,7 +1308,6 @@ def has_taken_partial_profit(symbol: str):
 
 def mark_partial_profit_taken(symbol: str):
     partial_profit_taken[symbol.upper()] = today_str()
-    persist_runtime_state()
 
 
 def sell_notional_ok(qty: float, price: float):
@@ -1430,31 +1375,6 @@ def should_stall_exit(position: Dict[str, Any]):
 # =========================
 def refresh_universe_if_needed(force=False):
     global current_universe, last_universe_refresh_ts
-
-    # Musk Mode must override the old weekly universe immediately; otherwise
-    # the loop can keep scanning yesterday's saved stock-memory universe.
-    try:
-        if "musk_mode_enabled" in globals() and musk_mode_enabled() and "apply_quality_only_universe" in globals():
-            apply_quality_only_universe()
-            for s in current_universe:
-                ensure_symbol_state(s, custom=s in custom_symbols)
-            last_universe_refresh_ts = time.time()
-            return
-    except Exception as e:
-        print(f"MUSK MODE UNIVERSE APPLY ERROR: {e}")
-
-    # Quality-only / dynamic hybrid mode should control the live trading universe.
-    # The old weekly universe is stock-memory driven, so do not let it overwrite
-    # the scanner-first final universe.
-    try:
-        if QUALITY_ONLY_MODE and "apply_quality_only_universe" in globals():
-            apply_quality_only_universe()
-            for s in current_universe:
-                ensure_symbol_state(s, custom=s in custom_symbols)
-            last_universe_refresh_ts = time.time()
-            return
-    except Exception as e:
-        print(f"QUALITY ONLY UNIVERSE APPLY ERROR: {e}")
 
     if AUTO_UNIVERSE_ENABLED:
         try:
@@ -1700,12 +1620,6 @@ def buy_custom_symbol(symbol: str):
 # SQLITE PERSISTENT STORAGE
 # =========================
 def db_connect():
-    try:
-        db_dir = os.path.dirname(SQLITE_DB_FILE)
-        if db_dir:
-            os.makedirs(db_dir, exist_ok=True)
-    except Exception:
-        pass
     conn = sqlite3.connect(SQLITE_DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
@@ -1786,15 +1700,6 @@ def init_db():
 
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS bot_state (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
-
-
-    cur.execute("""
         CREATE TABLE IF NOT EXISTS weekly_universe (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             week_start TEXT NOT NULL,
@@ -1818,131 +1723,6 @@ def init_db():
 
     conn.commit()
     conn.close()
-
-
-
-
-def save_bot_state_value(key: str, value: Any) -> None:
-    """Persist small runtime settings/state to SQLite so redeploys do not wipe them."""
-    if not SQLITE_ENABLED:
-        return
-    try:
-        init_db()
-        conn = db_connect()
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO bot_state (key, value, updated_at)
-            VALUES (?, ?, ?)
-            """,
-            (str(key), json.dumps(value), datetime.now(UTC).isoformat()),
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"BOT STATE SAVE ERROR {key}: {e}")
-
-
-def load_bot_state_value(key: str, fallback: Any):
-    """Load small runtime settings/state from SQLite."""
-    if not SQLITE_ENABLED:
-        return fallback
-    try:
-        init_db()
-        conn = db_connect()
-        row = conn.execute("SELECT value FROM bot_state WHERE key = ?", (str(key),)).fetchone()
-        conn.close()
-        if row:
-            return json.loads(row["value"])
-    except Exception as e:
-        print(f"BOT STATE LOAD ERROR {key}: {e}")
-    return fallback
-
-
-def rebuild_recent_trade_events_from_db(limit: int = 50) -> List[Dict[str, Any]]:
-    try:
-        init_db()
-        conn = db_connect()
-        rows = conn.execute("""
-            SELECT * FROM trades
-            WHERE side IN ('BUY', 'SELL')
-            ORDER BY timestamp DESC, id DESC
-            LIMIT ?
-        """, (int(limit),)).fetchall()
-        conn.close()
-
-        recent = []
-        for r in reversed(rows):
-            recent.append({
-                "day": r["day"] or "",
-                "time": r["time"] or "",
-                "side": str(r["side"] or "").upper(),
-                "symbol": str(r["symbol"] or "").upper(),
-                "qty": float(r["qty"] or 0.0),
-                "amount": float(r["amount"] or 0.0),
-                "amountGbp": float(r["amount_gbp"] or 0.0),
-                "reason": r["reason"] or "RESTORED FROM DB",
-                "pnl": float(r["pnl"] or 0.0),
-                "pnlGbp": float(r["pnl_gbp"] or 0.0),
-                "pnlPct": float(r["pnl_pct"] or 0.0),
-            })
-        return recent
-    except Exception as e:
-        print(f"RECENT TRADES RESTORE ERROR: {e}")
-        return []
-
-
-def ensure_recent_trades_restored(limit: int = 50) -> int:
-    """Keep the Activity / Recent Trades panel rebuilt from SQLite.
-
-    The raw trades table can contain hundreds of trades, but the in-memory
-    trade_events list can be empty/short after a redeploy. This safely
-    reloads the newest rows without touching the full database history.
-    """
-    global trade_events
-    try:
-        db_recent = rebuild_recent_trade_events_from_db(limit)
-        if isinstance(db_recent, list) and len(db_recent) > len(trade_events):
-            trade_events = db_recent[-limit:]
-            try:
-                save_bot_state_value("trade_events", trade_events[-100:])
-            except Exception:
-                pass
-        return len(trade_events)
-    except Exception as e:
-        print(f"ENSURE RECENT TRADES RESTORE ERROR: {e}")
-        return len(trade_events)
-
-
-def persist_runtime_state() -> None:
-    """Save important in-memory controls so deploys/restarts do not wipe bot memory."""
-    try:
-        save_bot_state_value("locked_today", locked_today)
-        save_bot_state_value("partial_profit_taken", partial_profit_taken)
-        save_bot_state_value("temp_blacklist", temp_blacklist)
-        save_bot_state_value("trade_events", trade_events[-100:])
-        save_bot_state_value("custom_symbols", custom_symbols)
-    except Exception as e:
-        print(f"PERSIST RUNTIME STATE ERROR: {e}")
-
-
-def persistence_payload() -> Dict[str, Any]:
-    try:
-        db_exists = os.path.exists(SQLITE_DB_FILE)
-        return {
-            "enabled": bool(SQLITE_ENABLED),
-            "dbFile": SQLITE_DB_FILE,
-            "dbExists": bool(db_exists),
-            "dbSizeBytes": os.path.getsize(SQLITE_DB_FILE) if db_exists else 0,
-            "stateDir": os.path.dirname(SQLITE_DB_FILE) or ".",
-            "usingRenderDisk": str(SQLITE_DB_FILE).startswith("/var/data"),
-            "recentTradesRestored": len(trade_events),
-            "lockedTodayCount": len(locked_today),
-            "partialProfitCount": len(partial_profit_taken),
-            "tempBlacklistCount": len(temp_blacklist),
-            "message": "Persistent disk active" if str(SQLITE_DB_FILE).startswith("/var/data") else "SQLite active",
-        }
-    except Exception as e:
-        return {"enabled": bool(SQLITE_ENABLED), "dbFile": SQLITE_DB_FILE, "error": str(e)}
 
 
 def save_trade_to_db(event: Dict[str, Any], source: str = "bot"):
@@ -3168,29 +2948,22 @@ def build_weekly_universe(force=False):
 
 
 def auto_universe_payload():
-    # Dashboard should show the live active universe, not just historical ranking rows.
-    live_symbols = list(dict.fromkeys([str(s).upper() for s in current_universe]))
-    db_rows = get_weekly_universe_from_db()
-    row_by_symbol = {str(r.get("symbol", "")).upper(): r for r in db_rows if isinstance(r, dict)}
-    rows = []
-    for i, sym in enumerate(live_symbols):
-        row = dict(row_by_symbol.get(sym, {}))
-        row.setdefault("symbol", sym)
-        row.setdefault("score", max(0, 100 - i))
-        row.setdefault("reason", "live active universe")
-        row.setdefault("status", "active")
-        rows.append(row)
+    active = get_weekly_universe_from_db()
+
+    # If DB has not been populated yet but stock memory exists, show live preview.
+    if not active:
+        preview = universe_rows_from_stock_memory()[:AUTO_UNIVERSE_SIZE]
+        active = preview
 
     return {
         "enabled": AUTO_UNIVERSE_ENABLED,
-        "size": len(live_symbols),
+        "size": AUTO_UNIVERSE_SIZE,
         "weekStart": week_start_str(),
-        "activeSymbols": live_symbols,
-        "rows": rows,
+        "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe),
+        "rows": active,
         "lastRefresh": get_last_universe_refresh(),
         "candidatePoolSize": len(AUTO_UNIVERSE_CANDIDATE_POOL),
         "keepWinners": True,
-        "source": "live_current_universe",
     }
 
 
@@ -3235,8 +3008,6 @@ def build_status_payload(bot_name, scans):
         "fx": fx_payload(),
         "autoUniverse": auto_universe_payload(),
         "dynamicMarketScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
-        "muskMode": musk_mode_payload() if "musk_mode_payload" in globals() else {"enabled": False},
-        "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
         "strictOneCyclePerStockPerDay": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
@@ -3332,13 +3103,11 @@ def build_status_payload(bot_name, scans):
             } for s in scans
         ],
         "banking": banking_payload(),
-        "persistence": persistence_payload() if "persistence_payload" in globals() else {},
         "logs": [
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
             f"FX | USDGBP={get_usd_to_gbp_rate():.4f} | source={fx_cache.get('source', 'fallback')}",
             f"DB | sqlite={SQLITE_ENABLED} | raw_trades={db_summary_payload().get('totalTrades', 0)} | closed={closed_trade_summary_payload().get('closedTrades', 0)} | pnl_gbp={closed_trade_summary_payload().get('totalPnlGbp', 0):.2f}",
-            f"PERSISTENCE | db={SQLITE_DB_FILE} | recent={len(trade_events)} | locked={len(locked_today)} | partials={len(partial_profit_taken)}",
             f"BACKFILL | chunk={BACKFILL_CHUNK_SIZE} | max_pages={BACKFILL_MAX_PAGES}",
             f"OPTIMIZER | enabled={PROFIT_OPTIMIZER_ENABLED} | today_realised={today_realised_pnl():.2f} | block={profit_guardrail_status()[1] or 'none'}",
             f"ANALYTICS | profit_factor={analytics_payload().get('profitFactor', 0):.2f} | avg_win={analytics_payload().get('averageWin', 0):.2f} | avg_loss={analytics_payload().get('averageLoss', 0):.2f}",
@@ -3664,22 +3433,13 @@ def root():
 
 @app.get("/status")
 def get_status():
-    try:
-        ensure_recent_trades_restored(50)
-    except Exception as e:
-        print(f"STATUS RECENT RESTORE ERROR: {e}")
-
-    # Return a snapshot so FastAPI is not serialising latest_status while
-    # the background bot thread is mutating it. This fixes:
-    # RuntimeError: dictionary changed size during iteration
-    snapshot = copy.deepcopy(latest_status)
-    snapshot["botVersion"] = "v1.1-strict-profit-mode"
+    latest_status["botVersion"] = "v1.1-strict-profit-mode"
     try:
         if "merge_manual_picks_into_auto_universe" in globals():
-            return merge_manual_picks_into_auto_universe(snapshot)
+            return merge_manual_picks_into_auto_universe(latest_status)
     except Exception as e:
         print(f"STATUS MANUAL PICK MERGE ERROR: {e}")
-    return snapshot
+    return latest_status
 
 
 @app.post("/pause")
@@ -3774,17 +3534,10 @@ def emergency_sell(request: Request):
 @app.post("/rebuild-closed-trades")
 def rebuild_closed_trades(request: Request):
     verify_api_key(request)
-    result = rebuild_closed_trades_from_orders()
-    update_status(BOT_NAME, latest_scans)
-    return result
-
-
-@app.get("/rebuild-closed-trades")
-def rebuild_closed_trades_get(request: Request):
-    verify_api_key(request)
-    result = rebuild_closed_trades_from_orders()
-    update_status(BOT_NAME, latest_scans)
-    return result
+    with bot_lock:
+        result = rebuild_closed_trades_from_orders()
+        update_status(BOT_NAME, latest_scans)
+        return result
 
 
 
@@ -3811,17 +3564,10 @@ def refresh_universe(request: Request):
 @app.post("/backfill-trades")
 def backfill_trades(request: Request):
     verify_api_key(request)
-    result = backfill_trades_from_alpaca_full()
-    update_status(BOT_NAME, latest_scans)
-    return result
-
-
-@app.get("/backfill-trades")
-def backfill_trades_get(request: Request):
-    verify_api_key(request)
-    result = backfill_trades_from_alpaca_full()
-    update_status(BOT_NAME, latest_scans)
-    return result
+    with bot_lock:
+        result = backfill_trades_from_alpaca_full()
+        update_status(BOT_NAME, latest_scans)
+        return result
 
 
 # =========================
@@ -3850,6 +3596,7 @@ def run_bot_loop():
                 if not clock.is_open:
                     print("Market closed. Waiting...")
                     update_status(BOT_NAME, latest_scans)
+                    time.sleep(CHECK_INTERVAL)
                     continue
 
                 scans = []
@@ -3888,19 +3635,6 @@ def startup_event():
     global bot_thread_started
     if bot_thread_started:
         return
-    try:
-        init_db()
-        load_persistent_state()
-        if "musk_mode_enabled" in globals():
-            print(f"MUSK MODE RESTORED | enabled={musk_mode_enabled()}")
-        if "spacex_hold_enabled" in globals():
-            print(f"MUSK HOLD RESTORED | enabled={spacex_hold_enabled()}")
-        try:
-            update_status(BOT_NAME, latest_scans)
-        except Exception as e:
-            print(f"STARTUP STATUS BUILD WARNING: {e}")
-    except Exception as e:
-        print(f"STARTUP RESTORE ERROR: {e}")
     bot_thread_started = True
     threading.Thread(target=run_bot_loop, daemon=True).start()
 
@@ -4616,258 +4350,36 @@ BLOCKED_WEAK_TICKERS = {
     "RIVN", "F", "AAL", "GIS", "PYPL"
 }
 
-# =========================
-# MUSK MODE
-# =========================
-# Publicly tradable Musk-focused/sympathy names. SpaceX and xAI are private,
-# so they are deliberately not added as fake tickers. PYPL is historically
-# Musk-related but remains blocked if the weak-ticker filter blocks it.
-MUSK_MODE_ENV_DEFAULT = os.getenv("MUSK_MODE_ENABLED", "false").lower() == "true"
-MUSK_MODE_UNIVERSE = [
-    "TSLA",  # Tesla - main Musk stock
-    "SPCX",  # SpaceX proxy/ticker used by the bot when available
-    "NVDA",  # AI / autonomy / robotics sympathy
-    "AMD",
-    "QCOM",
-    "QQQ",   # broad tech risk filter / liquidity fallback
-]
-MUSK_PRIVATE_NOTES = ["SpaceX is private", "xAI is private", "X/Twitter is private"]
-
-
-MUSK_MODE_FILE = persistent_state_file("musk_mode.json") if "persistent_state_file" in globals() else os.path.join("backend", "state", "musk_mode.json")
-
-
-def musk_mode_enabled() -> bool:
-    try:
-        if "load_bot_state_value" in globals():
-            saved = load_bot_state_value("musk_mode_enabled", None)
-            if isinstance(saved, bool):
-                return saved
-            if isinstance(saved, str):
-                return saved.lower() == "true"
-    except Exception:
-        pass
-    try:
-        if os.path.exists(MUSK_MODE_FILE):
-            with open(MUSK_MODE_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f).get("enabled")
-            if isinstance(saved, bool):
-                return saved
-    except Exception:
-        pass
-    return bool(MUSK_MODE_ENV_DEFAULT)
-
-
-def save_musk_mode_enabled(enabled: bool) -> bool:
-    enabled = bool(enabled)
-    saved_ok = False
-    try:
-        if "save_bot_state_value" in globals():
-            save_bot_state_value("musk_mode_enabled", enabled)
-            saved_ok = True
-    except Exception as e:
-        print(f"MUSK MODE DB SAVE ERROR: {e}")
-    try:
-        os.makedirs(os.path.dirname(MUSK_MODE_FILE), exist_ok=True)
-        with open(MUSK_MODE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"enabled": enabled, "updatedAt": datetime.now(UTC).isoformat()}, f, indent=2)
-        saved_ok = True
-    except Exception as e:
-        print(f"MUSK MODE FILE SAVE ERROR: {e}")
-    if not saved_ok:
-        print("MUSK MODE SAVE WARNING: could not persist setting")
-    return enabled
-
-
-def musk_mode_payload() -> Dict[str, Any]:
-    enabled = musk_mode_enabled()
-    active = [s for s in MUSK_MODE_UNIVERSE if s not in BLOCKED_WEAK_TICKERS]
-    return {
-        "enabled": enabled,
-        "activeSymbols": active,
-        "configuredSymbols": MUSK_MODE_UNIVERSE,
-        "privateNotes": MUSK_PRIVATE_NOTES,
-        "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
-        "mode": "musk-focus" if enabled else "off",
-        "message": "Musk Mode ON: focusing universe on TSLA/SPCX and related liquid tech names" if enabled else "Musk Mode OFF",
-    }
-
-
-# =========================
-# SPACEX / SPCX HOLD UNTIL MANUAL RELEASE
-# =========================
-SPACEX_HOLD_ENV_DEFAULT = os.getenv("SPACEX_HOLD_UNTIL_MANUAL", "false").lower() == "true"
-# Backwards-compatible name, but this now holds every Musk Mode symbol, not only SPCX.
-DEFAULT_MUSK_HOLD_SYMBOLS = ",".join(MUSK_MODE_UNIVERSE)
-SPACEX_HOLD_SYMBOLS = [s.strip().upper() for s in os.getenv("SPACEX_HOLD_SYMBOLS", DEFAULT_MUSK_HOLD_SYMBOLS).split(",") if s.strip()]
-SPACEX_HOLD_FILE = persistent_state_file("spacex_hold.json") if "persistent_state_file" in globals() else os.path.join("backend", "state", "spacex_hold.json")
-SPACEX_HOLD_ALLOWED_REASONS = ["MANUAL", "EMERGENCY"]
-
-
-def spacex_hold_enabled() -> bool:
-    try:
-        if "load_bot_state_value" in globals():
-            saved = load_bot_state_value("spacex_hold_enabled", None)
-            if isinstance(saved, bool):
-                return saved
-            if isinstance(saved, str):
-                return saved.lower() == "true"
-    except Exception:
-        pass
-    try:
-        if os.path.exists(SPACEX_HOLD_FILE):
-            with open(SPACEX_HOLD_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f).get("enabled")
-            if isinstance(saved, bool):
-                return saved
-    except Exception:
-        pass
-    return bool(SPACEX_HOLD_ENV_DEFAULT)
-
-
-def save_spacex_hold_enabled(enabled: bool) -> bool:
-    enabled = bool(enabled)
-    saved_ok = False
-    try:
-        if "save_bot_state_value" in globals():
-            save_bot_state_value("spacex_hold_enabled", enabled)
-            saved_ok = True
-    except Exception as e:
-        print(f"SPACEX HOLD DB SAVE ERROR: {e}")
-    try:
-        os.makedirs(os.path.dirname(SPACEX_HOLD_FILE), exist_ok=True)
-        with open(SPACEX_HOLD_FILE, "w", encoding="utf-8") as f:
-            json.dump({"enabled": enabled, "symbols": SPACEX_HOLD_SYMBOLS, "updatedAt": datetime.now(UTC).isoformat()}, f, indent=2)
-        saved_ok = True
-    except Exception as e:
-        print(f"SPACEX HOLD FILE SAVE ERROR: {e}")
-    if not saved_ok:
-        print("SPACEX HOLD SAVE WARNING: could not persist setting")
-    return enabled
-
-
-def spacex_hold_payload() -> Dict[str, Any]:
-    enabled = spacex_hold_enabled()
-    return {
-        "enabled": enabled,
-        "symbols": SPACEX_HOLD_SYMBOLS,
-        "mode": "hold-until-manual" if enabled else "off",
-        "allowedSellReasons": SPACEX_HOLD_ALLOWED_REASONS,
-        "message": "Musk hold ON: auto sells/rotation/stall/trailing/partial exits are blocked for all Musk Mode symbols until manual release" if enabled else "Musk hold OFF",
-    }
-
-
-def spacex_hold_blocks_sell(symbol: str, reason: str = "") -> bool:
-    sym = str(symbol or "").upper().strip()
-    if not spacex_hold_enabled() or sym not in SPACEX_HOLD_SYMBOLS:
-        return False
-    upper_reason = str(reason or "").upper()
-    # Manual sell and emergency sell remain allowed so the user is never trapped.
-    if any(term in upper_reason for term in SPACEX_HOLD_ALLOWED_REASONS):
-        return False
-    return True
-
-
-@app.get("/spacex-hold")
-def api_get_spacex_hold():
-    return {"ok": True, **spacex_hold_payload()}
-
-
-@app.post("/spacex-hold")
-def api_set_spacex_hold(request: Request, payload: dict = Body(...)):
-    verify_api_key(request)
-    enabled = bool(payload.get("enabled"))
-    save_spacex_hold_enabled(enabled)
-    try:
-        latest_status["spaceXHold"] = spacex_hold_payload()
-        latest_status.setdefault("muskMode", musk_mode_payload())
-        latest_status["lastAction"] = "Musk hold ON" if enabled else "Musk hold OFF"
-        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
-    except Exception as e:
-        print(f"SPACEX HOLD STATUS UPDATE ERROR: {e}")
-    return {
-        "ok": True,
-        "message": "SPCX hold ON - auto sells blocked until you turn hold off or manually sell" if enabled else "SPCX hold OFF - normal auto sell rules restored",
-        **spacex_hold_payload(),
-    }
-
-
 def quality_only_symbols():
-    """Final tradable universe with live scanner priority.
-
-    Weighting intention:
-    - Manual pins always stay first.
-    - Live scanner/market movers come next and should dominate.
-    - Stock memory can add only a small number of proven profitable names.
-    - Core quality names are the fallback.
-
-    This stops old stock-memory winners from taking over the Final Bot Universe.
-    """
     symbols = []
-    musk_on = musk_mode_enabled() if "musk_mode_enabled" in globals() else False
-
-    def add_symbol(sym: str, allow_blocked: bool = False):
-        sym = str(sym or "").upper().strip()
-        if not sym:
-            return
-        if not allow_blocked and sym in BLOCKED_WEAK_TICKERS:
-            return
-        if sym not in symbols:
-            symbols.append(sym)
 
     # Manual pins always get first priority unless explicitly blocked.
     try:
         if "load_manual_universe_picks" in globals() and callable(globals()["load_manual_universe_picks"]):
             for sym in load_manual_universe_picks():
-                add_symbol(sym)
+                sym = str(sym).upper().strip()
+                if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
+                    symbols.append(sym)
     except Exception as e:
         print(f"QUALITY ONLY MANUAL MERGE ERROR: {e}")
 
-    if musk_on:
-        # Musk Mode intentionally narrows the universe rather than mixing in
-        # random market movers. Manual pins still remain first if the user adds any.
-        for sym in MUSK_MODE_UNIVERSE:
-            add_symbol(sym)
-        return symbols
-
-    # 1) Live scanner picks are the main discovery layer and get priority.
+    # Dynamic scanner picks are the main discovery layer.
     try:
         if DYNAMIC_MARKET_SCANNER_ENABLED:
             for sym in dynamic_market_symbols():
-                add_symbol(sym)
+                sym = str(sym).upper().strip()
+                if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
+                    symbols.append(sym)
     except Exception as e:
         print(f"QUALITY ONLY DYNAMIC MERGE ERROR: {e}")
 
-    # 2) Stock memory is now limited: it can add only a few profitable names
-    # and it cannot dominate the final universe.
-    try:
-        memory_limit = int(os.getenv("MEMORY_UNIVERSE_MAX_SYMBOLS", "3") or 3)
-        added_memory = 0
-        for row in stock_memory_universe_rows(40) if "stock_memory_universe_rows" in globals() else universe_rows_from_stock_memory():
-            if added_memory >= memory_limit:
-                break
-            sym = str(row.get("symbol", "")).upper().strip()
-            total_pnl = float(row.get("totalPnl", 0) or 0)
-            score = float(row.get("score", 0) or 0)
-            # Only add genuinely useful memory picks. Tiny/no-profit names no longer jump in.
-            if total_pnl >= 1.00 or score >= 15.0:
-                before = len(symbols)
-                add_symbol(sym)
-                if len(symbols) > before:
-                    added_memory += 1
-    except Exception as e:
-        print(f"QUALITY ONLY MEMORY MERGE ERROR: {e}")
-
-    # 3) Core quality names are the safety fallback and stable baseline.
+    # Core quality names are the safety fallback and stable baseline.
     for sym in QUALITY_ONLY_UNIVERSE:
-        add_symbol(sym)
+        sym = str(sym).upper().strip()
+        if sym and sym not in symbols and sym not in BLOCKED_WEAK_TICKERS:
+            symbols.append(sym)
 
-    # Keep the universe controlled. Manual + scanner + memory + fallback, capped.
-    try:
-        max_symbols = int(os.getenv("FINAL_UNIVERSE_MAX_SYMBOLS", str(AUTO_UNIVERSE_SIZE or 12)) or 12)
-    except Exception:
-        max_symbols = 12
-    return symbols[:max(1, max_symbols)]
+    return symbols
 
 def quality_only_rows():
     rows = []
@@ -4890,9 +4402,6 @@ def quality_only_rows():
         base_score = 100 - (i * 3.0)
         score = float(dyn.get("score", base_score)) if dyn else base_score
         reason = dyn.get("reason") if dyn else "core quality universe | weak tickers blocked"
-        if musk_mode_enabled() and sym in MUSK_MODE_UNIVERSE and not is_manual:
-            reason = "Musk Mode | TSLA / Elon-linked liquid tech focus | risk checks still active"
-            score = max(score, 97.0 - i)
         if is_manual:
             reason = "manual pick | pinned to universe" + (f" | {reason}" if reason else "")
             score = max(score, 99.0)
@@ -4939,9 +4448,7 @@ def apply_quality_only_universe():
     try:
         latest_status["autoUniverse"] = {
             "enabled": True,
-            "mode": "musk-focus" if musk_mode_enabled() else ("dynamic-quality-hybrid" if DYNAMIC_MARKET_SCANNER_ENABLED else "quality-only"),
-            "muskMode": musk_mode_payload(),
-            "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
+            "mode": "dynamic-quality-hybrid" if DYNAMIC_MARKET_SCANNER_ENABLED else "quality-only",
             "size": len(symbols),
             "activeSymbols": symbols,
             "rows": rows,
@@ -4987,40 +4494,10 @@ def api_quality_universe():
     return {
         "ok": True,
         "qualityOnlyMode": QUALITY_ONLY_MODE,
-        "muskMode": musk_mode_payload(),
-        "spaceXHold": spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False},
         "activeSymbols": quality_only_symbols(),
         "blockedWeakTickers": sorted(list(BLOCKED_WEAK_TICKERS)),
         "rows": quality_only_rows(),
     }
-
-@app.get("/musk-mode")
-def api_get_musk_mode():
-    return {"ok": True, **musk_mode_payload()}
-
-
-@app.post("/musk-mode")
-def api_set_musk_mode(request: Request, payload: dict = Body(...)):
-    verify_api_key(request)
-    enabled = bool(payload.get("enabled"))
-    save_musk_mode_enabled(enabled)
-    symbols = apply_quality_only_universe()
-    try:
-        update_status(BOT_NAME, latest_scans)
-        latest_status["muskMode"] = musk_mode_payload()
-        latest_status["spaceXHold"] = spacex_hold_payload() if "spacex_hold_payload" in globals() else {"enabled": False}
-        latest_status["lastAction"] = "Musk Mode ON" if enabled else "Musk Mode OFF"
-        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
-    except Exception as e:
-        print(f"MUSK MODE STATUS UPDATE ERROR: {e}")
-    return {
-        "ok": True,
-        "message": "Musk Mode ON - focusing on TSLA and related liquid tech names" if enabled else "Musk Mode OFF - back to dynamic quality universe",
-        "activeSymbols": symbols,
-        "autoUniverse": force_quality_auto_universe_payload() if "force_quality_auto_universe_payload" in globals() else {},
-        **musk_mode_payload(),
-    }
-
 
 @app.post("/apply-quality-universe")
 def api_apply_quality_universe(request: Request):
@@ -5076,8 +4553,7 @@ def force_quality_auto_universe_payload():
 
     return {
         "enabled": True,
-        "mode": "musk-focus" if musk_mode_enabled() else ("dynamic-quality-hybrid" if DYNAMIC_MARKET_SCANNER_ENABLED else "quality-only"),
-        "muskMode": musk_mode_payload(),
+        "mode": "dynamic-quality-hybrid" if DYNAMIC_MARKET_SCANNER_ENABLED else "quality-only",
         "size": len(symbols),
         "weekStart": datetime.now(UTC).date().isoformat(),
         "monthStart": datetime.now(UTC).replace(day=1).date().isoformat(),
@@ -5290,8 +4766,6 @@ def banking_payload():
     cap_gbp = trading_cap_gbp()
 
     effective = max(0.0, min(equity, cap_usd)) if cap_usd > 0 else max(0.0, equity)
-    open_position_value = _open_position_value_usd() if "_open_position_value_usd" in globals() else 0.0
-    remaining_cap = max(0.0, effective - open_position_value)
     banked = max(0.0, equity - effective) if cap_usd > 0 else 0.0
 
     return {
@@ -5308,10 +4782,6 @@ def banking_payload():
         "accountEquity": equity,
         "effectiveTradingEquity": effective,
         "effectiveTradingEquityGbp": money_gbp(effective),
-        "openPositionValueUsd": open_position_value,
-        "openPositionValueGbp": money_gbp(open_position_value),
-        "remainingTradingCapUsd": remaining_cap,
-        "remainingTradingCapGbp": money_gbp(remaining_cap),
         "bankedProfitCashBuffer": banked,
         "bankedProfitCashBufferGbp": money_gbp(banked),
         "message": "Profit banking active" if cap_usd > 0 else "Profit banking disabled",
@@ -5515,46 +4985,11 @@ def _compat_gbp(usd):
             return float(usd or 0) * 0.78
 
 def _compat_account_equity():
-    """Return account equity/buying power with safe fallbacks for page refresh."""
     try:
         a = get_account()
-        equity = float(getattr(a, "equity", 0) or 0)
-        buying_power = float(getattr(a, "buying_power", 0) or 0)
-        if equity > 0 or buying_power > 0:
-            return equity, buying_power
+        return float(getattr(a, "equity", 0) or 0), float(getattr(a, "buying_power", 0) or 0)
     except Exception:
-        pass
-
-    try:
-        acct = latest_status.get("account", {}) if isinstance(latest_status, dict) else {}
-        equity = float(acct.get("equity", 0) or 0)
-        buying_power = float(acct.get("buyingPower", 0) or acct.get("buying_power", 0) or 0)
-        if equity > 0 or buying_power > 0:
-            return equity, buying_power
-    except Exception:
-        pass
-
-    return 0.0, 0.0
-
-
-def _open_position_value_usd():
-    try:
-        return sum(float(p.get("marketValue", 0) or 0) for p in get_all_positions())
-    except Exception:
-        return 0.0
-
-
-def remaining_trading_cap_usd(account_equity: float = None) -> float:
-    try:
-        if account_equity is None:
-            account_equity, _ = _compat_account_equity()
-        cap = trading_cap_usd() if "trading_cap_usd" in globals() else 0.0
-        if cap <= 0:
-            return max(0.0, float(account_equity or 0))
-        effective = max(0.0, min(float(account_equity or 0), cap))
-        return max(0.0, effective - _open_position_value_usd())
-    except Exception:
-        return 0.0
+        return 0.0, 0.0
 
 def _compat_baseline_value():
     data = _compat_read(_COMPAT_BASELINE_FILE, {})
@@ -5623,29 +5058,15 @@ def _compat_buy_preview():
         max_positions = 1
 
     try:
-        open_positions = len(get_all_positions())
+        positions = get_positions() if "get_positions" in globals() else []
+        open_positions = len(positions)
     except Exception:
         open_positions = 0
 
-    cap_usd = trading_cap_usd() if "trading_cap_usd" in globals() else 0.0
-
-    # Saved/display cap must NEVER become £0 just because:
-    # - Alpaca briefly fails during refresh, or
-    # - open positions have already used the cap.
-    #
-    # Buy sizing still uses remaining_cap below.
-    if cap_usd > 0:
-        display_capped_equity = cap_usd
-        if equity > 0:
-            capped_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else min(equity, cap_usd)
-        else:
-            capped_equity = cap_usd
-    else:
+    try:
         capped_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
-        display_capped_equity = capped_equity
-
-    open_value = _open_position_value_usd() if "_open_position_value_usd" in globals() else 0.0
-    remaining_cap = max(0.0, capped_equity - open_value)
+    except Exception:
+        capped_equity = equity
 
     try:
         cash_buffer = float(globals().get("CASH_BUFFER", 0.50))
@@ -5657,15 +5078,8 @@ def _compat_buy_preview():
     except Exception:
         full_buffer = 2.00
 
-    remaining_slots = max(0, max_positions - open_positions)
-
-    if remaining_slots <= 0 or remaining_cap <= 0:
-        partial_usd = 0.0
-        full_usd = 0.0
-    else:
-        partial_usd = max(0.0, min(remaining_cap / max(1, remaining_slots), max(0.0, buying_power - cash_buffer)))
-        full_usd = max(0.0, min(remaining_cap, max(0.0, buying_power - full_buffer)))
-
+    partial_usd = max(0.0, min(capped_equity / max(1, max_positions), max(0.0, buying_power - cash_buffer)))
+    full_usd = max(0.0, min(capped_equity, max(0.0, buying_power - full_buffer)))
     mode = _compat_load_buy_mode()
 
     return {
@@ -5675,18 +5089,13 @@ def _compat_buy_preview():
         "partialGbp": round(_compat_gbp(partial_usd), 2),
         "fullUsd": round(full_usd, 2),
         "fullGbp": round(_compat_gbp(full_usd), 2),
-        # This is the saved cap shown in the UI, not the remaining amount.
-        "cappedEquityUsd": round(display_capped_equity, 2),
-        "cappedEquityGbp": round(_compat_gbp(display_capped_equity), 2),
-        "remainingCapUsd": round(remaining_cap, 2),
-        "remainingCapGbp": round(_compat_gbp(remaining_cap), 2),
-        "openPositionValueUsd": round(open_value, 2),
-        "openPositionValueGbp": round(_compat_gbp(open_value), 2),
+        "cappedEquityUsd": round(capped_equity, 2),
+        "cappedEquityGbp": round(_compat_gbp(capped_equity), 2),
         "buyingPowerUsd": round(buying_power, 2),
         "buyingPowerGbp": round(_compat_gbp(buying_power), 2),
         "maxPositions": max_positions,
         "openPositions": open_positions,
-        "remainingSlots": remaining_slots,
+        "remainingSlots": max(0, max_positions - open_positions),
     }
 
 @app.get("/buy-size-preview")
