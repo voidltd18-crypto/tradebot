@@ -1740,7 +1740,7 @@ def save_trade_to_db(event: Dict[str, Any], source: str = "bot"):
         fx_rate = float(event.get("fxRate") or get_usd_to_gbp_rate())
 
         cur.execute("""
-            INSERT OR IGNORE INTO trades (
+            INSERT OR REPLACE INTO trades (
                 alpaca_order_id, timestamp, day, time, symbol, side, qty, price,
                 amount, amount_gbp, pnl, pnl_gbp, pnl_pct, reason,
                 equity, equity_gbp, fx_rate, source
@@ -2194,7 +2194,15 @@ def order_is_filled(order):
 
 
 def get_order_side(order):
-    return str(getattr(order, "side", "")).upper()
+    """Return clean BUY/SELL even when alpaca-py gives an enum like OrderSide.BUY."""
+    raw = getattr(order, "side", "")
+    value = getattr(raw, "value", raw)
+    text = str(value).upper().strip()
+    if "." in text:
+        text = text.split(".")[-1]
+    if text in ("BUY", "SELL"):
+        return text
+    return text
 
 
 def get_order_symbol(order):
@@ -2433,7 +2441,7 @@ def backfill_trades_from_alpaca():
                 continue
 
             symbol = str(getattr(order, "symbol", "")).upper()
-            side = str(getattr(order, "side", "")).upper()
+            side = get_order_side(order)
             filled_avg_price = float(getattr(order, "filled_avg_price", 0) or 0)
             timestamp_obj = parse_order_timestamp(order)
 
@@ -3715,7 +3723,8 @@ def reports():
         total_deposited = equity
         deposit_source = "equity-baseline"
     total_gain_loss = equity + total_withdrawn - total_deposited
-    closed = status.get("closedTrades") or []
+    # Always read closed trades fresh from SQLite so Reports does not show stale April rows.
+    closed = closed_trades_from_db(500) if "closed_trades_from_db" in globals() else (status.get("closedTrades") or [])
     timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
     equity_history = []
     for i, e in enumerate(timeline if isinstance(timeline, list) else []):
@@ -3745,7 +3754,7 @@ def reports():
         "lostSinceDeposit": abs(min(total_gain_loss, 0.0)),
         "dayPnl": _safe_num(account.get("pnlDay")),
         "realisedNet": _safe_num(db.get("totalPnl")),
-        "closedTrades": closed[-200:] if isinstance(closed, list) else [],
+        "closedTrades": closed[:200] if isinstance(closed, list) else [],
         "equityHistory": equity_history[-500:],
         "winRate": _safe_num(db.get("winRate")) * 100.0,
         "totalTrades": int(_safe_num(db.get("totalTrades"))),
