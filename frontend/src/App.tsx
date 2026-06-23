@@ -393,10 +393,11 @@ const fetchData = useCallback(async (force = false) => {
     if (optimistic) setData(optimistic);
 
     const isWeeklyRefresh = endpoint === "/refresh-universe";
-    setMessage(isWeeklyRefresh ? "Dynamic market refresh sent. Updating universe..." : `Sent ${endpoint}. Updating dashboard...`);
+    setMessage(isWeeklyRefresh ? "Dynamic market refresh sent. Updating universe..." : isTradeMaintenance ? `${endpoint} started. This can take 1-3 minutes on Render...` : `Sent ${endpoint}. Updating dashboard...`);
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), isWeeklyRefresh ? 12000 : 30000);
+    const isTradeMaintenance = endpoint === "/backfill-trades" || endpoint === "/rebuild-closed-trades";
+    const timeout = setTimeout(() => controller.abort(), isWeeklyRefresh ? 12000 : isTradeMaintenance ? 180000 : 30000);
 
     try {
       const res = await fetch(`${API_URL}${endpoint}`, {
