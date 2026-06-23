@@ -311,7 +311,8 @@ const fetchData = useCallback(async (force = false) => {
     try {
       const res = await fetch(`${API_URL}${endpoint}`, {
         method: "POST",
-        headers: secureHeaders,
+        headers: { ...secureHeaders, "Content-Type": "application/json" },
+        body: JSON.stringify({ run: true, ts: Date.now() }),
         cache: "no-store",
       });
       const json = await readJson(res);
@@ -991,7 +992,7 @@ const fetchData = useCallback(async (force = false) => {
         {replayResult?.notes && <p className="notice">{replayResult.notes}</p>}
         {Array.isArray(replayResult?.bySymbol) && replayResult.bySymbol.length > 0 && <div className="table-wrap"><table><thead><tr><th>Symbol</th><th>Trades</th><th>Win rate</th><th>PnL</th></tr></thead><tbody>{replayResult.bySymbol.slice(0,12).map((r:AnyObj)=><tr key={r.symbol}><td>{r.symbol}</td><td>{r.trades}</td><td>{pct(Number(r.winRate || 0) * 100)}</td><td className={tone(r.pnlGbp)}>{gbp(r.pnlGbp)} / {usd(r.pnlUsd)}</td></tr>)}</tbody></table></div>}
       </Card>
-      <Card title="Closed Trade History"><div className="table-wrap"><table><thead><tr><th>Date / Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th></tr></thead><tbody>{closedTrades.slice(-80).reverse().map((t:AnyObj,i:number)=><tr key={i}><td>{tradeDateTime(t)}</td><td>{t.symbol}</td><td>{usd(t.entryPrice)}</td><td>{usd(t.exitPrice)}</td><td>{Number(t.qty || 0).toFixed(4)}</td><td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td><td className={tone(t.pnl)}>{pct(t.pnlPct)}</td></tr>)}{!closedTrades.length && <tr><td colSpan={7}>No matched closed trades yet.</td></tr>}</tbody></table></div></Card>
+      <Card title="Closed Trade History"><div className="table-wrap"><table><thead><tr><th>Date / Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th></tr></thead><tbody>{closedTrades.slice(0,80).map((t:AnyObj,i:number)=><tr key={i}><td>{tradeDateTime(t)}</td><td>{t.symbol}</td><td>{usd(t.entryPrice)}</td><td>{usd(t.exitPrice)}</td><td>{Number(t.qty || 0).toFixed(4)}</td><td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td><td className={tone(t.pnl)}>{pct(t.pnlPct)}</td></tr>)}{!closedTrades.length && <tr><td colSpan={7}>No matched closed trades yet.</td></tr>}</tbody></table></div></Card>
     </main>}
 
     {tab==="positions" && <Card title="All Positions — Best to Worst"><p className="muted">Sorted by PnL %, strongest winners glow green and weakest positions glow orange/red.</p><div className="position-list">{positions.map((p:AnyObj)=><article className="position" key={p.symbol} style={positionGlowStyle(p)}><div><h3>{p.symbol}</h3><p>Qty {Number(p.qty || 0).toFixed(4)} · Entry {usd(p.entry)} · Price {usd(p.price)}</p><p>Value <b>{gbp(p.marketValueGbp ?? p.marketValue * rate)}</b> / {usd(p.marketValue)}</p></div><div className="position-side"><b className={tone(p.pnl)}>PnL {gbp(p.pnlGbp ?? p.pnl * rate)} / {usd(p.pnl)} / {pct(p.pnlPct)}</b><span>{p.trailingActive ? `Trailing floor ${usd(p.trailFloor)}` : `Trail starts ${usd(p.trailStartPrice)}`}</span><button className="danger" onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button></div></article>)}{!positions.length && <p className="muted">No open positions.</p>}</div></Card>}
