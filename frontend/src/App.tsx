@@ -75,6 +75,28 @@ const [banking, setBanking] = useState<AnyObj>({});
   const trades = Array.isArray(data?.trades) ? data.trades : [];
   const logs = Array.isArray(data?.logs) ? data.logs : [];
   const closedTrades = Array.isArray(reports?.closedTrades) ? reports.closedTrades : [];
+  const getTradeTs = (t: AnyObj) => {
+    const raw = t?.timestamp || t?.filledAt || t?.submittedAt || (t?.day && t?.time ? `${t.day}T${t.time}` : t?.day || t?.time || "");
+    const n = new Date(raw).getTime();
+    return Number.isFinite(n) ? n : 0;
+  };
+  const sortedClosedTrades = [...closedTrades].sort((a:AnyObj,b:AnyObj) => getTradeTs(b) - getTradeTs(a));
+  const tradeDateText = (t: AnyObj) => {
+    if (t?.day) {
+      const m = String(t.day).match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (m) return `${m[3]}/${m[2]}/${m[1]}`;
+      return String(t.day);
+    }
+    const raw = t?.timestamp || t?.filledAt || t?.submittedAt;
+    const d = new Date(raw || "");
+    return Number.isFinite(d.getTime()) ? d.toLocaleDateString("en-GB") : "—";
+  };
+  const tradeTimeText = (t: AnyObj) => {
+    if (t?.time) return String(t.time).slice(0,8);
+    const raw = t?.timestamp || t?.filledAt || t?.submittedAt;
+    const d = new Date(raw || "");
+    return Number.isFinite(d.getTime()) ? d.toLocaleTimeString("en-GB", { hour12:false }) : "—";
+  };
   const equityHistory = Array.isArray(reports?.equityHistory) ? reports.equityHistory : (Array.isArray(data?.tradeTimeline) ? data.tradeTimeline : []);
   const bankingEnabled = Boolean(banking?.enabled || data?.banking?.enabled);
   const bankingCap = Number(banking?.maxTradingCapital ?? data?.banking?.maxTradingCapital ?? 0);
@@ -912,7 +934,7 @@ const fetchData = useCallback(async (force = false) => {
     </main>}
 
     {tab==="reports" && <main className="reports-page">
-      <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
+      <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button onClick={() => action("/backfill-trades")}>Backfill Past Trades</button><button className="ghost" onClick={() => action("/backfill-trades-limited")}>Quick Backfill</button><button onClick={() => action("/rebuild-closed-trades")}>Rebuild Closed Trades</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
           <input
             className="input"
             placeholder="Baseline £ e.g. 989.86"
@@ -950,7 +972,7 @@ const fetchData = useCallback(async (force = false) => {
         {replayResult?.notes && <p className="notice">{replayResult.notes}</p>}
         {Array.isArray(replayResult?.bySymbol) && replayResult.bySymbol.length > 0 && <div className="table-wrap"><table><thead><tr><th>Symbol</th><th>Trades</th><th>Win rate</th><th>PnL</th></tr></thead><tbody>{replayResult.bySymbol.slice(0,12).map((r:AnyObj)=><tr key={r.symbol}><td>{r.symbol}</td><td>{r.trades}</td><td>{pct(Number(r.winRate || 0) * 100)}</td><td className={tone(r.pnlGbp)}>{gbp(r.pnlGbp)} / {usd(r.pnlUsd)}</td></tr>)}</tbody></table></div>}
       </Card>
-      <Card title="Closed Trade History"><div className="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th></tr></thead><tbody>{closedTrades.slice(-80).reverse().map((t:AnyObj,i:number)=><tr key={i}><td>{t.time || "—"}</td><td>{t.symbol}</td><td>{usd(t.entryPrice)}</td><td>{usd(t.exitPrice)}</td><td>{Number(t.qty || 0).toFixed(4)}</td><td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td><td className={tone(t.pnl)}>{pct(t.pnlPct)}</td></tr>)}{!closedTrades.length && <tr><td colSpan={7}>No matched closed trades yet.</td></tr>}</tbody></table></div></Card>
+      <Card title="Closed Trade History"><div className="table-wrap"><table><thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th></tr></thead><tbody>{sortedClosedTrades.slice(0,80).map((t:AnyObj,i:number)=><tr key={`${t.symbol || "trade"}-${t.timestamp || t.day || ""}-${i}`}><td>{tradeDateText(t)}</td><td>{tradeTimeText(t)}</td><td>{t.symbol}</td><td>{usd(t.entryPrice)}</td><td>{usd(t.exitPrice)}</td><td>{Number(t.qty || 0).toFixed(4)}</td><td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td><td className={tone(t.pnl)}>{pct(t.pnlPct)}</td></tr>)}{!closedTrades.length && <tr><td colSpan={8}>No matched closed trades yet.</td></tr>}</tbody></table></div></Card>
     </main>}
 
     {tab==="positions" && <Card title="All Positions — Best to Worst"><p className="muted">Sorted by PnL %, strongest winners glow green and weakest positions glow orange/red.</p><div className="position-list">{positions.map((p:AnyObj)=><article className="position" key={p.symbol} style={positionGlowStyle(p)}><div><h3>{p.symbol}</h3><p>Qty {Number(p.qty || 0).toFixed(4)} · Entry {usd(p.entry)} · Price {usd(p.price)}</p><p>Value <b>{gbp(p.marketValueGbp ?? p.marketValue * rate)}</b> / {usd(p.marketValue)}</p></div><div className="position-side"><b className={tone(p.pnl)}>PnL {gbp(p.pnlGbp ?? p.pnl * rate)} / {usd(p.pnl)} / {pct(p.pnlPct)}</b><span>{p.trailingActive ? `Trailing floor ${usd(p.trailFloor)}` : `Trail starts ${usd(p.trailStartPrice)}`}</span><button className="danger" onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button></div></article>)}{!positions.length && <p className="muted">No open positions.</p>}</div></Card>}
