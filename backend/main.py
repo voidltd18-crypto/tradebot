@@ -722,6 +722,12 @@ def get_market_status_payload():
         return {"isOpen": False, "label": "UNKNOWN", "error": str(e), "timestamp": "", "nextOpen": "", "nextClose": ""}
 
 
+
+@app.get("/market-status")
+def api_market_status():
+    return get_market_status_payload()
+
+
 def get_quote(symbol: str):
     req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
     quote = data_client.get_stock_latest_quote(req)[symbol]
@@ -3768,10 +3774,17 @@ def emergency_sell(request: Request):
 @app.post("/rebuild-closed-trades")
 def rebuild_closed_trades(request: Request):
     verify_api_key(request)
-    with bot_lock:
-        result = rebuild_closed_trades_from_orders()
-        update_status(BOT_NAME, latest_scans)
-        return result
+    result = rebuild_closed_trades_from_orders()
+    update_status(BOT_NAME, latest_scans)
+    return result
+
+
+@app.get("/rebuild-closed-trades")
+def rebuild_closed_trades_get(request: Request):
+    verify_api_key(request)
+    result = rebuild_closed_trades_from_orders()
+    update_status(BOT_NAME, latest_scans)
+    return result
 
 
 
@@ -3798,10 +3811,17 @@ def refresh_universe(request: Request):
 @app.post("/backfill-trades")
 def backfill_trades(request: Request):
     verify_api_key(request)
-    with bot_lock:
-        result = backfill_trades_from_alpaca_full()
-        update_status(BOT_NAME, latest_scans)
-        return result
+    result = backfill_trades_from_alpaca_full()
+    update_status(BOT_NAME, latest_scans)
+    return result
+
+
+@app.get("/backfill-trades")
+def backfill_trades_get(request: Request):
+    verify_api_key(request)
+    result = backfill_trades_from_alpaca_full()
+    update_status(BOT_NAME, latest_scans)
+    return result
 
 
 # =========================
