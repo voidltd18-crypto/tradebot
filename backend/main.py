@@ -2106,101 +2106,6 @@ def rebuild_closed_trades_from_orders():
     }
 
 
-def closed_trades_live_from_raw_trades(limit: int = 1000):
-    """
-    Builds closed trades directly from the raw trades table for Reports.
-    This is a display-safe fallback: it does not delete or write anything.
-    It fixes cases where closed_trades is stale but raw Alpaca backfill contains newer fills.
-    """
-    if not SQLITE_ENABLED:
-        return []
-
-    try:
-        init_db()
-        conn = db_connect()
-        rows = conn.execute("""
-            SELECT *
-            FROM trades
-            WHERE symbol IS NOT NULL
-              AND side IN ('BUY', 'SELL')
-              AND qty > 0
-            ORDER BY timestamp ASC, id ASC
-        """).fetchall()
-        conn.close()
-
-        open_lots: Dict[str, List[Dict[str, Any]]] = {}
-        closed: List[Dict[str, Any]] = []
-        rate = get_usd_to_gbp_rate()
-
-        for r in rows:
-            symbol = str(r["symbol"] or "").upper()
-            side = str(r["side"] or "").upper()
-            qty = float(r["qty"] or 0.0)
-            price = float(r["price"] or 0.0)
-
-            if price <= 0 and qty > 0:
-                amount = float(r["amount"] or 0.0)
-                if amount > 0:
-                    price = amount / qty
-
-            if not symbol or qty <= 0 or price <= 0:
-                continue
-
-            if side == "BUY":
-                open_lots.setdefault(symbol, []).append({
-                    "qty": qty,
-                    "price": price,
-                    "order_id": r["alpaca_order_id"],
-                    "timestamp": r["timestamp"],
-                })
-                continue
-
-            if side == "SELL":
-                remaining = qty
-                lots = open_lots.setdefault(symbol, [])
-
-                while remaining > 1e-9 and lots:
-                    lot = lots[0]
-                    used_qty = min(remaining, float(lot["qty"]))
-                    entry_price = float(lot["price"])
-                    exit_price = price
-                    pnl = (exit_price - entry_price) * used_qty
-                    pnl_pct = ((exit_price / entry_price) - 1.0) * 100.0 if entry_price > 0 else 0.0
-
-                    closed.append({
-                        "id": f"live-{len(closed)+1}",
-                        "timestamp": r["timestamp"],
-                        "day": r["day"],
-                        "time": r["time"],
-                        "symbol": symbol,
-                        "side": "SELL",
-                        "qty": used_qty,
-                        "entryPrice": entry_price,
-                        "exitPrice": exit_price,
-                        "price": exit_price,
-                        "pnl": round(pnl, 6),
-                        "pnlGbp": round(pnl * rate, 6),
-                        "pnlPct": round(pnl_pct, 6),
-                        "fxRate": rate,
-                        "reason": "LIVE FIFO MATCHED CLOSED TRADE",
-                        "source": "live_fifo_reports",
-                        "equity": 0.0,
-                        "equityGbp": 0.0,
-                    })
-
-                    lot["qty"] = float(lot["qty"]) - used_qty
-                    remaining -= used_qty
-                    if lot["qty"] <= 1e-9:
-                        lots.pop(0)
-
-        closed.sort(key=lambda x: str(x.get("timestamp") or ""), reverse=True)
-        return closed[:limit]
-
-    except Exception as e:
-        print(f"LIVE CLOSED TRADES REPORT ERROR: {e}")
-        return []
-
-
 def closed_trade_summary_payload():
     closed = closed_trades_from_db(10000)
     wins = [t for t in closed if float(t.get("pnl") or 0.0) >= 0]
@@ -3630,14 +3535,7 @@ def emergency_sell(request: Request):
 def rebuild_closed_trades(request: Request):
     verify_api_key(request)
     with bot_lock:
-        print("REBUILD CLOSED TRADES BUTTON HIT")
         result = rebuild_closed_trades_from_orders()
-        try:
-            newest = closed_trades_live_from_raw_trades(1)
-            result["newestLiveClosedTrade"] = newest[0] if newest else None
-        except Exception as e:
-            result["newestLiveClosedTradeError"] = str(e)
-        print(f"REBUILD CLOSED TRADES RESULT: {result}")
         update_status(BOT_NAME, latest_scans)
         return result
 
@@ -3817,7 +3715,7 @@ def reports():
         total_deposited = equity
         deposit_source = "equity-baseline"
     total_gain_loss = equity + total_withdrawn - total_deposited
-    closed = closed_trades_live_from_raw_trades(1000) or closed_trades_from_db(1000) or status.get("closedTrades") or []
+    closed = status.get("closedTrades") or []
     timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
     equity_history = []
     for i, e in enumerate(timeline if isinstance(timeline, list) else []):
