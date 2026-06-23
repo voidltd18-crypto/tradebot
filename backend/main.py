@@ -1970,7 +1970,7 @@ def closed_trades_from_db(limit: int = 1000):
         conn = db_connect()
         rows = conn.execute("""
             SELECT * FROM closed_trades
-            ORDER BY datetime(timestamp) DESC, timestamp DESC, id DESC
+            ORDER BY timestamp DESC
             LIMIT ?
         """, (limit,)).fetchall()
         conn.close()
@@ -2104,6 +2104,101 @@ def rebuild_closed_trades_from_orders():
         "matchedClosedTrades": closed_count,
         "unmatchedSells": unmatched_sells,
     }
+
+
+def closed_trades_live_from_raw_trades(limit: int = 1000):
+    """
+    Builds closed trades directly from the raw trades table for Reports.
+    This is a display-safe fallback: it does not delete or write anything.
+    It fixes cases where closed_trades is stale but raw Alpaca backfill contains newer fills.
+    """
+    if not SQLITE_ENABLED:
+        return []
+
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute("""
+            SELECT *
+            FROM trades
+            WHERE symbol IS NOT NULL
+              AND side IN ('BUY', 'SELL')
+              AND qty > 0
+            ORDER BY timestamp ASC, id ASC
+        """).fetchall()
+        conn.close()
+
+        open_lots: Dict[str, List[Dict[str, Any]]] = {}
+        closed: List[Dict[str, Any]] = []
+        rate = get_usd_to_gbp_rate()
+
+        for r in rows:
+            symbol = str(r["symbol"] or "").upper()
+            side = str(r["side"] or "").upper()
+            qty = float(r["qty"] or 0.0)
+            price = float(r["price"] or 0.0)
+
+            if price <= 0 and qty > 0:
+                amount = float(r["amount"] or 0.0)
+                if amount > 0:
+                    price = amount / qty
+
+            if not symbol or qty <= 0 or price <= 0:
+                continue
+
+            if side == "BUY":
+                open_lots.setdefault(symbol, []).append({
+                    "qty": qty,
+                    "price": price,
+                    "order_id": r["alpaca_order_id"],
+                    "timestamp": r["timestamp"],
+                })
+                continue
+
+            if side == "SELL":
+                remaining = qty
+                lots = open_lots.setdefault(symbol, [])
+
+                while remaining > 1e-9 and lots:
+                    lot = lots[0]
+                    used_qty = min(remaining, float(lot["qty"]))
+                    entry_price = float(lot["price"])
+                    exit_price = price
+                    pnl = (exit_price - entry_price) * used_qty
+                    pnl_pct = ((exit_price / entry_price) - 1.0) * 100.0 if entry_price > 0 else 0.0
+
+                    closed.append({
+                        "id": f"live-{len(closed)+1}",
+                        "timestamp": r["timestamp"],
+                        "day": r["day"],
+                        "time": r["time"],
+                        "symbol": symbol,
+                        "side": "SELL",
+                        "qty": used_qty,
+                        "entryPrice": entry_price,
+                        "exitPrice": exit_price,
+                        "price": exit_price,
+                        "pnl": round(pnl, 6),
+                        "pnlGbp": round(pnl * rate, 6),
+                        "pnlPct": round(pnl_pct, 6),
+                        "fxRate": rate,
+                        "reason": "LIVE FIFO MATCHED CLOSED TRADE",
+                        "source": "live_fifo_reports",
+                        "equity": 0.0,
+                        "equityGbp": 0.0,
+                    })
+
+                    lot["qty"] = float(lot["qty"]) - used_qty
+                    remaining -= used_qty
+                    if lot["qty"] <= 1e-9:
+                        lots.pop(0)
+
+        closed.sort(key=lambda x: str(x.get("timestamp") or ""), reverse=True)
+        return closed[:limit]
+
+    except Exception as e:
+        print(f"LIVE CLOSED TRADES REPORT ERROR: {e}")
+        return []
 
 
 def closed_trade_summary_payload():
@@ -2243,29 +2338,17 @@ def get_query_order_status_all():
 def fetch_all_orders_paginated():
     """
     Alpaca-py pagination/backfill.
-
-    IMPORTANT FIX:
-    The restored 08/06 build could keep pulling the older March/April section
-    of order history. This version explicitly asks Alpaca for recent history
-    first using AFTER + UNTIL + DESC, then walks backwards page-by-page.
+    Pulls ALL orders backwards in chunks using `until`, same idea as the user-provided snippet.
     """
     all_orders = []
     until = datetime.now(UTC)
-    lookback_days = int(os.getenv("BACKFILL_LOOKBACK_DAYS", "365") or 365)
-    after = until - timedelta(days=lookback_days)
     seen_ids = set()
-
-    print(
-        f"BACKFILL START: after={after.isoformat()} until={until.isoformat()} "
-        f"chunk={BACKFILL_CHUNK_SIZE} max_pages={BACKFILL_MAX_PAGES}"
-    )
 
     for page in range(BACKFILL_MAX_PAGES):
         try:
             req = GetOrdersRequest(
                 status=get_query_order_status_all(),
                 limit=BACKFILL_CHUNK_SIZE,
-                after=after,
                 until=until,
                 direction="desc",
                 nested=False,
@@ -2275,7 +2358,6 @@ def fetch_all_orders_paginated():
             req = GetOrdersRequest(
                 status=get_query_order_status_all(),
                 limit=BACKFILL_CHUNK_SIZE,
-                after=after,
                 until=until,
                 direction="desc",
             )
@@ -2283,12 +2365,10 @@ def fetch_all_orders_paginated():
         chunk = trading_client.get_orders(filter=req)
 
         if not chunk:
-            print(f"BACKFILL PAGE {page + 1}: fetched=0 new=0")
             break
 
         new_count = 0
         earliest = None
-        newest = None
 
         for order in chunk:
             oid = get_order_id(order)
@@ -2304,22 +2384,18 @@ def fetch_all_orders_paginated():
             ts = parse_order_timestamp(order)
             if earliest is None or str(ts) < str(earliest):
                 earliest = ts
-            if newest is None or str(ts) > str(newest):
-                newest = ts
 
-        print(
-            f"BACKFILL PAGE {page + 1}: fetched={len(chunk)} new={new_count} "
-            f"newest={newest} earliest={earliest}"
-        )
+        print(f"BACKFILL PAGE {page + 1}: fetched={len(chunk)} new={new_count}")
 
         if new_count == 0 or len(chunk) < BACKFILL_CHUNK_SIZE:
             break
 
-        # Move until backwards to just before the earliest order timestamp in this chunk.
+        # Move until backwards to the earliest order timestamp in this chunk.
         if earliest:
             try:
                 until = earliest - timedelta(microseconds=1)
             except Exception:
+                # If alpaca returns string timestamps.
                 try:
                     until = datetime.fromisoformat(str(earliest).replace("Z", "+00:00")) - timedelta(microseconds=1)
                 except Exception:
@@ -2327,14 +2403,6 @@ def fetch_all_orders_paginated():
         else:
             break
 
-        # Safety stop if we have walked past the lookback start.
-        try:
-            if until <= after:
-                break
-        except Exception:
-            pass
-
-    print(f"BACKFILL COMPLETE: total_orders={len(all_orders)}")
     return all_orders
 
 
@@ -3562,33 +3630,17 @@ def emergency_sell(request: Request):
 def rebuild_closed_trades(request: Request):
     verify_api_key(request)
     with bot_lock:
+        print("REBUILD CLOSED TRADES BUTTON HIT")
         result = rebuild_closed_trades_from_orders()
+        try:
+            newest = closed_trades_live_from_raw_trades(1)
+            result["newestLiveClosedTrade"] = newest[0] if newest else None
+        except Exception as e:
+            result["newestLiveClosedTradeError"] = str(e)
+        print(f"REBUILD CLOSED TRADES RESULT: {result}")
         update_status(BOT_NAME, latest_scans)
         return result
 
-
-
-@app.get("/reports-debug")
-def reports_debug(request: Request):
-    verify_api_key(request)
-    init_db()
-    conn = db_connect()
-    try:
-        trade_rows = conn.execute("""
-            SELECT COUNT(*) AS c, MIN(timestamp) AS oldest, MAX(timestamp) AS newest
-            FROM trades
-        """).fetchone()
-        closed_rows = conn.execute("""
-            SELECT COUNT(*) AS c, MIN(timestamp) AS oldest, MAX(timestamp) AS newest
-            FROM closed_trades
-        """).fetchone()
-    finally:
-        conn.close()
-    return {
-        "ok": True,
-        "trades": dict(trade_rows) if trade_rows else {},
-        "closedTrades": dict(closed_rows) if closed_rows else {},
-    }
 
 
 @app.post("/backfill-trades-limited")
@@ -3765,7 +3817,7 @@ def reports():
         total_deposited = equity
         deposit_source = "equity-baseline"
     total_gain_loss = equity + total_withdrawn - total_deposited
-    closed = status.get("closedTrades") or []
+    closed = closed_trades_live_from_raw_trades(1000) or closed_trades_from_db(1000) or status.get("closedTrades") or []
     timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
     equity_history = []
     for i, e in enumerate(timeline if isinstance(timeline, list) else []):
