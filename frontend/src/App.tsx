@@ -623,33 +623,6 @@ const fetchData = useCallback(async (force = false) => {
     return d.toLocaleDateString(undefined, { month:"short", day:"2-digit" });
   }
 
-
-
-  function closedTradeRawDate(t: AnyObj) {
-    return t.timestamp || t.exitTime || t.closedAt || t.filledAt || t.time || t.date || "";
-  }
-  function closedTradeMs(t: AnyObj) {
-    const raw = closedTradeRawDate(t);
-    const d = new Date(raw);
-    return Number.isNaN(d.getTime()) ? 0 : d.getTime();
-  }
-  function closedTradeDate(t: AnyObj) {
-    const raw = closedTradeRawDate(t);
-    const d = new Date(raw);
-    if (Number.isNaN(d.getTime())) return raw ? String(raw).slice(0, 10) : "—";
-    return d.toLocaleDateString("en-GB");
-  }
-  function closedTradeTime(t: AnyObj) {
-    const raw = closedTradeRawDate(t);
-    const d = new Date(raw);
-    if (Number.isNaN(d.getTime())) return String(t.time || "—").slice(0, 8);
-    return d.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  }
-
-  const sortedClosedTrades = useMemo(() => {
-    return [...closedTrades].sort((a: AnyObj, b: AnyObj) => closedTradeMs(b) - closedTradeMs(a));
-  }, [closedTrades]);
-
   const reportChart = useMemo(() => equityHistory.map((e:AnyObj, i:number) => {
     const raw = e.time || e.timestamp || e.t || e.label || "";
     return {
@@ -939,7 +912,7 @@ const fetchData = useCallback(async (force = false) => {
     </main>}
 
     {tab==="reports" && <main className="reports-page">
-      <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button onClick={() => action("/backfill-trades")}>Backfill Past Trades</button><button className="ghost" onClick={() => action("/backfill-trades-limited")}>Quick Backfill</button><button className="ghost" onClick={() => action("/rebuild-closed-trades")}>Rebuild Closed Trades</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
+      <div className="actions report-actions"><button onClick={() => fetchData(true)}>Refresh Reports</button><button className="danger" onClick={resetBaseline}>Reset PnL Baseline</button>
           <input
             className="input"
             placeholder="Baseline £ e.g. 989.86"
@@ -977,7 +950,7 @@ const fetchData = useCallback(async (force = false) => {
         {replayResult?.notes && <p className="notice">{replayResult.notes}</p>}
         {Array.isArray(replayResult?.bySymbol) && replayResult.bySymbol.length > 0 && <div className="table-wrap"><table><thead><tr><th>Symbol</th><th>Trades</th><th>Win rate</th><th>PnL</th></tr></thead><tbody>{replayResult.bySymbol.slice(0,12).map((r:AnyObj)=><tr key={r.symbol}><td>{r.symbol}</td><td>{r.trades}</td><td>{pct(Number(r.winRate || 0) * 100)}</td><td className={tone(r.pnlGbp)}>{gbp(r.pnlGbp)} / {usd(r.pnlUsd)}</td></tr>)}</tbody></table></div>}
       </Card>
-      <Card title="Closed Trade History"><div className="table-wrap"><table><thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th></tr></thead><tbody>{sortedClosedTrades.slice(0,80).map((t:AnyObj,i:number)=><tr key={i}><td>{closedTradeDate(t)}</td><td>{closedTradeTime(t)}</td><td>{t.symbol}</td><td>{usd(t.entryPrice)}</td><td>{usd(t.exitPrice)}</td><td>{Number(t.qty || 0).toFixed(4)}</td><td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td><td className={tone(t.pnl)}>{pct(t.pnlPct)}</td></tr>)}{!closedTrades.length && <tr><td colSpan={8}>No matched closed trades yet.</td></tr>}</tbody></table></div></Card>
+      <Card title="Closed Trade History"><div className="table-wrap"><table><thead><tr><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th></tr></thead><tbody>{closedTrades.slice(-80).reverse().map((t:AnyObj,i:number)=><tr key={i}><td>{t.time || "—"}</td><td>{t.symbol}</td><td>{usd(t.entryPrice)}</td><td>{usd(t.exitPrice)}</td><td>{Number(t.qty || 0).toFixed(4)}</td><td className={tone(t.pnl)}>{gbp(Number(t.pnl || 0) * rate)} / {usd(t.pnl)}</td><td className={tone(t.pnl)}>{pct(t.pnlPct)}</td></tr>)}{!closedTrades.length && <tr><td colSpan={7}>No matched closed trades yet.</td></tr>}</tbody></table></div></Card>
     </main>}
 
     {tab==="positions" && <Card title="All Positions — Best to Worst"><p className="muted">Sorted by PnL %, strongest winners glow green and weakest positions glow orange/red.</p><div className="position-list">{positions.map((p:AnyObj)=><article className="position" key={p.symbol} style={positionGlowStyle(p)}><div><h3>{p.symbol}</h3><p>Qty {Number(p.qty || 0).toFixed(4)} · Entry {usd(p.entry)} · Price {usd(p.price)}</p><p>Value <b>{gbp(p.marketValueGbp ?? p.marketValue * rate)}</b> / {usd(p.marketValue)}</p></div><div className="position-side"><b className={tone(p.pnl)}>PnL {gbp(p.pnlGbp ?? p.pnl * rate)} / {usd(p.pnl)} / {pct(p.pnlPct)}</b><span>{p.trailingActive ? `Trailing floor ${usd(p.trailFloor)}` : `Trail starts ${usd(p.trailStartPrice)}`}</span><button className="danger" onClick={() => action(`/sell/${p.symbol}`)}>Sell {p.symbol}</button></div></article>)}{!positions.length && <p className="muted">No open positions.</p>}</div></Card>}
