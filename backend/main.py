@@ -1968,11 +1968,9 @@ def closed_trades_from_db(limit: int = 1000):
     try:
         init_db()
         conn = db_connect()
-        # Newest first. The old 08/06 build used ASC + LIMIT, which could show
-        # only the oldest saved trades and hide May/June trades once the DB grew.
         rows = conn.execute("""
             SELECT * FROM closed_trades
-            ORDER BY timestamp DESC
+            ORDER BY datetime(timestamp) DESC, timestamp DESC, id DESC
             LIMIT ?
         """, (limit,)).fetchall()
         conn.close()
@@ -2245,17 +2243,29 @@ def get_query_order_status_all():
 def fetch_all_orders_paginated():
     """
     Alpaca-py pagination/backfill.
-    Pulls ALL orders backwards in chunks using `until`, same idea as the user-provided snippet.
+
+    IMPORTANT FIX:
+    The restored 08/06 build could keep pulling the older March/April section
+    of order history. This version explicitly asks Alpaca for recent history
+    first using AFTER + UNTIL + DESC, then walks backwards page-by-page.
     """
     all_orders = []
     until = datetime.now(UTC)
+    lookback_days = int(os.getenv("BACKFILL_LOOKBACK_DAYS", "365") or 365)
+    after = until - timedelta(days=lookback_days)
     seen_ids = set()
+
+    print(
+        f"BACKFILL START: after={after.isoformat()} until={until.isoformat()} "
+        f"chunk={BACKFILL_CHUNK_SIZE} max_pages={BACKFILL_MAX_PAGES}"
+    )
 
     for page in range(BACKFILL_MAX_PAGES):
         try:
             req = GetOrdersRequest(
                 status=get_query_order_status_all(),
                 limit=BACKFILL_CHUNK_SIZE,
+                after=after,
                 until=until,
                 direction="desc",
                 nested=False,
@@ -2265,6 +2275,7 @@ def fetch_all_orders_paginated():
             req = GetOrdersRequest(
                 status=get_query_order_status_all(),
                 limit=BACKFILL_CHUNK_SIZE,
+                after=after,
                 until=until,
                 direction="desc",
             )
@@ -2272,10 +2283,12 @@ def fetch_all_orders_paginated():
         chunk = trading_client.get_orders(filter=req)
 
         if not chunk:
+            print(f"BACKFILL PAGE {page + 1}: fetched=0 new=0")
             break
 
         new_count = 0
         earliest = None
+        newest = None
 
         for order in chunk:
             oid = get_order_id(order)
@@ -2291,18 +2304,22 @@ def fetch_all_orders_paginated():
             ts = parse_order_timestamp(order)
             if earliest is None or str(ts) < str(earliest):
                 earliest = ts
+            if newest is None or str(ts) > str(newest):
+                newest = ts
 
-        print(f"BACKFILL PAGE {page + 1}: fetched={len(chunk)} new={new_count}")
+        print(
+            f"BACKFILL PAGE {page + 1}: fetched={len(chunk)} new={new_count} "
+            f"newest={newest} earliest={earliest}"
+        )
 
         if new_count == 0 or len(chunk) < BACKFILL_CHUNK_SIZE:
             break
 
-        # Move until backwards to the earliest order timestamp in this chunk.
+        # Move until backwards to just before the earliest order timestamp in this chunk.
         if earliest:
             try:
                 until = earliest - timedelta(microseconds=1)
             except Exception:
-                # If alpaca returns string timestamps.
                 try:
                     until = datetime.fromisoformat(str(earliest).replace("Z", "+00:00")) - timedelta(microseconds=1)
                 except Exception:
@@ -2310,6 +2327,14 @@ def fetch_all_orders_paginated():
         else:
             break
 
+        # Safety stop if we have walked past the lookback start.
+        try:
+            if until <= after:
+                break
+        except Exception:
+            pass
+
+    print(f"BACKFILL COMPLETE: total_orders={len(all_orders)}")
     return all_orders
 
 
@@ -3536,13 +3561,34 @@ def emergency_sell(request: Request):
 @app.post("/rebuild-closed-trades")
 def rebuild_closed_trades(request: Request):
     verify_api_key(request)
-    print("REBUILD CLOSED TRADES BUTTON HIT")
     with bot_lock:
         result = rebuild_closed_trades_from_orders()
-        print(f"REBUILD CLOSED TRADES RESULT: {result}")
         update_status(BOT_NAME, latest_scans)
         return result
 
+
+
+@app.get("/reports-debug")
+def reports_debug(request: Request):
+    verify_api_key(request)
+    init_db()
+    conn = db_connect()
+    try:
+        trade_rows = conn.execute("""
+            SELECT COUNT(*) AS c, MIN(timestamp) AS oldest, MAX(timestamp) AS newest
+            FROM trades
+        """).fetchone()
+        closed_rows = conn.execute("""
+            SELECT COUNT(*) AS c, MIN(timestamp) AS oldest, MAX(timestamp) AS newest
+            FROM closed_trades
+        """).fetchone()
+    finally:
+        conn.close()
+    return {
+        "ok": True,
+        "trades": dict(trade_rows) if trade_rows else {},
+        "closedTrades": dict(closed_rows) if closed_rows else {},
+    }
 
 
 @app.post("/backfill-trades-limited")
@@ -3719,17 +3765,8 @@ def reports():
         total_deposited = equity
         deposit_source = "equity-baseline"
     total_gain_loss = equity + total_withdrawn - total_deposited
-    # Read reports directly from SQLite so the page updates immediately after
-    # backfill/rebuild instead of relying on possibly stale latest_status.
-    try:
-        closed = closed_trades_from_db(500)
-    except Exception as e:
-        print(f"REPORTS CLOSED TRADE DB READ ERROR: {e}")
-        closed = status.get("closedTrades") or []
-    try:
-        timeline = trades_from_db(1000)
-    except Exception:
-        timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
+    closed = status.get("closedTrades") or []
+    timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
     equity_history = []
     for i, e in enumerate(timeline if isinstance(timeline, list) else []):
         if not isinstance(e, dict):
@@ -3758,8 +3795,7 @@ def reports():
         "lostSinceDeposit": abs(min(total_gain_loss, 0.0)),
         "dayPnl": _safe_num(account.get("pnlDay")),
         "realisedNet": _safe_num(db.get("totalPnl")),
-        # Already newest-first from DB. Return the latest 200 directly.
-        "closedTrades": closed[:200] if isinstance(closed, list) else [],
+        "closedTrades": closed[-200:] if isinstance(closed, list) else [],
         "equityHistory": equity_history[-500:],
         "winRate": _safe_num(db.get("winRate")) * 100.0,
         "totalTrades": int(_safe_num(db.get("totalTrades"))),
