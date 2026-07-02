@@ -77,7 +77,7 @@ SAFE_UNIVERSE = [
 CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
-MAX_POSITIONS = 6
+MAX_POSITIONS = 1
 MAX_NEW_BUYS_PER_LOOP = 1
 MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
@@ -101,9 +101,9 @@ MOMENTUM_LOOKBACK_POINTS = 5
 MIN_SHORT_MOMENTUM = -0.015
 MAX_SHORT_MOMENTUM = 0.045
 
-STOP_LOSS = 0.980
-TRAIL_START = 1.012
-TRAIL_GIVEBACK = 0.993
+STOP_LOSS = 0.960
+TRAIL_START = 1.060
+TRAIL_GIVEBACK = 0.980
 
 MAX_DAILY_LOSS = -100.00
 MAX_TRADES_PER_DAY = 12
@@ -130,19 +130,30 @@ AVOID_SAME_DAY_PROFIT_SELLS = True
 AVOID_SAME_DAY_ROTATION_SELLS = True
 MIN_HOLD_MINUTES_BEFORE_PROFIT_SELL = 45
 MIN_HOLD_MINUTES_BEFORE_ROTATION = 60
-HARD_STOP_LOSS_PCT = -3.50
+HARD_STOP_LOSS_PCT = -4.50
 MAX_NEW_BUYS_PER_DAY_PDT_AWARE = 6
 
 # Faster Exit / Partial Profit Mode
 FAST_EXIT_MODE_ENABLED = True
-PARTIAL_PROFIT_ENABLED = True
-PARTIAL_PROFIT_TRIGGER_PCT = 1.00
-PARTIAL_PROFIT_SELL_PCT = 0.50
-POST_PARTIAL_TRAIL_GIVEBACK = 0.996
-FAST_STOP_LOSS_PCT = -2.00
+PARTIAL_PROFIT_ENABLED = False
+PARTIAL_PROFIT_TRIGGER_PCT = 8.00
+PARTIAL_PROFIT_SELL_PCT = 0.00
+POST_PARTIAL_TRAIL_GIVEBACK = 0.980
+FAST_STOP_LOSS_PCT = -4.00
 STALL_EXIT_ENABLED = True
-STALL_EXIT_AFTER_MINUTES = 90
-STALL_EXIT_MIN_PNL_PCT = 0.30
+STALL_EXIT_AFTER_MINUTES = 4320
+STALL_EXIT_MIN_PNL_PCT = -1.00
+
+# Swing Hold AI: learns from closed-trade history and avoids quick exits.
+SWING_SNIPER_SAFE_MODE = True
+HOLD_AI_ENABLED = True
+HOLD_AI_LOOKBACK_DAYS = 180
+HOLD_AI_MIN_HOLD_MINUTES = 1440       # default: at least 1 trading day
+HOLD_AI_GOOD_SYMBOL_HOLD_MINUTES = 2880
+HOLD_AI_WEAK_SYMBOL_HOLD_MINUTES = 720
+HOLD_AI_MAX_STALL_MINUTES = 4320      # only consider a stall exit after 3 days
+HOLD_AI_MIN_TRAIL_PROFIT_PCT = 6.00
+HOLD_AI_TRAIL_GIVEBACK_PCT = 2.00
 MIN_SELL_NOTIONAL = 1.00
 
 # Profit Optimiser / Analytics / Auto-Improve
@@ -155,12 +166,12 @@ DAILY_LOSS_LIMIT_OPTIMIZER = -100.00
 PAUSE_BUYS_AFTER_DAILY_TARGET = True
 PAUSE_BUYS_AFTER_DAILY_LOSS = True
 
-OPTIMIZED_STOP_LOSS = 0.980
-OPTIMIZED_TRAIL_START = 1.020
-OPTIMIZED_TRAIL_GIVEBACK = 0.995
-OPTIMIZED_FAST_STOP_LOSS_PCT = -2.00
-OPTIMIZED_PARTIAL_PROFIT_TRIGGER_PCT = 1.50
-OPTIMIZED_PARTIAL_PROFIT_SELL_PCT = 0.35
+OPTIMIZED_STOP_LOSS = 0.960
+OPTIMIZED_TRAIL_START = 1.060
+OPTIMIZED_TRAIL_GIVEBACK = 0.980
+OPTIMIZED_FAST_STOP_LOSS_PCT = -4.00
+OPTIMIZED_PARTIAL_PROFIT_TRIGGER_PCT = 8.00
+OPTIMIZED_PARTIAL_PROFIT_SELL_PCT = 0.00
 
 AUTO_BLACKLIST_ENABLED = True
 AUTO_BLACKLIST_MIN_TRADES = 4
@@ -195,20 +206,6 @@ A_PLUS_MIN_QUALITY = 0.03
 A_PLUS_MAX_SPREAD = 0.010
 A_PLUS_REQUIRE_NON_NEGATIVE_MOMENTUM = True
 A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY = True
-
-# Adaptive AI Scoring - learns from rebuilt closed trade history
-ADAPTIVE_AI_SCORING_ENABLED = True
-ADAPTIVE_MIN_TRADES_SYMBOL = 3
-ADAPTIVE_MIN_TRADES_SETUP = 6
-ADAPTIVE_LOOKBACK_DAYS = 180
-ADAPTIVE_CACHE_SECONDS = 60
-ADAPTIVE_MAX_CONFIDENCE_BOOST = 0.12
-ADAPTIVE_MAX_CONFIDENCE_PENALTY = 0.18
-ADAPTIVE_GOOD_WINRATE = 0.58
-ADAPTIVE_BAD_WINRATE = 0.42
-ADAPTIVE_MIN_AVG_PNL_GOOD = 0.10
-ADAPTIVE_MIN_AVG_PNL_BAD = -0.25
-ADAPTIVE_RAISE_GATE_AFTER_POOR_HISTORY = True
 
 # Temporary loser blacklist
 LOSER_BLACKLIST_ENABLED = True
@@ -517,18 +514,11 @@ def a_plus_gate(scan: Dict[str, Any]):
     spread = float(scan.get("spread", 1.0))
     momentum = float(scan.get("short_momentum", scan.get("shortMomentum", 0.0)))
 
-    adaptive_delta, adaptive_reason = adaptive_ai_adjustment(scan)
-    min_conf = A_PLUS_MIN_CONFIDENCE
-    min_quality = A_PLUS_MIN_QUALITY
-    if ADAPTIVE_RAISE_GATE_AFTER_POOR_HISTORY and adaptive_delta < -0.05:
-        min_conf = min(0.90, min_conf + 0.05)
-        min_quality = min_quality + 0.004
+    if confidence < A_PLUS_MIN_CONFIDENCE:
+        return False, f"confidence {confidence:.2f} below A+ {A_PLUS_MIN_CONFIDENCE:.2f}"
 
-    if confidence < min_conf:
-        return False, f"confidence {confidence:.2f} below A+ {min_conf:.2f} ({adaptive_reason})"
-
-    if quality < min_quality:
-        return False, f"quality {quality:.4f} below A+ {min_quality:.4f} ({adaptive_reason})"
+    if quality < A_PLUS_MIN_QUALITY:
+        return False, f"quality {quality:.4f} below A+ {A_PLUS_MIN_QUALITY:.4f}"
 
     if spread > A_PLUS_MAX_SPREAD:
         return False, f"spread {spread:.4f} above A+ {A_PLUS_MAX_SPREAD:.4f}"
@@ -906,147 +896,6 @@ def memory_multiplier(symbol: str):
     return 1.0
 
 
-_adaptive_cache = {"ts": 0.0, "payload": None}
-
-
-def _adaptive_bucket_from_trade(t: Dict[str, Any]):
-    """Fallback setup bucket for old closed trades that do not store scan features."""
-    try:
-        pct = float(t.get("pnlPct") or 0.0)
-    except Exception:
-        pct = 0.0
-    # Bucket by historical outcome size so the learner still has useful context from old data.
-    if pct >= 2.0:
-        return "strong_winner"
-    if pct >= 0.0:
-        return "small_winner"
-    if pct <= -2.0:
-        return "hard_loser"
-    return "small_loser"
-
-
-def _adaptive_bucket_from_scan(scan: Dict[str, Any]):
-    quality = float(scan.get("quality_score", scan.get("qualityScore", 0.0)) or 0.0)
-    momentum = float(scan.get("short_momentum", scan.get("shortMomentum", 0.0)) or 0.0)
-    spread = float(scan.get("spread", 1.0) or 1.0)
-    pullback = float(scan.get("pullback", 0.0) or 0.0)
-
-    q = "q_hi" if quality >= 0.03 else "q_mid" if quality >= 0.02 else "q_low"
-    m = "mom_pos" if momentum >= 0.003 else "mom_flat" if momentum >= 0 else "mom_neg"
-    sp = "spread_tight" if spread <= 0.006 else "spread_ok" if spread <= 0.010 else "spread_wide"
-    pb = "pb_good" if SNIPER_MIN_PULLBACK <= pullback <= SNIPER_MAX_PULLBACK else "pb_bad"
-    return f"{q}|{m}|{sp}|{pb}"
-
-
-def _adaptive_build_payload():
-    closed = []
-    try:
-        if "closed_trades_from_db" in globals():
-            closed = closed_trades_from_db(5000)
-    except Exception as e:
-        print(f"ADAPTIVE READ ERROR: {e}")
-        closed = []
-
-    cutoff = datetime.now(UTC) - timedelta(days=ADAPTIVE_LOOKBACK_DAYS)
-    by_symbol: Dict[str, Dict[str, Any]] = {}
-    by_setup: Dict[str, Dict[str, Any]] = {}
-
-    def add_row(bucket: Dict[str, Any], pnl: float, pnl_pct: float):
-        bucket["trades"] += 1
-        bucket["totalPnl"] += pnl
-        bucket["totalPct"] += pnl_pct
-        if pnl >= 0:
-            bucket["wins"] += 1
-        else:
-            bucket["losses"] += 1
-
-    for t in closed:
-        try:
-            ts = parse_iso_dt(t.get("timestamp") or t.get("day") or "")
-            if ts and ts < cutoff:
-                continue
-        except Exception:
-            pass
-        symbol = str(t.get("symbol") or "").upper().strip()
-        if not symbol:
-            continue
-        pnl = float(t.get("pnl") or 0.0)
-        pnl_pct = float(t.get("pnlPct") or t.get("pnl_pct") or 0.0)
-        sym = by_symbol.setdefault(symbol, {"symbol": symbol, "trades": 0, "wins": 0, "losses": 0, "totalPnl": 0.0, "totalPct": 0.0})
-        add_row(sym, pnl, pnl_pct)
-        setup_name = _adaptive_bucket_from_trade(t)
-        setup = by_setup.setdefault(setup_name, {"setup": setup_name, "trades": 0, "wins": 0, "losses": 0, "totalPnl": 0.0, "totalPct": 0.0})
-        add_row(setup, pnl, pnl_pct)
-
-    for d in list(by_symbol.values()) + list(by_setup.values()):
-        d["winRate"] = d["wins"] / max(1, d["trades"])
-        d["avgPnl"] = d["totalPnl"] / max(1, d["trades"])
-        d["avgPct"] = d["totalPct"] / max(1, d["trades"])
-        if d["trades"] >= ADAPTIVE_MIN_TRADES_SYMBOL and d["winRate"] >= ADAPTIVE_GOOD_WINRATE and d["avgPnl"] >= ADAPTIVE_MIN_AVG_PNL_GOOD:
-            d["rating"] = "GOOD"
-        elif d["trades"] >= ADAPTIVE_MIN_TRADES_SYMBOL and (d["winRate"] <= ADAPTIVE_BAD_WINRATE or d["avgPnl"] <= ADAPTIVE_MIN_AVG_PNL_BAD):
-            d["rating"] = "BAD"
-        else:
-            d["rating"] = "NEUTRAL"
-
-    return {
-        "enabled": ADAPTIVE_AI_SCORING_ENABLED,
-        "lookbackDays": ADAPTIVE_LOOKBACK_DAYS,
-        "closedTradesUsed": sum(v["trades"] for v in by_symbol.values()),
-        "symbols": by_symbol,
-        "setups": by_setup,
-    }
-
-
-def adaptive_payload(force: bool = False):
-    now = time.time()
-    if not force and _adaptive_cache.get("payload") is not None and (now - float(_adaptive_cache.get("ts") or 0)) < ADAPTIVE_CACHE_SECONDS:
-        return _adaptive_cache["payload"]
-    payload = _adaptive_build_payload()
-    _adaptive_cache["ts"] = now
-    _adaptive_cache["payload"] = payload
-    return payload
-
-
-def adaptive_ai_adjustment(scan: Dict[str, Any]):
-    if not ADAPTIVE_AI_SCORING_ENABLED:
-        return 0.0, "adaptive off"
-    payload = adaptive_payload()
-    symbol = str(scan.get("symbol") or "").upper().strip()
-    sym = payload.get("symbols", {}).get(symbol) or {}
-
-    adjustment = 0.0
-    reasons = []
-
-    trades = int(sym.get("trades") or 0)
-    if trades >= ADAPTIVE_MIN_TRADES_SYMBOL:
-        win_rate = float(sym.get("winRate") or 0.0)
-        avg_pnl = float(sym.get("avgPnl") or 0.0)
-        if sym.get("rating") == "GOOD":
-            boost = min(ADAPTIVE_MAX_CONFIDENCE_BOOST, 0.03 + (win_rate - ADAPTIVE_GOOD_WINRATE) * 0.20 + max(0.0, avg_pnl) * 0.01)
-            adjustment += boost
-            reasons.append(f"{symbol} good history +{boost:.2f}")
-        elif sym.get("rating") == "BAD":
-            penalty = min(ADAPTIVE_MAX_CONFIDENCE_PENALTY, 0.05 + (ADAPTIVE_BAD_WINRATE - min(win_rate, ADAPTIVE_BAD_WINRATE)) * 0.25 + abs(min(0.0, avg_pnl)) * 0.015)
-            adjustment -= penalty
-            reasons.append(f"{symbol} weak history -{penalty:.2f}")
-
-    # Current live setup bucket support. Old trades do not contain live scan features yet,
-    # but this prepares the bot to learn as future trades add richer data.
-    setup_name = _adaptive_bucket_from_scan(scan)
-    setup = payload.get("setups", {}).get(setup_name) or {}
-    if int(setup.get("trades") or 0) >= ADAPTIVE_MIN_TRADES_SETUP:
-        if setup.get("rating") == "GOOD":
-            adjustment += min(0.04, ADAPTIVE_MAX_CONFIDENCE_BOOST / 2)
-            reasons.append("setup strong +0.04")
-        elif setup.get("rating") == "BAD":
-            adjustment -= min(0.06, ADAPTIVE_MAX_CONFIDENCE_PENALTY / 2)
-            reasons.append("setup weak -0.06")
-
-    adjustment = max(-ADAPTIVE_MAX_CONFIDENCE_PENALTY, min(ADAPTIVE_MAX_CONFIDENCE_BOOST, adjustment))
-    return adjustment, "; ".join(reasons) if reasons else "adaptive neutral"
-
-
 def add_trade_history_event(event: Dict[str, Any]):
     if not TRADE_TIMELINE_ENABLED:
         return
@@ -1097,10 +946,6 @@ def calculate_confidence(scan: Dict[str, Any]):
     confidence += 0.20 if momentum >= 0 else 0.10 if momentum >= SNIPER_MIN_MOMENTUM else 0.0
     confidence += 0.15 if SNIPER_MIN_PULLBACK <= pullback <= SNIPER_MAX_PULLBACK else 0.0
     confidence *= memory_multiplier(symbol)
-
-    adaptive_delta, adaptive_reason = adaptive_ai_adjustment({**scan, "symbol": symbol})
-    confidence += adaptive_delta
-
     confidence = max(0.0, min(1.0, confidence))
 
     label = "HIGH" if confidence >= 0.75 else "MEDIUM" if confidence >= 0.58 else "LOW"
@@ -1465,6 +1310,99 @@ def close_all_positions(reason="EMERGENCY SELL"):
 
 
 
+
+# =========================
+# SWING HOLD AI HELPERS
+# =========================
+def _parse_trade_dt(value: Any):
+    try:
+        if not value:
+            return None
+        txt = str(value).replace("Z", "+00:00")
+        return datetime.fromisoformat(txt)
+    except Exception:
+        return None
+
+
+def hold_ai_symbol_profile(symbol: str):
+    """Small, safe learning layer from rebuilt closed trades.
+    It does not predict prices. It only decides whether this symbol deserves
+    more patience or should be treated cautiously based on its own history.
+    """
+    sym = str(symbol or "").upper()
+    closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
+    cutoff = datetime.now(UTC) - timedelta(days=HOLD_AI_LOOKBACK_DAYS)
+    trades = []
+    for t in closed:
+        if str(t.get("symbol", "")).upper() != sym:
+            continue
+        dt = _parse_trade_dt(t.get("timestamp"))
+        if dt is not None and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        if dt is not None and dt < cutoff:
+            continue
+        trades.append(t)
+
+    wins = [t for t in trades if float(t.get("pnl") or 0.0) > 0]
+    losses = [t for t in trades if float(t.get("pnl") or 0.0) < 0]
+    total = sum(float(t.get("pnl") or 0.0) for t in trades)
+    avg_pct = sum(float(t.get("pnlPct") or 0.0) for t in trades) / max(1, len(trades))
+    win_rate = len(wins) / max(1, len(trades))
+
+    if len(trades) >= HOLD_AI_MIN_TRADES and win_rate >= 0.55 and total > 0:
+        bias = "PATIENT"
+        min_hold = HOLD_AI_GOOD_SYMBOL_HOLD_MINUTES
+    elif len(trades) >= HOLD_AI_MIN_TRADES and (win_rate <= 0.40 or total < 0):
+        bias = "CAUTIOUS"
+        min_hold = HOLD_AI_WEAK_SYMBOL_HOLD_MINUTES
+    else:
+        bias = "NORMAL"
+        min_hold = HOLD_AI_MIN_HOLD_MINUTES
+
+    return {
+        "symbol": sym,
+        "trades": len(trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "winRate": win_rate,
+        "totalPnl": total,
+        "avgPnlPct": avg_pct,
+        "bias": bias,
+        "minHoldMinutes": int(min_hold),
+    }
+
+
+def hold_ai_min_hold_minutes(symbol: str):
+    if not HOLD_AI_ENABLED:
+        return 0
+    return int(hold_ai_symbol_profile(symbol).get("minHoldMinutes") or HOLD_AI_MIN_HOLD_MINUTES)
+
+
+def hold_ai_blocks_soft_exit(position: Dict[str, Any], exit_reason: str):
+    """Returns True when Swing AI should keep holding instead of taking a soft exit.
+    Hard stops are intentionally not blocked.
+    """
+    if not HOLD_AI_ENABLED:
+        return False, "hold ai off"
+
+    symbol = str(position.get("symbol", "")).upper()
+    pnl_pct = float(position.get("pnlPct") or 0.0)
+    minutes = int(position.get("minutesSinceBuy") or 999999)
+    min_hold = hold_ai_min_hold_minutes(symbol)
+    profile = hold_ai_symbol_profile(symbol)
+
+    # Never soft-sell the same day unless it is a hard stop. This protects the
+    # account from PDT churn and stops the bot from scalping tiny moves.
+    if was_bought_today(symbol):
+        return True, f"HOLD AI same-day hold for {symbol}; soft exit blocked ({exit_reason})"
+
+    # Give valid swing setups time to develop unless they are near the hard stop.
+    if minutes < min_hold and pnl_pct > FAST_STOP_LOSS_PCT:
+        return True, f"HOLD AI {profile['bias']} min hold {minutes}/{min_hold}m; pnl={pnl_pct:.2f}%"
+
+    return False, f"HOLD AI allows {exit_reason}; {profile['bias']}"
+
+
 # =========================
 # FASTER EXIT HELPERS
 # =========================
@@ -1486,6 +1424,8 @@ def partial_profit_qty(position: Dict[str, Any]):
 
 
 def should_partial_profit(position: Dict[str, Any]):
+    if HOLD_AI_ENABLED:
+        return False, "swing hold ai: partial profit disabled"
     if not FAST_EXIT_MODE_ENABLED or not PARTIAL_PROFIT_ENABLED:
         return False, "partial profit disabled"
 
@@ -1525,8 +1465,14 @@ def should_stall_exit(position: Dict[str, Any]):
     minutes = int(position.get("minutesSinceBuy") or 999999)
     pnl_pct = float(position.get("pnlPct") or 0.0)
 
-    if minutes < STALL_EXIT_AFTER_MINUTES:
-        return False, f"held {minutes}m below stall timer"
+    ai_min = hold_ai_min_hold_minutes(symbol) if HOLD_AI_ENABLED else STALL_EXIT_AFTER_MINUTES
+    effective_stall = max(STALL_EXIT_AFTER_MINUTES, ai_min)
+
+    if minutes < effective_stall:
+        return False, f"held {minutes}m below swing stall timer {effective_stall}m"
+
+    if HOLD_AI_ENABLED and pnl_pct > -1.00:
+        return False, f"hold ai: pnl {pnl_pct:.2f}% not weak enough for stall exit"
 
     if pnl_pct > STALL_EXIT_MIN_PNL_PCT:
         return False, f"pnl {pnl_pct:.2f}% above stall minimum"
@@ -1673,6 +1619,10 @@ def manage_money_mode_positions():
 
         partial_ok, partial_reason = should_partial_profit(p)
         if partial_ok:
+            ai_block, ai_reason = hold_ai_blocks_soft_exit(p, "PARTIAL PROFIT TAKE")
+            if ai_block:
+                print(ai_reason)
+                continue
             try:
                 if pdt_aware_should_avoid_sell(symbol, "PARTIAL PROFIT TAKE", p["pnlPct"], allow_hard_stop=False):
                     continue
@@ -1687,6 +1637,10 @@ def manage_money_mode_positions():
 
         stall_ok, stall_reason = should_stall_exit(p)
         if stall_ok:
+            ai_block, ai_reason = hold_ai_blocks_soft_exit(p, "STALL EXIT")
+            if ai_block:
+                print(ai_reason)
+                continue
             try:
                 if pdt_aware_should_avoid_sell(symbol, "STALL EXIT", p["pnlPct"], allow_hard_stop=False):
                     continue
@@ -1704,6 +1658,10 @@ def manage_money_mode_positions():
             trail_floor = highest * giveback
 
             if price <= trail_floor:
+                ai_block, ai_reason = hold_ai_blocks_soft_exit(p, "MONEY MODE TRAILING PROFIT")
+                if ai_block:
+                    print(ai_reason)
+                    continue
                 try:
                     if pdt_aware_should_avoid_sell(symbol, "MONEY MODE TRAILING PROFIT", p["pnlPct"]):
                         continue
@@ -2779,7 +2737,6 @@ def analytics_payload():
         "worstStocks": sorted(rows, key=lambda x: (x["totalPnl"], x["winRate"]))[:10],
         "todayRealisedPnl": today_realised_pnl(),
         "todayRealisedPnlGbp": today_realised_pnl_gbp(),
-        "adaptiveAI": adaptive_payload(),
     }
 
 
@@ -3286,7 +3243,7 @@ def build_status_payload(bot_name, scans):
             f"BACKFILL | chunk={BACKFILL_CHUNK_SIZE} | max_pages={BACKFILL_MAX_PAGES}",
             f"OPTIMIZER | enabled={PROFIT_OPTIMIZER_ENABLED} | today_realised={today_realised_pnl():.2f} | block={profit_guardrail_status()[1] or 'none'}",
             f"ANALYTICS | profit_factor={analytics_payload().get('profitFactor', 0):.2f} | avg_win={analytics_payload().get('averageWin', 0):.2f} | avg_loss={analytics_payload().get('averageLoss', 0):.2f}",
-            f"ADAPTIVE AI | enabled={ADAPTIVE_AI_SCORING_ENABLED} | trades={adaptive_payload().get('closedTradesUsed', 0)} | symbols={len(adaptive_payload().get('symbols', {}))} | lookback={ADAPTIVE_LOOKBACK_DAYS}d",
+            f"HOLD AI | enabled={HOLD_AI_ENABLED} | min_hold={HOLD_AI_MIN_HOLD_MINUTES}m | good_hold={HOLD_AI_GOOD_SYMBOL_HOLD_MINUTES}m | max_positions={MAX_POSITIONS}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
@@ -3497,7 +3454,7 @@ def _load_position_settings() -> Dict[str, Any]:
                 return data
     except Exception as e:
         print(f"POSITION SETTINGS LOAD ERROR: {e}")
-    return {"maxPositions": int(MAX_POSITIONS)}
+    return {"maxPositions": int(MAX_POSITIONS), "swingSafeMode": bool(globals().get("SWING_SNIPER_SAFE_MODE", False))}
 
 
 def apply_position_settings(max_positions: int = None, save: bool = True) -> Dict[str, Any]:
@@ -3509,6 +3466,8 @@ def apply_position_settings(max_positions: int = None, save: bool = True) -> Dic
         value = int(MAX_POSITIONS)
 
     value = max(1, min(10, value))
+    if globals().get("SWING_SNIPER_SAFE_MODE", False):
+        value = 1
 
     MAX_POSITIONS = value
 
@@ -3876,23 +3835,6 @@ def reset_baseline(request: Request):
 def get_baseline():
     return {"ok": True, "baseline": load_equity_baseline()}
 
-@app.get("/adaptive-ai")
-def adaptive_ai_report():
-    payload = adaptive_payload(force=True)
-    symbols = list(payload.get("symbols", {}).values())
-    symbols.sort(key=lambda x: (x.get("rating") != "GOOD", -float(x.get("totalPnl") or 0), -float(x.get("winRate") or 0)))
-    weak = list(payload.get("symbols", {}).values())
-    weak.sort(key=lambda x: (x.get("rating") != "BAD", float(x.get("totalPnl") or 0), float(x.get("winRate") or 0)))
-    return {
-        "ok": True,
-        "enabled": ADAPTIVE_AI_SCORING_ENABLED,
-        "lookbackDays": ADAPTIVE_LOOKBACK_DAYS,
-        "closedTradesUsed": payload.get("closedTradesUsed", 0),
-        "bestSymbols": symbols[:10],
-        "weakSymbols": weak[:10],
-    }
-
-
 @app.get("/reports")
 def reports():
     status = latest_status if isinstance(latest_status, dict) else {}
@@ -4182,11 +4124,11 @@ def stock_preview(symbol: str):
 # =========================
 
 STRICT_PROFIT_MODE = os.getenv("STRICT_PROFIT_MODE", "true").lower() == "true"
-STRICT_STOP_LOSS_PCT = float(os.getenv("STRICT_STOP_LOSS_PCT", "-2.00"))
-STRICT_TAKE_PROFIT_PCT = float(os.getenv("STRICT_TAKE_PROFIT_PCT", "2.00"))
-STRICT_TRAIL_START_PCT = float(os.getenv("STRICT_TRAIL_START_PCT", "1.50"))
-STRICT_TRAIL_DROP_PCT = float(os.getenv("STRICT_TRAIL_DROP_PCT", "0.45"))
-STRICT_MAX_POSITIONS = int(os.getenv("STRICT_MAX_POSITIONS", "6"))
+STRICT_STOP_LOSS_PCT = float(os.getenv("STRICT_STOP_LOSS_PCT", "-4.00"))
+STRICT_TAKE_PROFIT_PCT = float(os.getenv("STRICT_TAKE_PROFIT_PCT", "8.00"))
+STRICT_TRAIL_START_PCT = float(os.getenv("STRICT_TRAIL_START_PCT", "6.00"))
+STRICT_TRAIL_DROP_PCT = float(os.getenv("STRICT_TRAIL_DROP_PCT", "2.00"))
+STRICT_MAX_POSITIONS = int(os.getenv("STRICT_MAX_POSITIONS", "1"))
 LOSER_COOLDOWN_DAYS = int(os.getenv("LOSER_COOLDOWN_DAYS", "3"))
 LOSER_COOLDOWN_FILE = os.path.join("backend", "state", "loser_cooldown.json")
 
