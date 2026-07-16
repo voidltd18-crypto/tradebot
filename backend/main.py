@@ -156,6 +156,26 @@ HOLD_AI_MIN_TRAIL_PROFIT_PCT = 6.00
 HOLD_AI_TRAIL_GIVEBACK_PCT = 2.00
 MIN_SELL_NOTIONAL = 1.00
 
+# =========================
+# TRADEBOT V2 SAFETY / EXPECTANCY ENGINE
+# =========================
+# V2 starts in validation-only mode. It will scan and explain trades, but it
+# will not place a new live buy until TRADEBOT_V2_LIVE_ENABLED=true is set.
+TRADEBOT_V2_ENABLED = os.getenv("TRADEBOT_V2_ENABLED", "true").lower() == "true"
+TRADEBOT_V2_LIVE_ENABLED = os.getenv("TRADEBOT_V2_LIVE_ENABLED", "false").lower() == "true"
+V2_MIN_SYMBOL_SAMPLES = int(os.getenv("V2_MIN_SYMBOL_SAMPLES", "8") or 8)
+V2_MIN_WIN_RATE = float(os.getenv("V2_MIN_WIN_RATE", "0.50") or 0.50)
+V2_MIN_PROFIT_FACTOR = float(os.getenv("V2_MIN_PROFIT_FACTOR", "1.10") or 1.10)
+V2_MIN_EXPECTANCY_PCT = float(os.getenv("V2_MIN_EXPECTANCY_PCT", "0.10") or 0.10)
+V2_LOOKBACK_DAYS = int(os.getenv("V2_LOOKBACK_DAYS", "365") or 365)
+
+# V2 deliberately disables rotation/churn. Existing positions are still
+# protected by hard-stop and swing-management rules.
+if TRADEBOT_V2_ENABLED:
+    ROTATION_MODE_ENABLED = False
+    MAX_NEW_BUYS_PER_LOOP = 1
+    MAX_POSITIONS = 1
+
 # Profit Optimiser / Analytics / Auto-Improve
 PROFIT_OPTIMIZER_ENABLED = True
 ANALYTICS_ENABLED = True
@@ -1482,6 +1502,55 @@ def should_stall_exit(position: Dict[str, Any]):
 
     return True, f"stall exit: held {minutes}m pnl={pnl_pct:.2f}%"
 
+
+
+# =========================
+# TRADEBOT V2 EXPECTANCY HELPERS
+# =========================
+def v2_symbol_expectancy(symbol: str):
+    sym = str(symbol or "").upper().strip()
+    closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
+    cutoff = datetime.now(UTC) - timedelta(days=V2_LOOKBACK_DAYS)
+    rows = []
+    for trade in closed:
+        if str(trade.get("symbol", "")).upper() != sym:
+            continue
+        dt = _parse_trade_dt(trade.get("timestamp"))
+        if dt is not None and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        if dt is not None and dt < cutoff:
+            continue
+        rows.append(trade)
+
+    pnls = [float(t.get("pnl") or 0.0) for t in rows]
+    pct = [float(t.get("pnlPct") or 0.0) for t in rows]
+    wins = [x for x in pnls if x > 0]
+    losses = [x for x in pnls if x < 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
+    win_rate = len(wins) / len(rows) if rows else 0.0
+    expectancy_pct = sum(pct) / len(pct) if pct else 0.0
+    enough = len(rows) >= V2_MIN_SYMBOL_SAMPLES
+    approved = enough and win_rate >= V2_MIN_WIN_RATE and profit_factor >= V2_MIN_PROFIT_FACTOR and expectancy_pct >= V2_MIN_EXPECTANCY_PCT
+    reasons = []
+    if not enough: reasons.append(f"only {len(rows)}/{V2_MIN_SYMBOL_SAMPLES} samples")
+    if enough and win_rate < V2_MIN_WIN_RATE: reasons.append(f"win rate {win_rate:.0%} below {V2_MIN_WIN_RATE:.0%}")
+    if enough and profit_factor < V2_MIN_PROFIT_FACTOR: reasons.append(f"profit factor {profit_factor:.2f} below {V2_MIN_PROFIT_FACTOR:.2f}")
+    if enough and expectancy_pct < V2_MIN_EXPECTANCY_PCT: reasons.append(f"expectancy {expectancy_pct:.2f}% below {V2_MIN_EXPECTANCY_PCT:.2f}%")
+    return {
+        "symbol": sym, "samples": len(rows), "wins": len(wins), "losses": len(losses),
+        "winRate": win_rate, "profitFactor": profit_factor,
+        "expectancyPct": expectancy_pct, "totalPnl": sum(pnls),
+        "approved": approved, "reason": "approved" if approved else "; ".join(reasons) or "not approved",
+    }
+
+def v2_trade_gate(scan: Dict[str, Any]):
+    if not TRADEBOT_V2_ENABLED:
+        return True, {"approved": True, "reason": "V2 disabled"}
+    profile = v2_symbol_expectancy(scan.get("symbol"))
+    return bool(profile.get("approved")), profile
+
 # =========================
 # STRATEGY
 # =========================
@@ -1527,6 +1596,11 @@ def pick_money_mode_stocks(scans):
             continue
         if not scan["ready_to_buy"]:
             continue
+        v2_ok, v2_profile = v2_trade_gate(scan)
+        if not v2_ok:
+            print(f"V2 SKIP {symbol} | {v2_profile.get('reason')}")
+            continue
+        scan["v2Expectancy"] = v2_profile
         candidates.append(scan)
     candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
     return candidates
@@ -1673,6 +1747,8 @@ def manage_money_mode_positions():
                 continue
 
 def money_mode_buy(scans, manual=False):
+    if TRADEBOT_V2_ENABLED and not PAPER and not TRADEBOT_V2_LIVE_ENABLED:
+        return "BUY BLOCKED | TradeBot V2 validation mode. Set TRADEBOT_V2_LIVE_ENABLED=true only after successful paper testing."
     if emergency_stop:
         return "BUY BLOCKED | emergency stop active"
     blocked, reason = risk_blocked()
@@ -1721,6 +1797,8 @@ def money_mode_buy(scans, manual=False):
 
 
 def buy_custom_symbol(symbol: str):
+    if TRADEBOT_V2_ENABLED and not PAPER and not TRADEBOT_V2_LIVE_ENABLED:
+        return {"ok": False, "message": "TradeBot V2 validation mode blocks new live buys."}
     symbol = symbol.upper().strip()
     if not symbol or not symbol.replace(".", "").replace("-", "").isalnum():
         return {"ok": False, "message": "Invalid ticker"}
@@ -3566,6 +3644,24 @@ def root():
     return {"message": "Rebuilt Sniper Profit Bot running", "status": "/status", "paperMode": PAPER}
 
 
+
+@app.get("/v2/status")
+def v2_status():
+    return {
+        "ok": True, "enabled": TRADEBOT_V2_ENABLED, "paper": PAPER,
+        "liveBuyingEnabled": TRADEBOT_V2_LIVE_ENABLED,
+        "mode": "paper" if PAPER else ("live" if TRADEBOT_V2_LIVE_ENABLED else "validation-only"),
+        "rules": {
+            "minSamples": V2_MIN_SYMBOL_SAMPLES, "minWinRate": V2_MIN_WIN_RATE,
+            "minProfitFactor": V2_MIN_PROFIT_FACTOR, "minExpectancyPct": V2_MIN_EXPECTANCY_PCT,
+            "lookbackDays": V2_LOOKBACK_DAYS, "maxPositions": MAX_POSITIONS,
+        },
+    }
+
+@app.get("/v2/explain/{symbol}")
+def v2_explain(symbol: str):
+    return {"ok": True, **v2_symbol_expectancy(symbol)}
+
 @app.get("/status")
 def get_status():
     latest_status["botVersion"] = "v1.1-strict-profit-mode"
@@ -5262,3 +5358,5 @@ def compat_post_buy_size_mode(payload: dict = Body(...), request: Request = None
         "fullBuyWhenOnePosition": saved == "full",
         "preview": _compat_buy_preview(),
     }
+
+print(f"TRADEBOT V2 | enabled={TRADEBOT_V2_ENABLED} mode={'paper' if PAPER else ('live' if TRADEBOT_V2_LIVE_ENABLED else 'validation-only')} min_samples={V2_MIN_SYMBOL_SAMPLES} min_pf={V2_MIN_PROFIT_FACTOR}")
