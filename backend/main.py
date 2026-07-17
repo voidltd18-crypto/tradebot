@@ -171,6 +171,8 @@ V2_MIN_EXPECTANCY_PCT = float(os.getenv("V2_MIN_EXPECTANCY_PCT", "0.10") or 0.10
 V2_LOOKBACK_DAYS = int(os.getenv("V2_LOOKBACK_DAYS", "365") or 365)
 V2_LOG_DECISIONS = os.getenv("V2_LOG_DECISIONS", "true").lower() == "true"
 V2_DECISION_DEDUPE_SECONDS = int(os.getenv("V2_DECISION_DEDUPE_SECONDS", "300") or 300)
+V2_OUTCOME_HORIZONS_HOURS = tuple(int(x.strip()) for x in os.getenv("V2_OUTCOME_HORIZONS_HOURS", "1,24,72,120").split(",") if x.strip())
+V2_OUTCOME_BATCH_SIZE = int(os.getenv("V2_OUTCOME_BATCH_SIZE", "100"))
 
 # V2 deliberately disables rotation/churn. Existing positions are still
 # protected by hard-stop and swing-management rules.
@@ -1595,7 +1597,7 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
     try:
         init_db()
         conn = db_connect()
-        conn.execute(
+        cur = conn.execute(
             """INSERT INTO v2_setup_decisions (
                 timestamp, symbol, decision, stage, reason, price, confidence,
                 quality, momentum, pullback, spread, ready_to_buy, sniper_pass,
@@ -1613,6 +1615,18 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
                 float(profile.get("expectancyPct") or 0.0), json.dumps(payload, default=str),
             ),
         )
+        decision_id = int(cur.lastrowid)
+        observed_at = datetime.now(UTC)
+        entry_price = float(scan.get("price") or 0.0)
+        if decision_id > 0 and entry_price > 0:
+            for horizon_hours in V2_OUTCOME_HORIZONS_HOURS:
+                due_at = observed_at + timedelta(hours=int(horizon_hours))
+                conn.execute(
+                    """INSERT OR IGNORE INTO v2_observation_outcomes
+                       (decision_id, symbol, observed_at, entry_price, horizon_hours, due_at, status)
+                       VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
+                    (decision_id, symbol, observed_at.isoformat(), entry_price, int(horizon_hours), due_at.isoformat()),
+                )
         conn.commit()
         conn.close()
     except Exception as e:
@@ -1698,6 +1712,175 @@ def v2_intelligence_summary():
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+# =========================
+# TRADEBOT V2 STAGE 2 — FORWARD REPLAY / OUTCOMES
+# =========================
+def v2_seed_missing_outcomes(limit: int = 5000) -> int:
+    """Create pending horizon rows for decisions recorded before Stage 2 was deployed."""
+    if not SQLITE_ENABLED:
+        return 0
+    created = 0
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute(
+            """SELECT id, timestamp, symbol, price FROM v2_setup_decisions
+               WHERE price > 0 ORDER BY id DESC LIMIT ?""",
+            (max(1, min(int(limit), 50000)),),
+        ).fetchall()
+        for row in rows:
+            try:
+                observed_at = datetime.fromisoformat(str(row["timestamp"]).replace("Z", "+00:00"))
+                if observed_at.tzinfo is None:
+                    observed_at = observed_at.replace(tzinfo=UTC)
+                for horizon_hours in V2_OUTCOME_HORIZONS_HOURS:
+                    cur = conn.execute(
+                        """INSERT OR IGNORE INTO v2_observation_outcomes
+                           (decision_id, symbol, observed_at, entry_price, horizon_hours, due_at, status)
+                           VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
+                        (int(row["id"]), str(row["symbol"]).upper(), observed_at.isoformat(),
+                         float(row["price"]), int(horizon_hours),
+                         (observed_at + timedelta(hours=int(horizon_hours))).isoformat()),
+                    )
+                    created += int(cur.rowcount or 0)
+            except Exception as row_error:
+                print(f"V2 OUTCOME SEED ROW ERROR: {row_error}")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"V2 OUTCOME SEED ERROR: {e}")
+    return created
+
+
+def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
+    """Snapshot the latest tradable midpoint once each horizon becomes due.
+
+    Evaluations run only from the active market loop, so overnight/weekend due rows
+    are completed at the next available live market quote rather than with stale data.
+    """
+    if not (TRADEBOT_V2_ENABLED and SQLITE_ENABLED):
+        return {"ok": False, "evaluated": 0, "reason": "V2 or SQLite disabled"}
+    batch = max(1, min(int(limit or V2_OUTCOME_BATCH_SIZE), 1000))
+    evaluated = 0
+    errors = 0
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute(
+            """SELECT * FROM v2_observation_outcomes
+               WHERE status='PENDING' AND due_at<=?
+               ORDER BY due_at ASC LIMIT ?""",
+            (datetime.now(UTC).isoformat(), batch),
+        ).fetchall()
+        quote_cache: Dict[str, Dict[str, float]] = {}
+        for row in rows:
+            symbol = str(row["symbol"]).upper()
+            try:
+                if symbol not in quote_cache:
+                    quote_cache[symbol] = get_quote(symbol)
+                outcome_price = float(quote_cache[symbol]["mid"])
+                entry_price = float(row["entry_price"])
+                return_pct = ((outcome_price / entry_price) - 1.0) * 100.0 if entry_price > 0 else 0.0
+                conn.execute(
+                    """UPDATE v2_observation_outcomes
+                       SET evaluated_at=?, outcome_price=?, return_pct=?, status='COMPLETE', error=NULL
+                       WHERE id=?""",
+                    (datetime.now(UTC).isoformat(), outcome_price, return_pct, int(row["id"])),
+                )
+                evaluated += 1
+            except Exception as row_error:
+                errors += 1
+                conn.execute(
+                    """UPDATE v2_observation_outcomes SET error=? WHERE id=?""",
+                    (str(row_error)[:500], int(row["id"])),
+                )
+        conn.commit()
+        conn.close()
+        if evaluated or errors:
+            print(f"V2 OUTCOMES | evaluated={evaluated} errors={errors}")
+        return {"ok": True, "evaluated": evaluated, "errors": errors, "due": len(rows)}
+    except Exception as e:
+        print(f"V2 OUTCOME EVALUATION ERROR: {e}")
+        return {"ok": False, "evaluated": evaluated, "errors": errors + 1, "error": str(e)}
+
+
+def v2_outcomes_summary(symbol: Optional[str] = None) -> Dict[str, Any]:
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+    try:
+        init_db()
+        conn = db_connect()
+        params = []
+        where = ""
+        if symbol:
+            where = "WHERE o.symbol=?"
+            params.append(str(symbol).upper())
+        totals = conn.execute(
+            f"""SELECT COUNT(*) AS scheduled,
+                       SUM(CASE WHEN o.status='COMPLETE' THEN 1 ELSE 0 END) AS completed,
+                       SUM(CASE WHEN o.status='PENDING' THEN 1 ELSE 0 END) AS pending,
+                       COUNT(DISTINCT o.symbol) AS symbols
+                FROM v2_observation_outcomes o {where}""", params
+        ).fetchone()
+        profiles = conn.execute(
+            f"""SELECT o.horizon_hours,
+                       COUNT(*) AS samples,
+                       AVG(o.return_pct) AS avg_return_pct,
+                       SUM(CASE WHEN o.return_pct>0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS win_rate,
+                       AVG(CASE WHEN o.return_pct>0 THEN o.return_pct END) AS avg_win_pct,
+                       AVG(CASE WHEN o.return_pct<0 THEN o.return_pct END) AS avg_loss_pct,
+                       MIN(o.return_pct) AS worst_return_pct,
+                       MAX(o.return_pct) AS best_return_pct
+                FROM v2_observation_outcomes o
+                {where + (' AND ' if where else 'WHERE ')} o.status='COMPLETE'
+                GROUP BY o.horizon_hours ORDER BY o.horizon_hours""", params
+        ).fetchall()
+        by_stage = conn.execute(
+            f"""SELECT d.stage, d.decision, o.horizon_hours,
+                       COUNT(*) AS samples, AVG(o.return_pct) AS avg_return_pct,
+                       SUM(CASE WHEN o.return_pct>0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS win_rate
+                FROM v2_observation_outcomes o
+                JOIN v2_setup_decisions d ON d.id=o.decision_id
+                {where + (' AND ' if where else 'WHERE ')} o.status='COMPLETE'
+                GROUP BY d.stage, d.decision, o.horizon_hours
+                ORDER BY o.horizon_hours, samples DESC""", params
+        ).fetchall()
+        conn.close()
+        return {"ok": True, **(dict(totals) if totals else {}),
+                "horizons": [dict(r) for r in profiles], "byStage": [dict(r) for r in by_stage]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def v2_replay_rows(symbol: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
+    if not SQLITE_ENABLED:
+        return []
+    try:
+        init_db()
+        conn = db_connect()
+        params: List[Any] = []
+        where = ""
+        if symbol:
+            where = "WHERE d.symbol=?"
+            params.append(str(symbol).upper())
+        params.append(max(1, min(int(limit), 2000)))
+        rows = conn.execute(
+            f"""SELECT d.id AS decision_id, d.timestamp, d.symbol, d.decision, d.stage,
+                       d.reason, d.price AS entry_price, d.confidence, d.quality,
+                       d.momentum, d.pullback, o.horizon_hours, o.status,
+                       o.due_at, o.evaluated_at, o.outcome_price, o.return_pct
+                FROM v2_setup_decisions d
+                LEFT JOIN v2_observation_outcomes o ON o.decision_id=d.id
+                {where}
+                ORDER BY d.id DESC, o.horizon_hours ASC LIMIT ?""", params
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"V2 REPLAY ERROR: {e}")
+        return []
 
 # =========================
 # STRATEGY
@@ -2116,6 +2299,32 @@ def init_db():
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_v2_setup_decisions_decision
         ON v2_setup_decisions(decision)
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v2_observation_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            horizon_hours INTEGER NOT NULL,
+            due_at TEXT NOT NULL,
+            evaluated_at TEXT,
+            outcome_price REAL,
+            return_pct REAL,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            error TEXT,
+            UNIQUE(decision_id, horizon_hours)
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v2_outcomes_due
+        ON v2_observation_outcomes(status, due_at)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v2_outcomes_symbol
+        ON v2_observation_outcomes(symbol, horizon_hours)
     """)
 
     conn.commit()
@@ -3872,6 +4081,19 @@ def api_v2_setup_profiles(limit: int = 100):
 def api_v2_recent_decisions(limit: int = 100):
     return {"ok": True, "decisions": v2_recent_decisions(limit)}
 
+@app.get("/v2/outcomes-summary")
+def api_v2_outcomes_summary(symbol: Optional[str] = None):
+    return v2_outcomes_summary(symbol)
+
+@app.get("/v2/replay")
+def api_v2_replay(symbol: Optional[str] = None, limit: int = 200):
+    return {"ok": True, "rows": v2_replay_rows(symbol, limit)}
+
+@app.post("/v2/evaluate-outcomes")
+def api_v2_evaluate_outcomes(request: Request, limit: int = 100):
+    verify_api_key(request)
+    return v2_evaluate_due_outcomes(limit)
+
 @app.get("/status")
 def get_status():
     latest_status["botVersion"] = "v1.1-strict-profit-mode"
@@ -4017,6 +4239,9 @@ def backfill_trades(request: Request):
 def run_bot_loop():
     print("Rebuilt Sniper Profit Bot started...")
     init_db()
+    seeded_outcomes = v2_seed_missing_outcomes()
+    if seeded_outcomes:
+        print(f"V2 OUTCOMES | seeded={seeded_outcomes}")
     load_persistent_state()
     refresh_universe_if_needed(force=True)
     reset_daily_flags_if_needed()
@@ -4039,6 +4264,11 @@ def run_bot_loop():
                     update_status(BOT_NAME, latest_scans)
                     time.sleep(CHECK_INTERVAL)
                     continue
+
+                try:
+                    v2_evaluate_due_outcomes()
+                except Exception as e:
+                    print(f"V2 OUTCOME LOOP ERROR: {e}")
 
                 scans = []
                 for symbol in current_universe:
