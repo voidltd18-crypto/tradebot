@@ -1903,7 +1903,14 @@ def manage_money_mode_positions():
 
 def money_mode_buy(scans, manual=False):
     if TRADEBOT_V2_ENABLED and not PAPER and not TRADEBOT_V2_LIVE_ENABLED:
-        return "BUY BLOCKED | TradeBot V2 validation mode. Set TRADEBOT_V2_LIVE_ENABLED=true only after successful paper testing."
+        # Validation mode must still run the complete decision pipeline so V2 can
+        # record approved/rejected observations without submitting a live order.
+        try:
+            validation_picks = pick_money_mode_stocks(scans)
+            print(f"V2 VALIDATION | observations processed={len(scans)} approved={len(validation_picks)} live_order=False")
+        except Exception as e:
+            print(f"V2 VALIDATION LOG ERROR: {e}")
+        return "BUY BLOCKED | TradeBot V2 validation mode. Decisions recorded; live ordering remains disabled."
     if emergency_stop:
         return "BUY BLOCKED | emergency stop active"
     blocked, reason = risk_blocked()
