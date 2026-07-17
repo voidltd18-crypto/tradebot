@@ -147,7 +147,8 @@ STALL_EXIT_MIN_PNL_PCT = -1.00
 # Swing Hold AI: learns from closed-trade history and avoids quick exits.
 SWING_SNIPER_SAFE_MODE = True
 HOLD_AI_ENABLED = True
-HOLD_AI_LOOKBACK_DAYS = 180
+HOLD_AI_LOOKBACK_DAYS = int(os.getenv("HOLD_AI_LOOKBACK_DAYS", "180") or 180)
+HOLD_AI_MIN_TRADES = int(os.getenv("HOLD_AI_MIN_TRADES", "4") or 4)
 HOLD_AI_MIN_HOLD_MINUTES = 1440       # default: at least 1 trading day
 HOLD_AI_GOOD_SYMBOL_HOLD_MINUTES = 2880
 HOLD_AI_WEAK_SYMBOL_HOLD_MINUTES = 720
@@ -3508,7 +3509,7 @@ def build_status_payload(bot_name, scans):
             f"BACKFILL | chunk={BACKFILL_CHUNK_SIZE} | max_pages={BACKFILL_MAX_PAGES}",
             f"OPTIMIZER | enabled={PROFIT_OPTIMIZER_ENABLED} | today_realised={today_realised_pnl():.2f} | block={profit_guardrail_status()[1] or 'none'}",
             f"ANALYTICS | profit_factor={analytics_payload().get('profitFactor', 0):.2f} | avg_win={analytics_payload().get('averageWin', 0):.2f} | avg_loss={analytics_payload().get('averageLoss', 0):.2f}",
-            f"HOLD AI | enabled={HOLD_AI_ENABLED} | min_hold={HOLD_AI_MIN_HOLD_MINUTES}m | good_hold={HOLD_AI_GOOD_SYMBOL_HOLD_MINUTES}m | max_positions={MAX_POSITIONS}",
+            f"HOLD AI | enabled={HOLD_AI_ENABLED} | min_trades={HOLD_AI_MIN_TRADES} | min_hold={HOLD_AI_MIN_HOLD_MINUTES}m | good_hold={HOLD_AI_GOOD_SYMBOL_HOLD_MINUTES}m | max_positions={MAX_POSITIONS}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
