@@ -168,6 +168,8 @@ V2_MIN_WIN_RATE = float(os.getenv("V2_MIN_WIN_RATE", "0.50") or 0.50)
 V2_MIN_PROFIT_FACTOR = float(os.getenv("V2_MIN_PROFIT_FACTOR", "1.10") or 1.10)
 V2_MIN_EXPECTANCY_PCT = float(os.getenv("V2_MIN_EXPECTANCY_PCT", "0.10") or 0.10)
 V2_LOOKBACK_DAYS = int(os.getenv("V2_LOOKBACK_DAYS", "365") or 365)
+V2_LOG_DECISIONS = os.getenv("V2_LOG_DECISIONS", "true").lower() == "true"
+V2_DECISION_DEDUPE_SECONDS = int(os.getenv("V2_DECISION_DEDUPE_SECONDS", "300") or 300)
 
 # V2 deliberately disables rotation/churn. Existing positions are still
 # protected by hard-stop and swing-management rules.
@@ -1551,6 +1553,151 @@ def v2_trade_gate(scan: Dict[str, Any]):
     profile = v2_symbol_expectancy(scan.get("symbol"))
     return bool(profile.get("approved")), profile
 
+
+# =========================
+# TRADEBOT V2 INTELLIGENCE LOG
+# =========================
+def _v2_decision_recently_logged(symbol: str, decision: str, stage: str) -> bool:
+    if not SQLITE_ENABLED:
+        return False
+    try:
+        init_db()
+        cutoff = (datetime.now(UTC) - timedelta(seconds=V2_DECISION_DEDUPE_SECONDS)).isoformat()
+        conn = db_connect()
+        row = conn.execute(
+            """SELECT id FROM v2_setup_decisions
+               WHERE symbol=? AND decision=? AND stage=? AND timestamp>=?
+               ORDER BY id DESC LIMIT 1""",
+            (str(symbol).upper(), str(decision), str(stage), cutoff),
+        ).fetchone()
+        conn.close()
+        return row is not None
+    except Exception as e:
+        print(f"V2 DECISION DEDUPE ERROR: {e}")
+        return False
+
+
+def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, reason: str, profile: Optional[Dict[str, Any]] = None):
+    if not (TRADEBOT_V2_ENABLED and V2_LOG_DECISIONS and SQLITE_ENABLED):
+        return
+    symbol = str(scan.get("symbol") or "").upper().strip()
+    if not symbol or _v2_decision_recently_logged(symbol, decision, stage):
+        return
+    profile = profile or {}
+    payload = {
+        "confidenceLabel": scan.get("confidence_label"),
+        "sniperReason": scan.get("sniper_reason"),
+        "aPlusReason": scan.get("a_plus_reason"),
+        "lockedToday": bool(scan.get("locked_today")),
+        "v2": profile,
+    }
+    try:
+        init_db()
+        conn = db_connect()
+        conn.execute(
+            """INSERT INTO v2_setup_decisions (
+                timestamp, symbol, decision, stage, reason, price, confidence,
+                quality, momentum, pullback, spread, ready_to_buy, sniper_pass,
+                a_plus_pass, historical_samples, historical_win_rate,
+                historical_profit_factor, historical_expectancy_pct, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                datetime.now(UTC).isoformat(), symbol, str(decision), str(stage), str(reason)[:1000],
+                float(scan.get("price") or 0.0), float(scan.get("confidence") or 0.0),
+                float(scan.get("quality_score") or 0.0), float(scan.get("short_momentum") or 0.0),
+                float(scan.get("pullback") or 0.0), float(scan.get("spread") or 0.0),
+                int(bool(scan.get("ready_to_buy"))), int(bool(scan.get("sniper_pass"))),
+                int(bool(scan.get("a_plus_pass"))), int(profile.get("samples") or 0),
+                float(profile.get("winRate") or 0.0), float(profile.get("profitFactor") or 0.0),
+                float(profile.get("expectancyPct") or 0.0), json.dumps(payload, default=str),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"V2 DECISION LOG ERROR {symbol}: {e}")
+
+
+def v2_recent_decisions(limit: int = 100):
+    if not SQLITE_ENABLED:
+        return []
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute(
+            "SELECT * FROM v2_setup_decisions ORDER BY id DESC LIMIT ?",
+            (max(1, min(int(limit), 1000)),),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"V2 RECENT DECISIONS ERROR: {e}")
+        return []
+
+
+def v2_setup_profiles(limit: int = 100):
+    if not SQLITE_ENABLED:
+        return []
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute(
+            """SELECT symbol,
+                      COUNT(*) AS observations,
+                      SUM(CASE WHEN decision='APPROVED' THEN 1 ELSE 0 END) AS approvals,
+                      AVG(confidence) AS avg_confidence,
+                      AVG(quality) AS avg_quality,
+                      AVG(historical_win_rate) AS avg_historical_win_rate,
+                      AVG(historical_profit_factor) AS avg_historical_profit_factor,
+                      AVG(historical_expectancy_pct) AS avg_historical_expectancy_pct,
+                      MAX(timestamp) AS last_seen
+               FROM v2_setup_decisions
+               GROUP BY symbol
+               ORDER BY approvals DESC, observations DESC, symbol ASC
+               LIMIT ?""",
+            (max(1, min(int(limit), 500)),),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"V2 SETUP PROFILES ERROR: {e}")
+        return []
+
+
+def v2_intelligence_summary():
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+    try:
+        init_db()
+        conn = db_connect()
+        totals = conn.execute(
+            """SELECT COUNT(*) AS observations,
+                      COUNT(DISTINCT symbol) AS symbols,
+                      SUM(CASE WHEN decision='APPROVED' THEN 1 ELSE 0 END) AS approvals,
+                      SUM(CASE WHEN decision='REJECTED' THEN 1 ELSE 0 END) AS rejections,
+                      MIN(timestamp) AS first_observation,
+                      MAX(timestamp) AS last_observation
+               FROM v2_setup_decisions"""
+        ).fetchone()
+        stages = conn.execute(
+            """SELECT stage, COUNT(*) AS count
+               FROM v2_setup_decisions GROUP BY stage ORDER BY count DESC"""
+        ).fetchall()
+        conn.close()
+        data = dict(totals) if totals else {}
+        observations = int(data.get("observations") or 0)
+        approvals = int(data.get("approvals") or 0)
+        return {
+            "ok": True,
+            **data,
+            "approvalRate": approvals / observations if observations else 0.0,
+            "stages": [dict(r) for r in stages],
+            "recent": v2_recent_decisions(20),
+            "profiles": v2_setup_profiles(20),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 # =========================
 # STRATEGY
 # =========================
@@ -1582,25 +1729,32 @@ def pick_money_mode_stocks(scans):
         symbol = scan["symbol"]
         can_buy, reason = can_buy_symbol(symbol)
         if not can_buy:
+            record_v2_setup_decision(scan, "REJECTED", "account_gate", reason)
             continue
         if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
+            record_v2_setup_decision(scan, "REJECTED", "pdt_gate", "maximum new buys for today reached")
             continue
         sniper_ok, sniper_reason = sniper_passes(scan)
         if not sniper_ok:
             print(f"SNIPER SKIP {symbol} | {sniper_reason}")
+            record_v2_setup_decision(scan, "REJECTED", "sniper_gate", sniper_reason)
             continue
 
         aplus_ok, aplus_reason = a_plus_gate(scan)
         if not aplus_ok:
             print(f"A+ SKIP {symbol} | {aplus_reason}")
+            record_v2_setup_decision(scan, "REJECTED", "a_plus_gate", aplus_reason)
             continue
         if not scan["ready_to_buy"]:
+            record_v2_setup_decision(scan, "REJECTED", "trigger_gate", "entry trigger not ready")
             continue
         v2_ok, v2_profile = v2_trade_gate(scan)
         if not v2_ok:
             print(f"V2 SKIP {symbol} | {v2_profile.get('reason')}")
+            record_v2_setup_decision(scan, "REJECTED", "expectancy_gate", v2_profile.get("reason", "not approved"), v2_profile)
             continue
         scan["v2Expectancy"] = v2_profile
+        record_v2_setup_decision(scan, "APPROVED", "final_gate", "all V2 gates passed", v2_profile)
         candidates.append(scan)
     candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
     return candidates
@@ -1921,6 +2075,39 @@ def init_db():
             symbols TEXT,
             reason TEXT
         )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v2_setup_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            stage TEXT,
+            reason TEXT,
+            price REAL,
+            confidence REAL,
+            quality REAL,
+            momentum REAL,
+            pullback REAL,
+            spread REAL,
+            ready_to_buy INTEGER,
+            sniper_pass INTEGER,
+            a_plus_pass INTEGER,
+            historical_samples INTEGER,
+            historical_win_rate REAL,
+            historical_profit_factor REAL,
+            historical_expectancy_pct REAL,
+            payload_json TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v2_setup_decisions_symbol_time
+        ON v2_setup_decisions(symbol, timestamp)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v2_setup_decisions_decision
+        ON v2_setup_decisions(decision)
     """)
 
     conn.commit()
@@ -3655,12 +3842,27 @@ def v2_status():
             "minSamples": V2_MIN_SYMBOL_SAMPLES, "minWinRate": V2_MIN_WIN_RATE,
             "minProfitFactor": V2_MIN_PROFIT_FACTOR, "minExpectancyPct": V2_MIN_EXPECTANCY_PCT,
             "lookbackDays": V2_LOOKBACK_DAYS, "maxPositions": MAX_POSITIONS,
+            "logDecisions": V2_LOG_DECISIONS, "decisionDedupeSeconds": V2_DECISION_DEDUPE_SECONDS,
         },
     }
 
 @app.get("/v2/explain/{symbol}")
 def v2_explain(symbol: str):
-    return {"ok": True, **v2_symbol_expectancy(symbol)}
+    profile = v2_symbol_expectancy(symbol)
+    recent = [r for r in v2_recent_decisions(500) if str(r.get("symbol", "")).upper() == str(symbol).upper()][:20]
+    return {"ok": True, **profile, "recentDecisions": recent}
+
+@app.get("/v2/intelligence-summary")
+def api_v2_intelligence_summary():
+    return v2_intelligence_summary()
+
+@app.get("/v2/setup-profiles")
+def api_v2_setup_profiles(limit: int = 100):
+    return {"ok": True, "profiles": v2_setup_profiles(limit)}
+
+@app.get("/v2/recent-decisions")
+def api_v2_recent_decisions(limit: int = 100):
+    return {"ok": True, "decisions": v2_recent_decisions(limit)}
 
 @app.get("/status")
 def get_status():
