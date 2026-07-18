@@ -173,6 +173,8 @@ V2_LOG_DECISIONS = os.getenv("V2_LOG_DECISIONS", "true").lower() == "true"
 V2_DECISION_DEDUPE_SECONDS = int(os.getenv("V2_DECISION_DEDUPE_SECONDS", "300") or 300)
 V2_OUTCOME_HORIZONS_HOURS = tuple(int(x.strip()) for x in os.getenv("V2_OUTCOME_HORIZONS_HOURS", "1,24,72,120").split(",") if x.strip())
 V2_OUTCOME_BATCH_SIZE = int(os.getenv("V2_OUTCOME_BATCH_SIZE", "100"))
+V2_INDEPENDENT_SAMPLE_MINUTES = int(os.getenv("V2_INDEPENDENT_SAMPLE_MINUTES", "30"))
+V2_ESTIMATED_COST_BPS = float(os.getenv("V2_ESTIMATED_COST_BPS", "10"))
 
 # V2 deliberately disables rotation/churn. Existing positions are still
 # protected by hard-stop and swing-management rules.
@@ -1558,6 +1560,53 @@ def v2_trade_gate(scan: Dict[str, Any]):
 
 
 # =========================
+# TRADEBOT V2 SESSION / SAMPLE HELPERS
+# =========================
+def _v2_session_due_at(observed_at: datetime, horizon_hours: int) -> datetime:
+    """Translate legacy horizon labels into tradable-session checkpoints.
+
+    1 = one market hour; 24/72/120 = one/three/five trading sessions.
+    Weekends are skipped and holidays are naturally deferred because evaluation
+    only runs while Alpaca reports the market open.
+    """
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    current = observed_at.astimezone(et)
+    market_open = current.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = current.replace(hour=16, minute=0, second=0, microsecond=0)
+    if current < market_open:
+        current = market_open
+    elif current > market_close:
+        current = market_open + timedelta(days=1)
+    while current.weekday() >= 5:
+        current += timedelta(days=1)
+
+    if int(horizon_hours) == 1:
+        due = current + timedelta(hours=1)
+        if due > market_close:
+            overflow = due - market_close
+            due = (current + timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
+            while due.weekday() >= 5:
+                due += timedelta(days=1)
+            due += overflow
+        return due.astimezone(UTC)
+
+    sessions = max(1, int(round(int(horizon_hours) / 24)))
+    due = current
+    added = 0
+    while added < sessions:
+        due += timedelta(days=1)
+        if due.weekday() < 5:
+            added += 1
+    return due.astimezone(UTC)
+
+
+def _v2_sample_key(symbol: str, stage: str, decision: str, observed_at: datetime) -> str:
+    bucket_seconds = max(60, V2_INDEPENDENT_SAMPLE_MINUTES * 60)
+    bucket = int(observed_at.timestamp()) // bucket_seconds
+    return f"{symbol}:{stage}:{decision}:{bucket}"
+
+# =========================
 # TRADEBOT V2 INTELLIGENCE LOG
 # =========================
 def _v2_decision_recently_logged(symbol: str, decision: str, stage: str) -> bool:
@@ -1620,12 +1669,13 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
         entry_price = float(scan.get("price") or 0.0)
         if decision_id > 0 and entry_price > 0:
             for horizon_hours in V2_OUTCOME_HORIZONS_HOURS:
-                due_at = observed_at + timedelta(hours=int(horizon_hours))
+                due_at = _v2_session_due_at(observed_at, int(horizon_hours))
                 conn.execute(
                     """INSERT OR IGNORE INTO v2_observation_outcomes
-                       (decision_id, symbol, observed_at, entry_price, horizon_hours, due_at, status)
-                       VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
-                    (decision_id, symbol, observed_at.isoformat(), entry_price, int(horizon_hours), due_at.isoformat()),
+                       (decision_id, symbol, observed_at, entry_price, horizon_hours, due_at, status, sample_key)
+                       VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
+                    (decision_id, symbol, observed_at.isoformat(), entry_price, int(horizon_hours), due_at.isoformat(),
+                     _v2_sample_key(symbol, str(stage), str(decision), observed_at)),
                 )
         conn.commit()
         conn.close()
@@ -1718,7 +1768,7 @@ def v2_intelligence_summary():
 # TRADEBOT V2 STAGE 2 — FORWARD REPLAY / OUTCOMES
 # =========================
 def v2_seed_missing_outcomes(limit: int = 5000) -> int:
-    """Create pending horizon rows for decisions recorded before Stage 2 was deployed."""
+    """Create or repair pending outcomes using session-aware due dates."""
     if not SQLITE_ENABLED:
         return 0
     created = 0
@@ -1726,7 +1776,7 @@ def v2_seed_missing_outcomes(limit: int = 5000) -> int:
         init_db()
         conn = db_connect()
         rows = conn.execute(
-            """SELECT id, timestamp, symbol, price FROM v2_setup_decisions
+            """SELECT id, timestamp, symbol, price, decision, stage FROM v2_setup_decisions
                WHERE price > 0 ORDER BY id DESC LIMIT ?""",
             (max(1, min(int(limit), 50000)),),
         ).fetchall()
@@ -1735,16 +1785,22 @@ def v2_seed_missing_outcomes(limit: int = 5000) -> int:
                 observed_at = datetime.fromisoformat(str(row["timestamp"]).replace("Z", "+00:00"))
                 if observed_at.tzinfo is None:
                     observed_at = observed_at.replace(tzinfo=UTC)
+                key = _v2_sample_key(str(row["symbol"]).upper(), str(row["stage"]), str(row["decision"]), observed_at)
                 for horizon_hours in V2_OUTCOME_HORIZONS_HOURS:
+                    due = _v2_session_due_at(observed_at, int(horizon_hours)).isoformat()
                     cur = conn.execute(
                         """INSERT OR IGNORE INTO v2_observation_outcomes
-                           (decision_id, symbol, observed_at, entry_price, horizon_hours, due_at, status)
-                           VALUES (?, ?, ?, ?, ?, ?, 'PENDING')""",
+                           (decision_id, symbol, observed_at, entry_price, horizon_hours, due_at, status, sample_key)
+                           VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
                         (int(row["id"]), str(row["symbol"]).upper(), observed_at.isoformat(),
-                         float(row["price"]), int(horizon_hours),
-                         (observed_at + timedelta(hours=int(horizon_hours))).isoformat()),
+                         float(row["price"]), int(horizon_hours), due, key),
                     )
                     created += int(cur.rowcount or 0)
+                    conn.execute(
+                        """UPDATE v2_observation_outcomes SET due_at=?, sample_key=COALESCE(sample_key, ?)
+                           WHERE decision_id=? AND horizon_hours=? AND status='PENDING'""",
+                        (due, key, int(row["id"]), int(horizon_hours)),
+                    )
             except Exception as row_error:
                 print(f"V2 OUTCOME SEED ROW ERROR: {row_error}")
         conn.commit()
@@ -1752,7 +1808,6 @@ def v2_seed_missing_outcomes(limit: int = 5000) -> int:
     except Exception as e:
         print(f"V2 OUTCOME SEED ERROR: {e}")
     return created
-
 
 def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
     """Snapshot the latest tradable midpoint once each horizon becomes due.
@@ -1762,6 +1817,11 @@ def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
     """
     if not (TRADEBOT_V2_ENABLED and SQLITE_ENABLED):
         return {"ok": False, "evaluated": 0, "reason": "V2 or SQLite disabled"}
+    try:
+        if not trading_client.get_clock().is_open:
+            return {"ok": True, "evaluated": 0, "reason": "market closed; outcomes deferred"}
+    except Exception as clock_error:
+        return {"ok": False, "evaluated": 0, "reason": f"market clock unavailable: {clock_error}"}
     batch = max(1, min(int(limit or V2_OUTCOME_BATCH_SIZE), 1000))
     evaluated = 0
     errors = 0
@@ -1783,11 +1843,13 @@ def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
                 outcome_price = float(quote_cache[symbol]["mid"])
                 entry_price = float(row["entry_price"])
                 return_pct = ((outcome_price / entry_price) - 1.0) * 100.0 if entry_price > 0 else 0.0
+                estimated_cost_pct = max(0.0, V2_ESTIMATED_COST_BPS / 100.0)
+                net_return_pct = return_pct - estimated_cost_pct
                 conn.execute(
                     """UPDATE v2_observation_outcomes
-                       SET evaluated_at=?, outcome_price=?, return_pct=?, status='COMPLETE', error=NULL
+                       SET evaluated_at=?, outcome_price=?, return_pct=?, net_return_pct=?, estimated_cost_pct=?, status='COMPLETE', error=NULL
                        WHERE id=?""",
-                    (datetime.now(UTC).isoformat(), outcome_price, return_pct, int(row["id"])),
+                    (datetime.now(UTC).isoformat(), outcome_price, return_pct, net_return_pct, estimated_cost_pct, int(row["id"])),
                 )
                 evaluated += 1
             except Exception as row_error:
@@ -1812,47 +1874,55 @@ def v2_outcomes_summary(symbol: Optional[str] = None) -> Dict[str, Any]:
     try:
         init_db()
         conn = db_connect()
-        params = []
-        where = ""
+        params: List[Any] = []
+        symbol_clause = ""
         if symbol:
-            where = "WHERE o.symbol=?"
+            symbol_clause = " AND o.symbol=?"
             params.append(str(symbol).upper())
         totals = conn.execute(
             f"""SELECT COUNT(*) AS scheduled,
                        SUM(CASE WHEN o.status='COMPLETE' THEN 1 ELSE 0 END) AS completed,
                        SUM(CASE WHEN o.status='PENDING' THEN 1 ELSE 0 END) AS pending,
                        COUNT(DISTINCT o.symbol) AS symbols
-                FROM v2_observation_outcomes o {where}""", params
+                FROM v2_observation_outcomes o WHERE 1=1 {symbol_clause}""", params
         ).fetchone()
+        cte = f"""WITH ranked AS (
+                    SELECT o.*, d.stage, d.decision,
+                           ROW_NUMBER() OVER (PARTITION BY COALESCE(o.sample_key, CAST(o.decision_id AS TEXT)), o.horizon_hours
+                                              ORDER BY o.id ASC) AS rn
+                    FROM v2_observation_outcomes o
+                    JOIN v2_setup_decisions d ON d.id=o.decision_id
+                    WHERE o.status='COMPLETE' {symbol_clause}
+                 )"""
         profiles = conn.execute(
-            f"""SELECT o.horizon_hours,
-                       COUNT(*) AS samples,
-                       AVG(o.return_pct) AS avg_return_pct,
-                       SUM(CASE WHEN o.return_pct>0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS win_rate,
-                       AVG(CASE WHEN o.return_pct>0 THEN o.return_pct END) AS avg_win_pct,
-                       AVG(CASE WHEN o.return_pct<0 THEN o.return_pct END) AS avg_loss_pct,
-                       MIN(o.return_pct) AS worst_return_pct,
-                       MAX(o.return_pct) AS best_return_pct
-                FROM v2_observation_outcomes o
-                {where + (' AND ' if where else 'WHERE ')} o.status='COMPLETE'
-                GROUP BY o.horizon_hours ORDER BY o.horizon_hours""", params
+            cte + """ SELECT horizon_hours, COUNT(*) AS samples,
+                       AVG(net_return_pct) AS avg_return_pct,
+                       SUM(CASE WHEN net_return_pct>0 THEN 1 ELSE 0 END)*1.0/COUNT(*) AS win_rate,
+                       AVG(CASE WHEN net_return_pct>0 THEN net_return_pct END) AS avg_win_pct,
+                       AVG(CASE WHEN net_return_pct<0 THEN net_return_pct END) AS avg_loss_pct,
+                       MIN(net_return_pct) AS worst_return_pct, MAX(net_return_pct) AS best_return_pct,
+                       SUM(CASE WHEN net_return_pct>0 THEN net_return_pct ELSE 0 END) /
+                         NULLIF(ABS(SUM(CASE WHEN net_return_pct<0 THEN net_return_pct ELSE 0 END)),0) AS profit_factor,
+                       AVG(net_return_pct) AS expectancy_pct
+                FROM ranked WHERE rn=1 GROUP BY horizon_hours ORDER BY horizon_hours""", params
         ).fetchall()
         by_stage = conn.execute(
-            f"""SELECT d.stage, d.decision, o.horizon_hours,
-                       COUNT(*) AS samples, AVG(o.return_pct) AS avg_return_pct,
-                       SUM(CASE WHEN o.return_pct>0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS win_rate
-                FROM v2_observation_outcomes o
-                JOIN v2_setup_decisions d ON d.id=o.decision_id
-                {where + (' AND ' if where else 'WHERE ')} o.status='COMPLETE'
-                GROUP BY d.stage, d.decision, o.horizon_hours
-                ORDER BY o.horizon_hours, samples DESC""", params
+            cte + """ SELECT stage, decision, horizon_hours, COUNT(*) AS samples,
+                       AVG(net_return_pct) AS avg_return_pct,
+                       SUM(CASE WHEN net_return_pct>0 THEN 1 ELSE 0 END)*1.0/COUNT(*) AS win_rate,
+                       SUM(CASE WHEN net_return_pct>0 THEN net_return_pct ELSE 0 END) /
+                         NULLIF(ABS(SUM(CASE WHEN net_return_pct<0 THEN net_return_pct ELSE 0 END)),0) AS profit_factor
+                FROM ranked WHERE rn=1 GROUP BY stage, decision, horizon_hours
+                ORDER BY horizon_hours, samples DESC""", params
         ).fetchall()
         conn.close()
         return {"ok": True, **(dict(totals) if totals else {}),
+                "independentSampleMinutes": V2_INDEPENDENT_SAMPLE_MINUTES,
+                "estimatedRoundTripCostBps": V2_ESTIMATED_COST_BPS,
+                "horizonMeaning": {"1": "one market hour", "24": "one trading session", "72": "three trading sessions", "120": "five trading sessions"},
                 "horizons": [dict(r) for r in profiles], "byStage": [dict(r) for r in by_stage]}
     except Exception as e:
         return {"ok": False, "error": str(e)}
-
 
 def v2_replay_rows(symbol: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
     if not SQLITE_ENABLED:
@@ -1870,7 +1940,8 @@ def v2_replay_rows(symbol: Optional[str] = None, limit: int = 200) -> List[Dict[
             f"""SELECT d.id AS decision_id, d.timestamp, d.symbol, d.decision, d.stage,
                        d.reason, d.price AS entry_price, d.confidence, d.quality,
                        d.momentum, d.pullback, o.horizon_hours, o.status,
-                       o.due_at, o.evaluated_at, o.outcome_price, o.return_pct
+                       o.due_at, o.evaluated_at, o.outcome_price, o.return_pct,
+                       o.net_return_pct, o.estimated_cost_pct, o.sample_key
                 FROM v2_setup_decisions d
                 LEFT JOIN v2_observation_outcomes o ON o.decision_id=d.id
                 {where}
@@ -2313,11 +2384,24 @@ def init_db():
             evaluated_at TEXT,
             outcome_price REAL,
             return_pct REAL,
+            net_return_pct REAL,
+            estimated_cost_pct REAL,
+            sample_key TEXT,
             status TEXT NOT NULL DEFAULT 'PENDING',
             error TEXT,
             UNIQUE(decision_id, horizon_hours)
         )
     """)
+    for column_sql in (
+        "ALTER TABLE v2_observation_outcomes ADD COLUMN net_return_pct REAL",
+        "ALTER TABLE v2_observation_outcomes ADD COLUMN estimated_cost_pct REAL",
+        "ALTER TABLE v2_observation_outcomes ADD COLUMN sample_key TEXT",
+    ):
+        try:
+            cur.execute(column_sql)
+        except Exception:
+            pass
+
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_v2_outcomes_due
         ON v2_observation_outcomes(status, due_at)
