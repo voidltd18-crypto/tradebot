@@ -2402,6 +2402,22 @@ def init_db():
         except Exception:
             pass
 
+    # Repair legacy Stage 2 rows that were marked COMPLETE before the
+    # session-aware net return fields existed. They must be evaluated again
+    # during a live market session rather than counted as completed with NULL data.
+    cur.execute("""
+        UPDATE v2_observation_outcomes
+        SET status='PENDING',
+            evaluated_at=NULL,
+            outcome_price=NULL,
+            return_pct=NULL,
+            net_return_pct=NULL,
+            estimated_cost_pct=NULL,
+            error=NULL
+        WHERE status='COMPLETE'
+          AND net_return_pct IS NULL
+    """)
+
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_v2_outcomes_due
         ON v2_observation_outcomes(status, due_at)
