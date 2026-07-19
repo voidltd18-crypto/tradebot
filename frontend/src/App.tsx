@@ -131,7 +131,7 @@ const [banking, setBanking] = useState<AnyObj>({});
 
   
   const token = authToken || apiKey.trim();
-  const secureHeaders = token ? { "X-Auth-Token": token, "x-api-key": token } : {};
+  const secureHeaders = token ? { "x-api-key": token } : {};
 
   async function triggerDynamicMarketUniverseRefresh(loginToken: string, reason = "login") {
     if (!loginToken) return;
@@ -139,7 +139,7 @@ const [banking, setBanking] = useState<AnyObj>({});
       setMessage(reason === "login" ? "Login successful. Refreshing dynamic market universe..." : "Refreshing dynamic market universe...");
       const res = await fetch(`${API_URL}/refresh-universe`, {
         method: "POST",
-        headers: { "X-Auth-Token": loginToken, "x-api-key": loginToken },
+        headers: { "x-api-key": loginToken },
         cache: "no-store",
       });
       const json = await readJson(res);
@@ -617,7 +617,6 @@ const fetchData = useCallback(async (force = false) => {
       if (!res.ok || json?.ok === false) throw new Error(json?.detail || json?.message || "Could not set baseline");
 
       setMessage(`Baseline set to about £${gbpValue.toFixed(2)}.`);
-      await fetchReports();
       await fetchData(true);
     } catch (e:any) {
       setMessage(e?.message || "Could not set baseline.");
