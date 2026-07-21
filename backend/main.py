@@ -1172,6 +1172,18 @@ def confidence_notional(scan):
     return round(max(0.0, min(base * mult, cap)), 2)
 
 
+def proposed_buy_qty(scan: Dict[str, Any]) -> float:
+    """Display-only estimate. Live orders still use notional sizing at submission time."""
+    try:
+        price = float(scan.get("price") or 0.0)
+        if price <= 0:
+            return 0.0
+        notional = float(confidence_notional(scan))
+        return floor_qty(notional / price, 6)
+    except Exception:
+        return 0.0
+
+
 def can_buy_symbol(symbol: str):
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and is_locked_today(symbol):
         return False, f"{symbol} locked until tomorrow"
@@ -1926,6 +1938,56 @@ def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
         return {"ok": False, "evaluated": evaluated, "errors": errors + 1, "error": str(e)}
 
 
+def v2_normalise_reason(reason: str) -> str:
+    """Collapse highly specific numeric rejection messages into useful evidence buckets."""
+    raw = str(reason or "").strip().lower()
+    if not raw:
+        return "unspecified"
+
+    def bucket(value: float, width: float, decimals: int = 2) -> str:
+        low = (value // width) * width
+        high = low + width
+        return f"{low:.{decimals}f} to {high:.{decimals}f}"
+
+    match = re.search(r"confidence(?: too low)?\s+(-?\d+(?:\.\d+)?)", raw)
+    if match:
+        value = float(match.group(1))
+        return f"confidence {bucket(value, 0.10, 2)}"
+
+    match = re.search(r"quality(?: too low)?\s+(-?\d+(?:\.\d+)?)", raw)
+    if match:
+        value = float(match.group(1))
+        return f"quality {bucket(value, 0.005, 3)}"
+
+    match = re.search(r"momentum (?:negative|too weak)\s+(-?\d+(?:\.\d+)?)", raw)
+    if match:
+        value = float(match.group(1))
+        return f"momentum {bucket(value, 0.001, 3)}"
+
+    match = re.search(r"pullback outside sniper range\s+(-?\d+(?:\.\d+)?)", raw)
+    if match:
+        value = float(match.group(1))
+        return f"pullback {bucket(value, 0.005, 3)} outside range"
+
+    match = re.search(r"only\s+(\d+)/(\d+)\s+samples", raw)
+    if match:
+        have, need = int(match.group(1)), int(match.group(2))
+        return f"insufficient samples {have}/{need}"
+
+    if "win rate" in raw or "profit factor" in raw or "expectancy" in raw:
+        failures = []
+        if "win rate" in raw: failures.append("win rate")
+        if "profit factor" in raw: failures.append("profit factor")
+        if "expectancy" in raw: failures.append("expectancy")
+        return "expectancy gate: " + " + ".join(failures)
+
+    if "already holding" in raw:
+        return "already holding"
+    if "all v2 gates passed" in raw:
+        return "all V2 gates passed"
+    return raw[:160]
+
+
 def v2_outcomes_summary(symbol: Optional[str] = None) -> Dict[str, Any]:
     if not SQLITE_ENABLED:
         return {"ok": False, "message": "SQLite disabled"}
@@ -1946,6 +2008,17 @@ def v2_outcomes_summary(symbol: Optional[str] = None) -> Dict[str, Any]:
         ).fetchone()
         cte = f"""WITH ranked AS (
                     SELECT o.*, d.stage, d.decision, d.reason,
+                           CASE
+                             WHEN lower(d.reason) LIKE 'confidence%' THEN 'confidence threshold'
+                             WHEN lower(d.reason) LIKE 'quality%' THEN 'quality threshold'
+                             WHEN lower(d.reason) LIKE 'momentum negative%' THEN 'negative momentum'
+                             WHEN lower(d.reason) LIKE 'momentum too weak%' THEN 'weak momentum'
+                             WHEN lower(d.reason) LIKE 'pullback outside%' THEN 'pullback outside range'
+                             WHEN lower(d.reason) LIKE 'only % samples%' THEN 'insufficient samples'
+                             WHEN lower(d.reason) LIKE 'win rate%' OR lower(d.reason) LIKE 'profit factor%' OR lower(d.reason) LIKE 'expectancy%' THEN 'expectancy evidence below gate'
+                             WHEN lower(d.reason) LIKE '%already holding%' THEN 'already holding'
+                             ELSE d.reason
+                           END AS reason_bucket,
                            ROW_NUMBER() OVER (PARTITION BY COALESCE(o.sample_key, CAST(o.decision_id AS TEXT)), o.horizon_hours
                                               ORDER BY o.id ASC) AS rn
                     FROM v2_observation_outcomes o
@@ -1974,6 +2047,9 @@ def v2_outcomes_summary(symbol: Optional[str] = None) -> Dict[str, Any]:
         by_reason = conn.execute(
             cte + f" SELECT stage, decision, reason, horizon_hours, {metric_sql} FROM ranked WHERE rn=1 GROUP BY stage, decision, reason, horizon_hours ORDER BY horizon_hours, samples DESC", params
         ).fetchall()
+        by_reason_bucket = conn.execute(
+            cte + f" SELECT stage, decision, reason_bucket AS reason, horizon_hours, {metric_sql} FROM ranked WHERE rn=1 GROUP BY stage, decision, reason_bucket, horizon_hours ORDER BY horizon_hours, samples DESC", params
+        ).fetchall()
         by_symbol = conn.execute(
             cte + f" SELECT symbol, stage, decision, horizon_hours, {metric_sql} FROM ranked WHERE rn=1 GROUP BY symbol, stage, decision, horizon_hours ORDER BY horizon_hours, samples DESC", params
         ).fetchall()
@@ -1986,10 +2062,12 @@ def v2_outcomes_summary(symbol: Optional[str] = None) -> Dict[str, Any]:
                 "estimatedRoundTripCostBps": V2_ESTIMATED_COST_BPS,
                 "horizonMeaning": {"1": "one market hour", "24": "one trading session", "72": "three trading sessions", "120": "five trading sessions"},
                 "horizons": [dict(r) for r in profiles], "byStage": [dict(r) for r in by_stage],
-                "byReason": [dict(r) for r in by_reason], "bySymbol": [dict(r) for r in by_symbol],
+                "byReason": [dict(r) for r in by_reason],
+                "byReasonBucket": [dict(r) for r in by_reason_bucket], "bySymbol": [dict(r) for r in by_symbol],
                 "shadowRecommendations": shadow,
                 "shadowMode": True,
-                "shadowNote": "Forward recommendations are advisory and do not alter live approvals."}
+                "shadowNote": "Forward recommendations are advisory and do not alter live approvals.",
+                "evidencePatch": {"reasonBuckets": True, "safeTrustRatings": True, "proposedQtyAudit": True}}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -3336,60 +3414,75 @@ def analytics_payload():
         symbol = str(t.get("symbol", "")).upper()
         if not symbol:
             continue
-        row = by_symbol.setdefault(symbol, {"symbol": symbol, "trades": 0, "wins": 0, "losses": 0, "totalPnl": 0.0, "totalPnlGbp": 0.0, "winRate": 0.0, "avgPnl": 0.0, "trust": "NEW"})
+        row = by_symbol.setdefault(symbol, {
+            "symbol": symbol, "trades": 0, "wins": 0, "losses": 0, "breakevens": 0,
+            "totalPnl": 0.0, "totalPnlGbp": 0.0, "grossProfit": 0.0, "grossLoss": 0.0,
+            "winRate": 0.0, "avgPnl": 0.0, "profitFactor": 0.0, "trust": "NEW"
+        })
         pnl = float(t.get("pnl") or 0.0)
         row["trades"] += 1
         row["totalPnl"] += pnl
         row["totalPnlGbp"] += float(t.get("pnlGbp") or 0.0)
-        if pnl >= 0:
+        if pnl > 0:
             row["wins"] += 1
-        else:
+            row["grossProfit"] += pnl
+        elif pnl < 0:
             row["losses"] += 1
+            row["grossLoss"] += abs(pnl)
+        else:
+            row["breakevens"] += 1
 
     rows = []
     for row in by_symbol.values():
-        row["winRate"] = row["wins"] / max(1, row["trades"])
+        directional = row["wins"] + row["losses"]
+        row["winRate"] = row["wins"] / directional if directional else 0.0
         row["avgPnl"] = row["totalPnl"] / max(1, row["trades"])
-        if row["trades"] >= AUTO_BOOST_MIN_TRADES and row["winRate"] >= AUTO_BOOST_MIN_WINRATE and row["totalPnl"] >= AUTO_BOOST_MIN_TOTAL_PNL:
-            row["trust"] = "BOOST"
-        elif row["trades"] >= AUTO_BLACKLIST_MIN_TRADES and row["winRate"] <= AUTO_BLACKLIST_MAX_WINRATE and row["totalPnl"] <= AUTO_BLACKLIST_MAX_TOTAL_PNL:
+        row["profitFactor"] = row["grossProfit"] / row["grossLoss"] if row["grossLoss"] > 0 else (99.0 if row["grossProfit"] > 0 else 0.0)
+
+        enough_boost = row["trades"] >= AUTO_BOOST_MIN_TRADES
+        enough_blacklist = row["trades"] >= AUTO_BLACKLIST_MIN_TRADES
+        if enough_blacklist and row["totalPnl"] < 0 and row["profitFactor"] < 0.75:
             row["trust"] = "BLACKLIST"
+        elif row["trades"] >= 3 and (row["totalPnl"] <= 0 or row["profitFactor"] < 1.0):
+            row["trust"] = "REDUCE"
+        elif enough_boost and row["winRate"] >= AUTO_BOOST_MIN_WINRATE and row["totalPnl"] >= AUTO_BOOST_MIN_TOTAL_PNL and row["profitFactor"] >= 1.20:
+            row["trust"] = "BOOST"
         elif row["trades"] >= 3:
             row["trust"] = "NEUTRAL"
         rows.append(row)
 
     return {
         "enabled": ANALYTICS_ENABLED,
-        "closedTrades": len(closed),
-        "wins": len(wins),
-        "losses": len(losses),
-        "breakevens": len(breakevens),
+        "closedTrades": len(closed), "wins": len(wins), "losses": len(losses), "breakevens": len(breakevens),
         "winRate": len(wins) / max(1, len(wins) + len(losses)),
-        "totalPnl": total_pnl,
-        "totalPnlGbp": total_pnl_gbp,
-        "averageWin": avg_win,
-        "averageLoss": avg_loss,
-        "averageWinGbp": avg_win_gbp,
-        "averageLossGbp": avg_loss_gbp,
+        "totalPnl": total_pnl, "totalPnlGbp": total_pnl_gbp,
+        "averageWin": avg_win, "averageLoss": avg_loss,
+        "averageWinGbp": avg_win_gbp, "averageLossGbp": avg_loss_gbp,
         "profitFactor": gross_win / max(0.01, gross_loss),
-        "bestStocks": sorted(rows, key=lambda x: (x["totalPnl"], x["winRate"]), reverse=True)[:10],
-        "worstStocks": sorted(rows, key=lambda x: (x["totalPnl"], x["winRate"]))[:10],
-        "todayRealisedPnl": today_realised_pnl(),
-        "todayRealisedPnlGbp": today_realised_pnl_gbp(),
+        "trustDefinition": "BOOST requires positive PnL and PF >= 1.20; negative PnL/PF < 1 becomes REDUCE or BLACKLIST",
+        "bestStocks": sorted(rows, key=lambda x: (x["totalPnl"], x["profitFactor"]), reverse=True)[:10],
+        "worstStocks": sorted(rows, key=lambda x: (x["totalPnl"], x["profitFactor"]))[:10],
+        "todayRealisedPnl": today_realised_pnl(), "todayRealisedPnlGbp": today_realised_pnl_gbp(),
     }
 
 
 def symbol_stats(symbol: str):
     symbol = symbol.upper()
-    rows = analytics_payload().get("bestStocks", []) + analytics_payload().get("worstStocks", [])
-    for row in rows:
-        if row.get("symbol") == symbol:
-            return row
     closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
     trades = [t for t in closed if str(t.get("symbol", "")).upper() == symbol]
-    wins = [t for t in trades if float(t.get("pnl") or 0.0) >= 0]
-    total = sum(float(t.get("pnl") or 0.0) for t in trades)
-    return {"symbol": symbol, "trades": len(trades), "wins": len(wins), "winRate": len(wins) / max(1, len(trades)), "totalPnl": total}
+    pnls = [float(t.get("pnl") or 0.0) for t in trades]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    breakevens = [p for p in pnls if p == 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    directional = len(wins) + len(losses)
+    return {
+        "symbol": symbol, "trades": len(trades), "wins": len(wins), "losses": len(losses),
+        "breakevens": len(breakevens), "winRate": len(wins) / directional if directional else 0.0,
+        "totalPnl": sum(pnls), "avgPnl": sum(pnls) / max(1, len(pnls)),
+        "profitFactor": gross_profit / gross_loss if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0),
+    }
 
 
 def auto_improve_decision(symbol: str):
@@ -3399,13 +3492,19 @@ def auto_improve_decision(symbol: str):
     trades = int(row.get("trades") or 0)
     win_rate = float(row.get("winRate") or 0.0)
     total_pnl = float(row.get("totalPnl") or 0.0)
-    if AUTO_BLACKLIST_ENABLED and trades >= AUTO_BLACKLIST_MIN_TRADES and win_rate <= AUTO_BLACKLIST_MAX_WINRATE and total_pnl <= AUTO_BLACKLIST_MAX_TOTAL_PNL:
-        return {"action": "BLACKLIST", "multiplier": 0.0, "reason": f"weak history: trades={trades}, winRate={win_rate:.2f}, pnl=${total_pnl:.2f}"}
-    if AUTO_BOOST_ENABLED and trades >= AUTO_BOOST_MIN_TRADES and win_rate >= AUTO_BOOST_MIN_WINRATE and total_pnl >= AUTO_BOOST_MIN_TOTAL_PNL:
-        return {"action": "BOOST", "multiplier": AUTO_BOOST_MULTIPLIER, "reason": f"strong history: trades={trades}, winRate={win_rate:.2f}, pnl=${total_pnl:.2f}"}
-    if trades >= AUTO_BLACKLIST_MIN_TRADES and total_pnl < 0:
-        return {"action": "REDUCE", "multiplier": AUTO_REDUCE_MULTIPLIER, "reason": f"negative history: trades={trades}, pnl=${total_pnl:.2f}"}
-    return {"action": "NORMAL", "multiplier": 1.0, "reason": "normal history"}
+    profit_factor = float(row.get("profitFactor") or 0.0)
+
+    if AUTO_BLACKLIST_ENABLED and trades >= AUTO_BLACKLIST_MIN_TRADES and total_pnl < 0 and profit_factor < 0.75:
+        return {"action": "BLACKLIST", "multiplier": 0.0,
+                "reason": f"weak history: trades={trades}, winRate={win_rate:.2f}, PF={profit_factor:.2f}, pnl=${total_pnl:.2f}"}
+    if trades >= 3 and (total_pnl <= 0 or profit_factor < 1.0):
+        return {"action": "REDUCE", "multiplier": AUTO_REDUCE_MULTIPLIER,
+                "reason": f"negative expectancy: trades={trades}, winRate={win_rate:.2f}, PF={profit_factor:.2f}, pnl=${total_pnl:.2f}"}
+    if AUTO_BOOST_ENABLED and trades >= AUTO_BOOST_MIN_TRADES and win_rate >= AUTO_BOOST_MIN_WINRATE and total_pnl >= AUTO_BOOST_MIN_TOTAL_PNL and profit_factor >= 1.20:
+        return {"action": "BOOST", "multiplier": AUTO_BOOST_MULTIPLIER,
+                "reason": f"strong history: trades={trades}, winRate={win_rate:.2f}, PF={profit_factor:.2f}, pnl=${total_pnl:.2f}"}
+    return {"action": "NORMAL", "multiplier": 1.0,
+            "reason": f"normal history: trades={trades}, PF={profit_factor:.2f}, pnl=${total_pnl:.2f}"}
 
 
 def optimiser_allows_scan(scan):
@@ -3860,7 +3959,12 @@ def build_status_payload(bot_name, scans):
             {
                 "symbol": s["symbol"], "price": float(s["price"]), "ref": float(s["ref"]),
                 "trigger": float(s["buy_trigger"]), "spread": float(s["spread"]),
-                "qty": float(s["qty"]), "score": float(s["score"]),
+                "qty": 0.0 if float(s["qty"]) <= DUST_THRESHOLD else float(s["qty"]),
+                "heldQty": 0.0 if float(s["qty"]) <= DUST_THRESHOLD else float(s["qty"]),
+                "proposedQty": proposed_buy_qty(s),
+                "proposedNotional": confidence_notional(s),
+                "qtyMeaning": "heldQty; proposedQty is the estimated new order size",
+                "score": float(s["score"]),
                 "pullback": float(s["pullback"]), "shortMomentum": float(s["short_momentum"]),
                 "qualityScore": float(s["quality_score"]), "readyToBuy": bool(s["ready_to_buy"]),
                 "lockedToday": bool(s["locked_today"]), "custom": bool(s.get("custom", False)),
