@@ -1514,6 +1514,59 @@ def should_stall_exit(position: Dict[str, Any]):
 # =========================
 # TRADEBOT V2 EXPECTANCY HELPERS
 # =========================
+def v2_forward_shadow_profile(symbol: str, preferred_horizon: int = 24) -> Dict[str, Any]:
+    """Forward replay evidence only. This never changes the live gate."""
+    sym = str(symbol or "").upper().strip()
+    if not (SQLITE_ENABLED and sym):
+        return {"symbol": sym, "mode": "SHADOW", "recommendation": "WATCH", "samples": 0}
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute(
+            """WITH ranked AS (
+                   SELECT o.*,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY COALESCE(o.sample_key, CAST(o.decision_id AS TEXT)), o.horizon_hours
+                              ORDER BY o.id ASC
+                          ) AS rn
+                   FROM v2_observation_outcomes o
+                   WHERE o.status='COMPLETE' AND o.symbol=? AND o.net_return_pct IS NOT NULL
+               )
+               SELECT horizon_hours, COUNT(*) AS samples,
+                      AVG(net_return_pct) AS expectancy_pct,
+                      SUM(CASE WHEN net_return_pct>0 THEN 1 ELSE 0 END) AS wins,
+                      SUM(CASE WHEN net_return_pct<0 THEN 1 ELSE 0 END) AS losses,
+                      SUM(CASE WHEN net_return_pct=0 THEN 1 ELSE 0 END) AS breakevens,
+                      SUM(CASE WHEN net_return_pct>0 THEN net_return_pct ELSE 0 END) /
+                        NULLIF(ABS(SUM(CASE WHEN net_return_pct<0 THEN net_return_pct ELSE 0 END)),0) AS profit_factor
+               FROM ranked WHERE rn=1
+               GROUP BY horizon_hours ORDER BY CASE WHEN horizon_hours=? THEN 0 WHEN horizon_hours=1 THEN 1 ELSE 2 END, horizon_hours""",
+            (sym, int(preferred_horizon)),
+        ).fetchall()
+        conn.close()
+        row = dict(rows[0]) if rows else {}
+        wins = int(row.get("wins") or 0)
+        losses = int(row.get("losses") or 0)
+        directional = wins + losses
+        win_rate = wins / directional if directional else 0.0
+        samples = int(row.get("samples") or 0)
+        expectancy = float(row.get("expectancy_pct") or 0.0)
+        pf = row.get("profit_factor")
+        pf_value = float(pf) if pf is not None else (99.0 if wins and not losses else 0.0)
+        enough = samples >= V2_MIN_SYMBOL_SAMPLES
+        shadow_approved = enough and win_rate >= V2_MIN_WIN_RATE and pf_value >= V2_MIN_PROFIT_FACTOR and expectancy >= V2_MIN_EXPECTANCY_PCT
+        recommendation = "APPROVE" if shadow_approved else ("BLOCK" if enough else "WATCH")
+        return {
+            "symbol": sym, "mode": "SHADOW", "horizonHours": int(row.get("horizon_hours") or preferred_horizon),
+            "samples": samples, "wins": wins, "losses": losses, "breakevens": int(row.get("breakevens") or 0),
+            "winRate": win_rate, "profitFactor": pf_value, "expectancyPct": expectancy,
+            "recommendation": recommendation, "approved": shadow_approved,
+            "reason": "forward evidence passes" if shadow_approved else ("insufficient forward samples" if not enough else "forward evidence below gate"),
+        }
+    except Exception as e:
+        return {"symbol": sym, "mode": "SHADOW", "recommendation": "WATCH", "samples": 0, "error": str(e)}
+
+
 def v2_symbol_expectancy(symbol: str):
     sym = str(symbol or "").upper().strip()
     closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
@@ -1533,10 +1586,12 @@ def v2_symbol_expectancy(symbol: str):
     pct = [float(t.get("pnlPct") or 0.0) for t in rows]
     wins = [x for x in pnls if x > 0]
     losses = [x for x in pnls if x < 0]
+    breakevens = [x for x in pnls if x == 0]
     gross_profit = sum(wins)
     gross_loss = abs(sum(losses))
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
-    win_rate = len(wins) / len(rows) if rows else 0.0
+    directional = len(wins) + len(losses)
+    win_rate = len(wins) / directional if directional else 0.0
     expectancy_pct = sum(pct) / len(pct) if pct else 0.0
     enough = len(rows) >= V2_MIN_SYMBOL_SAMPLES
     approved = enough and win_rate >= V2_MIN_WIN_RATE and profit_factor >= V2_MIN_PROFIT_FACTOR and expectancy_pct >= V2_MIN_EXPECTANCY_PCT
@@ -1546,16 +1601,19 @@ def v2_symbol_expectancy(symbol: str):
     if enough and profit_factor < V2_MIN_PROFIT_FACTOR: reasons.append(f"profit factor {profit_factor:.2f} below {V2_MIN_PROFIT_FACTOR:.2f}")
     if enough and expectancy_pct < V2_MIN_EXPECTANCY_PCT: reasons.append(f"expectancy {expectancy_pct:.2f}% below {V2_MIN_EXPECTANCY_PCT:.2f}%")
     return {
-        "symbol": sym, "samples": len(rows), "wins": len(wins), "losses": len(losses),
-        "winRate": win_rate, "profitFactor": profit_factor,
+        "symbol": sym, "samples": len(rows), "wins": len(wins), "losses": len(losses), "breakevens": len(breakevens),
+        "directionalSamples": directional, "winRate": win_rate, "profitFactor": profit_factor,
         "expectancyPct": expectancy_pct, "totalPnl": sum(pnls),
         "approved": approved, "reason": "approved" if approved else "; ".join(reasons) or "not approved",
+        "forwardShadow": v2_forward_shadow_profile(sym),
     }
+
 
 def v2_trade_gate(scan: Dict[str, Any]):
     if not TRADEBOT_V2_ENABLED:
         return True, {"approved": True, "reason": "V2 disabled"}
     profile = v2_symbol_expectancy(scan.get("symbol"))
+    # Deliberately use historical approval only. forwardShadow is advisory.
     return bool(profile.get("approved")), profile
 
 
@@ -1887,40 +1945,51 @@ def v2_outcomes_summary(symbol: Optional[str] = None) -> Dict[str, Any]:
                 FROM v2_observation_outcomes o WHERE 1=1 {symbol_clause}""", params
         ).fetchone()
         cte = f"""WITH ranked AS (
-                    SELECT o.*, d.stage, d.decision,
+                    SELECT o.*, d.stage, d.decision, d.reason,
                            ROW_NUMBER() OVER (PARTITION BY COALESCE(o.sample_key, CAST(o.decision_id AS TEXT)), o.horizon_hours
                                               ORDER BY o.id ASC) AS rn
                     FROM v2_observation_outcomes o
                     JOIN v2_setup_decisions d ON d.id=o.decision_id
-                    WHERE o.status='COMPLETE' {symbol_clause}
+                    WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL {symbol_clause}
                  )"""
-        profiles = conn.execute(
-            cte + """ SELECT horizon_hours, COUNT(*) AS samples,
+        metric_sql = """COUNT(*) AS samples,
+                       SUM(CASE WHEN net_return_pct>0 THEN 1 ELSE 0 END) AS wins,
+                       SUM(CASE WHEN net_return_pct<0 THEN 1 ELSE 0 END) AS losses,
+                       SUM(CASE WHEN net_return_pct=0 THEN 1 ELSE 0 END) AS breakevens,
                        AVG(net_return_pct) AS avg_return_pct,
-                       SUM(CASE WHEN net_return_pct>0 THEN 1 ELSE 0 END)*1.0/COUNT(*) AS win_rate,
+                       SUM(CASE WHEN net_return_pct>0 THEN 1 ELSE 0 END)*1.0/
+                         NULLIF(SUM(CASE WHEN net_return_pct<>0 THEN 1 ELSE 0 END),0) AS win_rate,
                        AVG(CASE WHEN net_return_pct>0 THEN net_return_pct END) AS avg_win_pct,
                        AVG(CASE WHEN net_return_pct<0 THEN net_return_pct END) AS avg_loss_pct,
                        MIN(net_return_pct) AS worst_return_pct, MAX(net_return_pct) AS best_return_pct,
                        SUM(CASE WHEN net_return_pct>0 THEN net_return_pct ELSE 0 END) /
                          NULLIF(ABS(SUM(CASE WHEN net_return_pct<0 THEN net_return_pct ELSE 0 END)),0) AS profit_factor,
-                       AVG(net_return_pct) AS expectancy_pct
-                FROM ranked WHERE rn=1 GROUP BY horizon_hours ORDER BY horizon_hours""", params
+                       AVG(net_return_pct) AS expectancy_pct"""
+        profiles = conn.execute(
+            cte + f" SELECT horizon_hours, {metric_sql} FROM ranked WHERE rn=1 GROUP BY horizon_hours ORDER BY horizon_hours", params
         ).fetchall()
         by_stage = conn.execute(
-            cte + """ SELECT stage, decision, horizon_hours, COUNT(*) AS samples,
-                       AVG(net_return_pct) AS avg_return_pct,
-                       SUM(CASE WHEN net_return_pct>0 THEN 1 ELSE 0 END)*1.0/COUNT(*) AS win_rate,
-                       SUM(CASE WHEN net_return_pct>0 THEN net_return_pct ELSE 0 END) /
-                         NULLIF(ABS(SUM(CASE WHEN net_return_pct<0 THEN net_return_pct ELSE 0 END)),0) AS profit_factor
-                FROM ranked WHERE rn=1 GROUP BY stage, decision, horizon_hours
-                ORDER BY horizon_hours, samples DESC""", params
+            cte + f" SELECT stage, decision, horizon_hours, {metric_sql} FROM ranked WHERE rn=1 GROUP BY stage, decision, horizon_hours ORDER BY horizon_hours, samples DESC", params
+        ).fetchall()
+        by_reason = conn.execute(
+            cte + f" SELECT stage, decision, reason, horizon_hours, {metric_sql} FROM ranked WHERE rn=1 GROUP BY stage, decision, reason, horizon_hours ORDER BY horizon_hours, samples DESC", params
+        ).fetchall()
+        by_symbol = conn.execute(
+            cte + f" SELECT symbol, stage, decision, horizon_hours, {metric_sql} FROM ranked WHERE rn=1 GROUP BY symbol, stage, decision, horizon_hours ORDER BY horizon_hours, samples DESC", params
         ).fetchall()
         conn.close()
+        symbols_for_shadow = sorted({str(r["symbol"]) for r in by_symbol})
+        shadow = [v2_forward_shadow_profile(sym) for sym in symbols_for_shadow]
         return {"ok": True, **(dict(totals) if totals else {}),
+                "winRateDefinition": "wins / (wins + losses); breakevens excluded",
                 "independentSampleMinutes": V2_INDEPENDENT_SAMPLE_MINUTES,
                 "estimatedRoundTripCostBps": V2_ESTIMATED_COST_BPS,
                 "horizonMeaning": {"1": "one market hour", "24": "one trading session", "72": "three trading sessions", "120": "five trading sessions"},
-                "horizons": [dict(r) for r in profiles], "byStage": [dict(r) for r in by_stage]}
+                "horizons": [dict(r) for r in profiles], "byStage": [dict(r) for r in by_stage],
+                "byReason": [dict(r) for r in by_reason], "bySymbol": [dict(r) for r in by_symbol],
+                "shadowRecommendations": shadow,
+                "shadowMode": True,
+                "shadowNote": "Forward recommendations are advisory and do not alter live approvals."}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -2402,22 +2471,6 @@ def init_db():
         except Exception:
             pass
 
-    # Repair legacy Stage 2 rows that were marked COMPLETE before the
-    # session-aware net return fields existed. They must be evaluated again
-    # during a live market session rather than counted as completed with NULL data.
-    cur.execute("""
-        UPDATE v2_observation_outcomes
-        SET status='PENDING',
-            evaluated_at=NULL,
-            outcome_price=NULL,
-            return_pct=NULL,
-            net_return_pct=NULL,
-            estimated_cost_pct=NULL,
-            error=NULL
-        WHERE status='COMPLETE'
-          AND net_return_pct IS NULL
-    """)
-
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_v2_outcomes_due
         ON v2_observation_outcomes(status, due_at)
@@ -2814,8 +2867,9 @@ def rebuild_closed_trades_from_orders():
 
 def closed_trade_summary_payload():
     closed = closed_trades_from_db(10000)
-    wins = [t for t in closed if float(t.get("pnl") or 0.0) >= 0]
+    wins = [t for t in closed if float(t.get("pnl") or 0.0) > 0]
     losses = [t for t in closed if float(t.get("pnl") or 0.0) < 0]
+    breakevens = [t for t in closed if float(t.get("pnl") or 0.0) == 0]
     total_pnl = sum(float(t.get("pnl") or 0.0) for t in closed)
     total_pnl_gbp = sum(float(t.get("pnlGbp") or 0.0) for t in closed)
 
@@ -2823,7 +2877,8 @@ def closed_trade_summary_payload():
         "closedTrades": len(closed),
         "wins": len(wins),
         "losses": len(losses),
-        "winRate": len(wins) / max(1, len(closed)),
+        "breakevens": len(breakevens),
+        "winRate": len(wins) / max(1, len(wins) + len(losses)),
         "totalPnl": total_pnl,
         "totalPnlGbp": total_pnl_gbp,
     }
@@ -3264,8 +3319,9 @@ def profit_guardrail_status():
 
 def analytics_payload():
     closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
-    wins = [t for t in closed if float(t.get("pnl") or 0.0) >= 0]
+    wins = [t for t in closed if float(t.get("pnl") or 0.0) > 0]
     losses = [t for t in closed if float(t.get("pnl") or 0.0) < 0]
+    breakevens = [t for t in closed if float(t.get("pnl") or 0.0) == 0]
     total_pnl = sum(float(t.get("pnl") or 0.0) for t in closed)
     total_pnl_gbp = sum(float(t.get("pnlGbp") or 0.0) for t in closed)
     gross_win = sum(float(t.get("pnl") or 0.0) for t in wins)
@@ -3307,7 +3363,8 @@ def analytics_payload():
         "closedTrades": len(closed),
         "wins": len(wins),
         "losses": len(losses),
-        "winRate": len(wins) / max(1, len(closed)),
+        "breakevens": len(breakevens),
+        "winRate": len(wins) / max(1, len(wins) + len(losses)),
         "totalPnl": total_pnl,
         "totalPnlGbp": total_pnl_gbp,
         "averageWin": avg_win,
@@ -4188,6 +4245,15 @@ def api_v2_outcomes_summary(symbol: Optional[str] = None):
 @app.get("/v2/replay")
 def api_v2_replay(symbol: Optional[str] = None, limit: int = 200):
     return {"ok": True, "rows": v2_replay_rows(symbol, limit)}
+
+@app.get("/v2/shadow-recommendations")
+def api_v2_shadow_recommendations(symbol: Optional[str] = None):
+    if symbol:
+        return {"ok": True, "shadowMode": True, "recommendations": [v2_forward_shadow_profile(symbol)]}
+    summary = v2_outcomes_summary()
+    return {"ok": bool(summary.get("ok")), "shadowMode": True,
+            "note": "Advisory only; live gate unchanged.",
+            "recommendations": summary.get("shadowRecommendations", [])}
 
 @app.post("/v2/evaluate-outcomes")
 def api_v2_evaluate_outcomes(request: Request, limit: int = 100):
