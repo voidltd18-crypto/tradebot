@@ -4438,6 +4438,10 @@ def v2_status():
         "ok": True, "enabled": TRADEBOT_V2_ENABLED, "paper": PAPER,
         "liveBuyingEnabled": TRADEBOT_V2_LIVE_ENABLED,
         "mode": "paper" if PAPER else ("live" if TRADEBOT_V2_LIVE_ENABLED else "validation-only"),
+        "features": {
+            "decisionExplanation": True, "shadowVsOriginal": True,
+            "adaptiveThresholdAdvisory": True, "autoApplyThresholds": False
+        },
         "rules": {
             "minSamples": V2_MIN_SYMBOL_SAMPLES, "minWinRate": V2_MIN_WIN_RATE,
             "minProfitFactor": V2_MIN_PROFIT_FACTOR, "minExpectancyPct": V2_MIN_EXPECTANCY_PCT,
@@ -4448,9 +4452,198 @@ def v2_status():
 
 @app.get("/v2/explain/{symbol}")
 def v2_explain(symbol: str):
-    profile = v2_symbol_expectancy(symbol)
-    recent = [r for r in v2_recent_decisions(500) if str(r.get("symbol", "")).upper() == str(symbol).upper()][:20]
-    return {"ok": True, **profile, "recentDecisions": recent}
+    return v2_decision_explanation(symbol)
+
+@app.get("/v2/decision-review")
+def api_v2_decision_review(limit: int = 100):
+    return v2_decision_review(limit)
+
+@app.get("/v2/adaptive-thresholds")
+def api_v2_adaptive_thresholds(horizon_hours: int = 24, min_samples: int = 25):
+    return v2_adaptive_threshold_recommendations(horizon_hours, min_samples)
+
+
+
+# =========================
+# TRADEBOT V2 DECISION EXPLANATION + ADAPTIVE ADVISORY
+# =========================
+def _v2_metric_grade(samples: int, profit_factor: float, expectancy: float) -> str:
+    if samples < 8:
+        return "LOW"
+    if samples >= 30 and profit_factor >= 1.50 and expectancy > 0:
+        return "HIGH"
+    if profit_factor >= 1.10 and expectancy >= 0:
+        return "MEDIUM"
+    return "LOW"
+
+
+def v2_adaptive_threshold_recommendations(horizon_hours: int = 24, min_samples: int = 25) -> Dict[str, Any]:
+    """Evidence-only threshold search. It never modifies strategy settings."""
+    current_conf = float(A_PLUS_MIN_CONFIDENCE)
+    current_quality = float(A_PLUS_MIN_QUALITY)
+    result: Dict[str, Any] = {
+        "ok": True,
+        "advisoryOnly": True,
+        "applied": False,
+        "horizonHours": int(horizon_hours),
+        "minimumSamples": int(min_samples),
+        "current": {"confidence": current_conf, "quality": current_quality},
+    }
+    if not SQLITE_ENABLED:
+        return {**result, "ok": False, "message": "SQLite disabled"}
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute(
+            """WITH ranked AS (
+                   SELECT d.confidence, d.quality, o.net_return_pct,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY COALESCE(o.sample_key, CAST(o.decision_id AS TEXT)), o.horizon_hours
+                              ORDER BY o.id ASC
+                          ) AS rn
+                   FROM v2_observation_outcomes o
+                   JOIN v2_setup_decisions d ON d.id=o.decision_id
+                   WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL
+                     AND o.horizon_hours=?
+               )
+               SELECT confidence, quality, net_return_pct FROM ranked WHERE rn=1""",
+            (int(horizon_hours),),
+        ).fetchall()
+        conn.close()
+        observations = [dict(r) for r in rows]
+        conf_candidates = sorted(set([round(x, 2) for x in [0.55,0.58,0.60,0.62,0.65,0.67,0.68,0.69,0.70,0.72,0.75]] + [round(current_conf,2)]))
+        quality_candidates = sorted(set([round(x, 3) for x in [0.018,0.020,0.022,0.024,0.025,0.026,0.028,0.030]] + [round(current_quality,3)]))
+        candidates = []
+        for conf in conf_candidates:
+            for quality in quality_candidates:
+                returns = [float(r["net_return_pct"]) for r in observations
+                           if float(r.get("confidence") or 0.0) >= conf and float(r.get("quality") or 0.0) >= quality]
+                if len(returns) < int(min_samples):
+                    continue
+                wins = [x for x in returns if x > 0]
+                losses = [x for x in returns if x < 0]
+                gross_profit = sum(wins)
+                gross_loss = abs(sum(losses))
+                pf = gross_profit / gross_loss if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
+                expectancy = sum(returns) / len(returns)
+                win_rate = len(wins) / (len(wins)+len(losses)) if (wins or losses) else 0.0
+                # Prefer robust expectancy and PF; lightly penalise very small samples.
+                robustness = min(1.0, len(returns) / 100.0)
+                score = expectancy * min(pf, 4.0) * (0.5 + 0.5 * robustness)
+                candidates.append({
+                    "confidence": conf, "quality": quality, "samples": len(returns),
+                    "winRate": win_rate, "profitFactor": pf, "expectancyPct": expectancy,
+                    "score": score,
+                })
+        candidates.sort(key=lambda x: (x["score"], x["samples"]), reverse=True)
+        current_match = next((x for x in candidates if abs(x["confidence"]-round(current_conf,2)) < 1e-9 and abs(x["quality"]-round(current_quality,3)) < 1e-9), None)
+        best = candidates[0] if candidates else None
+        recommendation = "KEEP_CURRENT"
+        reason = "Not enough completed evidence to recommend a change."
+        if best:
+            if current_match and best["score"] <= current_match["score"] * 1.05:
+                best = current_match
+                reason = "Current thresholds are within 5% of the best evidence score."
+            else:
+                recommendation = "REVIEW_CHANGE"
+                reason = "A different threshold pair has materially stronger completed shadow evidence."
+        result.update({
+            "observations": len(observations),
+            "recommendation": recommendation,
+            "reason": reason,
+            "recommended": best,
+            "currentEvidence": current_match,
+            "topCandidates": candidates[:10],
+            "safetyNote": "Recommendation only. No live or saved strategy setting was changed.",
+        })
+        return result
+    except Exception as e:
+        return {**result, "ok": False, "error": str(e)}
+
+
+def v2_decision_explanation(symbol: str) -> Dict[str, Any]:
+    sym = str(symbol or "").upper().strip()
+    scans = latest_status.get("scans") or []
+    scan = next((s for s in scans if str(s.get("symbol", "")).upper() == sym), {})
+    profile = v2_symbol_expectancy(sym)
+    forward = profile.get("forwardShadow") or v2_forward_shadow_profile(sym)
+    recent = [r for r in v2_recent_decisions(500) if str(r.get("symbol", "")).upper() == sym]
+    latest = recent[0] if recent else {}
+    confidence = float(scan.get("confidence") if scan else latest.get("confidence") or 0.0)
+    quality = float(scan.get("qualityScore") if scan else latest.get("quality") or 0.0)
+    momentum = float(scan.get("shortMomentum") if scan else latest.get("momentum") or 0.0)
+    pullback = float(scan.get("pullback") if scan else latest.get("pullback") or 0.0)
+    checks = [
+        {"name": "Sniper confidence", "passed": confidence >= float(SNIPER_MIN_CONFIDENCE), "value": confidence, "required": float(SNIPER_MIN_CONFIDENCE)},
+        {"name": "Sniper quality", "passed": quality >= float(SNIPER_MIN_QUALITY), "value": quality, "required": float(SNIPER_MIN_QUALITY)},
+        {"name": "A+ confidence", "passed": confidence >= float(A_PLUS_MIN_CONFIDENCE), "value": confidence, "required": float(A_PLUS_MIN_CONFIDENCE)},
+        {"name": "A+ quality", "passed": quality >= float(A_PLUS_MIN_QUALITY), "value": quality, "required": float(A_PLUS_MIN_QUALITY)},
+        {"name": "Momentum non-negative", "passed": momentum >= 0.0, "value": momentum, "required": 0.0},
+        {"name": "Historical expectancy gate", "passed": bool(profile.get("approved")), "value": float(profile.get("expectancyPct") or 0.0), "required": float(V2_MIN_EXPECTANCY_PCT)},
+    ]
+    live_decision = str(latest.get("decision") or ("APPROVED" if scan.get("aPlusPass") else "REJECTED" if scan else "UNKNOWN"))
+    live_reason = str(latest.get("reason") or scan.get("aPlusReason") or scan.get("sniperReason") or "No recorded reason")
+    shadow_decision = str(forward.get("recommendation") or "WATCH")
+    mismatch = ((live_decision == "APPROVED" and shadow_decision == "BLOCK") or
+                (live_decision == "REJECTED" and shadow_decision == "APPROVE"))
+    estimated_skip_cost = None
+    if live_decision == "REJECTED" and shadow_decision == "APPROVE":
+        estimated_skip_cost = float(forward.get("expectancyPct") or 0.0)
+    samples = int(forward.get("samples") or 0)
+    pf = float(forward.get("profitFactor") or 0.0)
+    exp = float(forward.get("expectancyPct") or 0.0)
+    return {
+        "ok": True,
+        "symbol": sym,
+        "decision": live_decision,
+        "stage": latest.get("stage"),
+        "reason": live_reason,
+        "checks": checks,
+        "historicalEvidence": profile,
+        "forwardShadow": forward,
+        "comparison": {
+            "originalDecision": live_decision,
+            "shadowRecommendation": shadow_decision,
+            "disagreement": mismatch,
+            "estimatedCostOfSkipPct": estimated_skip_cost,
+            "evidenceConfidence": _v2_metric_grade(samples, pf, exp),
+            "note": "Shadow advice is evidence-only and cannot place an order.",
+        },
+        "latestScan": scan,
+        "recentDecisions": recent[:20],
+    }
+
+
+def v2_decision_review(limit: int = 100) -> Dict[str, Any]:
+    decisions = v2_recent_decisions(max(1, min(int(limit), 500)))
+    rows = []
+    profile_cache: Dict[str, Dict[str, Any]] = {}
+    for d in decisions:
+        sym = str(d.get("symbol") or "").upper()
+        if sym not in profile_cache:
+            profile_cache[sym] = v2_forward_shadow_profile(sym)
+        shadow = profile_cache[sym]
+        original = str(d.get("decision") or "UNKNOWN")
+        recommendation = str(shadow.get("recommendation") or "WATCH")
+        disagreement = ((original == "APPROVED" and recommendation == "BLOCK") or
+                        (original == "REJECTED" and recommendation == "APPROVE"))
+        rows.append({
+            "decisionId": d.get("id"), "timestamp": d.get("timestamp"), "symbol": sym,
+            "originalDecision": original, "stage": d.get("stage"), "reason": d.get("reason"),
+            "confidence": d.get("confidence"), "quality": d.get("quality"),
+            "shadowRecommendation": recommendation,
+            "shadowSamples": shadow.get("samples"), "shadowWinRate": shadow.get("winRate"),
+            "shadowProfitFactor": shadow.get("profitFactor"), "shadowExpectancyPct": shadow.get("expectancyPct"),
+            "disagreement": disagreement,
+            "estimatedCostOfSkipPct": float(shadow.get("expectancyPct") or 0.0) if original == "REJECTED" and recommendation == "APPROVE" else None,
+        })
+    return {
+        "ok": True, "advisoryOnly": True, "count": len(rows),
+        "disagreements": sum(1 for r in rows if r["disagreement"]),
+        "rows": rows,
+        "note": "Comparison only; live ordering and saved thresholds remain unchanged.",
+    }
+
 
 @app.get("/v2/intelligence-summary")
 def api_v2_intelligence_summary():
