@@ -4615,6 +4615,22 @@ def api_v4_market_dna(symbol: Optional[str] = None, limit: int = 100):
 def api_v4_similarity(symbol: str, horizon_hours: int = 24, limit: int = 50):
     return v4_similarity_for_symbol(symbol, horizon_hours, limit)
 
+@app.get("/v4/explain/{decision_id}")
+def api_v4_explain(decision_id: int, horizon_hours: int = 24, limit: int = 50):
+    return v4_explain_decision(decision_id, horizon_hours, limit)
+
+@app.get("/v4/explain-symbol/{symbol}")
+def api_v4_explain_symbol(symbol: str, horizon_hours: int = 24, limit: int = 50):
+    return v4_explain_latest_symbol(symbol, horizon_hours, limit)
+
+@app.get("/v4/confidence/{symbol}")
+def api_v4_confidence(symbol: str, horizon_hours: int = 24, limit: int = 50):
+    return v4_contextual_confidence_for_symbol(symbol, horizon_hours, limit)
+
+@app.get("/v4/confidence-decision/{decision_id}")
+def api_v4_confidence_decision(decision_id: int, horizon_hours: int = 24, limit: int = 50):
+    return v4_contextual_confidence_for_decision(decision_id, horizon_hours, limit)
+
 @app.get("/v4/patterns")
 def api_v4_patterns(horizon_hours: int = 24, min_samples: int = 8):
     return v4_pattern_report(horizon_hours, min_samples)
@@ -4626,7 +4642,7 @@ def api_v4_weekly_intelligence(horizon_hours: int = 24):
 
 
 # =========================
-# TRADEBOT V4.1 — MARKET DNA / SIMILARITY / PATTERN INTELLIGENCE
+# TRADEBOT V4.3 — CONTEXTUAL SIMILARITY / CONFIDENCE INTELLIGENCE
 # =========================
 def _v4_session_name(dt: datetime) -> str:
     hour = dt.hour
@@ -4753,11 +4769,128 @@ def _v4_current_scan(symbol: str) -> Dict[str, Any]:
     return {}
 
 
+def _v4_weighted_similarity_summary(ranked: List[Dict[str, Any]], limit: int) -> Dict[str, Any]:
+    """Summarise contextual neighbours with similarity, recency and sample-size controls."""
+    chosen = ranked[:max(1, min(int(limit or V4_SIMILARITY_LIMIT), 200))]
+    if not chosen:
+        return {
+            "matches": 0, "effectiveSamples": 0.0, "winRate": 0.0,
+            "profitFactor": 0.0, "profitFactorDisplay": 0.0,
+            "expectancyPct": 0.0, "averageSimilarity": 0.0,
+            "evidenceReliability": 0.0, "recommendation": "WATCH",
+        }
+
+    weighted_wins = weighted_losses = weighted_return = total_weight = 0.0
+    gross_profit = gross_loss = 0.0
+    now = datetime.now(UTC)
+    for item in chosen:
+        similarity = max(0.0, min(1.0, float(item.get("similarity") or 0.0)))
+        evaluated_at = item.get("evaluated_at") or item.get("observed_at")
+        age_days = 365.0
+        try:
+            dt = datetime.fromisoformat(str(evaluated_at).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            age_days = max(0.0, (now - dt.astimezone(UTC)).total_seconds() / 86400.0)
+        except Exception:
+            pass
+        recency = 0.5 ** (age_days / 90.0)  # 90-day half-life
+        weight = max(0.01, similarity ** 2 * recency)
+        ret = float(item.get("net_return_pct") or 0.0)
+        total_weight += weight
+        weighted_return += ret * weight
+        if ret > 0:
+            weighted_wins += weight
+            gross_profit += ret * weight
+        elif ret < 0:
+            weighted_losses += weight
+            gross_loss += abs(ret) * weight
+
+    decisive_weight = weighted_wins + weighted_losses
+    win_rate = weighted_wins / decisive_weight if decisive_weight > 0 else 0.0
+    expectancy = weighted_return / total_weight if total_weight > 0 else 0.0
+    pf = gross_profit / gross_loss if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
+    avg_similarity = sum(float(x.get("similarity") or 0.0) for x in chosen) / len(chosen)
+    effective_samples = total_weight
+    sample_score = min(1.0, effective_samples / max(1.0, float(V4_SIMILARITY_MIN_SAMPLES)))
+    similarity_score = min(1.0, max(0.0, (avg_similarity - 0.25) / 0.50))
+    reliability = sample_score * similarity_score
+    enough = len(chosen) >= V4_SIMILARITY_MIN_SAMPLES and effective_samples >= max(4.0, V4_SIMILARITY_MIN_SAMPLES * 0.40)
+    recommendation = "WATCH"
+    if enough and reliability >= 0.35:
+        if expectancy > 0.10 and pf >= 1.10 and win_rate >= 0.50:
+            recommendation = "APPROVE"
+        elif expectancy < 0 or pf < 0.90:
+            recommendation = "BLOCK"
+    return {
+        "matches": len(chosen),
+        "effectiveSamples": effective_samples,
+        "winRate": win_rate,
+        "profitFactor": pf,
+        "profitFactorDisplay": min(pf, 20.0),
+        "expectancyPct": expectancy,
+        "averageSimilarity": avg_similarity,
+        "evidenceReliability": reliability,
+        "recommendation": recommendation,
+        "chosen": chosen,
+    }
+
+
+def _v4_rank_contextual_rows(rows: List[Any], target: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Rank historical observations by the full setup, not merely by ticker."""
+    numeric_scales = {
+        "confidence": 0.15, "quality": 0.015, "momentum": 0.02,
+        "pullback": 0.02, "spread": 0.01, "spy_move": 0.012, "qqq_move": 0.015,
+    }
+    ranked: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        distance = 0.0
+        used = 0
+        for key, scale in numeric_scales.items():
+            tv = target.get(key)
+            rv = item.get(key)
+            if tv is None or rv is None:
+                continue
+            distance += ((float(rv or 0.0) - float(tv or 0.0)) / scale) ** 2
+            used += 1
+        if used == 0:
+            continue
+        if str(item.get("market_regime") or "UNKNOWN") != str(target.get("market_regime") or "UNKNOWN"):
+            distance += 1.00
+        if str(item.get("session_name") or "UNKNOWN") != str(target.get("session_name") or "UNKNOWN"):
+            distance += 0.35
+        if int(item.get("weekday") or -1) != int(target.get("weekday") or -2):
+            distance += 0.08
+        # Same-symbol history is useful but cannot dominate contextual evidence.
+        if str(item.get("symbol") or "").upper() == str(target.get("symbol") or "").upper():
+            distance = max(0.0, distance - 0.20)
+        similarity = 1.0 / (1.0 + math.sqrt(max(0.0, distance)))
+        ranked.append({**item, "similarity": similarity})
+    ranked.sort(key=lambda x: x["similarity"], reverse=True)
+    return ranked
+
+
+def _v4_target_from_scan(symbol: str, current: Dict[str, Any]) -> Dict[str, Any]:
+    now = datetime.now(UTC)
+    return {
+        "symbol": str(symbol or "").upper(),
+        "confidence": float(current.get("confidence") or 0.0),
+        "quality": float(current.get("quality_score") or current.get("qualityScore") or 0.0),
+        "momentum": float(current.get("short_momentum") or current.get("shortMomentum") or 0.0),
+        "pullback": float(current.get("pullback") or 0.0),
+        "spread": float(current.get("spread") or 0.0),
+        "spy_move": _v4_index_move("SPY"), "qqq_move": _v4_index_move("QQQ"),
+        "market_regime": _v4_market_regime(), "session_name": _v4_session_name(now),
+        "weekday": now.weekday(),
+    }
+
+
 def v4_similarity_for_symbol(symbol: str, horizon_hours: int = 24, limit: int = 50) -> Dict[str, Any]:
-    """Nearest-neighbour evidence using only recorded bot features. Advisory only."""
+    """V4.3 contextual nearest-neighbour evidence. Advisory only."""
     sym = str(symbol or "").upper().strip()
     current = _v4_current_scan(sym)
-    base = {"ok": True, "advisoryOnly": True, "symbol": sym, "horizonHours": int(horizon_hours)}
+    base = {"ok": True, "version": "V4.3", "advisoryOnly": True, "symbol": sym, "horizonHours": int(horizon_hours)}
     if not current:
         return {**base, "recommendation": "WATCH", "reason": "No current scan available", "matches": 0}
     try:
@@ -4768,44 +4901,231 @@ def v4_similarity_for_symbol(symbol: str, horizon_hours: int = 24, limit: int = 
                WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL AND o.horizon_hours=?
                ORDER BY o.evaluated_at DESC LIMIT 5000""", (int(horizon_hours),)
         ).fetchall(); conn.close()
-        target = {
-            "confidence": float(current.get("confidence") or 0.0),
-            "quality": float(current.get("quality_score") or current.get("qualityScore") or 0.0),
-            "momentum": float(current.get("short_momentum") or current.get("shortMomentum") or 0.0),
-            "pullback": float(current.get("pullback") or 0.0),
-            "spread": float(current.get("spread") or 0.0),
-        }
-        scales = {"confidence": 0.15, "quality": 0.015, "momentum": 0.02, "pullback": 0.02, "spread": 0.01}
-        ranked = []
-        for row in rows:
-            r = dict(row)
-            dist = 0.0
-            for key, scale in scales.items():
-                dist += ((float(r.get(key) or 0.0) - target[key]) / scale) ** 2
-            if str(r.get("market_regime") or "UNKNOWN") != _v4_market_regime():
-                dist += 0.75
-            similarity = 1.0 / (1.0 + math.sqrt(dist))
-            ranked.append({**r, "similarity": similarity})
-        ranked.sort(key=lambda x: x["similarity"], reverse=True)
-        chosen = ranked[:max(1, min(int(limit or V4_SIMILARITY_LIMIT), 200))]
-        returns = [float(x.get("net_return_pct") or 0.0) for x in chosen]
-        wins = [x for x in returns if x > 0]; losses = [x for x in returns if x < 0]
-        gp, gl = sum(wins), abs(sum(losses))
-        pf = gp / gl if gl > 0 else (99.0 if gp > 0 else 0.0)
-        wr = len(wins) / max(1, len(wins) + len(losses))
-        expectancy = sum(returns) / max(1, len(returns))
-        enough = len(chosen) >= V4_SIMILARITY_MIN_SAMPLES
-        recommendation = "APPROVE" if enough and expectancy > 0 and pf >= 1.10 else ("BLOCK" if enough else "WATCH")
-        return {**base, "recommendation": recommendation, "matches": len(chosen),
-                "winRate": wr, "profitFactor": pf, "expectancyPct": expectancy,
-                "averageSimilarity": sum(float(x["similarity"]) for x in chosen) / max(1, len(chosen)),
-                "minimumSamples": V4_SIMILARITY_MIN_SAMPLES,
+        target = _v4_target_from_scan(sym, current)
+        ranked = _v4_rank_contextual_rows(list(rows), target)
+        summary = _v4_weighted_similarity_summary(ranked, limit)
+        chosen = summary.pop("chosen", [])
+        return {**base, **summary, "minimumSamples": V4_SIMILARITY_MIN_SAMPLES,
                 "currentFeatures": target,
-                "topMatches": [{k: x.get(k) for k in ("decision_id","symbol","observed_at","decision","stage","market_regime","confidence","quality","momentum","pullback","spread","net_return_pct","similarity")} for x in chosen[:10]],
-                "note": "Similarity evidence is advisory and cannot place or block an order."}
+                "topMatches": [{k: x.get(k) for k in (
+                    "decision_id","symbol","observed_at","decision","stage","market_regime","session_name",
+                    "confidence","quality","momentum","pullback","spread","spy_move","qqq_move",
+                    "net_return_pct","similarity") } for x in chosen[:10]],
+                "note": "Contextual evidence uses similarity and recency weighting and cannot place or block an order."}
     except Exception as e:
         return {**base, "ok": False, "error": str(e), "recommendation": "WATCH", "matches": 0}
 
+
+def _v4_similarity_for_dna(dna: Dict[str, Any], horizon_hours: int = 24,
+                           limit: int = 50, exclude_decision_id: Optional[int] = None) -> Dict[str, Any]:
+    symbol = str(dna.get("symbol") or "").upper().strip()
+    base = {"ok": True, "version": "V4.3", "advisoryOnly": True, "symbol": symbol, "horizonHours": int(horizon_hours)}
+    try:
+        init_db(); conn = db_connect()
+        sql = """SELECT d.*,o.net_return_pct,o.evaluated_at FROM v4_market_dna d
+                 JOIN v2_observation_outcomes o ON o.decision_id=d.decision_id
+                 WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL AND o.horizon_hours=?"""
+        params: List[Any] = [int(horizon_hours)]
+        if exclude_decision_id is not None:
+            sql += " AND d.decision_id<>?"; params.append(int(exclude_decision_id))
+        sql += " ORDER BY o.evaluated_at DESC LIMIT 5000"
+        rows = conn.execute(sql, params).fetchall(); conn.close()
+        target = {k: dna.get(k) for k in (
+            "symbol","confidence","quality","momentum","pullback","spread","spy_move","qqq_move",
+            "market_regime","session_name","weekday")}
+        ranked = _v4_rank_contextual_rows(list(rows), target)
+        summary = _v4_weighted_similarity_summary(ranked, limit)
+        chosen = summary.pop("chosen", [])
+        return {**base, **summary, "minimumSamples": V4_SIMILARITY_MIN_SAMPLES,
+                "currentFeatures": target,
+                "topMatches": [{k: x.get(k) for k in (
+                    "decision_id","symbol","observed_at","decision","stage","market_regime","session_name",
+                    "confidence","quality","momentum","pullback","spread","spy_move","qqq_move",
+                    "net_return_pct","similarity") } for x in chosen[:10]],
+                "note": "Historical similarity is advisory and cannot place or block an order."}
+    except Exception as e:
+        return {**base, "ok": False, "error": str(e), "recommendation": "WATCH", "matches": 0}
+
+
+def _v4_contextual_confidence(dna: Dict[str, Any], similarity: Dict[str, Any]) -> Dict[str, Any]:
+    confidence = max(0.0, min(1.0, float(dna.get("confidence") or 0.0)))
+    quality = max(0.0, float(dna.get("quality") or 0.0))
+    momentum = float(dna.get("momentum") or 0.0)
+    spread = max(0.0, float(dna.get("spread") or 0.0))
+    technical = 100.0 * max(0.0, min(1.0,
+        confidence * 0.55 + min(1.0, quality / 0.04) * 0.25 +
+        max(0.0, min(1.0, 0.5 + momentum / 0.04)) * 0.15 +
+        max(0.0, min(1.0, 1.0 - spread / 0.02)) * 0.05))
+    recommendation = str(similarity.get("recommendation") or "WATCH")
+    wr = float(similarity.get("winRate") or 0.0)
+    expectancy = float(similarity.get("expectancyPct") or 0.0)
+    historical_raw = wr * 70.0 + max(0.0, min(30.0, 15.0 + expectancy * 10.0))
+    reliability = max(0.0, min(1.0, float(similarity.get("evidenceReliability") or 0.0)))
+    historical = 50.0 + (historical_raw - 50.0) * reliability
+    spy = dna.get("spy_move"); qqq = dna.get("qqq_move")
+    moves = [float(x) for x in (spy, qqq) if x is not None]
+    market = 50.0 if not moves else max(0.0, min(100.0, 50.0 + (sum(moves)/len(moves)) * 2500.0))
+    if recommendation == "BLOCK": historical = min(historical, 40.0)
+    elif recommendation == "APPROVE": historical = max(historical, 60.0)
+    overall = technical * 0.55 + historical * 0.30 + market * 0.15
+    grade = "HIGH" if overall >= 75 and reliability >= 0.35 else ("MEDIUM" if overall >= 60 else "LOW")
+    return {
+        "technicalScore": round(technical, 2), "historicalScore": round(historical, 2),
+        "marketScore": round(market, 2), "dataReliabilityScore": round(reliability * 100.0, 2),
+        "overallScore": round(overall, 2), "grade": grade,
+        "advisoryRecommendation": recommendation,
+        "weights": {"technical": 0.55, "historical": 0.30, "market": 0.15},
+    }
+
+
+def v4_contextual_confidence_for_symbol(symbol: str, horizon_hours: int = 24, limit: int = 50) -> Dict[str, Any]:
+    sym = str(symbol or "").upper().strip(); current = _v4_current_scan(sym)
+    if not current:
+        return {"ok": False, "version": "V4.3", "symbol": sym, "message": "No current scan available"}
+    now = datetime.now(UTC)
+    dna = _v4_target_from_scan(sym, current)
+    dna.update({"price": current.get("price")})
+    similarity = v4_similarity_for_symbol(sym, horizon_hours, limit)
+    return {"ok": True, "version": "V4.3", "advisoryOnly": True, "symbol": sym,
+            "observedAt": now.isoformat(), "confidenceBreakdown": _v4_contextual_confidence(dna, similarity),
+            "historicalEvidence": similarity,
+            "note": "The score is explanatory only and does not change the live gate."}
+
+
+def v4_contextual_confidence_for_decision(decision_id: int, horizon_hours: int = 24, limit: int = 50) -> Dict[str, Any]:
+    try:
+        init_db(); conn = db_connect()
+        row = conn.execute("SELECT * FROM v4_market_dna WHERE decision_id=?", (int(decision_id),)).fetchone(); conn.close()
+        if not row:
+            return {"ok": False, "decisionId": int(decision_id), "message": "Decision not found"}
+        dna = dict(row); similarity = _v4_similarity_for_dna(dna, horizon_hours, limit, int(decision_id))
+        return {"ok": True, "version": "V4.3", "advisoryOnly": True, "decisionId": int(decision_id),
+                "symbol": dna.get("symbol"), "confidenceBreakdown": _v4_contextual_confidence(dna, similarity),
+                "historicalEvidence": similarity,
+                "note": "The score audits a stored decision and cannot alter live trading."}
+    except Exception as e:
+        return {"ok": False, "decisionId": int(decision_id), "error": str(e)}
+
+
+def _v4_explanation_reasons(dna: Dict[str, Any], similarity: Dict[str, Any]) -> List[Dict[str, Any]]:
+    reasons: List[Dict[str, Any]] = []
+
+    def add(label: str, passed: Optional[bool], detail: str) -> None:
+        status = "INFO" if passed is None else ("PASS" if passed else "CAUTION")
+        reasons.append({"status": status, "label": label, "detail": detail})
+
+    confidence = float(dna.get("confidence") or 0.0)
+    quality = float(dna.get("quality") or 0.0)
+    momentum = float(dna.get("momentum") or 0.0)
+    spread = float(dna.get("spread") or 0.0)
+    add("Confidence", confidence >= 0.70, f"Recorded confidence {confidence:.3f}")
+    add("Quality", quality >= 0.026, f"Recorded quality {quality:.4f}")
+    add("Momentum", momentum > 0, f"Short momentum {momentum:.4f}")
+    add("Spread", spread <= 0.01 if spread > 0 else None, f"Recorded spread {spread:.4f}")
+    add("A+ gate", bool(dna.get("a_plus_pass")), "Passed" if dna.get("a_plus_pass") else "Not passed")
+    add("Sniper gate", bool(dna.get("sniper_pass")), "Passed" if dna.get("sniper_pass") else "Not passed")
+    add("Market regime", None, str(dna.get("market_regime") or "UNKNOWN"))
+    add("Session", None, str(dna.get("session_name") or "UNKNOWN"))
+
+    matches = int(similarity.get("matches") or 0)
+    if matches:
+        wr = float(similarity.get("winRate") or 0.0)
+        pf = float(similarity.get("profitFactor") or 0.0)
+        exp = float(similarity.get("expectancyPct") or 0.0)
+        add("Historical evidence", similarity.get("recommendation") == "APPROVE",
+            f"{matches} matches | win rate {wr:.1%} | PF {pf:.2f} | expectancy {exp:.3f}%")
+    else:
+        add("Historical evidence", None, "No completed comparable outcomes yet")
+    return reasons
+
+
+def v4_explain_decision(decision_id: int, horizon_hours: int = 24, limit: int = 50) -> Dict[str, Any]:
+    """Return a complete, human-readable audit for one stored decision."""
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+    try:
+        init_db()
+        conn = db_connect()
+        row = conn.execute(
+            """SELECT d.*,s.timestamp AS decision_timestamp,s.payload_json AS decision_payload_json
+               FROM v4_market_dna d
+               LEFT JOIN v2_setup_decisions s ON s.id=d.decision_id
+               WHERE d.decision_id=?""",
+            (int(decision_id),),
+        ).fetchone()
+        if not row:
+            conn.close()
+            return {"ok": False, "message": "Decision not found", "decisionId": int(decision_id)}
+        dna = dict(row)
+        outcomes = [dict(r) for r in conn.execute(
+            """SELECT horizon_hours,status,due_at,evaluated_at,outcome_price,return_pct,
+                      net_return_pct,estimated_cost_pct,error
+               FROM v2_observation_outcomes WHERE decision_id=? ORDER BY horizon_hours""",
+            (int(decision_id),),
+        ).fetchall()]
+        conn.close()
+        try:
+            dna["payload"] = json.loads(dna.pop("payload_json") or "{}")
+        except Exception:
+            dna["payload"] = {}
+        try:
+            dna["decisionPayload"] = json.loads(dna.pop("decision_payload_json") or "{}")
+        except Exception:
+            dna["decisionPayload"] = {}
+
+        similarity = _v4_similarity_for_dna(dna, horizon_hours, limit, int(decision_id))
+        confidence_breakdown = _v4_contextual_confidence(dna, similarity)
+        reasons = _v4_explanation_reasons(dna, similarity)
+        original_decision = str(dna.get("decision") or "UNKNOWN")
+        advisory = str(similarity.get("recommendation") or "WATCH")
+        agreement = (
+            "AGREE" if (original_decision == "APPROVE" and advisory == "APPROVE") or
+                       (original_decision != "APPROVE" and advisory == "BLOCK")
+            else "INSUFFICIENT_EVIDENCE" if advisory == "WATCH" else "DISAGREE"
+        )
+        return {
+            "ok": True,
+            "version": "V4.3",
+            "advisoryOnly": True,
+            "decisionId": int(decision_id),
+            "symbol": dna.get("symbol"),
+            "decision": original_decision,
+            "stage": dna.get("stage"),
+            "reason": dna.get("reason"),
+            "observedAt": dna.get("observed_at"),
+            "marketRegime": dna.get("market_regime"),
+            "session": dna.get("session_name"),
+            "features": {k: dna.get(k) for k in (
+                "price", "confidence", "quality", "momentum", "pullback", "spread",
+                "ready_to_buy", "sniper_pass", "a_plus_pass", "spy_move", "qqq_move",
+                "position_count"
+            )},
+            "historicalEvidence": similarity,
+            "confidenceBreakdown": confidence_breakdown,
+            "explanation": reasons,
+            "advisoryAgreement": agreement,
+            "outcomes": outcomes,
+            "note": "This explanation audits the decision; it does not alter live trading.",
+        }
+    except Exception as e:
+        return {"ok": False, "decisionId": int(decision_id), "error": str(e)}
+
+
+def v4_explain_latest_symbol(symbol: str, horizon_hours: int = 24, limit: int = 50) -> Dict[str, Any]:
+    sym = str(symbol or "").upper().strip()
+    try:
+        init_db()
+        conn = db_connect()
+        row = conn.execute(
+            "SELECT decision_id FROM v4_market_dna WHERE symbol=? ORDER BY id DESC LIMIT 1",
+            (sym,),
+        ).fetchone()
+        conn.close()
+        if not row:
+            return {"ok": False, "symbol": sym, "message": "No Market DNA decision found for symbol"}
+        return v4_explain_decision(int(row["decision_id"]), horizon_hours, limit)
+    except Exception as e:
+        return {"ok": False, "symbol": sym, "error": str(e)}
 
 def _v4_metrics(values: List[float]) -> Dict[str, Any]:
     wins = [x for x in values if x > 0]; losses = [x for x in values if x < 0]
@@ -4894,11 +5214,12 @@ def v4_status_payload() -> Dict[str, Any]:
         conn.close()
     except Exception:
         count, complete, rows = 0, 0, []
-    return {"ok": True, "version": "V4.1", "mode": "advisory-data-collection",
+    return {"ok": True, "version": "V4.3", "mode": "advisory-contextual-intelligence",
             "marketDnaEnabled": V4_MARKET_DNA_ENABLED, "dnaRows": count,
             "completedOutcomeLinks": complete, "latestDna": rows[0] if rows else None,
             "features": {"marketDna": True, "similarityEngine": True, "patternMiner": True,
-                         "weeklyIntelligence": True, "liveGateChanged": False}}
+                         "weeklyIntelligence": True, "explainability": True, "contextualSimilarity": True,
+                         "confidenceBreakdown": True, "recencyWeighting": True, "liveGateChanged": False}}
 
 
 # =========================
