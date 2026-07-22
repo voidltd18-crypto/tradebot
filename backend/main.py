@@ -184,6 +184,12 @@ V2_OUTCOME_BATCH_SIZE = int(os.getenv("V2_OUTCOME_BATCH_SIZE", "100"))
 V2_INDEPENDENT_SAMPLE_MINUTES = int(os.getenv("V2_INDEPENDENT_SAMPLE_MINUTES", "30"))
 V2_ESTIMATED_COST_BPS = float(os.getenv("V2_ESTIMATED_COST_BPS", "10"))
 
+# TradeBot V4.1 intelligence foundation. Advisory/data-collection only.
+V4_MARKET_DNA_ENABLED = os.getenv("V4_MARKET_DNA_ENABLED", "true").lower() == "true"
+V4_SIMILARITY_MIN_SAMPLES = int(os.getenv("V4_SIMILARITY_MIN_SAMPLES", "8") or 8)
+V4_SIMILARITY_LIMIT = int(os.getenv("V4_SIMILARITY_LIMIT", "50") or 50)
+V4_PATTERN_MIN_SAMPLES = int(os.getenv("V4_PATTERN_MIN_SAMPLES", "8") or 8)
+
 # V2 deliberately disables rotation/churn. Existing positions are still
 # protected by hard-stop and swing-management rules.
 if TRADEBOT_V2_ENABLED:
@@ -1755,6 +1761,8 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
                     (decision_id, symbol, observed_at.isoformat(), entry_price, int(horizon_hours), due_at.isoformat(),
                      _v2_sample_key(symbol, str(stage), str(decision), observed_at)),
                 )
+        if decision_id > 0 and V4_MARKET_DNA_ENABLED:
+            record_v4_market_dna(conn, decision_id, scan, decision, stage, reason, observed_at)
         conn.commit()
         conn.close()
     except Exception as e:
@@ -2564,6 +2572,43 @@ def init_db():
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_v2_outcomes_symbol
         ON v2_observation_outcomes(symbol, horizon_hours)
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v4_market_dna (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_id INTEGER NOT NULL UNIQUE,
+            observed_at TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            stage TEXT,
+            reason TEXT,
+            market_regime TEXT,
+            session_name TEXT,
+            weekday INTEGER,
+            hour_utc INTEGER,
+            price REAL,
+            confidence REAL,
+            quality REAL,
+            momentum REAL,
+            pullback REAL,
+            spread REAL,
+            ready_to_buy INTEGER,
+            sniper_pass INTEGER,
+            a_plus_pass INTEGER,
+            spy_move REAL,
+            qqq_move REAL,
+            position_count INTEGER,
+            payload_json TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v4_dna_symbol_time
+        ON v4_market_dna(symbol, observed_at)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v4_dna_decision
+        ON v4_market_dna(decision, stage)
     """)
 
     cur.execute("""
@@ -4525,7 +4570,9 @@ def v2_status():
         "features": {
             "decisionExplanation": True, "shadowVsOriginal": True,
             "adaptiveThresholdAdvisory": True, "autoApplyThresholds": V2_AUTO_APPLY_THRESHOLDS,
-            "guardedOptimizer": True, "strategyTimeline": True
+            "guardedOptimizer": True, "strategyTimeline": True,
+            "marketDna": V4_MARKET_DNA_ENABLED, "similarityEngine": True,
+            "patternMiner": True, "weeklyIntelligence": True
         },
         "rules": {
             "minSamples": V2_MIN_SYMBOL_SAMPLES, "minWinRate": V2_MIN_WIN_RATE,
@@ -4556,6 +4603,302 @@ def api_v2_strategy_rollback(request: Request):
     verify_api_key(request)
     return v2_rollback_latest_strategy()
 
+@app.get("/v4/status")
+def api_v4_status():
+    return v4_status_payload()
+
+@app.get("/v4/market-dna")
+def api_v4_market_dna(symbol: Optional[str] = None, limit: int = 100):
+    return {"ok": True, "rows": v4_market_dna_rows(symbol, limit)}
+
+@app.get("/v4/similarity/{symbol}")
+def api_v4_similarity(symbol: str, horizon_hours: int = 24, limit: int = 50):
+    return v4_similarity_for_symbol(symbol, horizon_hours, limit)
+
+@app.get("/v4/patterns")
+def api_v4_patterns(horizon_hours: int = 24, min_samples: int = 8):
+    return v4_pattern_report(horizon_hours, min_samples)
+
+@app.get("/v4/weekly-intelligence")
+def api_v4_weekly_intelligence(horizon_hours: int = 24):
+    return v4_weekly_intelligence(horizon_hours)
+
+
+
+# =========================
+# TRADEBOT V4.1 — MARKET DNA / SIMILARITY / PATTERN INTELLIGENCE
+# =========================
+def _v4_session_name(dt: datetime) -> str:
+    hour = dt.hour
+    if hour < 14:
+        return "PRE_MARKET_OR_EARLY_UTC"
+    if hour < 17:
+        return "US_MORNING"
+    if hour < 20:
+        return "US_AFTERNOON"
+    return "US_LATE_OR_AFTER_HOURS"
+
+
+def _v4_index_move(symbol: str) -> Optional[float]:
+    try:
+        st = state.get(symbol) or {}
+        curve = st.get("price_curve") or []
+        if len(curve) >= 2:
+            first = float(curve[0].get("value") or 0.0)
+            last = float(curve[-1].get("value") or 0.0)
+            if first > 0:
+                return (last / first) - 1.0
+    except Exception:
+        pass
+    return None
+
+
+def _v4_market_regime() -> str:
+    spy = _v4_index_move("SPY")
+    qqq = _v4_index_move("QQQ")
+    values = [x for x in (spy, qqq) if x is not None]
+    if not values:
+        return "UNKNOWN"
+    avg = sum(values) / len(values)
+    if avg >= 0.007:
+        return "STRONG_RISK_ON"
+    if avg >= 0.0015:
+        return "RISK_ON"
+    if avg <= -0.007:
+        return "STRONG_RISK_OFF"
+    if avg <= -0.0015:
+        return "RISK_OFF"
+    return "SIDEWAYS"
+
+
+def record_v4_market_dna(conn, decision_id: int, scan: Dict[str, Any], decision: str,
+                         stage: str, reason: str, observed_at: datetime) -> None:
+    """Persist the exact context available to the live bot. It never changes an order decision."""
+    try:
+        position_count = 0
+        try:
+            position_count = len(get_all_positions())
+        except Exception:
+            pass
+        payload = {
+            "confidenceLabel": scan.get("confidence_label"),
+            "sniperReason": scan.get("sniper_reason"),
+            "aPlusReason": scan.get("a_plus_reason"),
+            "lockedToday": bool(scan.get("locked_today")),
+            "custom": bool(scan.get("custom")),
+            "source": "live_scan_context",
+        }
+        conn.execute(
+            """INSERT OR REPLACE INTO v4_market_dna (
+               decision_id,observed_at,symbol,decision,stage,reason,market_regime,
+               session_name,weekday,hour_utc,price,confidence,quality,momentum,pullback,
+               spread,ready_to_buy,sniper_pass,a_plus_pass,spy_move,qqq_move,
+               position_count,payload_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                int(decision_id), observed_at.isoformat(), str(scan.get("symbol") or "").upper(),
+                str(decision), str(stage), str(reason)[:1000], _v4_market_regime(),
+                _v4_session_name(observed_at), int(observed_at.weekday()), int(observed_at.hour),
+                float(scan.get("price") or 0.0), float(scan.get("confidence") or 0.0),
+                float(scan.get("quality_score") or 0.0), float(scan.get("short_momentum") or 0.0),
+                float(scan.get("pullback") or 0.0), float(scan.get("spread") or 0.0),
+                int(bool(scan.get("ready_to_buy"))), int(bool(scan.get("sniper_pass"))),
+                int(bool(scan.get("a_plus_pass"))), _v4_index_move("SPY"), _v4_index_move("QQQ"),
+                position_count, json.dumps(payload, default=str),
+            ),
+        )
+    except Exception as e:
+        print(f"V4 MARKET DNA ERROR: {e}")
+
+
+def v4_market_dna_rows(symbol: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    if not SQLITE_ENABLED:
+        return []
+    try:
+        init_db(); conn = db_connect()
+        params: List[Any] = []
+        where = ""
+        if symbol:
+            where = "WHERE symbol=?"
+            params.append(str(symbol).upper())
+        params.append(max(1, min(int(limit), 2000)))
+        rows = conn.execute(f"SELECT * FROM v4_market_dna {where} ORDER BY id DESC LIMIT ?", params).fetchall()
+        conn.close()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["payload"] = json.loads(item.pop("payload_json") or "{}")
+            except Exception:
+                item["payload"] = {}
+            result.append(item)
+        return result
+    except Exception as e:
+        print(f"V4 DNA READ ERROR: {e}")
+        return []
+
+
+def _v4_current_scan(symbol: str) -> Dict[str, Any]:
+    sym = str(symbol or "").upper()
+    for scan in latest_scans:
+        if str(scan.get("symbol") or "").upper() == sym:
+            return scan
+    for scan in latest_status.get("scans") or []:
+        if str(scan.get("symbol") or "").upper() == sym:
+            return {
+                "symbol": sym, "price": scan.get("price"), "confidence": scan.get("confidence"),
+                "quality_score": scan.get("qualityScore"), "short_momentum": scan.get("shortMomentum"),
+                "pullback": scan.get("pullback"), "spread": scan.get("spread"),
+            }
+    return {}
+
+
+def v4_similarity_for_symbol(symbol: str, horizon_hours: int = 24, limit: int = 50) -> Dict[str, Any]:
+    """Nearest-neighbour evidence using only recorded bot features. Advisory only."""
+    sym = str(symbol or "").upper().strip()
+    current = _v4_current_scan(sym)
+    base = {"ok": True, "advisoryOnly": True, "symbol": sym, "horizonHours": int(horizon_hours)}
+    if not current:
+        return {**base, "recommendation": "WATCH", "reason": "No current scan available", "matches": 0}
+    try:
+        init_db(); conn = db_connect()
+        rows = conn.execute(
+            """SELECT d.*,o.net_return_pct,o.evaluated_at
+               FROM v4_market_dna d JOIN v2_observation_outcomes o ON o.decision_id=d.decision_id
+               WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL AND o.horizon_hours=?
+               ORDER BY o.evaluated_at DESC LIMIT 5000""", (int(horizon_hours),)
+        ).fetchall(); conn.close()
+        target = {
+            "confidence": float(current.get("confidence") or 0.0),
+            "quality": float(current.get("quality_score") or current.get("qualityScore") or 0.0),
+            "momentum": float(current.get("short_momentum") or current.get("shortMomentum") or 0.0),
+            "pullback": float(current.get("pullback") or 0.0),
+            "spread": float(current.get("spread") or 0.0),
+        }
+        scales = {"confidence": 0.15, "quality": 0.015, "momentum": 0.02, "pullback": 0.02, "spread": 0.01}
+        ranked = []
+        for row in rows:
+            r = dict(row)
+            dist = 0.0
+            for key, scale in scales.items():
+                dist += ((float(r.get(key) or 0.0) - target[key]) / scale) ** 2
+            if str(r.get("market_regime") or "UNKNOWN") != _v4_market_regime():
+                dist += 0.75
+            similarity = 1.0 / (1.0 + math.sqrt(dist))
+            ranked.append({**r, "similarity": similarity})
+        ranked.sort(key=lambda x: x["similarity"], reverse=True)
+        chosen = ranked[:max(1, min(int(limit or V4_SIMILARITY_LIMIT), 200))]
+        returns = [float(x.get("net_return_pct") or 0.0) for x in chosen]
+        wins = [x for x in returns if x > 0]; losses = [x for x in returns if x < 0]
+        gp, gl = sum(wins), abs(sum(losses))
+        pf = gp / gl if gl > 0 else (99.0 if gp > 0 else 0.0)
+        wr = len(wins) / max(1, len(wins) + len(losses))
+        expectancy = sum(returns) / max(1, len(returns))
+        enough = len(chosen) >= V4_SIMILARITY_MIN_SAMPLES
+        recommendation = "APPROVE" if enough and expectancy > 0 and pf >= 1.10 else ("BLOCK" if enough else "WATCH")
+        return {**base, "recommendation": recommendation, "matches": len(chosen),
+                "winRate": wr, "profitFactor": pf, "expectancyPct": expectancy,
+                "averageSimilarity": sum(float(x["similarity"]) for x in chosen) / max(1, len(chosen)),
+                "minimumSamples": V4_SIMILARITY_MIN_SAMPLES,
+                "currentFeatures": target,
+                "topMatches": [{k: x.get(k) for k in ("decision_id","symbol","observed_at","decision","stage","market_regime","confidence","quality","momentum","pullback","spread","net_return_pct","similarity")} for x in chosen[:10]],
+                "note": "Similarity evidence is advisory and cannot place or block an order."}
+    except Exception as e:
+        return {**base, "ok": False, "error": str(e), "recommendation": "WATCH", "matches": 0}
+
+
+def _v4_metrics(values: List[float]) -> Dict[str, Any]:
+    wins = [x for x in values if x > 0]; losses = [x for x in values if x < 0]
+    gp, gl = sum(wins), abs(sum(losses))
+    return {"samples": len(values), "winRate": len(wins) / max(1, len(wins)+len(losses)),
+            "profitFactor": gp / gl if gl > 0 else (99.0 if gp > 0 else 0.0),
+            "expectancyPct": sum(values) / max(1, len(values)),
+            "bestReturnPct": max(values) if values else 0.0, "worstReturnPct": min(values) if values else 0.0}
+
+
+def v4_pattern_report(horizon_hours: int = 24, min_samples: int = 8) -> Dict[str, Any]:
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+    try:
+        init_db(); conn = db_connect()
+        rows = [dict(r) for r in conn.execute(
+            """SELECT d.*,o.net_return_pct FROM v4_market_dna d
+               JOIN v2_observation_outcomes o ON o.decision_id=d.decision_id
+               WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL AND o.horizon_hours=?""",
+            (int(horizon_hours),)).fetchall()]
+        conn.close()
+        groups: Dict[str, Dict[str, List[float]]] = {
+            "marketRegime": {}, "session": {}, "stage": {}, "confidenceBand": {}, "qualityBand": {}
+        }
+        for r in rows:
+            ret = float(r.get("net_return_pct") or 0.0)
+            conf = float(r.get("confidence") or 0.0); qual = float(r.get("quality") or 0.0)
+            conf_band = f"{math.floor(conf*10)/10:.1f}-{math.floor(conf*10)/10+0.1:.1f}"
+            qlow = math.floor(qual/0.005)*0.005
+            qual_band = f"{qlow:.3f}-{qlow+0.005:.3f}"
+            keys = {"marketRegime": str(r.get("market_regime") or "UNKNOWN"),
+                    "session": str(r.get("session_name") or "UNKNOWN"),
+                    "stage": str(r.get("stage") or "UNKNOWN"),
+                    "confidenceBand": conf_band, "qualityBand": qual_band}
+            for category, key in keys.items():
+                groups[category].setdefault(key, []).append(ret)
+        output = {}
+        for category, mapping in groups.items():
+            items = [{"name": name, **_v4_metrics(vals)} for name, vals in mapping.items() if len(vals) >= int(min_samples)]
+            items.sort(key=lambda x: (x["expectancyPct"], x["profitFactor"], x["samples"]), reverse=True)
+            output[category] = items
+        all_metrics = _v4_metrics([float(r.get("net_return_pct") or 0.0) for r in rows])
+        return {"ok": True, "advisoryOnly": True, "horizonHours": int(horizon_hours),
+                "minimumSamplesPerPattern": int(min_samples), "observations": len(rows),
+                "overall": all_metrics, "patterns": output,
+                "bestPatterns": [{"category": cat, **items[0]} for cat, items in output.items() if items],
+                "note": "Patterns are descriptive evidence only; no live threshold is changed."}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def v4_weekly_intelligence(horizon_hours: int = 24) -> Dict[str, Any]:
+    report = v4_pattern_report(horizon_hours, V4_PATTERN_MIN_SAMPLES)
+    if not report.get("ok"):
+        return report
+    cutoff = datetime.now(UTC) - timedelta(days=7)
+    try:
+        init_db(); conn = db_connect()
+        rows = [dict(r) for r in conn.execute(
+            """SELECT d.*,o.net_return_pct FROM v4_market_dna d
+               JOIN v2_observation_outcomes o ON o.decision_id=d.decision_id
+               WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL
+                 AND o.horizon_hours=? AND d.observed_at>=?""",
+            (int(horizon_hours), cutoff.isoformat())).fetchall()]
+        conn.close()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    metrics = _v4_metrics([float(r.get("net_return_pct") or 0.0) for r in rows])
+    best = report.get("bestPatterns") or []
+    recommendation = "COLLECT_MORE_EVIDENCE"
+    if metrics["samples"] >= V4_PATTERN_MIN_SAMPLES:
+        recommendation = "CONTINUE_CURRENT_GUARDS" if metrics["expectancyPct"] >= 0 else "REVIEW_WEAK_PATTERNS"
+    return {"ok": True, "advisoryOnly": True, "periodDays": 7, "horizonHours": int(horizon_hours),
+            "weekly": metrics, "recommendation": recommendation, "topPatterns": best[:5],
+            "marketDnaRows": len(v4_market_dna_rows(limit=2000)),
+            "nextStep": "Use similarity and pattern evidence in shadow mode before any guarded optimiser proposal."}
+
+
+def v4_status_payload() -> Dict[str, Any]:
+    try:
+        rows = v4_market_dna_rows(limit=1)
+        init_db(); conn = db_connect()
+        count = int(conn.execute("SELECT COUNT(*) FROM v4_market_dna").fetchone()[0])
+        complete = int(conn.execute("""SELECT COUNT(*) FROM v4_market_dna d JOIN v2_observation_outcomes o
+                                      ON o.decision_id=d.decision_id WHERE o.status='COMPLETE'""").fetchone()[0])
+        conn.close()
+    except Exception:
+        count, complete, rows = 0, 0, []
+    return {"ok": True, "version": "V4.1", "mode": "advisory-data-collection",
+            "marketDnaEnabled": V4_MARKET_DNA_ENABLED, "dnaRows": count,
+            "completedOutcomeLinks": complete, "latestDna": rows[0] if rows else None,
+            "features": {"marketDna": True, "similarityEngine": True, "patternMiner": True,
+                         "weeklyIntelligence": True, "liveGateChanged": False}}
 
 
 # =========================
