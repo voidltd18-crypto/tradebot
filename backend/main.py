@@ -47,6 +47,14 @@ API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 DASHBOARD_API_KEY = os.getenv("DASHBOARD_API_KEY") or os.getenv("ADMIN_PASSWORD") or os.getenv("API_ACCESS_KEY") or ""
 
+# Guarded adaptive optimiser. Disabled by default; advisory/stability tracking still runs.
+V2_AUTO_APPLY_THRESHOLDS = os.getenv("V2_AUTO_APPLY_THRESHOLDS", "false").lower() == "true"
+V2_OPTIMIZER_REQUIRED_STABLE_RUNS = int(os.getenv("V2_OPTIMIZER_REQUIRED_STABLE_RUNS", "5") or 5)
+V2_OPTIMIZER_MIN_IMPROVEMENT = float(os.getenv("V2_OPTIMIZER_MIN_IMPROVEMENT", "0.08") or 0.08)
+V2_OPTIMIZER_MAX_DRAWDOWN_INCREASE = float(os.getenv("V2_OPTIMIZER_MAX_DRAWDOWN_INCREASE", "0.10") or 0.10)
+V2_OPTIMIZER_MAX_CONF_STEP = float(os.getenv("V2_OPTIMIZER_MAX_CONF_STEP", "0.04") or 0.04)
+V2_OPTIMIZER_MAX_QUALITY_STEP = float(os.getenv("V2_OPTIMIZER_MAX_QUALITY_STEP", "0.004") or 0.004)
+
 PAPER = os.getenv("PAPER", "false").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -2558,6 +2566,40 @@ def init_db():
         ON v2_observation_outcomes(symbol, horizon_hours)
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v2_optimizer_evaluations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            evaluated_at TEXT NOT NULL,
+            horizon_hours INTEGER NOT NULL,
+            candidate_confidence REAL,
+            candidate_quality REAL,
+            current_confidence REAL,
+            current_quality REAL,
+            eligible INTEGER DEFAULT 0,
+            stable_key TEXT,
+            payload_json TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v2_optimizer_eval_time
+        ON v2_optimizer_evaluations(evaluated_at)
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v2_strategy_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            version_label TEXT NOT NULL,
+            action TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            quality REAL NOT NULL,
+            previous_confidence REAL,
+            previous_quality REAL,
+            reason TEXT,
+            metrics_json TEXT,
+            rollback_of INTEGER
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -4248,18 +4290,53 @@ def apply_strategy_settings(level: int = None, preset: str = None, save: bool = 
     return payload
 
 
+def apply_custom_a_plus_thresholds(confidence: float, quality: float, reason: str = "adaptive optimiser", save: bool = True) -> Dict[str, Any]:
+    global A_PLUS_MIN_CONFIDENCE, A_PLUS_MIN_QUALITY
+    confidence = max(0.50, min(0.90, float(confidence)))
+    quality = max(0.010, min(0.100, float(quality)))
+    previous_conf = float(A_PLUS_MIN_CONFIDENCE)
+    previous_quality = float(A_PLUS_MIN_QUALITY)
+    A_PLUS_MIN_CONFIDENCE = confidence
+    A_PLUS_MIN_QUALITY = quality
+    payload = current_strategy_settings_payload()
+    payload.update({
+        "preset": "custom", "label": "Adaptive Custom",
+        "aPlusMinConfidence": confidence, "aPlusMinQuality": quality,
+        "updatedAt": datetime.now(UTC).isoformat(), "changeReason": reason,
+    })
+    if save:
+        _save_strategy_settings(payload)
+    try:
+        init_db()
+        conn = db_connect()
+        count = conn.execute("SELECT COUNT(*) FROM v2_strategy_versions").fetchone()[0]
+        conn.execute(
+            """INSERT INTO v2_strategy_versions
+               (created_at, version_label, action, confidence, quality, previous_confidence, previous_quality, reason, metrics_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (datetime.now(UTC).isoformat(), f"V2.{count+1}", "APPLY", confidence, quality,
+             previous_conf, previous_quality, reason, json.dumps({})),
+        )
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"STRATEGY VERSION SAVE ERROR: {e}")
+    return payload
+
+
 def current_strategy_settings_payload() -> Dict[str, Any]:
     saved = _load_strategy_settings()
     preset_key = str(saved.get("preset") or _strategy_preset_from_level(int(saved.get("level", 0)))).lower()
-    if preset_key not in STRATEGY_PRESETS:
+    is_custom = preset_key == "custom"
+    if preset_key not in STRATEGY_PRESETS and not is_custom:
         preset_key = "safe"
+    preset_cfg = STRATEGY_PRESETS.get(preset_key, {"label": "Adaptive Custom"})
 
     # Keep runtime values as source of truth after startup has applied saved config.
     return {
         "ok": True,
-        "level": int(saved.get("level", {"safe": 0, "balanced": 1, "aggressive": 2}.get(preset_key, 0))),
+        "level": int(saved.get("level", {"safe": 0, "balanced": 1, "aggressive": 2}.get(preset_key, -1))),
         "preset": preset_key,
-        "label": STRATEGY_PRESETS[preset_key]["label"],
+        "label": preset_cfg["label"],
         "aPlusMinConfidence": float(A_PLUS_MIN_CONFIDENCE),
         "sniperMinConfidence": float(SNIPER_MIN_CONFIDENCE),
         "aPlusMinQuality": float(A_PLUS_MIN_QUALITY),
@@ -4285,11 +4362,18 @@ def api_set_strategy_settings(request: Request, payload: dict = Body(...)):
 
 try:
     saved_strategy = _load_strategy_settings()
-    apply_strategy_settings(
-        level=int(saved_strategy.get("level", 0)),
-        preset=saved_strategy.get("preset", "safe"),
-        save=False,
-    )
+    if str(saved_strategy.get("preset") or "").lower() == "custom":
+        apply_custom_a_plus_thresholds(
+            float(saved_strategy.get("aPlusMinConfidence", A_PLUS_MIN_CONFIDENCE)),
+            float(saved_strategy.get("aPlusMinQuality", A_PLUS_MIN_QUALITY)),
+            reason="restore saved adaptive settings", save=False,
+        )
+    else:
+        apply_strategy_settings(
+            level=int(saved_strategy.get("level", 0)),
+            preset=saved_strategy.get("preset", "safe"),
+            save=False,
+        )
 except Exception as e:
     print(f"STRATEGY SETTINGS STARTUP APPLY ERROR: {e}")
 
@@ -4440,7 +4524,8 @@ def v2_status():
         "mode": "paper" if PAPER else ("live" if TRADEBOT_V2_LIVE_ENABLED else "validation-only"),
         "features": {
             "decisionExplanation": True, "shadowVsOriginal": True,
-            "adaptiveThresholdAdvisory": True, "autoApplyThresholds": False
+            "adaptiveThresholdAdvisory": True, "autoApplyThresholds": V2_AUTO_APPLY_THRESHOLDS,
+            "guardedOptimizer": True, "strategyTimeline": True
         },
         "rules": {
             "minSamples": V2_MIN_SYMBOL_SAMPLES, "minWinRate": V2_MIN_WIN_RATE,
@@ -4462,6 +4547,15 @@ def api_v2_decision_review(limit: int = 100):
 def api_v2_adaptive_thresholds(horizon_hours: int = 24, min_samples: int = 25):
     return v2_adaptive_threshold_recommendations(horizon_hours, min_samples)
 
+@app.get("/v2/strategy-timeline")
+def api_v2_strategy_timeline(limit: int = 50):
+    return v2_strategy_timeline(limit)
+
+@app.post("/v2/strategy-rollback")
+def api_v2_strategy_rollback(request: Request):
+    verify_api_key(request)
+    return v2_rollback_latest_strategy()
+
 
 
 # =========================
@@ -4477,88 +4571,170 @@ def _v2_metric_grade(samples: int, profit_factor: float, expectancy: float) -> s
     return "LOW"
 
 
+def _v2_drawdown(returns: List[float]) -> float:
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for value in returns:
+        equity += float(value)
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+    return max_dd
+
+
+def _v2_candidate_metrics(observations: List[Dict[str, Any]], confidence: float, quality: float, min_samples: int) -> Optional[Dict[str, Any]]:
+    selected = [r for r in observations if float(r.get("confidence") or 0) >= confidence and float(r.get("quality") or 0) >= quality]
+    returns = [float(r.get("net_return_pct") or 0) for r in selected]
+    if len(returns) < int(min_samples):
+        return None
+    wins = [x for x in returns if x > 0]
+    losses = [x for x in returns if x < 0]
+    gp, gl = sum(wins), abs(sum(losses))
+    pf = gp / gl if gl > 0 else (99.0 if gp > 0 else 0.0)
+    exp = sum(returns) / len(returns)
+    wr = len(wins) / (len(wins)+len(losses)) if (wins or losses) else 0.0
+    dd = _v2_drawdown(returns)
+    robustness = min(1.0, len(returns)/100.0)
+    score = exp * min(pf, 4.0) * (0.5 + 0.5*robustness) / (1.0 + dd)
+    return {"confidence": confidence, "quality": quality, "samples": len(returns), "winRate": wr,
+            "profitFactor": pf, "expectancyPct": exp, "maxDrawdownPct": dd,
+            "largestLossPct": min(returns) if returns else 0.0, "score": score}
+
+
+def _v2_blacklisted_symbols() -> set:
+    blocked = set()
+    try:
+        stats = symbol_stats()
+        rows = stats.values() if isinstance(stats, dict) else stats
+        for row in rows or []:
+            if str(row.get("trust") or "").upper() in {"BLACKLIST", "AVOID"}:
+                blocked.add(str(row.get("symbol") or "").upper())
+    except Exception:
+        try:
+            for row in (analytics_payload().get("worstStocks") or []):
+                if str(row.get("trust") or "").upper() in {"BLACKLIST", "AVOID"}:
+                    blocked.add(str(row.get("symbol") or "").upper())
+        except Exception:
+            pass
+    return blocked
+
+
+def _v2_step_toward(current: float, target: float, maximum_step: float, decimals: int) -> float:
+    delta = max(-maximum_step, min(maximum_step, target-current))
+    return round(current+delta, decimals)
+
+
 def v2_adaptive_threshold_recommendations(horizon_hours: int = 24, min_samples: int = 25) -> Dict[str, Any]:
-    """Evidence-only threshold search. It never modifies strategy settings."""
-    current_conf = float(A_PLUS_MIN_CONFIDENCE)
-    current_quality = float(A_PLUS_MIN_QUALITY)
-    result: Dict[str, Any] = {
-        "ok": True,
-        "advisoryOnly": True,
-        "applied": False,
-        "horizonHours": int(horizon_hours),
-        "minimumSamples": int(min_samples),
-        "current": {"confidence": current_conf, "quality": current_quality},
-    }
+    """Guarded optimiser: blacklist filtering, rolling windows, drawdown, stability and optional staged apply."""
+    current_conf, current_quality = float(A_PLUS_MIN_CONFIDENCE), float(A_PLUS_MIN_QUALITY)
+    result = {"ok": True, "advisoryOnly": not V2_AUTO_APPLY_THRESHOLDS, "applied": False,
+              "horizonHours": int(horizon_hours), "minimumSamples": int(min_samples),
+              "current": {"confidence": current_conf, "quality": current_quality}}
     if not SQLITE_ENABLED:
         return {**result, "ok": False, "message": "SQLite disabled"}
     try:
-        init_db()
-        conn = db_connect()
-        rows = conn.execute(
-            """WITH ranked AS (
-                   SELECT d.confidence, d.quality, o.net_return_pct,
-                          ROW_NUMBER() OVER (
-                              PARTITION BY COALESCE(o.sample_key, CAST(o.decision_id AS TEXT)), o.horizon_hours
-                              ORDER BY o.id ASC
-                          ) AS rn
-                   FROM v2_observation_outcomes o
-                   JOIN v2_setup_decisions d ON d.id=o.decision_id
-                   WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL
-                     AND o.horizon_hours=?
-               )
-               SELECT confidence, quality, net_return_pct FROM ranked WHERE rn=1""",
-            (int(horizon_hours),),
-        ).fetchall()
-        conn.close()
-        observations = [dict(r) for r in rows]
-        conf_candidates = sorted(set([round(x, 2) for x in [0.55,0.58,0.60,0.62,0.65,0.67,0.68,0.69,0.70,0.72,0.75]] + [round(current_conf,2)]))
-        quality_candidates = sorted(set([round(x, 3) for x in [0.018,0.020,0.022,0.024,0.025,0.026,0.028,0.030]] + [round(current_quality,3)]))
-        candidates = []
-        for conf in conf_candidates:
-            for quality in quality_candidates:
-                returns = [float(r["net_return_pct"]) for r in observations
-                           if float(r.get("confidence") or 0.0) >= conf and float(r.get("quality") or 0.0) >= quality]
-                if len(returns) < int(min_samples):
-                    continue
-                wins = [x for x in returns if x > 0]
-                losses = [x for x in returns if x < 0]
-                gross_profit = sum(wins)
-                gross_loss = abs(sum(losses))
-                pf = gross_profit / gross_loss if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
-                expectancy = sum(returns) / len(returns)
-                win_rate = len(wins) / (len(wins)+len(losses)) if (wins or losses) else 0.0
-                # Prefer robust expectancy and PF; lightly penalise very small samples.
-                robustness = min(1.0, len(returns) / 100.0)
-                score = expectancy * min(pf, 4.0) * (0.5 + 0.5 * robustness)
-                candidates.append({
-                    "confidence": conf, "quality": quality, "samples": len(returns),
-                    "winRate": win_rate, "profitFactor": pf, "expectancyPct": expectancy,
-                    "score": score,
-                })
-        candidates.sort(key=lambda x: (x["score"], x["samples"]), reverse=True)
-        current_match = next((x for x in candidates if abs(x["confidence"]-round(current_conf,2)) < 1e-9 and abs(x["quality"]-round(current_quality,3)) < 1e-9), None)
-        best = candidates[0] if candidates else None
-        recommendation = "KEEP_CURRENT"
-        reason = "Not enough completed evidence to recommend a change."
-        if best:
-            if current_match and best["score"] <= current_match["score"] * 1.05:
-                best = current_match
-                reason = "Current thresholds are within 5% of the best evidence score."
-            else:
-                recommendation = "REVIEW_CHANGE"
-                reason = "A different threshold pair has materially stronger completed shadow evidence."
-        result.update({
-            "observations": len(observations),
-            "recommendation": recommendation,
-            "reason": reason,
-            "recommended": best,
-            "currentEvidence": current_match,
-            "topCandidates": candidates[:10],
-            "safetyNote": "Recommendation only. No live or saved strategy setting was changed.",
-        })
+        init_db(); conn=db_connect()
+        blocked=_v2_blacklisted_symbols()
+        rows=conn.execute("""WITH ranked AS (
+              SELECT d.symbol,d.confidence,d.quality,o.net_return_pct,o.observed_at,
+              ROW_NUMBER() OVER (PARTITION BY COALESCE(o.sample_key,CAST(o.decision_id AS TEXT)),o.horizon_hours ORDER BY o.id ASC) rn
+              FROM v2_observation_outcomes o JOIN v2_setup_decisions d ON d.id=o.decision_id
+              WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL AND o.horizon_hours=?)
+              SELECT symbol,confidence,quality,net_return_pct,observed_at FROM ranked WHERE rn=1""",(int(horizon_hours),)).fetchall()
+        all_obs=[dict(r) for r in rows]
+        observations=[r for r in all_obs if str(r.get("symbol") or "").upper() not in blocked]
+        now=datetime.now(UTC)
+        windows=[24,72,168,720]
+        confs=sorted(set([round(x,2) for x in [0.55,0.58,0.60,0.62,0.65,0.66,0.67,0.68,0.69,0.70,0.72,0.75,current_conf]]))
+        quals=sorted(set([round(x,3) for x in [0.018,0.020,0.022,0.024,0.025,0.026,0.028,0.030,current_quality]]))
+        candidates=[]
+        for conf in confs:
+            for qual in quals:
+                window_metrics=[]
+                for hours in windows:
+                    cutoff=now-timedelta(hours=hours)
+                    subset=[]
+                    for r in observations:
+                        try: dt=datetime.fromisoformat(str(r.get("observed_at")).replace("Z","+00:00"))
+                        except Exception: continue
+                        if dt>=cutoff: subset.append(r)
+                    metric=_v2_candidate_metrics(subset,conf,qual,min_samples)
+                    if metric: window_metrics.append({"hours":hours,**metric})
+                base=_v2_candidate_metrics(observations,conf,qual,min_samples)
+                if not base: continue
+                positive=sum(1 for m in window_metrics if m["expectancyPct"]>0 and m["profitFactor"]>=1.1)
+                base["positiveWindows"]=positive; base["availableWindows"]=len(window_metrics); base["windows"]=window_metrics
+                base["stableScore"]=base["score"]*(0.5+0.5*(positive/max(1,len(window_metrics))))
+                candidates.append(base)
+        candidates.sort(key=lambda x:(x["stableScore"],x["samples"]),reverse=True)
+        current=next((x for x in candidates if x["confidence"]==round(current_conf,2) and x["quality"]==round(current_quality,3)),None)
+        best=candidates[0] if candidates else None
+        recommendation="KEEP_CURRENT"; reason="Not enough completed, non-blacklisted evidence."
+        eligible=False; staged=None
+        if best and current:
+            improvement=(best["stableScore"]-current["stableScore"])/max(abs(current["stableScore"]),1e-9)
+            dd_ok=best["maxDrawdownPct"] <= current["maxDrawdownPct"]*(1+V2_OPTIMIZER_MAX_DRAWDOWN_INCREASE)+0.05
+            windows_ok=best["positiveWindows"]>=max(1,(best["availableWindows"]+1)//2)
+            materially_better=improvement>=V2_OPTIMIZER_MIN_IMPROVEMENT and best["expectancyPct"]>current["expectancyPct"] and best["profitFactor"]>=current["profitFactor"]
+            eligible=bool(materially_better and dd_ok and windows_ok)
+            if eligible:
+                staged={**best,
+                    "confidence":_v2_step_toward(current_conf,best["confidence"],V2_OPTIMIZER_MAX_CONF_STEP,2),
+                    "quality":_v2_step_toward(current_quality,best["quality"],V2_OPTIMIZER_MAX_QUALITY_STEP,3),
+                    "targetConfidence":best["confidence"],"targetQuality":best["quality"]}
+                recommendation="STABILITY_TEST"; reason="Candidate passed blacklist, rolling-window and drawdown safeguards."
+            else: reason="Best candidate did not pass every stability, improvement and drawdown safeguard."
+        stable_key=f"{(staged or best or {}).get('confidence')}:{(staged or best or {}).get('quality')}"
+        conn.execute("INSERT INTO v2_optimizer_evaluations (evaluated_at,horizon_hours,candidate_confidence,candidate_quality,current_confidence,current_quality,eligible,stable_key,payload_json) VALUES (?,?,?,?,?,?,?,?,?)",
+            (now.isoformat(),int(horizon_hours),(staged or best or {}).get("confidence"),(staged or best or {}).get("quality"),current_conf,current_quality,1 if eligible else 0,stable_key,json.dumps({"best":best,"current":current})))
+        recent=conn.execute("SELECT stable_key,eligible FROM v2_optimizer_evaluations ORDER BY id DESC LIMIT ?",(V2_OPTIMIZER_REQUIRED_STABLE_RUNS,)).fetchall()
+        stable_runs=len(recent)==V2_OPTIMIZER_REQUIRED_STABLE_RUNS and all(int(r["eligible"])==1 and r["stable_key"]==stable_key for r in recent)
+        if eligible and stable_runs: recommendation="READY_TO_APPLY"
+        if eligible and stable_runs and V2_AUTO_APPLY_THRESHOLDS and staged:
+            apply_custom_a_plus_thresholds(staged["confidence"],staged["quality"],"guarded adaptive optimiser",True)
+            result["applied"]=True; recommendation="APPLIED_STAGED_CHANGE"
+        conn.commit(); conn.close()
+        result.update({"observations":len(observations),"excludedBlacklistSymbols":sorted(blocked),"excludedObservationCount":len(all_obs)-len(observations),
+            "recommendation":recommendation,"reason":reason,"recommended":best,"stagedRecommendation":staged,"currentEvidence":current,
+            "topCandidates":candidates[:10],"stability":{"requiredRuns":V2_OPTIMIZER_REQUIRED_STABLE_RUNS,"matchingRuns":sum(1 for r in recent if r["stable_key"]==stable_key and int(r["eligible"])==1),"passed":stable_runs},
+            "safeguards":{"rollingWindowsHours":windows,"minimumImprovementPct":V2_OPTIMIZER_MIN_IMPROVEMENT*100,"maxDrawdownIncreasePct":V2_OPTIMIZER_MAX_DRAWDOWN_INCREASE*100,"maxConfidenceStep":V2_OPTIMIZER_MAX_CONF_STEP,"maxQualityStep":V2_OPTIMIZER_MAX_QUALITY_STEP},
+            "safetyNote":"Thresholds only apply when auto-apply is enabled and all safeguards pass for consecutive evaluations."})
         return result
     except Exception as e:
-        return {**result, "ok": False, "error": str(e)}
+        return {**result,"ok":False,"error":str(e)}
+
+
+def v2_rollback_latest_strategy() -> Dict[str, Any]:
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+    try:
+        init_db(); conn = db_connect()
+        row = conn.execute("SELECT * FROM v2_strategy_versions WHERE action='APPLY' ORDER BY id DESC LIMIT 1").fetchone()
+        if not row:
+            conn.close(); return {"ok": False, "message": "No applied adaptive strategy version to roll back"}
+        row = dict(row)
+        previous_conf = row.get("previous_confidence")
+        previous_quality = row.get("previous_quality")
+        if previous_conf is None or previous_quality is None:
+            conn.close(); return {"ok": False, "message": "Previous thresholds are unavailable"}
+        conn.close()
+        result = apply_custom_a_plus_thresholds(float(previous_conf), float(previous_quality), f"rollback of strategy version {row.get('version_label')}", True)
+        return {"ok": True, "rolledBack": row.get("version_label"), "settings": result}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def v2_strategy_timeline(limit: int = 50) -> Dict[str, Any]:
+    if not SQLITE_ENABLED: return {"ok":False,"message":"SQLite disabled","rows":[]}
+    try:
+        init_db(); conn=db_connect()
+        rows=[dict(r) for r in conn.execute("SELECT * FROM v2_strategy_versions ORDER BY id DESC LIMIT ?",(max(1,min(int(limit),200)),)).fetchall()]
+        conn.close()
+        for r in rows:
+            try: r["metrics"]=json.loads(r.pop("metrics_json") or "{}")
+            except Exception: r["metrics"]={}
+        return {"ok":True,"count":len(rows),"rows":rows}
+    except Exception as e: return {"ok":False,"error":str(e),"rows":[]}
 
 
 def v2_decision_explanation(symbol: str) -> Dict[str, Any]:
