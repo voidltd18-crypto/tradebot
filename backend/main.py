@@ -190,6 +190,12 @@ V4_SIMILARITY_MIN_SAMPLES = int(os.getenv("V4_SIMILARITY_MIN_SAMPLES", "8") or 8
 V4_SIMILARITY_LIMIT = int(os.getenv("V4_SIMILARITY_LIMIT", "50") or 50)
 V4_PATTERN_MIN_SAMPLES = int(os.getenv("V4_PATTERN_MIN_SAMPLES", "8") or 8)
 
+# TradeBot V5.1 Replay Laboratory. Research/advisory only.
+V5_REPLAY_ENABLED = os.getenv("V5_REPLAY_ENABLED", "true").lower() == "true"
+V5_REPLAY_DEFAULT_HORIZON_HOURS = int(os.getenv("V5_REPLAY_DEFAULT_HORIZON_HOURS", "24") or 24)
+V5_REPLAY_MIN_SAMPLES = int(os.getenv("V5_REPLAY_MIN_SAMPLES", "8") or 8)
+V5_REPLAY_MAX_ROWS = int(os.getenv("V5_REPLAY_MAX_ROWS", "10000") or 10000)
+
 # V2 deliberately disables rotation/churn. Existing positions are still
 # protected by hard-stop and swing-management rules.
 if TRADEBOT_V2_ENABLED:
@@ -2609,6 +2615,48 @@ def init_db():
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_v4_dna_decision
         ON v4_market_dna(decision, stage)
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v5_replay_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            label TEXT,
+            date_from TEXT,
+            date_to TEXT,
+            horizon_hours INTEGER NOT NULL,
+            observation_count INTEGER NOT NULL DEFAULT 0,
+            variant_count INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v5_replay_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            variant_key TEXT NOT NULL,
+            variant_name TEXT NOT NULL,
+            trades INTEGER NOT NULL DEFAULT 0,
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+            win_rate REAL,
+            profit_factor REAL,
+            expectancy_pct REAL,
+            total_return_pct REAL,
+            max_drawdown_pct REAL,
+            largest_win_pct REAL,
+            largest_loss_pct REAL,
+            config_json TEXT,
+            UNIQUE(run_id, variant_key)
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v5_replay_runs_created
+        ON v5_replay_runs(created_at)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v5_replay_results_run
+        ON v5_replay_results(run_id, expectancy_pct)
     """)
 
     cur.execute("""
@@ -7225,5 +7273,210 @@ def compat_post_buy_size_mode(payload: dict = Body(...), request: Request = None
         "fullBuyWhenOnePosition": saved == "full",
         "preview": _compat_buy_preview(),
     }
+
+
+
+# =========================
+# TRADEBOT V5.1 — REPLAY LABORATORY
+# =========================
+def _v5_replay_variants() -> List[Dict[str, Any]]:
+    """Fixed, explainable research variants. None can alter live settings."""
+    return [
+        {"key": "current_a_plus", "name": "Current A+ thresholds", "confidence": 0.70, "quality": 0.026, "momentum_min": 0.0, "spread_max": 0.010},
+        {"key": "confidence_068", "name": "Confidence 0.68", "confidence": 0.68, "quality": 0.026, "momentum_min": 0.0, "spread_max": 0.010},
+        {"key": "confidence_072", "name": "Confidence 0.72", "confidence": 0.72, "quality": 0.026, "momentum_min": 0.0, "spread_max": 0.010},
+        {"key": "quality_022", "name": "Quality 0.022", "confidence": 0.70, "quality": 0.022, "momentum_min": 0.0, "spread_max": 0.010},
+        {"key": "quality_030", "name": "Quality 0.030", "confidence": 0.70, "quality": 0.030, "momentum_min": 0.0, "spread_max": 0.010},
+        {"key": "no_momentum", "name": "Momentum gate disabled", "confidence": 0.70, "quality": 0.026, "momentum_min": None, "spread_max": 0.010},
+        {"key": "relaxed_spread", "name": "Spread max 0.015", "confidence": 0.70, "quality": 0.026, "momentum_min": 0.0, "spread_max": 0.015},
+        {"key": "historical_live_decision", "name": "Original approved decisions", "original_approved_only": True},
+    ]
+
+
+def _v5_variant_accepts(row: Dict[str, Any], variant: Dict[str, Any]) -> bool:
+    if variant.get("original_approved_only"):
+        return str(row.get("decision") or "").upper() == "APPROVED"
+    confidence = float(row.get("confidence") or 0.0)
+    quality = float(row.get("quality") or 0.0)
+    momentum = float(row.get("momentum") or 0.0)
+    spread = float(row.get("spread") or 999.0)
+    if confidence < float(variant.get("confidence", 0.0)):
+        return False
+    if quality < float(variant.get("quality", 0.0)):
+        return False
+    momentum_min = variant.get("momentum_min")
+    if momentum_min is not None and momentum < float(momentum_min):
+        return False
+    if spread > float(variant.get("spread_max", 999.0)):
+        return False
+    return True
+
+
+def _v5_replay_metrics(values: List[float]) -> Dict[str, Any]:
+    clean = [float(v) for v in values if v is not None and math.isfinite(float(v))]
+    wins = [v for v in clean if v > 0]
+    losses = [v for v in clean if v < 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    equity = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    for value in clean:
+        equity += value
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, peak - equity)
+    return {
+        "trades": len(clean),
+        "wins": len(wins),
+        "losses": len(losses),
+        "winRate": len(wins) / max(1, len(wins) + len(losses)),
+        "profitFactor": gross_profit / gross_loss if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0),
+        "expectancyPct": sum(clean) / max(1, len(clean)),
+        "totalReturnPct": sum(clean),
+        "maxDrawdownPct": max_drawdown,
+        "largestWinPct": max(clean) if clean else 0.0,
+        "largestLossPct": min(clean) if clean else 0.0,
+    }
+
+
+def v5_run_replay(date_from: Optional[str] = None, date_to: Optional[str] = None,
+                  horizon_hours: int = V5_REPLAY_DEFAULT_HORIZON_HOURS,
+                  label: Optional[str] = None) -> Dict[str, Any]:
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+    if not V5_REPLAY_ENABLED:
+        return {"ok": False, "message": "V5 replay disabled"}
+    horizon = max(1, int(horizon_hours))
+    try:
+        init_db()
+        conn = db_connect()
+        where = ["o.status='COMPLETE'", "o.net_return_pct IS NOT NULL", "o.horizon_hours=?"]
+        params: List[Any] = [horizon]
+        if date_from:
+            where.append("d.observed_at>=?")
+            params.append(str(date_from))
+        if date_to:
+            where.append("d.observed_at<=?")
+            params.append(str(date_to))
+        rows = [dict(r) for r in conn.execute(
+            f"""SELECT d.*,o.net_return_pct,o.sample_key,o.evaluated_at
+                 FROM v4_market_dna d JOIN v2_observation_outcomes o ON o.decision_id=d.decision_id
+                 WHERE {' AND '.join(where)} ORDER BY d.observed_at ASC LIMIT ?""",
+            tuple(params + [V5_REPLAY_MAX_ROWS]),
+        ).fetchall()]
+        variants = _v5_replay_variants()
+        created_at = datetime.now(UTC).isoformat()
+        cur = conn.execute(
+            """INSERT INTO v5_replay_runs(created_at,label,date_from,date_to,horizon_hours,observation_count,variant_count,payload_json)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (created_at, label or "Replay Laboratory", date_from, date_to, horizon, len(rows), len(variants),
+             json.dumps({"advisoryOnly": True, "source": "v4_market_dna+v2_observation_outcomes"})),
+        )
+        run_id = int(cur.lastrowid)
+        results = []
+        for variant in variants:
+            returns = [float(r["net_return_pct"]) for r in rows if _v5_variant_accepts(r, variant)]
+            metrics = _v5_replay_metrics(returns)
+            eligible = metrics["trades"] >= V5_REPLAY_MIN_SAMPLES
+            result = {"variantKey": variant["key"], "variantName": variant["name"], **metrics,
+                      "eligible": eligible, "config": variant}
+            results.append(result)
+            conn.execute(
+                """INSERT OR REPLACE INTO v5_replay_results
+                   (run_id,variant_key,variant_name,trades,wins,losses,win_rate,profit_factor,expectancy_pct,
+                    total_return_pct,max_drawdown_pct,largest_win_pct,largest_loss_pct,config_json)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (run_id, variant["key"], variant["name"], metrics["trades"], metrics["wins"], metrics["losses"],
+                 metrics["winRate"], metrics["profitFactor"], metrics["expectancyPct"], metrics["totalReturnPct"],
+                 metrics["maxDrawdownPct"], metrics["largestWinPct"], metrics["largestLossPct"], json.dumps(variant)),
+            )
+        conn.commit()
+        conn.close()
+        results.sort(key=lambda x: (bool(x["eligible"]), x["expectancyPct"], x["profitFactor"]), reverse=True)
+        best = next((r for r in results if r["eligible"]), None)
+        baseline = next((r for r in results if r["variantKey"] == "current_a_plus"), None)
+        return {
+            "ok": True, "version": "V5.1", "advisoryOnly": True, "runId": run_id,
+            "createdAt": created_at, "dateFrom": date_from, "dateTo": date_to,
+            "horizonHours": horizon, "observations": len(rows), "minimumSamples": V5_REPLAY_MIN_SAMPLES,
+            "bestVariant": best, "baseline": baseline, "leaderboard": results,
+            "note": "Replay results are research evidence only. No live threshold or order logic was changed.",
+        }
+    except Exception as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return {"ok": False, "version": "V5.1", "error": str(e)}
+
+
+def v5_replay_leaderboard(run_id: Optional[int] = None, limit: int = 25) -> Dict[str, Any]:
+    try:
+        init_db(); conn = db_connect()
+        if run_id is None:
+            row = conn.execute("SELECT id FROM v5_replay_runs ORDER BY id DESC LIMIT 1").fetchone()
+            if not row:
+                conn.close(); return {"ok": True, "version": "V5.1", "runs": 0, "leaderboard": []}
+            run_id = int(row["id"])
+        run = conn.execute("SELECT * FROM v5_replay_runs WHERE id=?", (int(run_id),)).fetchone()
+        if not run:
+            conn.close(); return {"ok": False, "message": "Replay run not found", "runId": int(run_id)}
+        rows = [dict(r) for r in conn.execute(
+            """SELECT * FROM v5_replay_results WHERE run_id=?
+               ORDER BY expectancy_pct DESC, profit_factor DESC LIMIT ?""", (int(run_id), max(1, min(int(limit), 100)))).fetchall()]
+        conn.close()
+        for row in rows:
+            try: row["config"] = json.loads(row.pop("config_json") or "{}")
+            except Exception: row["config"] = {}
+        return {"ok": True, "version": "V5.1", "advisoryOnly": True, "run": dict(run), "leaderboard": rows}
+    except Exception as e:
+        return {"ok": False, "version": "V5.1", "error": str(e)}
+
+
+def v5_status_payload() -> Dict[str, Any]:
+    try:
+        init_db(); conn = db_connect()
+        run_count = int(conn.execute("SELECT COUNT(*) FROM v5_replay_runs").fetchone()[0])
+        latest = conn.execute("SELECT * FROM v5_replay_runs ORDER BY id DESC LIMIT 1").fetchone()
+        observation_count = int(conn.execute(
+            """SELECT COUNT(*) FROM v4_market_dna d JOIN v2_observation_outcomes o ON o.decision_id=d.decision_id
+               WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL""").fetchone()[0])
+        conn.close()
+    except Exception:
+        run_count, latest, observation_count = 0, None, 0
+    return {"ok": True, "version": "V5.1", "mode": "advisory-replay-laboratory",
+            "enabled": V5_REPLAY_ENABLED, "advisoryOnly": True, "liveGateChanged": False,
+            "completedObservations": observation_count, "replayRuns": run_count,
+            "latestRun": dict(latest) if latest else None,
+            "features": {"candidateCapture": True, "historicalReplay": True, "strategyVariants": True,
+                         "persistentLeaderboards": True, "automaticLiveChanges": False},
+            "rules": {"defaultHorizonHours": V5_REPLAY_DEFAULT_HORIZON_HOURS,
+                      "minimumSamples": V5_REPLAY_MIN_SAMPLES, "maxRowsPerReplay": V5_REPLAY_MAX_ROWS}}
+
+
+@app.get("/v5/status")
+def api_v5_status():
+    return v5_status_payload()
+
+
+@app.post("/v5/replay/run")
+def api_v5_replay_run(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v5_run_replay(payload.get("dateFrom"), payload.get("dateTo"),
+                         int(payload.get("horizonHours") or V5_REPLAY_DEFAULT_HORIZON_HOURS),
+                         payload.get("label"))
+
+
+@app.get("/v5/replay/leaderboard")
+def api_v5_replay_leaderboard(run_id: Optional[int] = None, limit: int = 25):
+    return v5_replay_leaderboard(run_id, limit)
+
+
+@app.post("/v5/replay/day")
+def api_v5_replay_day(request: Request, day: str, horizon_hours: int = V5_REPLAY_DEFAULT_HORIZON_HOURS):
+    verify_api_key(request)
+    start = f"{day}T00:00:00+00:00"
+    end = f"{day}T23:59:59.999999+00:00"
+    return v5_run_replay(start, end, horizon_hours, f"Daily replay {day}")
 
 print(f"TRADEBOT V2 | enabled={TRADEBOT_V2_ENABLED} mode={'paper' if PAPER else ('live' if TRADEBOT_V2_LIVE_ENABLED else 'validation-only')} min_samples={V2_MIN_SYMBOL_SAMPLES} min_pf={V2_MIN_PROFIT_FACTOR}")
