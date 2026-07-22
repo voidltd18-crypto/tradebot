@@ -3651,9 +3651,9 @@ def should_refresh_weekly_universe(force=False):
 
 def universe_rows_from_stock_memory():
     """
-    Build a visible top-12 watchlist directly from the already-working stock memory.
-    This is intentionally based on closed-trade performance so the panel always lines up
-    with what the user sees in Stock Memory.
+    Build the weekly watchlist from closed-trade memory using the same PnL/PF
+    rules as the live optimiser. BLACKLIST symbols are excluded from new-entry
+    selection even when an older saved universe still labels them as GOOD.
     """
     rows = []
 
@@ -3666,44 +3666,152 @@ def universe_rows_from_stock_memory():
             memory = []
 
     for m in memory:
-        symbol = str(m.get("symbol", "")).upper()
+        symbol = str(m.get("symbol", "")).upper().strip()
         if not symbol:
             continue
 
-        trades = int(m.get("trades") or 0)
-        win_rate = float(m.get("winRate") or 0.0)
-        avg_pnl = float(m.get("avgPnl") or 0.0)
-        total_pnl = float(m.get("totalPnl") or 0.0)
-        trust = str(m.get("trust") or "NEW")
+        stats = symbol_stats(symbol)
+        decision = auto_improve_decision(symbol)
+        action = str(decision.get("action") or "NORMAL").upper()
 
-        # Balanced score: rewards enough history, high win-rate, positive average PnL,
-        # and good total PnL. Penalises weak performers.
+        # A currently held symbol must remain visible for position management,
+        # but a BLACKLIST symbol must never be selected for a fresh entry.
+        held_qty = 0.0
+        try:
+            held_qty, _ = get_position(symbol)
+            held_qty = float(held_qty or 0.0)
+        except Exception:
+            held_qty = 0.0
+
+        if action == "BLACKLIST" and held_qty <= DUST_THRESHOLD:
+            continue
+
+        trades = int(stats.get("trades") or 0)
+        win_rate = float(stats.get("winRate") or 0.0)
+        avg_pnl = float(stats.get("avgPnl") or 0.0)
+        total_pnl = float(stats.get("totalPnl") or 0.0)
+        profit_factor = float(stats.get("profitFactor") or 0.0)
+
         score = 0.0
         score += min(trades, 20) * 0.6
         score += win_rate * 12.0
         score += avg_pnl * 3.0
         score += max(-10.0, min(10.0, total_pnl)) * 0.5
+        score += min(profit_factor, 4.0) * 1.5
 
-        if trust.upper() == "GOOD":
-            score += 5.0
-        elif trust.upper() == "BAD":
+        if action == "BOOST":
+            score += 6.0
+        elif action == "REDUCE":
             score -= 8.0
+        elif action == "BLACKLIST":
+            score -= 100.0
 
+        management_only = action == "BLACKLIST" and held_qty > DUST_THRESHOLD
         reason = (
-            f"trust {trust} | trades={trades} | "
-            f"winRate={win_rate*100:.2f}% | avgPnL=${avg_pnl:.2f} | totalPnL=${total_pnl:.2f}"
+            f"trust {action} | trades={trades} | winRate={win_rate*100:.2f}% | "
+            f"PF={profit_factor:.2f} | avgPnL=${avg_pnl:.2f} | totalPnL=${total_pnl:.2f}"
         )
+        if management_only:
+            reason = "currently held; management only | " + reason
 
         rows.append({
             "symbol": symbol,
             "score": round(score, 4),
             "reason": reason,
             "status": "active",
+            "trust": action,
+            "profitFactor": profit_factor,
+            "totalPnl": total_pnl,
+            "eligibleForNewBuy": not management_only and action != "BLACKLIST",
+            "managementOnly": management_only,
         })
 
     rows.sort(key=lambda r: r["score"], reverse=True)
     return rows
 
+
+def reconcile_auto_universe_rows(rows, target_size=None):
+    """Re-score saved universe rows with current optimiser evidence.
+
+    This repairs stale weekly labels immediately after a deployment. Symbols
+    currently classified BLACKLIST are removed from new-entry selection. Open
+    positions are retained as management-only rows so exit logic can still see
+    them. Empty slots are filled from the candidate pool with non-blacklisted
+    symbols.
+    """
+    target_size = int(target_size or AUTO_UNIVERSE_SIZE)
+    result = []
+    seen = set()
+
+    def append_symbol(symbol, original=None):
+        symbol = str(symbol or "").upper().strip()
+        if not symbol or symbol in seen:
+            return
+
+        decision = auto_improve_decision(symbol)
+        action = str(decision.get("action") or "NORMAL").upper()
+        stats = symbol_stats(symbol)
+        held_qty = 0.0
+        try:
+            held_qty, _ = get_position(symbol)
+            held_qty = float(held_qty or 0.0)
+        except Exception:
+            pass
+
+        management_only = action == "BLACKLIST" and held_qty > DUST_THRESHOLD
+        if action == "BLACKLIST" and not management_only:
+            return
+
+        original = original or {}
+        score = float(original.get("score") or 0.0)
+        if action == "BOOST":
+            score += 6.0
+        elif action == "REDUCE":
+            score -= 8.0
+        elif management_only:
+            score = max(score, 20.0)
+
+        reason = (
+            f"trust {action} | trades={int(stats.get('trades') or 0)} | "
+            f"winRate={float(stats.get('winRate') or 0.0)*100:.2f}% | "
+            f"PF={float(stats.get('profitFactor') or 0.0):.2f} | "
+            f"avgPnL=${float(stats.get('avgPnl') or 0.0):.2f} | "
+            f"totalPnL=${float(stats.get('totalPnl') or 0.0):.2f}"
+        )
+        if management_only:
+            reason = "currently held; management only | " + reason
+
+        result.append({
+            **original,
+            "symbol": symbol,
+            "score": round(score, 4),
+            "reason": reason,
+            "status": "active",
+            "trust": action,
+            "profitFactor": float(stats.get("profitFactor") or 0.0),
+            "totalPnl": float(stats.get("totalPnl") or 0.0),
+            "eligibleForNewBuy": not management_only and action != "BLACKLIST",
+            "managementOnly": management_only,
+        })
+        seen.add(symbol)
+
+    for row in rows or []:
+        append_symbol(row.get("symbol"), row)
+
+    # Refill removed BLACKLIST slots from the current memory ranking first.
+    for row in universe_rows_from_stock_memory():
+        if len(result) >= target_size:
+            break
+        append_symbol(row.get("symbol"), row)
+
+    # Then use the normal candidate pool, still respecting BLACKLIST evidence.
+    for symbol in AUTO_UNIVERSE_CANDIDATE_POOL:
+        if len(result) >= target_size:
+            break
+        append_symbol(symbol, score_candidate_symbol(symbol))
+
+    result.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
+    return result[:target_size]
 
 def score_candidate_symbol(symbol):
     """
@@ -3803,6 +3911,7 @@ def build_weekly_universe(force=False):
     if not chosen:
         chosen = [{"symbol": s, "score": 0, "reason": "fallback safe universe", "status": "active"} for s in SAFE_UNIVERSE[:AUTO_UNIVERSE_SIZE]]
 
+    chosen = reconcile_auto_universe_rows(chosen, AUTO_UNIVERSE_SIZE)
     save_weekly_universe(chosen, "forced refresh" if force else "weekly refresh")
     current_universe = [r["symbol"] for r in chosen]
 
@@ -3818,24 +3927,37 @@ def build_weekly_universe(force=False):
 
 
 def auto_universe_payload():
+    global current_universe
     active = get_weekly_universe_from_db()
 
     # If DB has not been populated yet but stock memory exists, show live preview.
     if not active:
-        preview = universe_rows_from_stock_memory()[:AUTO_UNIVERSE_SIZE]
-        active = preview
+        active = universe_rows_from_stock_memory()[:AUTO_UNIVERSE_SIZE]
+
+    # Always re-score saved rows against current optimiser evidence. This makes
+    # stale GOOD labels disappear immediately after deployment and suppresses
+    # BLACKLIST symbols without waiting for the next weekly refresh.
+    active = reconcile_auto_universe_rows(active, AUTO_UNIVERSE_SIZE)
+    symbols = [r["symbol"] for r in active]
+    if symbols:
+        current_universe = symbols[:]
+        for symbol in current_universe:
+            ensure_symbol_state(symbol, custom=symbol in custom_symbols)
 
     return {
         "enabled": AUTO_UNIVERSE_ENABLED,
-        "size": AUTO_UNIVERSE_SIZE,
+        "size": len(active),
+        "configuredSize": AUTO_UNIVERSE_SIZE,
         "weekStart": week_start_str(),
-        "activeSymbols": [r["symbol"] for r in active] if active else list(current_universe),
+        "activeSymbols": symbols if active else list(current_universe),
         "rows": active,
         "lastRefresh": get_last_universe_refresh(),
         "candidatePoolSize": len(AUTO_UNIVERSE_CANDIDATE_POOL),
         "keepWinners": True,
+        "liveRescored": True,
+        "blacklistSuppressed": True,
+        "trustDefinition": "BOOST/REDUCE/BLACKLIST uses current PnL and profit factor; BLACKLIST symbols are excluded from new entries",
     }
-
 
 
 
@@ -5472,6 +5594,8 @@ def force_quality_auto_universe_payload():
             rows = quality_universe_rows()
         else:
             rows = []
+        if "reconcile_auto_universe_rows" in globals():
+            rows = reconcile_auto_universe_rows(rows, len(rows) or AUTO_UNIVERSE_SIZE)
         symbols = [r["symbol"] for r in rows]
     except Exception:
         rows = []
