@@ -196,13 +196,16 @@ V5_REPLAY_DEFAULT_HORIZON_HOURS = int(os.getenv("V5_REPLAY_DEFAULT_HORIZON_HOURS
 V5_REPLAY_MIN_SAMPLES = int(os.getenv("V5_REPLAY_MIN_SAMPLES", "8") or 8)
 V5_REPLAY_MAX_ROWS = int(os.getenv("V5_REPLAY_MAX_ROWS", "10000") or 10000)
 
-# TradeBot V6.1 Self-Evolving Intelligence. Shadow/advisory only.
+# TradeBot V6.2 Self-Evolving Intelligence. Automatic historical bootstrap; shadow/advisory only.
 V6_BRAINS_ENABLED = os.getenv("V6_BRAINS_ENABLED", "true").lower() == "true"
 V6_DEFAULT_HORIZON_HOURS = int(os.getenv("V6_DEFAULT_HORIZON_HOURS", "24") or 24)
 V6_MIN_SAMPLES = int(os.getenv("V6_MIN_SAMPLES", "12") or 12)
 V6_RECOMMENDATION_MIN_PF = float(os.getenv("V6_RECOMMENDATION_MIN_PF", "1.15") or 1.15)
 V6_RECOMMENDATION_MIN_EXPECTANCY = float(os.getenv("V6_RECOMMENDATION_MIN_EXPECTANCY", "0.10") or 0.10)
 V6_ACTIVE_BRAIN = os.getenv("V6_ACTIVE_BRAIN", "current_a_plus").strip().lower() or "current_a_plus"
+V6_AUTO_SYNC_ENABLED = os.getenv("V6_AUTO_SYNC_ENABLED", "true").lower() == "true"
+V6_AUTO_SYNC_INTERVAL_SECONDS = max(30, int(os.getenv("V6_AUTO_SYNC_INTERVAL_SECONDS", "300") or 300))
+V6_AUTO_SYNC_LIMIT = max(100, min(int(os.getenv("V6_AUTO_SYNC_LIMIT", "50000") or 50000), 50000))
 
 # V2 deliberately disables rotation/churn. Existing positions are still
 # protected by hard-stop and swing-management rules.
@@ -362,6 +365,8 @@ bot_enabled = True
 manual_override = False
 emergency_stop = False
 bot_thread_started = False
+v6_sync_thread_started = False
+v6_last_sync_result: Dict[str, Any] = {}
 bot_lock = threading.Lock()
 
 starting_equity_today: Optional[float] = None
@@ -5830,11 +5835,13 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started
-    if bot_thread_started:
-        return
-    bot_thread_started = True
-    threading.Thread(target=run_bot_loop, daemon=True).start()
+    global bot_thread_started, v6_sync_thread_started
+    if not bot_thread_started:
+        bot_thread_started = True
+        threading.Thread(target=run_bot_loop, daemon=True).start()
+    if V6_BRAINS_ENABLED and V6_AUTO_SYNC_ENABLED and not v6_sync_thread_started:
+        v6_sync_thread_started = True
+        threading.Thread(target=v6_auto_sync_worker, daemon=True).start()
 
 
 
@@ -7536,7 +7543,7 @@ def api_v5_replay_day(request: Request, day: str, horizon_hours: int = V5_REPLAY
 
 
 # =========================
-# TRADEBOT V6.1 — SELF-EVOLVING MULTI-BRAIN SHADOW ENGINE
+# TRADEBOT V6.2 — SELF-EVOLVING MULTI-BRAIN SHADOW ENGINE
 # =========================
 def _v6_brains() -> List[Dict[str, Any]]:
     """Configuration-driven research brains. They observe only; none can place orders."""
@@ -7589,12 +7596,45 @@ def v6_sync_brains(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = 1
                      float(row.get("pullback") or 0),float(row.get("spread") or 0),json.dumps(brain),now))
                 inserted += conn.total_changes-before
         conn.commit(); conn.close()
-        return {"ok":True,"version":"V6.1","advisoryOnly":True,"horizonHours":horizon,"sourceObservations":len(rows),
+        return {"ok":True,"version":"V6.2","advisoryOnly":True,"horizonHours":horizon,"sourceObservations":len(rows),
                 "brains":len(brains),"newShadowRows":inserted,"acceptedEvaluations":accepted,"liveGateChanged":False}
     except Exception as e:
         try: conn.close()
         except Exception: pass
-        return {"ok":False,"version":"V6.1","error":str(e)}
+        return {"ok":False,"version":"V6.2","error":str(e)}
+
+
+def v6_auto_sync_worker() -> None:
+    """Continuously backfill historical and newly completed outcomes into every research brain.
+
+    This worker is idempotent because v6_brain_observations has a unique key on
+    (brain_key, decision_id, horizon_hours). It never places orders or changes live gates.
+    """
+    global v6_last_sync_result
+    first_run = True
+    while True:
+        try:
+            result = v6_sync_brains(V6_DEFAULT_HORIZON_HOURS, V6_AUTO_SYNC_LIMIT)
+            result["automatic"] = True
+            result["ranAt"] = datetime.now(UTC).isoformat()
+            v6_last_sync_result = result
+            if first_run or int(result.get("newShadowRows") or 0) > 0:
+                print(
+                    "V6 AUTO SYNC | "
+                    f"source={result.get('sourceObservations', 0)} "
+                    f"new={result.get('newShadowRows', 0)} "
+                    f"accepted={result.get('acceptedEvaluations', 0)}"
+                )
+            first_run = False
+        except Exception as exc:
+            v6_last_sync_result = {
+                "ok": False,
+                "automatic": True,
+                "ranAt": datetime.now(UTC).isoformat(),
+                "error": str(exc),
+            }
+            print(f"V6 AUTO SYNC ERROR: {exc}")
+        time.sleep(V6_AUTO_SYNC_INTERVAL_SECONDS)
 
 
 def _v6_score_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -7618,9 +7658,9 @@ def v6_brain_scoreboard(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, regime: O
             score=(metrics["expectancyPct"]*max(0.0,min(metrics["profitFactor"],3.0))) if eligible else -999.0
             board.append({"brainKey":key,"brainName":brain["name"],**metrics,"eligible":eligible,"researchScore":score,"config":brain})
         board.sort(key=lambda x:(x["eligible"],x["researchScore"],x["trades"]),reverse=True)
-        return {"ok":True,"version":"V6.1","advisoryOnly":True,"horizonHours":horizon,"marketRegime":regime,
+        return {"ok":True,"version":"V6.2","advisoryOnly":True,"horizonHours":horizon,"marketRegime":regime,
                 "minimumSamples":V6_MIN_SAMPLES,"leader":next((x for x in board if x["eligible"]),None),"scoreboard":board}
-    except Exception as e: return {"ok":False,"version":"V6.1","error":str(e)}
+    except Exception as e: return {"ok":False,"version":"V6.2","error":str(e)}
 
 
 def v6_recommendation(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, regime: Optional[str] = None, persist: bool = True) -> Dict[str, Any]:
@@ -7635,7 +7675,7 @@ def v6_recommendation(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, regime: Opt
             action="RECOMMEND_SWITCH"
     samples=int(best["trades"] if best else 0)
     grade="HIGH" if samples>=50 else ("MEDIUM" if samples>=25 else ("LOW" if samples>=V6_MIN_SAMPLES else "INSUFFICIENT"))
-    payload={"ok":True,"version":"V6.1","advisoryOnly":True,"automaticLiveChanges":False,"action":action,
+    payload={"ok":True,"version":"V6.2","advisoryOnly":True,"automaticLiveChanges":False,"action":action,
              "currentBrain":V6_ACTIVE_BRAIN,"recommendedBrain":best["brainKey"] if best else None,
              "confidenceGrade":grade,"marketRegime":regime,"horizonHours":int(horizon_hours),
              "leader":best,"current":current,"safeguards":{"minimumSamples":V6_MIN_SAMPLES,
@@ -7656,16 +7696,23 @@ def v6_status_payload() -> Dict[str, Any]:
         init_db(); conn=db_connect()
         shadow_rows=int(conn.execute("SELECT COUNT(*) FROM v6_brain_observations").fetchone()[0])
         accepted_rows=int(conn.execute("SELECT COUNT(*) FROM v6_brain_observations WHERE accepted=1").fetchone()[0])
+        source_rows=int(conn.execute("""SELECT COUNT(*) FROM v4_market_dna d JOIN v2_observation_outcomes o
+            ON o.decision_id=d.decision_id WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL
+            AND o.horizon_hours=?""", (V6_DEFAULT_HORIZON_HOURS,)).fetchone()[0])
         latest=conn.execute("SELECT created_at FROM v6_brain_observations ORDER BY id DESC LIMIT 1").fetchone(); conn.close()
-    except Exception: shadow_rows,accepted_rows,latest=0,0,None
-    return {"ok":True,"version":"V6.1","mode":"self-evolving-shadow-intelligence","enabled":V6_BRAINS_ENABLED,
+    except Exception: shadow_rows,accepted_rows,source_rows,latest=0,0,0,None
+    return {"ok":True,"version":"V6.2","mode":"self-evolving-shadow-intelligence","enabled":V6_BRAINS_ENABLED,
             "advisoryOnly":True,"automaticLiveChanges":False,"liveGateChanged":False,"activeBrain":V6_ACTIVE_BRAIN,
-            "brainCount":len(_v6_brains()),"shadowEvaluations":shadow_rows,"acceptedShadowEvaluations":accepted_rows,
-            "latestShadowAt":latest["created_at"] if latest else None,
+            "brainCount":len(_v6_brains()),"sourceCompletedObservations":source_rows,
+            "shadowEvaluations":shadow_rows,"acceptedShadowEvaluations":accepted_rows,
+            "latestShadowAt":latest["created_at"] if latest else None,"lastAutomaticSync":v6_last_sync_result or None,
             "features":{"configurationDrivenBrains":True,"multiBrainShadowing":True,"regimeScoreboards":True,
-                        "guardedRecommendations":True,"selfGeneratedBrains":False,"automaticPromotion":False},
+                        "guardedRecommendations":True,"automaticHistoricalBootstrap":True,
+                        "continuousOutcomeSync":True,"selfGeneratedBrains":False,"automaticPromotion":False},
             "rules":{"defaultHorizonHours":V6_DEFAULT_HORIZON_HOURS,"minimumSamples":V6_MIN_SAMPLES,
-                     "minimumProfitFactor":V6_RECOMMENDATION_MIN_PF,"minimumExpectancyPct":V6_RECOMMENDATION_MIN_EXPECTANCY}}
+                     "minimumProfitFactor":V6_RECOMMENDATION_MIN_PF,"minimumExpectancyPct":V6_RECOMMENDATION_MIN_EXPECTANCY,
+                     "autoSyncEnabled":V6_AUTO_SYNC_ENABLED,"autoSyncIntervalSeconds":V6_AUTO_SYNC_INTERVAL_SECONDS,
+                     "autoSyncLimit":V6_AUTO_SYNC_LIMIT}}
 
 
 @app.get("/v6/status")
