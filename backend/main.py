@@ -196,6 +196,14 @@ V5_REPLAY_DEFAULT_HORIZON_HOURS = int(os.getenv("V5_REPLAY_DEFAULT_HORIZON_HOURS
 V5_REPLAY_MIN_SAMPLES = int(os.getenv("V5_REPLAY_MIN_SAMPLES", "8") or 8)
 V5_REPLAY_MAX_ROWS = int(os.getenv("V5_REPLAY_MAX_ROWS", "10000") or 10000)
 
+# TradeBot V6.1 Self-Evolving Intelligence. Shadow/advisory only.
+V6_BRAINS_ENABLED = os.getenv("V6_BRAINS_ENABLED", "true").lower() == "true"
+V6_DEFAULT_HORIZON_HOURS = int(os.getenv("V6_DEFAULT_HORIZON_HOURS", "24") or 24)
+V6_MIN_SAMPLES = int(os.getenv("V6_MIN_SAMPLES", "12") or 12)
+V6_RECOMMENDATION_MIN_PF = float(os.getenv("V6_RECOMMENDATION_MIN_PF", "1.15") or 1.15)
+V6_RECOMMENDATION_MIN_EXPECTANCY = float(os.getenv("V6_RECOMMENDATION_MIN_EXPECTANCY", "0.10") or 0.10)
+V6_ACTIVE_BRAIN = os.getenv("V6_ACTIVE_BRAIN", "current_a_plus").strip().lower() or "current_a_plus"
+
 # V2 deliberately disables rotation/churn. Existing positions are still
 # protected by hard-stop and swing-management rules.
 if TRADEBOT_V2_ENABLED:
@@ -2657,6 +2665,52 @@ def init_db():
     cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_v5_replay_results_run
         ON v5_replay_results(run_id, expectancy_pct)
+    """)
+
+
+    # V6.1 multi-brain shadow intelligence. These tables never drive live orders.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v6_brain_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            brain_key TEXT NOT NULL,
+            brain_name TEXT NOT NULL,
+            decision_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            market_regime TEXT,
+            horizon_hours INTEGER NOT NULL,
+            accepted INTEGER NOT NULL DEFAULT 0,
+            return_pct REAL,
+            confidence REAL,
+            quality REAL,
+            momentum REAL,
+            pullback REAL,
+            spread REAL,
+            config_json TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(brain_key, decision_id, horizon_hours)
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v6_brain_results
+        ON v6_brain_observations(brain_key, horizon_hours, accepted, observed_at)
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_v6_brain_regime
+        ON v6_brain_observations(market_regime, brain_key, horizon_hours)
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v6_recommendations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            horizon_hours INTEGER NOT NULL,
+            market_regime TEXT,
+            current_brain TEXT,
+            recommended_brain TEXT,
+            confidence_grade TEXT,
+            approved INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT
+        )
     """)
 
     cur.execute("""
@@ -7478,5 +7532,162 @@ def api_v5_replay_day(request: Request, day: str, horizon_hours: int = V5_REPLAY
     start = f"{day}T00:00:00+00:00"
     end = f"{day}T23:59:59.999999+00:00"
     return v5_run_replay(start, end, horizon_hours, f"Daily replay {day}")
+
+
+
+# =========================
+# TRADEBOT V6.1 — SELF-EVOLVING MULTI-BRAIN SHADOW ENGINE
+# =========================
+def _v6_brains() -> List[Dict[str, Any]]:
+    """Configuration-driven research brains. They observe only; none can place orders."""
+    return [
+        {"key":"current_a_plus","name":"Current A+","min_confidence":0.70,"min_quality":0.026,"max_spread":0.010,"momentum_min":0.0},
+        {"key":"conservative","name":"Conservative","min_confidence":0.78,"min_quality":0.032,"max_spread":0.007,"momentum_min":0.0},
+        {"key":"aggressive","name":"Aggressive","min_confidence":0.62,"min_quality":0.018,"max_spread":0.015,"momentum_min":-0.01},
+        {"key":"momentum","name":"Momentum","min_confidence":0.68,"min_quality":0.024,"max_spread":0.012,"momentum_min":0.012},
+        {"key":"mean_reversion","name":"Mean Reversion","min_confidence":0.64,"min_quality":0.020,"max_spread":0.010,"pullback_min":0.010,"momentum_max":0.010},
+        {"key":"breakout","name":"Breakout","min_confidence":0.72,"min_quality":0.030,"max_spread":0.012,"momentum_min":0.020},
+    ]
+
+
+def _v6_accepts(row: Dict[str, Any], brain: Dict[str, Any]) -> bool:
+    confidence=float(row.get("confidence") or 0.0); quality=float(row.get("quality") or 0.0)
+    momentum=float(row.get("momentum") or 0.0); pullback=float(row.get("pullback") or 0.0)
+    spread=float(row.get("spread") if row.get("spread") is not None else 999.0)
+    if confidence < float(brain.get("min_confidence",0.0)): return False
+    if quality < float(brain.get("min_quality",0.0)): return False
+    if spread > float(brain.get("max_spread",999.0)): return False
+    if "momentum_min" in brain and momentum < float(brain["momentum_min"]): return False
+    if "momentum_max" in brain and momentum > float(brain["momentum_max"]): return False
+    if "pullback_min" in brain and pullback < float(brain["pullback_min"]): return False
+    return True
+
+
+def v6_sync_brains(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = 10000) -> Dict[str, Any]:
+    if not SQLITE_ENABLED: return {"ok":False,"message":"SQLite disabled"}
+    if not V6_BRAINS_ENABLED: return {"ok":False,"message":"V6 brains disabled"}
+    horizon=max(1,int(horizon_hours)); limit=max(1,min(int(limit),50000))
+    try:
+        init_db(); conn=db_connect()
+        rows=[dict(r) for r in conn.execute(
+            """SELECT d.*,o.net_return_pct FROM v4_market_dna d
+               JOIN v2_observation_outcomes o ON o.decision_id=d.decision_id
+               WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL AND o.horizon_hours=?
+               ORDER BY d.observed_at ASC LIMIT ?""",(horizon,limit)).fetchall()]
+        brains=_v6_brains(); inserted=0; accepted=0; now=datetime.now(UTC).isoformat()
+        for row in rows:
+            for brain in brains:
+                passed=1 if _v6_accepts(row,brain) else 0
+                accepted += passed
+                before=conn.total_changes
+                conn.execute("""INSERT OR IGNORE INTO v6_brain_observations
+                    (brain_key,brain_name,decision_id,symbol,observed_at,market_regime,horizon_hours,accepted,return_pct,confidence,quality,momentum,pullback,spread,config_json,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (brain["key"],brain["name"],int(row["decision_id"]),row.get("symbol") or "",row.get("observed_at") or now,
+                     row.get("market_regime") or "unknown",horizon,passed,float(row["net_return_pct"]),
+                     float(row.get("confidence") or 0),float(row.get("quality") or 0),float(row.get("momentum") or 0),
+                     float(row.get("pullback") or 0),float(row.get("spread") or 0),json.dumps(brain),now))
+                inserted += conn.total_changes-before
+        conn.commit(); conn.close()
+        return {"ok":True,"version":"V6.1","advisoryOnly":True,"horizonHours":horizon,"sourceObservations":len(rows),
+                "brains":len(brains),"newShadowRows":inserted,"acceptedEvaluations":accepted,"liveGateChanged":False}
+    except Exception as e:
+        try: conn.close()
+        except Exception: pass
+        return {"ok":False,"version":"V6.1","error":str(e)}
+
+
+def _v6_score_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    values=[float(r["return_pct"]) for r in rows if r.get("return_pct") is not None]
+    return _v5_replay_metrics(values)
+
+
+def v6_brain_scoreboard(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, regime: Optional[str] = None) -> Dict[str, Any]:
+    horizon=max(1,int(horizon_hours))
+    try:
+        init_db(); conn=db_connect(); params=[horizon]; extra=""
+        if regime:
+            extra=" AND lower(market_regime)=lower(?)"; params.append(regime)
+        rows=[dict(r) for r in conn.execute(
+            f"SELECT * FROM v6_brain_observations WHERE horizon_hours=? AND accepted=1{extra} ORDER BY observed_at",tuple(params)).fetchall()]
+        conn.close(); by={}
+        for r in rows: by.setdefault(r["brain_key"],[]).append(r)
+        configs={b["key"]:b for b in _v6_brains()}; board=[]
+        for key,brain in configs.items():
+            metrics=_v6_score_rows(by.get(key,[])); eligible=metrics["trades"]>=V6_MIN_SAMPLES
+            score=(metrics["expectancyPct"]*max(0.0,min(metrics["profitFactor"],3.0))) if eligible else -999.0
+            board.append({"brainKey":key,"brainName":brain["name"],**metrics,"eligible":eligible,"researchScore":score,"config":brain})
+        board.sort(key=lambda x:(x["eligible"],x["researchScore"],x["trades"]),reverse=True)
+        return {"ok":True,"version":"V6.1","advisoryOnly":True,"horizonHours":horizon,"marketRegime":regime,
+                "minimumSamples":V6_MIN_SAMPLES,"leader":next((x for x in board if x["eligible"]),None),"scoreboard":board}
+    except Exception as e: return {"ok":False,"version":"V6.1","error":str(e)}
+
+
+def v6_recommendation(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, regime: Optional[str] = None, persist: bool = True) -> Dict[str, Any]:
+    board=v6_brain_scoreboard(horizon_hours,regime)
+    if not board.get("ok"): return board
+    eligible=[x for x in board["scoreboard"] if x["eligible"] and x["profitFactor"]>=V6_RECOMMENDATION_MIN_PF and x["expectancyPct"]>=V6_RECOMMENDATION_MIN_EXPECTANCY]
+    best=eligible[0] if eligible else None
+    current=next((x for x in board["scoreboard"] if x["brainKey"]==V6_ACTIVE_BRAIN),None)
+    action="KEEP_CURRENT"
+    if best and best["brainKey"]!=V6_ACTIVE_BRAIN:
+        if not current or not current["eligible"] or best["researchScore"] > current["researchScore"]*1.10:
+            action="RECOMMEND_SWITCH"
+    samples=int(best["trades"] if best else 0)
+    grade="HIGH" if samples>=50 else ("MEDIUM" if samples>=25 else ("LOW" if samples>=V6_MIN_SAMPLES else "INSUFFICIENT"))
+    payload={"ok":True,"version":"V6.1","advisoryOnly":True,"automaticLiveChanges":False,"action":action,
+             "currentBrain":V6_ACTIVE_BRAIN,"recommendedBrain":best["brainKey"] if best else None,
+             "confidenceGrade":grade,"marketRegime":regime,"horizonHours":int(horizon_hours),
+             "leader":best,"current":current,"safeguards":{"minimumSamples":V6_MIN_SAMPLES,
+             "minimumProfitFactor":V6_RECOMMENDATION_MIN_PF,"minimumExpectancyPct":V6_RECOMMENDATION_MIN_EXPECTANCY,
+             "requiredImprovement":0.10},"note":"Recommendation only. No live strategy or order gate was changed."}
+    if persist and SQLITE_ENABLED:
+        try:
+            conn=db_connect(); conn.execute("""INSERT INTO v6_recommendations
+                (created_at,horizon_hours,market_regime,current_brain,recommended_brain,confidence_grade,approved,payload_json)
+                VALUES(?,?,?,?,?,?,0,?)""",(datetime.now(UTC).isoformat(),int(horizon_hours),regime,V6_ACTIVE_BRAIN,
+                payload["recommendedBrain"],grade,json.dumps(payload))); conn.commit(); conn.close()
+        except Exception: pass
+    return payload
+
+
+def v6_status_payload() -> Dict[str, Any]:
+    try:
+        init_db(); conn=db_connect()
+        shadow_rows=int(conn.execute("SELECT COUNT(*) FROM v6_brain_observations").fetchone()[0])
+        accepted_rows=int(conn.execute("SELECT COUNT(*) FROM v6_brain_observations WHERE accepted=1").fetchone()[0])
+        latest=conn.execute("SELECT created_at FROM v6_brain_observations ORDER BY id DESC LIMIT 1").fetchone(); conn.close()
+    except Exception: shadow_rows,accepted_rows,latest=0,0,None
+    return {"ok":True,"version":"V6.1","mode":"self-evolving-shadow-intelligence","enabled":V6_BRAINS_ENABLED,
+            "advisoryOnly":True,"automaticLiveChanges":False,"liveGateChanged":False,"activeBrain":V6_ACTIVE_BRAIN,
+            "brainCount":len(_v6_brains()),"shadowEvaluations":shadow_rows,"acceptedShadowEvaluations":accepted_rows,
+            "latestShadowAt":latest["created_at"] if latest else None,
+            "features":{"configurationDrivenBrains":True,"multiBrainShadowing":True,"regimeScoreboards":True,
+                        "guardedRecommendations":True,"selfGeneratedBrains":False,"automaticPromotion":False},
+            "rules":{"defaultHorizonHours":V6_DEFAULT_HORIZON_HOURS,"minimumSamples":V6_MIN_SAMPLES,
+                     "minimumProfitFactor":V6_RECOMMENDATION_MIN_PF,"minimumExpectancyPct":V6_RECOMMENDATION_MIN_EXPECTANCY}}
+
+
+@app.get("/v6/status")
+def api_v6_status(): return v6_status_payload()
+
+@app.post("/v6/brains/sync")
+def api_v6_brains_sync(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v6_sync_brains(int(payload.get("horizonHours") or V6_DEFAULT_HORIZON_HOURS),int(payload.get("limit") or 10000))
+
+@app.get("/v6/brains")
+def api_v6_brains(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, regime: Optional[str] = None):
+    return v6_brain_scoreboard(horizon_hours,regime)
+
+@app.get("/v6/recommendation")
+def api_v6_recommendation(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, regime: Optional[str] = None):
+    return v6_recommendation(horizon_hours,regime,False)
+
+@app.post("/v6/recommendation/run")
+def api_v6_recommendation_run(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v6_recommendation(int(payload.get("horizonHours") or V6_DEFAULT_HORIZON_HOURS),payload.get("regime"),True)
+
 
 print(f"TRADEBOT V2 | enabled={TRADEBOT_V2_ENABLED} mode={'paper' if PAPER else ('live' if TRADEBOT_V2_LIVE_ENABLED else 'validation-only')} min_samples={V2_MIN_SYMBOL_SAMPLES} min_pf={V2_MIN_PROFIT_FACTOR}")
