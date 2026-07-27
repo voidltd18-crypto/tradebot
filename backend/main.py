@@ -19,7 +19,8 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest
+from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
 
 # ============================================================
@@ -196,7 +197,7 @@ V5_REPLAY_DEFAULT_HORIZON_HOURS = int(os.getenv("V5_REPLAY_DEFAULT_HORIZON_HOURS
 V5_REPLAY_MIN_SAMPLES = int(os.getenv("V5_REPLAY_MIN_SAMPLES", "8") or 8)
 V5_REPLAY_MAX_ROWS = int(os.getenv("V5_REPLAY_MAX_ROWS", "10000") or 10000)
 
-# TradeBot V6.3 Validated Self-Evolving Intelligence. Independent, entry-ready shadow evidence only.
+# TradeBot V6.4 Outcome-Time Forensics. Historical checkpoint evidence only.
 V6_BRAINS_ENABLED = os.getenv("V6_BRAINS_ENABLED", "true").lower() == "true"
 V6_DEFAULT_HORIZON_HOURS = int(os.getenv("V6_DEFAULT_HORIZON_HOURS", "24") or 24)
 V6_MIN_SAMPLES = int(os.getenv("V6_MIN_SAMPLES", "12") or 12)
@@ -206,6 +207,10 @@ V6_ACTIVE_BRAIN = os.getenv("V6_ACTIVE_BRAIN", "current_a_plus").strip().lower()
 V6_AUTO_SYNC_ENABLED = os.getenv("V6_AUTO_SYNC_ENABLED", "true").lower() == "true"
 V6_AUTO_SYNC_INTERVAL_SECONDS = max(30, int(os.getenv("V6_AUTO_SYNC_INTERVAL_SECONDS", "300") or 300))
 V6_AUTO_SYNC_LIMIT = max(100, min(int(os.getenv("V6_AUTO_SYNC_LIMIT", "50000") or 50000), 50000))
+V6_OUTCOME_MAX_DELAY_MINUTES = max(1, int(os.getenv("V6_OUTCOME_MAX_DELAY_MINUTES", "30") or 30))
+V6_HISTORICAL_BAR_LOOKBACK_MINUTES = max(5, int(os.getenv("V6_HISTORICAL_BAR_LOOKBACK_MINUTES", "15") or 15))
+V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES = max(5, int(os.getenv("V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES", "45") or 45))
+V6_REPAIR_BATCH_SIZE = max(1, min(int(os.getenv("V6_REPAIR_BATCH_SIZE", "200") or 200), 1000))
 
 # V2 deliberately disables rotation/churn. Existing positions are still
 # protected by hard-stop and swing-management rules.
@@ -1914,63 +1919,122 @@ def v2_seed_missing_outcomes(limit: int = 5000) -> int:
         print(f"V2 OUTCOME SEED ERROR: {e}")
     return created
 
-def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
-    """Snapshot the latest tradable midpoint once each horizon becomes due.
+def _v6_parse_utc(value: Any) -> datetime:
+    dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
-    Evaluations run only from the active market loop, so overnight/weekend due rows
-    are completed at the next available live market quote rather than with stale data.
+
+def _v6_historical_checkpoint_price(symbol: str, due_at: Any) -> Dict[str, Any]:
+    """Return the first one-minute bar at/after the intended checkpoint.
+
+    A small look-back is requested to handle provider boundary behaviour, but a
+    bar before due_at is used only when no later bar exists inside the allowed
+    window. The selected timestamp and delay are always returned for validation.
     """
+    due = _v6_parse_utc(due_at)
+    start = due - timedelta(minutes=V6_HISTORICAL_BAR_LOOKBACK_MINUTES)
+    end = due + timedelta(minutes=V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES)
+    request = StockBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Minute, start=start, end=end)
+    response = data_client.get_stock_bars(request)
+    try:
+        bars = list(response[symbol])
+    except Exception:
+        data = getattr(response, "data", {}) or {}
+        bars = list(data.get(symbol, []))
+    if not bars:
+        raise RuntimeError("historical_bar_unavailable")
+    candidates=[]
+    for bar in bars:
+        ts=getattr(bar,"timestamp",None)
+        close=getattr(bar,"close",None)
+        if ts is None or close is None:
+            continue
+        bar_at=_v6_parse_utc(ts)
+        candidates.append((bar_at,float(close)))
+    if not candidates:
+        raise RuntimeError("historical_bar_unavailable")
+    after=[item for item in candidates if item[0] >= due]
+    selected=min(after,key=lambda item:item[0]) if after else min(candidates,key=lambda item:abs((item[0]-due).total_seconds()))
+    bar_at, price = selected
+    delay_minutes=(bar_at-due).total_seconds()/60.0
+    return {"price":price,"barAt":bar_at.isoformat(),"delayMinutes":delay_minutes,"source":"alpaca_historical_1min_close"}
+
+
+def _v6_write_historical_outcome(conn: sqlite3.Connection, row: Any) -> Dict[str, Any]:
+    symbol=str(row["symbol"]).upper()
+    checkpoint=_v6_historical_checkpoint_price(symbol,row["due_at"])
+    outcome_price=float(checkpoint["price"]); entry_price=float(row["entry_price"] or 0.0)
+    if entry_price <= 0:
+        raise RuntimeError("missing_or_invalid_entry_price")
+    return_pct=((outcome_price/entry_price)-1.0)*100.0
+    estimated_cost_pct=max(0.0,V2_ESTIMATED_COST_BPS/100.0)
+    net_return_pct=return_pct-estimated_cost_pct
+    now=datetime.now(UTC).isoformat()
+    conn.execute("""UPDATE v2_observation_outcomes
+       SET evaluated_at=?, outcome_price=?, return_pct=?, net_return_pct=?, estimated_cost_pct=?,
+           evaluation_delay_minutes=?, outcome_bar_at=?, outcome_source=?, repaired_at=?, status='COMPLETE', error=NULL
+       WHERE id=?""",
+       (checkpoint["barAt"],outcome_price,return_pct,net_return_pct,estimated_cost_pct,
+        float(checkpoint["delayMinutes"]),checkpoint["barAt"],checkpoint["source"],now,int(row["id"])))
+    return checkpoint
+
+
+def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
+    """Evaluate due outcomes at their historical checkpoint, never at the worker's current quote."""
     if not (TRADEBOT_V2_ENABLED and SQLITE_ENABLED):
-        return {"ok": False, "evaluated": 0, "reason": "V2 or SQLite disabled"}
+        return {"ok":False,"evaluated":0,"reason":"V2 or SQLite disabled"}
+    batch=max(1,min(int(limit or V2_OUTCOME_BATCH_SIZE),1000)); evaluated=0; errors=0
     try:
-        if not trading_client.get_clock().is_open:
-            return {"ok": True, "evaluated": 0, "reason": "market closed; outcomes deferred"}
-    except Exception as clock_error:
-        return {"ok": False, "evaluated": 0, "reason": f"market clock unavailable: {clock_error}"}
-    batch = max(1, min(int(limit or V2_OUTCOME_BATCH_SIZE), 1000))
-    evaluated = 0
-    errors = 0
-    try:
-        init_db()
-        conn = db_connect()
-        rows = conn.execute(
-            """SELECT * FROM v2_observation_outcomes
-               WHERE status='PENDING' AND due_at<=?
-               ORDER BY due_at ASC LIMIT ?""",
-            (datetime.now(UTC).isoformat(), batch),
-        ).fetchall()
-        quote_cache: Dict[str, Dict[str, float]] = {}
+        init_db(); conn=db_connect()
+        rows=conn.execute("""SELECT * FROM v2_observation_outcomes
+            WHERE status='PENDING' AND due_at<=? ORDER BY due_at ASC LIMIT ?""",
+            (datetime.now(UTC).isoformat(),batch)).fetchall()
         for row in rows:
-            symbol = str(row["symbol"]).upper()
             try:
-                if symbol not in quote_cache:
-                    quote_cache[symbol] = get_quote(symbol)
-                outcome_price = float(quote_cache[symbol]["mid"])
-                entry_price = float(row["entry_price"])
-                return_pct = ((outcome_price / entry_price) - 1.0) * 100.0 if entry_price > 0 else 0.0
-                estimated_cost_pct = max(0.0, V2_ESTIMATED_COST_BPS / 100.0)
-                net_return_pct = return_pct - estimated_cost_pct
-                conn.execute(
-                    """UPDATE v2_observation_outcomes
-                       SET evaluated_at=?, outcome_price=?, return_pct=?, net_return_pct=?, estimated_cost_pct=?, status='COMPLETE', error=NULL
-                       WHERE id=?""",
-                    (datetime.now(UTC).isoformat(), outcome_price, return_pct, net_return_pct, estimated_cost_pct, int(row["id"])),
-                )
-                evaluated += 1
+                _v6_write_historical_outcome(conn,row); evaluated += 1
             except Exception as row_error:
                 errors += 1
-                conn.execute(
-                    """UPDATE v2_observation_outcomes SET error=? WHERE id=?""",
-                    (str(row_error)[:500], int(row["id"])),
-                )
-        conn.commit()
-        conn.close()
-        if evaluated or errors:
-            print(f"V2 OUTCOMES | evaluated={evaluated} errors={errors}")
-        return {"ok": True, "evaluated": evaluated, "errors": errors, "due": len(rows)}
+                conn.execute("UPDATE v2_observation_outcomes SET error=? WHERE id=?",(str(row_error)[:500],int(row["id"])))
+        conn.commit(); conn.close()
+        if evaluated or errors: print(f"V6.4 OUTCOMES | historical={evaluated} errors={errors}")
+        return {"ok":True,"version":"V6.4","evaluated":evaluated,"errors":errors,"due":len(rows),
+                "outcomeSource":"alpaca_historical_1min_close"}
     except Exception as e:
-        print(f"V2 OUTCOME EVALUATION ERROR: {e}")
-        return {"ok": False, "evaluated": evaluated, "errors": errors + 1, "error": str(e)}
+        try: conn.close()
+        except Exception: pass
+        return {"ok":False,"version":"V6.4","evaluated":evaluated,"errors":errors+1,"error":str(e)}
+
+
+def v6_repair_outcome_times(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = V6_REPAIR_BATCH_SIZE) -> Dict[str, Any]:
+    """Repair legacy live-quote outcomes using the intended historical due_at checkpoint."""
+    horizon=max(1,int(horizon_hours)); batch=max(1,min(int(limit),1000)); repaired=0; errors=0; samples=[]
+    try:
+        init_db(); conn=db_connect()
+        rows=conn.execute("""SELECT * FROM v2_observation_outcomes
+            WHERE horizon_hours=? AND status='COMPLETE'
+              AND (outcome_source IS NULL OR outcome_source!='alpaca_historical_1min_close' OR outcome_bar_at IS NULL)
+            ORDER BY due_at ASC LIMIT ?""",(horizon,batch)).fetchall()
+        for row in rows:
+            try:
+                cp=_v6_write_historical_outcome(conn,row); repaired += 1
+                if len(samples)<10: samples.append({"id":int(row["id"]),"symbol":row["symbol"],"dueAt":row["due_at"],**cp})
+            except Exception as exc:
+                errors += 1
+                conn.execute("UPDATE v2_observation_outcomes SET error=? WHERE id=?",(str(exc)[:500],int(row["id"])))
+        conn.commit()
+        remaining=int(conn.execute("""SELECT COUNT(*) FROM v2_observation_outcomes
+            WHERE horizon_hours=? AND status='COMPLETE'
+              AND (outcome_source IS NULL OR outcome_source!='alpaca_historical_1min_close' OR outcome_bar_at IS NULL)""",(horizon,)).fetchone()[0])
+        conn.close()
+        return {"ok":True,"version":"V6.4","advisoryOnly":True,"horizonHours":horizon,"processed":len(rows),
+                "repaired":repaired,"errors":errors,"remaining":remaining,"samples":samples,
+                "note":"Research outcomes only were repaired. Live trading logic was unchanged."}
+    except Exception as e:
+        try: conn.close()
+        except Exception: pass
+        return {"ok":False,"version":"V6.4","error":str(e),"repaired":repaired,"errors":errors+1}
 
 
 def v2_normalise_reason(reason: str) -> str:
@@ -2578,6 +2642,10 @@ def init_db():
         "ALTER TABLE v2_observation_outcomes ADD COLUMN net_return_pct REAL",
         "ALTER TABLE v2_observation_outcomes ADD COLUMN estimated_cost_pct REAL",
         "ALTER TABLE v2_observation_outcomes ADD COLUMN sample_key TEXT",
+        "ALTER TABLE v2_observation_outcomes ADD COLUMN evaluation_delay_minutes REAL",
+        "ALTER TABLE v2_observation_outcomes ADD COLUMN outcome_bar_at TEXT",
+        "ALTER TABLE v2_observation_outcomes ADD COLUMN outcome_source TEXT",
+        "ALTER TABLE v2_observation_outcomes ADD COLUMN repaired_at TEXT",
     ):
         try:
             cur.execute(column_sql)
@@ -7543,7 +7611,7 @@ def api_v5_replay_day(request: Request, day: str, horizon_hours: int = V5_REPLAY
 
 
 # =========================
-# TRADEBOT V6.3 — VALIDATED MULTI-BRAIN SHADOW ENGINE
+# TRADEBOT V6.4 — OUTCOME-TIME FORENSICS + VALIDATED SHADOW ENGINE
 # =========================
 def _v6_brains() -> List[Dict[str, Any]]:
     """Configuration-driven research brains. They observe only; none can place orders."""
@@ -7584,6 +7652,15 @@ def _v6_validate_source_row(row: Dict[str, Any]) -> Dict[str, Any]:
     if entry <= 0: reasons.append("missing_or_invalid_entry_price")
     if outcome <= 0: reasons.append("missing_or_invalid_outcome_price")
     if not bool(int(row.get("ready_to_buy") or 0)): reasons.append("entry_trigger_not_ready")
+    due_at=row.get("due_at"); bar_at=row.get("outcome_bar_at"); source=str(row.get("outcome_source") or "")
+    if source != "alpaca_historical_1min_close": reasons.append("outcome_not_historical_checkpoint")
+    if not bar_at: reasons.append("outcome_timestamp_missing")
+    if due_at and bar_at:
+        try:
+            delay=(_v6_parse_utc(bar_at)-_v6_parse_utc(due_at)).total_seconds()/60.0
+            if delay < -V6_HISTORICAL_BAR_LOOKBACK_MINUTES: reasons.append("outcome_timestamp_before_allowed_window")
+            if delay > V6_OUTCOME_MAX_DELAY_MINUTES: reasons.append("outcome_evaluated_too_late")
+        except Exception: reasons.append("outcome_timestamp_mismatch")
     if entry > 0 and outcome > 0:
         expected=((outcome/entry)-1.0)*100.0
         if abs(expected-raw) > 0.02: reasons.append("raw_return_formula_mismatch")
@@ -7601,6 +7678,7 @@ def _v6_source_rows(horizon_hours: int, limit: int) -> List[Dict[str, Any]]:
                SELECT d.*, o.entry_price, o.outcome_price,
                       o.return_pct AS raw_return_pct, o.net_return_pct,
                       o.estimated_cost_pct, o.sample_key, o.due_at, o.evaluated_at,
+                      o.evaluation_delay_minutes, o.outcome_bar_at, o.outcome_source, o.repaired_at,
                       ROW_NUMBER() OVER (
                           PARTITION BY COALESCE(o.sample_key, CAST(o.decision_id AS TEXT)), o.horizon_hours
                           ORDER BY o.id ASC
@@ -7630,13 +7708,16 @@ def v6_validation_report(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: i
                 samples.append({"decisionId":row.get("decision_id"),"symbol":row.get("symbol"),
                                 "observedAt":row.get("observed_at"),"reasons":check["reasons"],
                                 "entryPrice":row.get("entry_price"),"outcomePrice":row.get("outcome_price"),
-                                "rawReturnPct":row.get("raw_return_pct"),"netReturnPct":row.get("net_return_pct")})
-    return {"ok":True,"version":"V6.3","advisoryOnly":True,"horizonHours":horizon,
+                                "rawReturnPct":row.get("raw_return_pct"),"netReturnPct":row.get("net_return_pct"),
+                                "dueAt":row.get("due_at"),"outcomeBarAt":row.get("outcome_bar_at"),
+                                "outcomeSource":row.get("outcome_source"),"evaluationDelayMinutes":row.get("evaluation_delay_minutes")})
+    return {"ok":True,"version":"V6.4","advisoryOnly":True,"horizonHours":horizon,
             "independentSourceObservations":len(rows),"entryReadyObservations":entry_ready,
             "validLearningObservations":valid,"invalidLearningObservations":len(rows)-valid,
             "invalidReasons":reason_counts,"invalidSamples":samples,
             "rules":{"independentSampleBuckets":True,"requiresEntryTriggerReady":True,
-                     "returnFormulaTolerancePct":0.02,"maximumAbsoluteReturnPct":50.0}}
+                     "returnFormulaTolerancePct":0.02,"maximumAbsoluteReturnPct":50.0,
+                     "historicalCheckpointRequired":True,"maximumOutcomeDelayMinutes":V6_OUTCOME_MAX_DELAY_MINUTES}}
 
 
 def v6_sync_brains(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = 10000) -> Dict[str, Any]:
@@ -7666,14 +7747,14 @@ def v6_sync_brains(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = 1
                      float(row.get("pullback") or 0),float(row.get("spread") or 0),json.dumps(brain),now))
                 inserted += conn.total_changes-before
         conn.commit(); conn.close()
-        return {"ok":True,"version":"V6.3","advisoryOnly":True,"horizonHours":horizon,
+        return {"ok":True,"version":"V6.4","advisoryOnly":True,"horizonHours":horizon,
                 "independentSourceObservations":len(rows),"validLearningObservations":valid_rows,
                 "invalidObservationsRejected":rejected_invalid,"brains":len(brains),
                 "newShadowRows":inserted,"acceptedEvaluations":accepted,"liveGateChanged":False}
     except Exception as e:
         try: conn.close()
         except Exception: pass
-        return {"ok":False,"version":"V6.3","error":str(e)}
+        return {"ok":False,"version":"V6.4","error":str(e)}
 
 
 def v6_rebuild_validated(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = V6_AUTO_SYNC_LIMIT) -> Dict[str, Any]:
@@ -7687,7 +7768,7 @@ def v6_rebuild_validated(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: i
         return {**result,"rebuild":True,"legacyRowsRemoved":removed,
                 "note":"Research rows only were rebuilt. Live trading logic was unchanged."}
     except Exception as e:
-        return {"ok":False,"version":"V6.3","error":str(e)}
+        return {"ok":False,"version":"V6.4","error":str(e)}
 
 
 def v6_auto_sync_worker() -> None:
@@ -7700,14 +7781,14 @@ def v6_auto_sync_worker() -> None:
             result["automatic"] = True; result["ranAt"] = datetime.now(UTC).isoformat()
             v6_last_sync_result = result
             if first_run or int(result.get("newShadowRows") or 0) > 0:
-                print("V6.3 AUTO SYNC | "
+                print("V6.4 AUTO SYNC | "
                       f"source={result.get('independentSourceObservations', 0)} "
                       f"valid={result.get('validLearningObservations', 0)} "
                       f"new={result.get('newShadowRows', 0)} accepted={result.get('acceptedEvaluations', 0)}")
             first_run = False
         except Exception as exc:
             v6_last_sync_result = {"ok":False,"automatic":True,"ranAt":datetime.now(UTC).isoformat(),"error":str(exc)}
-            print(f"V6.3 AUTO SYNC ERROR: {exc}")
+            print(f"V6.4 AUTO SYNC ERROR: {exc}")
         time.sleep(V6_AUTO_SYNC_INTERVAL_SECONDS)
 
 
@@ -7761,12 +7842,12 @@ def v6_brain_scoreboard(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, regime: O
         board.sort(key=lambda x:(x["recommendationEligible"],x["researchScore"],x["trades"]),reverse=True)
         leader=next((x for x in board if x["recommendationEligible"]),None)
         research_leader=next((x for x in board if x["sampleEligible"]),None)
-        return {"ok":True,"version":"V6.3","advisoryOnly":True,"horizonHours":horizon,"marketRegime":regime,
+        return {"ok":True,"version":"V6.4","advisoryOnly":True,"horizonHours":horizon,"marketRegime":regime,
                 "minimumSamples":V6_MIN_SAMPLES,"leader":leader,"researchLeader":research_leader,
                 "healthyLeaderAvailable":leader is not None,
                 "leaderRule":"A leader must pass samples, profit factor, expectancy and positive 95% lower expectancy bound.",
                 "scoreboard":board}
-    except Exception as e: return {"ok":False,"version":"V6.3","error":str(e)}
+    except Exception as e: return {"ok":False,"version":"V6.4","error":str(e)}
 
 
 def v6_recommendation(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, regime: Optional[str] = None, persist: bool = True) -> Dict[str, Any]:
@@ -7781,7 +7862,7 @@ def v6_recommendation(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, regime: Opt
             action="RECOMMEND_SWITCH"
     samples=int(best["trades"] if best else 0)
     grade="HIGH" if best and samples>=50 else ("MEDIUM" if best and samples>=25 else ("LOW" if best else "INSUFFICIENT"))
-    payload={"ok":True,"version":"V6.3","advisoryOnly":True,"automaticLiveChanges":False,"action":action,
+    payload={"ok":True,"version":"V6.4","advisoryOnly":True,"automaticLiveChanges":False,"action":action,
              "currentBrain":V6_ACTIVE_BRAIN,"recommendedBrain":best["brainKey"] if best else None,
              "confidenceGrade":grade,"marketRegime":regime,"horizonHours":int(horizon_hours),
              "leader":best,"current":current,"safeguards":{"minimumSamples":V6_MIN_SAMPLES,
@@ -7808,7 +7889,7 @@ def v6_status_payload() -> Dict[str, Any]:
         source_rows=int(validation.get("independentSourceObservations") or 0)
     except Exception:
         shadow_rows,accepted_rows,source_rows,latest,validation=0,0,0,None,{"ok":False}
-    return {"ok":True,"version":"V6.3","mode":"validated-self-evolving-shadow-intelligence","enabled":V6_BRAINS_ENABLED,
+    return {"ok":True,"version":"V6.4","mode":"historical-checkpoint-validated-shadow-intelligence","enabled":V6_BRAINS_ENABLED,
             "advisoryOnly":True,"automaticLiveChanges":False,"liveGateChanged":False,"activeBrain":V6_ACTIVE_BRAIN,
             "brainCount":len(_v6_brains()),"sourceCompletedObservations":source_rows,
             "validLearningObservations":validation.get("validLearningObservations",0),
@@ -7817,13 +7898,15 @@ def v6_status_payload() -> Dict[str, Any]:
             "latestShadowAt":latest["created_at"] if latest else None,"lastAutomaticSync":v6_last_sync_result or None,
             "features":{"configurationDrivenBrains":True,"multiBrainShadowing":True,"regimeScoreboards":True,
                         "guardedRecommendations":True,"automaticHistoricalBootstrap":True,
-                        "continuousOutcomeSync":True,"independentSampleDedupe":True,
+                        "continuousOutcomeSync":True,"historicalCheckpointOutcomes":True,"outcomeTimeRepair":True,
+                        "independentSampleDedupe":True,
                         "entryTriggerValidation":True,"returnFormulaValidation":True,
                         "confidenceBoundRanking":True,"selfGeneratedBrains":False,"automaticPromotion":False},
             "rules":{"defaultHorizonHours":V6_DEFAULT_HORIZON_HOURS,"minimumSamples":V6_MIN_SAMPLES,
                      "minimumProfitFactor":V6_RECOMMENDATION_MIN_PF,"minimumExpectancyPct":V6_RECOMMENDATION_MIN_EXPECTANCY,
                      "autoSyncEnabled":V6_AUTO_SYNC_ENABLED,"autoSyncIntervalSeconds":V6_AUTO_SYNC_INTERVAL_SECONDS,
-                     "autoSyncLimit":V6_AUTO_SYNC_LIMIT}}
+                     "autoSyncLimit":V6_AUTO_SYNC_LIMIT,"maximumOutcomeDelayMinutes":V6_OUTCOME_MAX_DELAY_MINUTES,
+                     "repairBatchSize":V6_REPAIR_BATCH_SIZE}}
 
 
 @app.get("/v6/status")
@@ -7832,6 +7915,13 @@ def api_v6_status(): return v6_status_payload()
 @app.get("/v6/validation")
 def api_v6_validation(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = V6_AUTO_SYNC_LIMIT):
     return v6_validation_report(horizon_hours,limit)
+
+@app.post("/v6/outcomes/repair")
+def api_v6_outcomes_repair(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v6_repair_outcome_times(int(payload.get("horizonHours") or V6_DEFAULT_HORIZON_HOURS),
+                                   int(payload.get("limit") or V6_REPAIR_BATCH_SIZE))
+
 
 @app.post("/v6/brains/sync")
 def api_v6_brains_sync(request: Request, payload: Dict[str, Any] = Body(default={})):
