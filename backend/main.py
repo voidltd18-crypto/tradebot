@@ -8589,8 +8589,8 @@ def api_v8_maintenance(request: Request, payload: Dict[str, Any] = Body(default=
 # TRADEBOT V9.0 — MARKET MEMORY ENGINE
 # Rich decision-time observations. Shadow-only and unable to alter live trading.
 # =========================
-V9_VERSION = "V9.0"
-V9_NAME = "Market Memory Engine"
+V9_VERSION = "V9.1"
+V9_NAME = "Live Market Intelligence Engine"
 V9_ENABLED = os.getenv("V9_ENABLED", "true").lower() == "true"
 V9_MIN_READY_OBSERVATIONS = max(100, int(os.getenv("V9_MIN_READY_OBSERVATIONS", "1000") or 1000))
 V9_MIN_FIELD_COVERAGE = max(0.50, min(float(os.getenv("V9_MIN_FIELD_COVERAGE", "0.80") or 0.80), 1.0))
@@ -8676,14 +8676,172 @@ def _v9_scan_value(scan: Dict[str, Any], *keys: str, default: Any = None) -> Any
     return default
 
 
+
+# =========================
+# V9.1 LIVE MARKET INTELLIGENCE COLLECTOR
+# Shadow-only: enriches memory records and never changes order decisions.
+# =========================
+V91_INTELLIGENCE_ENABLED = os.getenv("V91_INTELLIGENCE_ENABLED", "true").lower() == "true"
+V91_CACHE_SECONDS = max(30, int(os.getenv("V91_CACHE_SECONDS", "180") or 180))
+_v91_cache: Dict[str, Dict[str, Any]] = {}
+_v91_cache_lock = threading.Lock()
+
+V91_SECTOR_MAP = {
+    "AAPL":"Technology","MSFT":"Technology","NVDA":"Technology","AMD":"Technology","INTC":"Technology",
+    "QCOM":"Technology","MU":"Technology","GOOG":"Communication Services","GOOGL":"Communication Services",
+    "META":"Communication Services","AMZN":"Consumer Discretionary","TSLA":"Consumer Discretionary",
+    "F":"Consumer Discretionary","GM":"Consumer Discretionary","HOOD":"Financials","SOFI":"Financials",
+    "JPM":"Financials","BAC":"Financials","KO":"Consumer Staples","GIS":"Consumer Staples",
+    "PPL":"Utilities","XOM":"Energy","CVX":"Energy","LLY":"Healthcare","PFE":"Healthcare",
+    "PLTR":"Technology","LCID":"Consumer Discretionary","RIVN":"Consumer Discretionary","SNAP":"Communication Services",
+}
+V91_SECTOR_ETF = {
+    "Technology":"XLK","Communication Services":"XLC","Consumer Discretionary":"XLY","Financials":"XLF",
+    "Consumer Staples":"XLP","Utilities":"XLU","Energy":"XLE","Healthcare":"XLV","Industrials":"XLI",
+    "Materials":"XLB","Real Estate":"XLRE",
+}
+
+def _v91_bars(symbol: str, timeframe: Any, start: datetime, end: datetime) -> List[Any]:
+    req=StockBarsRequest(symbol_or_symbols=[symbol], timeframe=timeframe, start=start, end=end)
+    response=data_client.get_stock_bars(req)
+    try: return list(response[symbol])
+    except Exception:
+        data=getattr(response,"data",{}) or {}
+        return list(data.get(symbol,[]))
+
+def _v91_ema(values: List[float], period: int) -> Optional[float]:
+    if not values: return None
+    alpha=2.0/(period+1.0); value=float(values[0])
+    for item in values[1:]: value=alpha*float(item)+(1.0-alpha)*value
+    return value
+
+def _v91_pct_distance(price: float, reference: Optional[float]) -> Optional[float]:
+    return None if not reference or reference <= 0 else ((price/reference)-1.0)*100.0
+
+def _v91_cached(symbol: str) -> Optional[Dict[str, Any]]:
+    with _v91_cache_lock:
+        item=_v91_cache.get(symbol)
+        if item and time.time()-float(item.get("cached_at",0)) < V91_CACHE_SECONDS:
+            return dict(item.get("data") or {})
+    return None
+
+def _v91_store_cache(symbol: str, data: Dict[str, Any]) -> None:
+    with _v91_cache_lock: _v91_cache[symbol]={"cached_at":time.time(),"data":dict(data)}
+
+def _v91_symbol_intelligence(symbol: str, price: float) -> Dict[str, Any]:
+    sym=str(symbol).upper(); cached=_v91_cached(sym)
+    if cached is not None: return cached
+    result: Dict[str, Any]={}
+    now=datetime.now(UTC)
+    try:
+        daily=_v91_bars(sym,TimeFrame.Day,now-timedelta(days=45),now)
+        daily_rows=[]
+        for b in daily:
+            try: daily_rows.append({"o":float(b.open),"h":float(b.high),"l":float(b.low),"c":float(b.close),"v":float(b.volume or 0)})
+            except Exception: pass
+        if daily_rows:
+            previous=daily_rows[-2] if len(daily_rows)>=2 else daily_rows[-1]
+            today=daily_rows[-1]
+            result["gap_pct"]=_v91_pct_distance(today["o"],previous["c"])
+            trs=[]
+            for i,row in enumerate(daily_rows[-15:]):
+                prev_close=daily_rows[max(0,len(daily_rows)-15+i-1)]["c"]
+                trs.append(max(row["h"]-row["l"],abs(row["h"]-prev_close),abs(row["l"]-prev_close)))
+            atr=sum(trs)/len(trs) if trs else None
+            result["atr_pct"]=(atr/price*100.0) if atr and price>0 else None
+            avg_vol=sum(x["v"] for x in daily_rows[-21:-1])/max(1,len(daily_rows[-21:-1]))
+            result["average_daily_volume"]=avg_vol
+    except Exception as e: result["daily_error"]=str(e)[:160]
+    try:
+        et=ZoneInfo("America/New_York"); now_et=now.astimezone(et)
+        session_open=now_et.replace(hour=9,minute=30,second=0,microsecond=0).astimezone(UTC)
+        pre_open=now_et.replace(hour=4,minute=0,second=0,microsecond=0).astimezone(UTC)
+        start=min(pre_open,now-timedelta(hours=14))
+        bars=_v91_bars(sym,TimeFrame.Minute,start,now)
+        rows=[]
+        for b in bars:
+            try: rows.append((b.timestamp,float(b.open),float(b.high),float(b.low),float(b.close),float(b.volume or 0)))
+            except Exception: pass
+        if rows:
+            closes=[x[4] for x in rows]; volumes=[x[5] for x in rows]
+            typical=[(x[2]+x[3]+x[4])/3.0 for x in rows]
+            total_volume=sum(volumes); pv=sum(t*v for t,v in zip(typical,volumes)); vwap=pv/total_volume if total_volume>0 else None
+            result["distance_vwap_pct"]=_v91_pct_distance(price,vwap)
+            result["ema9_distance_pct"]=_v91_pct_distance(price,_v91_ema(closes,9))
+            result["ema20_distance_pct"]=_v91_pct_distance(price,_v91_ema(closes,20))
+            result["ema50_distance_pct"]=_v91_pct_distance(price,_v91_ema(closes,50))
+            high=max(x[2] for x in rows); low=min(x[3] for x in rows)
+            result["day_range_position"]=(price-low)/(high-low) if high>low else 0.5
+            elapsed=max(1.0,min(390.0,(now-session_open).total_seconds()/60.0)); fraction=max(1/390,elapsed/390.0)
+            avg_daily=float(result.get("average_daily_volume") or 0.0)
+            result["relative_volume"]=(total_volume/(avg_daily*fraction)) if avg_daily>0 else None
+            result["premarket_volume"]=sum(x[5] for x in rows if _v6_parse_utc(x[0]) < session_open)
+            orb_end=session_open+timedelta(minutes=30)
+            orb=[x for x in rows if session_open <= _v6_parse_utc(x[0]) <= orb_end]
+            result["opening_range_breakout"]=bool(orb and price > max(x[2] for x in orb))
+            result["current_volume"]=total_volume
+    except Exception as e: result["intraday_error"]=str(e)[:160]
+    sector=V91_SECTOR_MAP.get(sym,"unknown"); result["sector"]=sector
+    _v91_store_cache(sym,result); return result
+
+def _v91_market_context() -> Dict[str, Any]:
+    cached=_v91_cached("__MARKET__")
+    if cached is not None: return cached
+    context: Dict[str, Any]={}
+    moves=[]
+    for symbol in ("SPY","QQQ"):
+        try:
+            q=get_quote(symbol); intel=_v91_symbol_intelligence(symbol,float(q["mid"]))
+            move=(intel.get("gap_pct") or 0.0)+(intel.get("distance_vwap_pct") or 0.0)
+            context[f"{symbol.lower()}_move_pct"]=move; moves.append(move)
+            context[f"{symbol.lower()}_above_vwap"]=(intel.get("distance_vwap_pct") or 0.0)>0
+        except Exception: pass
+    avg=sum(moves)/len(moves) if moves else 0.0
+    both_above=bool(context.get("spy_above_vwap") and context.get("qqq_above_vwap"))
+    both_below=bool(context.get("spy_above_vwap") is False and context.get("qqq_above_vwap") is False)
+    if avg>=1.0 and both_above: regime="STRONG_RISK_ON"
+    elif avg>=0.2 and both_above: regime="RISK_ON"
+    elif avg<=-1.0 and both_below: regime="STRONG_RISK_OFF"
+    elif avg<=-0.2 and both_below: regime="RISK_OFF"
+    elif abs(avg)<0.25: regime="SIDEWAYS"
+    else: regime="MIXED"
+    context["market_regime"]=regime
+    _v91_store_cache("__MARKET__",context); return context
+
+def _v91_enrich_scan(scan: Dict[str, Any]) -> Dict[str, Any]:
+    if not V91_INTELLIGENCE_ENABLED: return scan
+    symbol=str(scan.get("symbol") or "").upper(); price=float(scan.get("price") or 0.0)
+    if not symbol or price<=0: return scan
+    enriched=dict(scan)
+    try: enriched.update({k:v for k,v in _v91_symbol_intelligence(symbol,price).items() if v is not None})
+    except Exception as e: enriched["v91_symbol_error"]=str(e)[:160]
+    try:
+        market=_v91_market_context(); enriched["market_regime"]=market.get("market_regime","UNKNOWN")
+        if market.get("spy_move_pct") is not None: enriched["spy_move"]=float(market["spy_move_pct"])/100.0
+        if market.get("qqq_move_pct") is not None: enriched["qqq_move"]=float(market["qqq_move_pct"])/100.0
+    except Exception as e: enriched["v91_market_error"]=str(e)[:160]
+    sector=enriched.get("sector")
+    etf=V91_SECTOR_ETF.get(str(sector))
+    if etf:
+        try:
+            q=get_quote(etf); si=_v91_symbol_intelligence(etf,float(q["mid"]))
+            enriched["sector_strength"]=(si.get("gap_pct") or 0.0)+(si.get("distance_vwap_pct") or 0.0)
+        except Exception: pass
+    return enriched
+
 def _v9_capture_snapshot(conn, decision_id: int, scan: Dict[str, Any], decision: str,
                          stage: str, reason: str, observed_at: datetime, source: str = "live") -> None:
     symbol=str(scan.get("symbol") or "").upper().strip()
     if not symbol or decision_id <= 0:
         return
+    if source == "live":
+        scan = _v91_enrich_scan(scan)
     dna=conn.execute("SELECT market_regime,session_name,weekday,hour_utc,spy_move,qqq_move,position_count FROM v4_market_dna WHERE decision_id=?",(decision_id,)).fetchone()
     if dna:
         regime,session,weekday,hour,spy,qqq,positions=dna
+        regime=scan.get("market_regime") or regime
+        spy=scan.get("spy_move") if scan.get("spy_move") is not None else spy
+        qqq=scan.get("qqq_move") if scan.get("qqq_move") is not None else qqq
     else:
         regime=_v4_market_regime(); session=_v4_session_name(observed_at); weekday=observed_at.weekday(); hour=observed_at.hour
         spy=_v4_index_move("SPY"); qqq=_v4_index_move("QQQ")
@@ -8802,7 +8960,8 @@ def v9_status_payload() -> Dict[str, Any]:
             "liveSnapshots":cov["liveSnapshots"],"missingSnapshots":cov["missingSnapshots"],"v10Ready":cov["v10Ready"],
             "features":{"automaticDecisionSnapshots":True,"historicalBackfill":True,"explainableDecisionMemory":True,
                         "marketContext":True,"technicalFeatureSchema":True,"newsAndFundamentalPlaceholders":True,
-                        "coverageMonitoring":True,"shadowOnly":True}}
+                        "coverageMonitoring":True,"liveTechnicalCollection":V91_INTELLIGENCE_ENABLED,"marketRegimeDetection":True,
+                        "relativeVolume":True,"vwapAndEmaDistances":True,"atrAndGap":True,"sectorContext":True,"shadowOnly":True}}
 
 
 @app.get('/v9/status')
@@ -8817,3 +8976,15 @@ def api_v9_memory(limit: int = 50): return v9_recent_memory(limit)
 @app.post('/v9/backfill')
 def api_v9_backfill(request: Request, payload: Dict[str, Any] = Body(default={})):
     verify_api_key(request); return v9_backfill(int(payload.get('limit') or 5000))
+
+
+@app.get('/v9/intelligence/{symbol}')
+def api_v9_intelligence(symbol: str, request: Request):
+    verify_api_key(request)
+    sym=str(symbol or '').upper().strip()
+    if not re.fullmatch(r'[A-Z.\-]{1,10}',sym):
+        raise HTTPException(status_code=400,detail='Invalid symbol')
+    quote=get_quote(sym)
+    scan={'symbol':sym,'price':quote['mid'],'bid':quote['bid'],'ask':quote['ask'],'spread':quote['spread']}
+    enriched=_v91_enrich_scan(scan)
+    return {'ok':True,'version':V9_VERSION,'symbol':sym,'intelligence':enriched}
