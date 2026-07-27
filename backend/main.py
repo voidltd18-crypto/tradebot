@@ -1801,6 +1801,11 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
                 )
         if decision_id > 0 and V4_MARKET_DNA_ENABLED:
             record_v4_market_dna(conn, decision_id, scan, decision, stage, reason, observed_at)
+        if decision_id > 0 and globals().get("V9_ENABLED", False):
+            try:
+                _v9_capture_snapshot(conn, decision_id, scan, decision, stage, reason, observed_at)
+            except Exception as v9_error:
+                print(f"V9 SNAPSHOT ERROR {symbol}: {v9_error}")
         conn.commit()
         conn.close()
     except Exception as e:
@@ -8578,3 +8583,237 @@ def api_v8_cleanup(request: Request, payload: Dict[str, Any] = Body(default={}))
 @app.post('/v8/maintenance')
 def api_v8_maintenance(request: Request, payload: Dict[str, Any] = Body(default={})):
     verify_api_key(request); return v8_maintenance('manual',int(payload.get('horizonHours') or V6_DEFAULT_HORIZON_HOURS))
+
+
+# =========================
+# TRADEBOT V9.0 — MARKET MEMORY ENGINE
+# Rich decision-time observations. Shadow-only and unable to alter live trading.
+# =========================
+V9_VERSION = "V9.0"
+V9_NAME = "Market Memory Engine"
+V9_ENABLED = os.getenv("V9_ENABLED", "true").lower() == "true"
+V9_MIN_READY_OBSERVATIONS = max(100, int(os.getenv("V9_MIN_READY_OBSERVATIONS", "1000") or 1000))
+V9_MIN_FIELD_COVERAGE = max(0.50, min(float(os.getenv("V9_MIN_FIELD_COVERAGE", "0.80") or 0.80), 1.0))
+
+
+def _v9_ensure_tables() -> None:
+    _v8_ensure_tables()
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v9_market_memory (
+        decision_id INTEGER PRIMARY KEY,
+        captured_at TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        decision TEXT,
+        stage TEXT,
+        reason TEXT,
+        price REAL,
+        confidence REAL,
+        quality REAL,
+        momentum REAL,
+        pullback REAL,
+        spread REAL,
+        ready_to_buy INTEGER,
+        sniper_pass INTEGER,
+        a_plus_pass INTEGER,
+        market_regime TEXT,
+        session_name TEXT,
+        weekday INTEGER,
+        hour_utc INTEGER,
+        spy_move REAL,
+        qqq_move REAL,
+        position_count INTEGER,
+        relative_volume REAL,
+        gap_pct REAL,
+        distance_vwap_pct REAL,
+        ema9_distance_pct REAL,
+        ema20_distance_pct REAL,
+        ema50_distance_pct REAL,
+        atr_pct REAL,
+        day_range_position REAL,
+        opening_range_breakout INTEGER,
+        premarket_volume REAL,
+        sector TEXT,
+        sector_strength REAL,
+        news_score REAL,
+        earnings_days INTEGER,
+        float_shares REAL,
+        shares_outstanding REAL,
+        payload_json TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'live'
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v9_memory_symbol_time ON v9_market_memory(symbol, observed_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v9_memory_stage ON v9_market_memory(stage, decision)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v9_memory_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        run_type TEXT NOT NULL,
+        processed INTEGER NOT NULL DEFAULT 0,
+        inserted INTEGER NOT NULL DEFAULT 0,
+        updated INTEGER NOT NULL DEFAULT 0,
+        errors INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT
+    )""")
+    conn.commit(); conn.close()
+
+
+def _v9_num(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return default
+        x=float(value)
+        return x if math.isfinite(x) else default
+    except Exception:
+        return default
+
+
+def _v9_scan_value(scan: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    for key in keys:
+        if key in scan and scan.get(key) is not None:
+            return scan.get(key)
+    return default
+
+
+def _v9_capture_snapshot(conn, decision_id: int, scan: Dict[str, Any], decision: str,
+                         stage: str, reason: str, observed_at: datetime, source: str = "live") -> None:
+    symbol=str(scan.get("symbol") or "").upper().strip()
+    if not symbol or decision_id <= 0:
+        return
+    dna=conn.execute("SELECT market_regime,session_name,weekday,hour_utc,spy_move,qqq_move,position_count FROM v4_market_dna WHERE decision_id=?",(decision_id,)).fetchone()
+    if dna:
+        regime,session,weekday,hour,spy,qqq,positions=dna
+    else:
+        regime=_v4_market_regime(); session=_v4_session_name(observed_at); weekday=observed_at.weekday(); hour=observed_at.hour
+        spy=_v4_index_move("SPY"); qqq=_v4_index_move("QQQ")
+        try: positions=len(trading_client.get_all_positions())
+        except Exception: positions=0
+    payload={
+        "schemaVersion":1,
+        "explanation":{
+            "decision":str(decision),"stage":str(stage),"reason":str(reason)[:1000],
+            "sniperReason":scan.get("sniper_reason"),"aPlusReason":scan.get("a_plus_reason")
+        },
+        "rawScan":{k:v for k,v in scan.items() if isinstance(v,(str,int,float,bool,type(None)))}
+    }
+    fields={
+        "relative_volume":_v9_num(_v9_scan_value(scan,"relative_volume","rvol","relativeVolume")),
+        "gap_pct":_v9_num(_v9_scan_value(scan,"gap_pct","gap_percent","gapPercent")),
+        "distance_vwap_pct":_v9_num(_v9_scan_value(scan,"distance_vwap_pct","vwap_distance_pct","distanceFromVwapPct")),
+        "ema9_distance_pct":_v9_num(_v9_scan_value(scan,"ema9_distance_pct","ema9DistancePct")),
+        "ema20_distance_pct":_v9_num(_v9_scan_value(scan,"ema20_distance_pct","ema20DistancePct")),
+        "ema50_distance_pct":_v9_num(_v9_scan_value(scan,"ema50_distance_pct","ema50DistancePct")),
+        "atr_pct":_v9_num(_v9_scan_value(scan,"atr_pct","atrPercent")),
+        "day_range_position":_v9_num(_v9_scan_value(scan,"day_range_position","range_position","dayRangePosition")),
+        "opening_range_breakout":int(bool(_v9_scan_value(scan,"opening_range_breakout","orb","openingRangeBreakout",default=False))),
+        "premarket_volume":_v9_num(_v9_scan_value(scan,"premarket_volume","premarketVolume")),
+        "sector":str(_v9_scan_value(scan,"sector",default="unknown") or "unknown"),
+        "sector_strength":_v9_num(_v9_scan_value(scan,"sector_strength","sectorStrength")),
+        "news_score":_v9_num(_v9_scan_value(scan,"news_score","newsScore")),
+        "earnings_days":int(_v9_num(_v9_scan_value(scan,"earnings_days","days_to_earnings","earningsDays"),999) or 999),
+        "float_shares":_v9_num(_v9_scan_value(scan,"float_shares","float","floatShares")),
+        "shares_outstanding":_v9_num(_v9_scan_value(scan,"shares_outstanding","sharesOutstanding")),
+    }
+    conn.execute("""INSERT OR REPLACE INTO v9_market_memory(
+        decision_id,captured_at,observed_at,symbol,decision,stage,reason,price,confidence,quality,momentum,pullback,spread,
+        ready_to_buy,sniper_pass,a_plus_pass,market_regime,session_name,weekday,hour_utc,spy_move,qqq_move,position_count,
+        relative_volume,gap_pct,distance_vwap_pct,ema9_distance_pct,ema20_distance_pct,ema50_distance_pct,atr_pct,
+        day_range_position,opening_range_breakout,premarket_volume,sector,sector_strength,news_score,earnings_days,
+        float_shares,shares_outstanding,payload_json,source)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (decision_id,datetime.now(UTC).isoformat(),observed_at.isoformat(),symbol,str(decision),str(stage),str(reason)[:1000],
+         _v9_num(scan.get("price"),0.0),_v9_num(scan.get("confidence"),0.0),_v9_num(scan.get("quality_score"),0.0),
+         _v9_num(scan.get("short_momentum"),0.0),_v9_num(scan.get("pullback"),0.0),_v9_num(scan.get("spread"),0.0),
+         int(bool(scan.get("ready_to_buy"))),int(bool(scan.get("sniper_pass"))),int(bool(scan.get("a_plus_pass"))),
+         str(regime or "unknown"),str(session or "unknown"),int(weekday or 0),int(hour or 0),_v9_num(spy,0.0),_v9_num(qqq,0.0),int(positions or 0),
+         fields["relative_volume"],fields["gap_pct"],fields["distance_vwap_pct"],fields["ema9_distance_pct"],fields["ema20_distance_pct"],
+         fields["ema50_distance_pct"],fields["atr_pct"],fields["day_range_position"],fields["opening_range_breakout"],fields["premarket_volume"],
+         fields["sector"],fields["sector_strength"],fields["news_score"],fields["earnings_days"],fields["float_shares"],fields["shares_outstanding"],
+         json.dumps(payload,default=str),str(source)))
+
+
+def v9_backfill(limit: int = 5000) -> Dict[str, Any]:
+    _v9_ensure_tables(); limit=max(1,min(int(limit),50000)); processed=inserted=errors=0
+    conn=db_connect()
+    rows=conn.execute("""SELECT d.id,d.timestamp,d.symbol,d.decision,d.stage,d.reason,d.price,d.confidence,d.quality,d.momentum,d.pullback,d.spread,
+        d.ready_to_buy,d.sniper_pass,d.a_plus_pass,d.payload_json
+        FROM v2_setup_decisions d LEFT JOIN v9_market_memory m ON m.decision_id=d.id
+        WHERE m.decision_id IS NULL ORDER BY d.id ASC LIMIT ?""",(limit,)).fetchall()
+    for row in rows:
+        processed+=1
+        try:
+            (did,ts,symbol,decision,stage,reason,price,confidence,quality,momentum,pullback,spread,ready,sniper,a_plus,payload_json)=row
+            try: observed=datetime.fromisoformat(str(ts).replace("Z","+00:00"))
+            except Exception: observed=datetime.now(UTC)
+            scan={"symbol":symbol,"price":price,"confidence":confidence,"quality_score":quality,"short_momentum":momentum,
+                  "pullback":pullback,"spread":spread,"ready_to_buy":bool(ready),"sniper_pass":bool(sniper),"a_plus_pass":bool(a_plus)}
+            try:
+                payload=json.loads(payload_json or "{}")
+                if isinstance(payload,dict):
+                    scan.update({k:v for k,v in payload.items() if k not in scan})
+            except Exception: pass
+            _v9_capture_snapshot(conn,int(did),scan,str(decision),str(stage),str(reason),observed,"historical_backfill")
+            inserted+=1
+        except Exception as e:
+            errors+=1; print(f"V9 BACKFILL ERROR: {e}")
+    now=datetime.now(UTC).isoformat(); payload={"ok":errors==0,"version":V9_VERSION,"processed":processed,"inserted":inserted,"errors":errors}
+    cur=conn.execute("INSERT INTO v9_memory_runs(created_at,run_type,processed,inserted,updated,errors,payload_json) VALUES(?,?,?,?,?,?,?)",
+                     (now,"backfill",processed,inserted,0,errors,json.dumps(payload)))
+    payload["runId"]=int(cur.lastrowid); conn.commit(); conn.close(); return payload
+
+
+def v9_coverage() -> Dict[str, Any]:
+    _v9_ensure_tables(); conn=db_connect(); total=int(conn.execute("SELECT COUNT(*) FROM v9_market_memory").fetchone()[0])
+    fields=["market_regime","spy_move","qqq_move","relative_volume","gap_pct","distance_vwap_pct","ema9_distance_pct","ema20_distance_pct",
+            "ema50_distance_pct","atr_pct","day_range_position","premarket_volume","sector","sector_strength","news_score","float_shares"]
+    coverage={}
+    for f in fields:
+        if f in ("market_regime","sector"):
+            present=int(conn.execute(f"SELECT COUNT(*) FROM v9_market_memory WHERE {f} IS NOT NULL AND lower({f}) NOT IN ('','unknown')").fetchone()[0])
+        else:
+            present=int(conn.execute(f"SELECT COUNT(*) FROM v9_market_memory WHERE {f} IS NOT NULL").fetchone()[0])
+        coverage[f]={"present":present,"coverage":round(present/total,4) if total else 0.0}
+    live=int(conn.execute("SELECT COUNT(*) FROM v9_market_memory WHERE source='live'").fetchone()[0]); backfilled=total-live
+    decisions=int(conn.execute("SELECT COUNT(*) FROM v2_setup_decisions").fetchone()[0]); conn.close()
+    rich=[coverage[f]["coverage"] for f in fields if f not in ("market_regime","spy_move","qqq_move")]
+    rich_avg=sum(rich)/len(rich) if rich else 0.0
+    ready=total>=V9_MIN_READY_OBSERVATIONS and rich_avg>=V9_MIN_FIELD_COVERAGE
+    return {"ok":True,"version":V9_VERSION,"totalSnapshots":total,"liveSnapshots":live,"backfilledSnapshots":backfilled,
+            "sourceDecisions":decisions,"missingSnapshots":max(0,decisions-total),"fieldCoverage":coverage,
+            "richFieldAverageCoverage":round(rich_avg,4),"v10Ready":ready,
+            "requirements":{"minimumSnapshots":V9_MIN_READY_OBSERVATIONS,"minimumRichFieldCoverage":V9_MIN_FIELD_COVERAGE}}
+
+
+def v9_recent_memory(limit: int = 50) -> Dict[str, Any]:
+    _v9_ensure_tables(); limit=max(1,min(int(limit),500)); conn=db_connect()
+    cols=[x[1] for x in conn.execute("PRAGMA table_info(v9_market_memory)").fetchall()]
+    rows=conn.execute("SELECT * FROM v9_market_memory ORDER BY decision_id DESC LIMIT ?",(limit,)).fetchall(); conn.close()
+    items=[]
+    for row in rows:
+        d=dict(zip(cols,row)); d.pop("payload_json",None); items.append(d)
+    return {"ok":True,"version":V9_VERSION,"count":len(items),"items":items}
+
+
+def v9_status_payload() -> Dict[str, Any]:
+    cov=v9_coverage()
+    return {"ok":True,"version":V9_VERSION,"name":V9_NAME,"enabled":V9_ENABLED,"advisoryOnly":True,
+            "automaticLiveChanges":False,"automaticPromotion":False,"snapshots":cov["totalSnapshots"],
+            "liveSnapshots":cov["liveSnapshots"],"missingSnapshots":cov["missingSnapshots"],"v10Ready":cov["v10Ready"],
+            "features":{"automaticDecisionSnapshots":True,"historicalBackfill":True,"explainableDecisionMemory":True,
+                        "marketContext":True,"technicalFeatureSchema":True,"newsAndFundamentalPlaceholders":True,
+                        "coverageMonitoring":True,"shadowOnly":True}}
+
+
+@app.get('/v9/status')
+def api_v9_status(): return v9_status_payload()
+
+@app.get('/v9/coverage')
+def api_v9_coverage(): return v9_coverage()
+
+@app.get('/v9/memory')
+def api_v9_memory(limit: int = 50): return v9_recent_memory(limit)
+
+@app.post('/v9/backfill')
+def api_v9_backfill(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request); return v9_backfill(int(payload.get('limit') or 5000))
