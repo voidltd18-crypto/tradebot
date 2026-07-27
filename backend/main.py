@@ -8,7 +8,9 @@ import sqlite3
 import math
 import re
 import threading
+import random
 from datetime import datetime, UTC, timedelta
+from zoneinfo import ZoneInfo
 from typing import Dict, Any, List, Optional
 
 import requests
@@ -212,6 +214,17 @@ V6_HISTORICAL_BAR_LOOKBACK_MINUTES = max(5, int(os.getenv("V6_HISTORICAL_BAR_LOO
 V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES = max(5, int(os.getenv("V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES", "45") or 45))
 V6_REPAIR_BATCH_SIZE = max(1, min(int(os.getenv("V6_REPAIR_BATCH_SIZE", "200") or 200), 1000))
 
+# TradeBot V7.0 Autonomous Research Lab. Shadow-only; never changes live trading.
+V7_ENABLED = os.getenv("V7_ENABLED", "true").lower() == "true"
+V7_AUTOMATIC_EVOLUTION = os.getenv("V7_AUTOMATIC_EVOLUTION", "true").lower() == "true"
+V7_POPULATION_LIMIT = max(6, min(int(os.getenv("V7_POPULATION_LIMIT", "30") or 30), 200))
+V7_CHILDREN_PER_RUN = max(1, min(int(os.getenv("V7_CHILDREN_PER_RUN", "12") or 12), 50))
+V7_MIN_PARENT_SAMPLES = max(V6_MIN_SAMPLES, int(os.getenv("V7_MIN_PARENT_SAMPLES", "20") or 20))
+V7_MUTATION_RATE = max(0.01, min(float(os.getenv("V7_MUTATION_RATE", "0.12") or 0.12), 0.50))
+V7_WEEKEND_MAINTENANCE_ENABLED = os.getenv("V7_WEEKEND_MAINTENANCE_ENABLED", "true").lower() == "true"
+V7_WEEKEND_DAY = max(0, min(int(os.getenv("V7_WEEKEND_DAY", "6") or 6), 6))  # Monday=0, Sunday=6
+V7_WEEKEND_HOUR_UK = max(0, min(int(os.getenv("V7_WEEKEND_HOUR_UK", "6") or 6), 23))
+
 # V2 deliberately disables rotation/churn. Existing positions are still
 # protected by hard-stop and swing-management rules.
 if TRADEBOT_V2_ENABLED:
@@ -371,6 +384,7 @@ manual_override = False
 emergency_stop = False
 bot_thread_started = False
 v6_sync_thread_started = False
+v7_weekend_thread_started = False
 v6_last_sync_result: Dict[str, Any] = {}
 bot_lock = threading.Lock()
 
@@ -5903,13 +5917,16 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started
     if not bot_thread_started:
         bot_thread_started = True
         threading.Thread(target=run_bot_loop, daemon=True).start()
     if V6_BRAINS_ENABLED and V6_AUTO_SYNC_ENABLED and not v6_sync_thread_started:
         v6_sync_thread_started = True
         threading.Thread(target=v6_auto_sync_worker, daemon=True).start()
+    if V7_ENABLED and V7_WEEKEND_MAINTENANCE_ENABLED and not v7_weekend_thread_started:
+        v7_weekend_thread_started = True
+        threading.Thread(target=v7_weekend_worker, daemon=True).start()
 
 
 
@@ -7946,6 +7963,306 @@ def api_v6_recommendation(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, regime:
 def api_v6_recommendation_run(request: Request, payload: Dict[str, Any] = Body(default={})):
     verify_api_key(request)
     return v6_recommendation(int(payload.get("horizonHours") or V6_DEFAULT_HORIZON_HOURS),payload.get("regime"),True)
+
+
+# =========================
+# TRADEBOT V7.0 — AUTONOMOUS RESEARCH LAB
+# =========================
+def _v7_ensure_tables() -> None:
+    if not SQLITE_ENABLED:
+        return
+    init_db()
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v7_brains (
+        brain_key TEXT PRIMARY KEY,
+        brain_name TEXT NOT NULL,
+        generation INTEGER NOT NULL DEFAULT 0,
+        parent_key TEXT,
+        status TEXT NOT NULL DEFAULT 'ACTIVE',
+        created_at TEXT NOT NULL,
+        retired_at TEXT,
+        config_json TEXT NOT NULL,
+        origin TEXT NOT NULL DEFAULT 'seed',
+        last_evaluated_at TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v7_evolution_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        horizon_hours INTEGER NOT NULL,
+        parent_count INTEGER NOT NULL DEFAULT 0,
+        children_created INTEGER NOT NULL DEFAULT 0,
+        brains_retired INTEGER NOT NULL DEFAULT 0,
+        champion_key TEXT,
+        payload_json TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v7_brain_results (
+        brain_key TEXT NOT NULL,
+        horizon_hours INTEGER NOT NULL,
+        evaluated_at TEXT NOT NULL,
+        trades INTEGER NOT NULL DEFAULT 0,
+        wins INTEGER NOT NULL DEFAULT 0,
+        losses INTEGER NOT NULL DEFAULT 0,
+        win_rate REAL,
+        profit_factor REAL,
+        expectancy_pct REAL,
+        expectancy_lower95_pct REAL,
+        max_drawdown_pct REAL,
+        research_score REAL,
+        eligible INTEGER NOT NULL DEFAULT 0,
+        accepted_decision_ids_json TEXT,
+        PRIMARY KEY(brain_key, horizon_hours)
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v7_maintenance_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        trigger TEXT NOT NULL,
+        repaired INTEGER NOT NULL DEFAULT 0,
+        errors INTEGER NOT NULL DEFAULT 0,
+        rebuild_json TEXT,
+        evolution_json TEXT,
+        ok INTEGER NOT NULL DEFAULT 0
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v7_brains_status ON v7_brains(status, generation)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v7_results_score ON v7_brain_results(horizon_hours, research_score)")
+    now = datetime.now(UTC).isoformat()
+    for brain in _v6_brains():
+        conn.execute("""INSERT OR IGNORE INTO v7_brains
+            (brain_key,brain_name,generation,parent_key,status,created_at,config_json,origin)
+            VALUES(?,?,0,NULL,'ACTIVE',?,?, 'v6_seed')""",
+            (brain['key'], brain['name'], now, json.dumps(brain, sort_keys=True)))
+    conn.commit(); conn.close()
+
+
+def _v7_active_brains() -> List[Dict[str, Any]]:
+    _v7_ensure_tables()
+    conn=db_connect()
+    rows=conn.execute("SELECT * FROM v7_brains WHERE status='ACTIVE' ORDER BY generation, created_at").fetchall()
+    conn.close()
+    out=[]
+    for row in rows:
+        item=dict(row)
+        try: item['config']=json.loads(item.pop('config_json'))
+        except Exception: item['config']={}
+        out.append(item)
+    return out
+
+
+def _v7_evaluate_brain(brain: Dict[str, Any], source_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    cfg=brain.get('config') or brain
+    accepted=[]
+    for row in source_rows:
+        if not _v6_validate_source_row(row).get('valid'):
+            continue
+        if _v6_accepts(row,cfg):
+            accepted.append({
+                'decision_id':int(row.get('decision_id') or 0),
+                'return_pct':float(row.get('net_return_pct') or 0.0),
+                'confidence':float(row.get('confidence') or 0.0),
+            })
+    metrics=_v6_score_rows(accepted)
+    sample_ok=metrics['trades'] >= V7_MIN_PARENT_SAMPLES
+    eligible=(sample_ok and metrics['profitFactor'] >= V6_RECOMMENDATION_MIN_PF
+              and metrics['expectancyPct'] >= V6_RECOMMENDATION_MIN_EXPECTANCY
+              and metrics['expectancyLower95Pct'] > 0)
+    score=_v6_research_score(metrics) if metrics['trades'] >= V6_MIN_SAMPLES else -999.0
+    return {**metrics,'eligible':eligible,'researchScore':score,
+            'acceptedDecisionIds':[x['decision_id'] for x in accepted]}
+
+
+def _v7_mutate_config(parent: Dict[str, Any], child_number: int, generation: int) -> Dict[str, Any]:
+    cfg=dict(parent)
+    parent_key=str(cfg.get('key') or 'brain')
+    seed=f"{parent_key}:{generation}:{child_number}:{datetime.now(UTC).date().isoformat()}"
+    rng=random.Random(seed)
+    ranges={
+        'min_confidence':(0.50,0.90,0.04),
+        'min_quality':(0.010,0.060,0.004),
+        'max_spread':(0.004,0.025,0.002),
+        'momentum_min':(-0.025,0.050,0.006),
+        'momentum_max':(-0.010,0.035,0.006),
+        'pullback_min':(0.000,0.050,0.005),
+    }
+    mutable=[k for k in ranges if k in cfg]
+    if not mutable:
+        mutable=['min_confidence','min_quality','max_spread']
+    mutation_count=1 if rng.random()>0.25 else 2
+    for key in rng.sample(mutable,min(mutation_count,len(mutable))):
+        lo,hi,base_step=ranges[key]
+        current=float(cfg.get(key,(lo+hi)/2))
+        step=base_step*(0.5+rng.random())
+        current += step if rng.random()>=0.5 else -step
+        cfg[key]=round(max(lo,min(hi,current)),4)
+    suffix=secrets.token_hex(3)
+    cfg['key']=f"{parent_key}_g{generation}_{suffix}"
+    cfg['name']=f"{parent.get('name', parent_key)} G{generation}.{child_number}"
+    cfg['research_only']=True
+    return cfg
+
+
+def v7_evolve(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS,
+              children: int = V7_CHILDREN_PER_RUN) -> Dict[str, Any]:
+    if not V7_ENABLED:
+        return {'ok':False,'version':'V7.0','message':'V7 disabled'}
+    _v7_ensure_tables()
+    horizon=max(1,int(horizon_hours)); child_count=max(1,min(int(children),50))
+    source=_v6_source_rows(horizon,V6_AUTO_SYNC_LIMIT)
+    brains=_v7_active_brains()
+    conn=db_connect(); now=datetime.now(UTC).isoformat()
+    evaluations=[]
+    for brain in brains:
+        result=_v7_evaluate_brain(brain,source)
+        evaluations.append({'brain':brain,'result':result})
+        conn.execute("""INSERT OR REPLACE INTO v7_brain_results
+            (brain_key,horizon_hours,evaluated_at,trades,wins,losses,win_rate,profit_factor,
+             expectancy_pct,expectancy_lower95_pct,max_drawdown_pct,research_score,eligible,
+             accepted_decision_ids_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (brain['brain_key'],horizon,now,result['trades'],result['wins'],result['losses'],
+             result['winRate'],result['profitFactor'],result['expectancyPct'],result['expectancyLower95Pct'],
+             result['maxDrawdownPct'],result['researchScore'],1 if result['eligible'] else 0,
+             json.dumps(result['acceptedDecisionIds'])))
+        conn.execute("UPDATE v7_brains SET last_evaluated_at=? WHERE brain_key=?",(now,brain['brain_key']))
+    evaluations.sort(key=lambda x:(x['result']['eligible'],x['result']['researchScore'],x['result']['trades']),reverse=True)
+    parent_pool=[x for x in evaluations if x['result']['trades']>=V7_MIN_PARENT_SAMPLES and x['result']['researchScore']>-999]
+    if not parent_pool:
+        parent_pool=evaluations[:min(3,len(evaluations))]
+    max_generation=max([int(x['brain'].get('generation') or 0) for x in evaluations] or [0])
+    generation=max_generation+1
+    created=[]
+    for i in range(child_count):
+        parent=parent_pool[i % max(1,len(parent_pool))]['brain']
+        child_cfg=_v7_mutate_config(parent['config'],i+1,generation)
+        conn.execute("""INSERT OR IGNORE INTO v7_brains
+            (brain_key,brain_name,generation,parent_key,status,created_at,config_json,origin)
+            VALUES(?,?,?,?, 'ACTIVE',?,?, 'mutation')""",
+            (child_cfg['key'],child_cfg['name'],generation,parent['brain_key'],now,json.dumps(child_cfg,sort_keys=True)))
+        created.append({'brainKey':child_cfg['key'],'brainName':child_cfg['name'],'parentKey':parent['brain_key'],'config':child_cfg})
+    active_count=int(conn.execute("SELECT COUNT(*) FROM v7_brains WHERE status='ACTIVE'").fetchone()[0])
+    retired=[]
+    if active_count > V7_POPULATION_LIMIT:
+        removable=[x for x in reversed(evaluations) if x['brain']['origin']!='v6_seed']
+        for item in removable[:active_count-V7_POPULATION_LIMIT]:
+            key=item['brain']['brain_key']
+            conn.execute("UPDATE v7_brains SET status='RETIRED',retired_at=? WHERE brain_key=?",(now,key))
+            retired.append(key)
+    champion=evaluations[0] if evaluations else None
+    payload={'ok':True,'version':'V7.0','advisoryOnly':True,'automaticLiveChanges':False,
+             'horizonHours':horizon,'sourceObservations':len(source),'brainsEvaluated':len(evaluations),
+             'generation':generation,'childrenCreated':len(created),'brainsRetired':len(retired),
+             'champion':({'brainKey':champion['brain']['brain_key'],'brainName':champion['brain']['brain_name'],
+                          **champion['result']} if champion else None),
+             'children':created,'retiredBrainKeys':retired,
+             'note':'All V7 brains are shadow-only. No live trading setting was changed.'}
+    cur=conn.execute("""INSERT INTO v7_evolution_runs
+        (created_at,completed_at,horizon_hours,parent_count,children_created,brains_retired,champion_key,payload_json)
+        VALUES(?,?,?,?,?,?,?,?)""",(now,datetime.now(UTC).isoformat(),horizon,len(parent_pool),len(created),len(retired),
+        champion['brain']['brain_key'] if champion else None,json.dumps(payload)))
+    payload['runId']=int(cur.lastrowid)
+    conn.commit(); conn.close()
+    return payload
+
+
+def v7_brain_lab(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS) -> Dict[str, Any]:
+    _v7_ensure_tables(); horizon=max(1,int(horizon_hours)); conn=db_connect()
+    rows=[dict(r) for r in conn.execute("""SELECT b.brain_key,b.brain_name,b.generation,b.parent_key,b.status,b.origin,b.created_at,
+        r.trades,r.wins,r.losses,r.win_rate,r.profit_factor,r.expectancy_pct,r.expectancy_lower95_pct,
+        r.max_drawdown_pct,r.research_score,r.eligible,b.config_json
+        FROM v7_brains b LEFT JOIN v7_brain_results r
+          ON r.brain_key=b.brain_key AND r.horizon_hours=?
+        ORDER BY CASE WHEN b.status='ACTIVE' THEN 0 ELSE 1 END,
+                 COALESCE(r.eligible,0) DESC,COALESCE(r.research_score,-999) DESC,b.generation DESC""",(horizon,)).fetchall()]
+    last=conn.execute("SELECT payload_json FROM v7_evolution_runs ORDER BY id DESC LIMIT 1").fetchone(); conn.close()
+    for row in rows:
+        try: row['config']=json.loads(row.pop('config_json'))
+        except Exception: row['config']={}
+        row['eligible']=bool(row.get('eligible') or 0)
+    champion=next((x for x in rows if x['status']=='ACTIVE' and x['eligible']),None)
+    research_champion=next((x for x in rows if x['status']=='ACTIVE' and x.get('trades') is not None),None)
+    return {'ok':True,'version':'V7.0','advisoryOnly':True,'horizonHours':horizon,
+            'activeBrains':sum(1 for x in rows if x['status']=='ACTIVE'),
+            'retiredBrains':sum(1 for x in rows if x['status']=='RETIRED'),
+            'champion':champion,'researchChampion':research_champion,'brains':rows,
+            'lastEvolutionRun':json.loads(last['payload_json']) if last and last['payload_json'] else None}
+
+
+def v7_maintenance(trigger: str = 'manual', horizon_hours: int = V6_DEFAULT_HORIZON_HOURS) -> Dict[str, Any]:
+    _v7_ensure_tables(); started=datetime.now(UTC).isoformat(); conn=db_connect()
+    cur=conn.execute("INSERT INTO v7_maintenance_runs(started_at,trigger) VALUES(?,?)",(started,str(trigger)))
+    run_id=int(cur.lastrowid); conn.commit(); conn.close()
+    repaired=0; errors=0; loops=0
+    while loops < 100:
+        result=v6_repair_outcome_times(horizon_hours,V6_REPAIR_BATCH_SIZE)
+        repaired += int(result.get('repaired') or 0); errors += int(result.get('errors') or 0); loops += 1
+        if int(result.get('remaining') or 0) <= 0: break
+        time.sleep(0.5)
+    rebuild=v6_rebuild_validated(horizon_hours,V6_AUTO_SYNC_LIMIT)
+    evolution=v7_evolve(horizon_hours,V7_CHILDREN_PER_RUN) if V7_AUTOMATIC_EVOLUTION else {'ok':True,'skipped':True}
+    ok=bool(rebuild.get('ok')) and bool(evolution.get('ok')) and errors==0
+    payload={'ok':ok,'version':'V7.0','trigger':trigger,'repairLoops':loops,'repaired':repaired,
+             'errors':errors,'remaining':0,'rebuild':rebuild,'evolution':evolution,
+             'advisoryOnly':True,'automaticLiveChanges':False}
+    conn=db_connect(); conn.execute("""UPDATE v7_maintenance_runs SET completed_at=?,repaired=?,errors=?,
+        rebuild_json=?,evolution_json=?,ok=? WHERE id=?""",(datetime.now(UTC).isoformat(),repaired,errors,
+        json.dumps(rebuild),json.dumps(evolution),1 if ok else 0,run_id)); conn.commit(); conn.close()
+    payload['maintenanceRunId']=run_id
+    return payload
+
+
+def v7_status_payload() -> Dict[str, Any]:
+    lab=v7_brain_lab(V6_DEFAULT_HORIZON_HOURS)
+    _v7_ensure_tables(); conn=db_connect()
+    last_maintenance=conn.execute("SELECT * FROM v7_maintenance_runs ORDER BY id DESC LIMIT 1").fetchone(); conn.close()
+    now_uk=datetime.now(ZoneInfo('Europe/London'))
+    days=(V7_WEEKEND_DAY-now_uk.weekday())%7
+    next_run=(now_uk+timedelta(days=days)).replace(hour=V7_WEEKEND_HOUR_UK,minute=0,second=0,microsecond=0)
+    if next_run <= now_uk: next_run += timedelta(days=7)
+    return {'ok':True,'version':'V7.0','name':'Autonomous Research Lab','enabled':V7_ENABLED,
+            'advisoryOnly':True,'automaticLiveChanges':False,'automaticPromotion':False,
+            'automaticEvolution':V7_AUTOMATIC_EVOLUTION,'weekendMaintenanceEnabled':V7_WEEKEND_MAINTENANCE_ENABLED,
+            'nextWeekendMaintenanceAt':next_run.isoformat(),'populationLimit':V7_POPULATION_LIMIT,
+            'childrenPerEvolution':V7_CHILDREN_PER_RUN,'activeBrains':lab.get('activeBrains',0),
+            'retiredBrains':lab.get('retiredBrains',0),'champion':lab.get('champion'),
+            'researchChampion':lab.get('researchChampion'),
+            'lastMaintenance':dict(last_maintenance) if last_maintenance else None,
+            'features':{'selfGeneratedBrains':True,'mutationLineage':True,'automaticRetirement':True,
+                        'shadowOnlyEvaluation':True,'weekendSelfClean':True,'humanApprovalRequired':True}}
+
+
+def v7_weekend_worker() -> None:
+    last_week_key=None
+    while True:
+        try:
+            now=datetime.now(ZoneInfo('Europe/London'))
+            week_key=f"{now.isocalendar().year}-{now.isocalendar().week}"
+            should_run=(now.weekday()==V7_WEEKEND_DAY and now.hour>=V7_WEEKEND_HOUR_UK)
+            if should_run and week_key != last_week_key:
+                print(f"V7 WEEKEND SELF-CLEAN | starting {now.isoformat()}")
+                result=v7_maintenance('weekend_scheduler',V6_DEFAULT_HORIZON_HOURS)
+                last_week_key=week_key
+                print(f"V7 WEEKEND SELF-CLEAN | ok={result.get('ok')} repaired={result.get('repaired')} run={result.get('maintenanceRunId')}")
+        except Exception as e:
+            print(f"V7 WEEKEND WORKER ERROR: {e}")
+        time.sleep(300)
+
+
+@app.get('/v7/status')
+def api_v7_status(): return v7_status_payload()
+
+@app.get('/v7/brains')
+def api_v7_brains(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS):
+    return v7_brain_lab(horizon_hours)
+
+@app.post('/v7/evolve')
+def api_v7_evolve(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v7_evolve(int(payload.get('horizonHours') or V6_DEFAULT_HORIZON_HOURS),
+                     int(payload.get('children') or V7_CHILDREN_PER_RUN))
+
+@app.post('/v7/maintenance')
+def api_v7_maintenance(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v7_maintenance('manual',int(payload.get('horizonHours') or V6_DEFAULT_HORIZON_HOURS))
 
 
 print(f"TRADEBOT V2 | enabled={TRADEBOT_V2_ENABLED} mode={'paper' if PAPER else ('live' if TRADEBOT_V2_LIVE_ENABLED else 'validation-only')} min_samples={V2_MIN_SYMBOL_SAMPLES} min_pf={V2_MIN_PROFIT_FACTOR}")
