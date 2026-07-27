@@ -8316,3 +8316,265 @@ def api_v7_maintenance(request: Request, payload: Dict[str, Any] = Body(default=
     verify_api_key(request); return v7_maintenance('manual',int(payload.get('horizonHours') or V6_DEFAULT_HORIZON_HOURS))
 
 print(f"TRADEBOT V2 | enabled={TRADEBOT_V2_ENABLED} mode={'paper' if PAPER else ('live' if TRADEBOT_V2_LIVE_ENABLED else 'validation-only')} min_samples={V2_MIN_SYMBOL_SAMPLES} min_pf={V2_MIN_PROFIT_FACTOR}")
+
+
+
+# =========================
+# TRADEBOT V8.0 — MARKET INTELLIGENCE ENGINE
+# Shadow-only. This layer cannot alter live trading settings.
+# =========================
+V8_VERSION = "V8.0"
+V8_NAME = "Market Intelligence Engine"
+V8_POPULATION_LIMIT = int(os.getenv("V8_POPULATION_LIMIT", "30"))
+V8_MIN_CONTEXT_SAMPLES = int(os.getenv("V8_MIN_CONTEXT_SAMPLES", "12"))
+
+
+def _v8_ensure_tables() -> None:
+    _v7_ensure_tables()
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v8_context_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        horizon_hours INTEGER NOT NULL,
+        source_observations INTEGER NOT NULL DEFAULT 0,
+        valid_observations INTEGER NOT NULL DEFAULT 0,
+        candidates_created INTEGER NOT NULL DEFAULT 0,
+        duplicates_skipped INTEGER NOT NULL DEFAULT 0,
+        retired INTEGER NOT NULL DEFAULT 0,
+        payload_json TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v8_context_results (
+        context_key TEXT NOT NULL,
+        horizon_hours INTEGER NOT NULL,
+        evaluated_at TEXT NOT NULL,
+        trades INTEGER NOT NULL DEFAULT 0,
+        wins INTEGER NOT NULL DEFAULT 0,
+        losses INTEGER NOT NULL DEFAULT 0,
+        win_rate REAL,
+        profit_factor REAL,
+        expectancy_pct REAL,
+        expectancy_lower95_pct REAL,
+        max_drawdown_pct REAL,
+        context_score REAL,
+        config_json TEXT NOT NULL,
+        PRIMARY KEY(context_key, horizon_hours)
+    )""")
+    conn.commit(); conn.close()
+
+
+def _v8_context_value(row: Dict[str, Any], key: str) -> Any:
+    if key in ("spy_move", "qqq_move", "confidence", "quality", "momentum", "pullback", "spread"):
+        try: return float(row.get(key) or 0.0)
+        except Exception: return 0.0
+    if key in ("hour_utc", "weekday", "position_count"):
+        try: return int(row.get(key) or 0)
+        except Exception: return 0
+    return str(row.get(key) or "unknown").lower()
+
+
+def _v8_context_accepts(row: Dict[str, Any], cfg: Dict[str, Any]) -> bool:
+    # Existing stock-level gates remain available.
+    if not _v6_accepts(row, cfg):
+        return False
+    spy = _v8_context_value(row, "spy_move")
+    qqq = _v8_context_value(row, "qqq_move")
+    hour = _v8_context_value(row, "hour_utc")
+    weekday = _v8_context_value(row, "weekday")
+    positions = _v8_context_value(row, "position_count")
+    regime = _v8_context_value(row, "market_regime")
+    session = _v8_context_value(row, "session_name")
+    checks = (
+        ("spy_min", spy, lambda a,b: a >= b), ("spy_max", spy, lambda a,b: a <= b),
+        ("qqq_min", qqq, lambda a,b: a >= b), ("qqq_max", qqq, lambda a,b: a <= b),
+        ("hour_min", hour, lambda a,b: a >= b), ("hour_max", hour, lambda a,b: a <= b),
+        ("position_count_max", positions, lambda a,b: a <= b),
+    )
+    for name, value, fn in checks:
+        if name in cfg and not fn(value, float(cfg[name])):
+            return False
+    if cfg.get("weekdays") and weekday not in {int(x) for x in cfg["weekdays"]}:
+        return False
+    if cfg.get("regimes") and regime not in {str(x).lower() for x in cfg["regimes"]}:
+        return False
+    if cfg.get("sessions") and session not in {str(x).lower() for x in cfg["sessions"]}:
+        return False
+    return True
+
+
+def _v8_eval(rows: List[Dict[str, Any]], cfg: Dict[str, Any]) -> Dict[str, Any]:
+    accepted=[{"decision_id":int(r.get("decision_id") or 0),
+               "return_pct":float(r.get("net_return_pct") or 0.0)}
+              for r in rows if _v8_context_accepts(r,cfg)]
+    metrics=_v6_score_rows(accepted)
+    eligible=(metrics["trades"] >= V7_MIN_PARENT_SAMPLES and
+              metrics["profitFactor"] >= V6_RECOMMENDATION_MIN_PF and
+              metrics["expectancyPct"] >= V6_RECOMMENDATION_MIN_EXPECTANCY and
+              metrics["expectancyLower95Pct"] > 0)
+    score=(_v6_research_score(metrics) if metrics["trades"] >= V6_MIN_SAMPLES else -999.0)
+    return {**metrics,"eligible":eligible,"researchScore":score,
+            "acceptedDecisionIds":[x["decision_id"] for x in accepted]}
+
+
+def _v8_signature(cfg: Dict[str, Any]) -> str:
+    ignored={"key","name","research_only","discovery_score","context_score"}
+    clean={k:v for k,v in cfg.items() if k not in ignored}
+    return json.dumps(clean,sort_keys=True,separators=(",",":"))
+
+
+def v8_cleanup_population(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS) -> Dict[str, Any]:
+    _v8_ensure_tables(); horizon=max(1,int(horizon_hours)); rows=_v7_valid_rows(horizon)
+    brains=_v7_active_brains(); evaluated=[]
+    for brain in brains:
+        result=_v8_eval(rows,brain.get("config") or {})
+        evaluated.append({"brain":brain,"result":result,"signature":_v8_signature(brain.get("config") or {})})
+    # Keep one copy per effective configuration. Prefer seed, then most trades, then score.
+    groups={}
+    for item in evaluated: groups.setdefault(item["signature"],[]).append(item)
+    retire=[]
+    for group in groups.values():
+        group.sort(key=lambda x:(x["brain"].get("origin")=="v6_seed",x["result"]["trades"],x["result"]["researchScore"]),reverse=True)
+        retire.extend(x["brain"]["brain_key"] for x in group[1:] if x["brain"].get("origin")!="v6_seed")
+    survivors=[x for x in evaluated if x["brain"]["brain_key"] not in set(retire)]
+    if len(survivors)>V8_POPULATION_LIMIT:
+        removable=[x for x in survivors if x["brain"].get("origin")!="v6_seed"]
+        removable.sort(key=lambda x:(x["result"]["eligible"],x["result"]["trades"]>0,x["result"]["researchScore"],x["result"]["expectancyPct"]))
+        retire.extend(x["brain"]["brain_key"] for x in removable[:max(0,len(survivors)-V8_POPULATION_LIMIT)])
+    retire=list(dict.fromkeys(retire)); now=datetime.now(UTC).isoformat()
+    if retire:
+        conn=db_connect()
+        for key in retire: conn.execute("UPDATE v7_brains SET status='RETIRED',retired_at=? WHERE brain_key=? AND origin!='v6_seed'",(now,key))
+        conn.commit(); conn.close()
+    active=max(0,len(brains)-len(retire))
+    return {"ok":True,"version":V8_VERSION,"populationLimit":V8_POPULATION_LIMIT,
+            "activeBefore":len(brains),"retired":len(retire),"activeAfter":active,
+            "retiredBrainKeys":retire,"duplicateProtection":True}
+
+
+def _v8_market_context_candidates(rows: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    if not rows: return []
+    spy=[_v8_context_value(r,"spy_move") for r in rows]; qqq=[_v8_context_value(r,"qqq_move") for r in rows]
+    spread=[_v8_context_value(r,"spread") for r in rows]; pull=[_v8_context_value(r,"pullback") for r in rows]
+    hours=sorted(set(_v8_context_value(r,"hour_utc") for r in rows))
+    sessions=sorted(set(_v8_context_value(r,"session_name") for r in rows))
+    regimes=sorted(set(_v8_context_value(r,"market_regime") for r in rows))
+    configs=[]
+    # Broad market alignment and risk-off filters.
+    for sm in sorted(set(round(_v7_quantile(spy,q),5) for q in (.2,.4,.6))):
+        for qm in sorted(set(round(_v7_quantile(qqq,q),5) for q in (.2,.4,.6))):
+            configs.append({"spy_min":sm,"qqq_min":qm,"max_spread":round(_v7_quantile(spread,.6),5)})
+    # Session/time filters discovered from actual observations.
+    for session in sessions:
+        configs.append({"sessions":[session],"max_spread":round(_v7_quantile(spread,.6),5),"pullback_max":round(_v7_quantile(pull,.6),5)})
+    if hours:
+        for start in hours:
+            for width in (1,2,3): configs.append({"hour_min":start,"hour_max":start+width,"spy_min":round(_v7_quantile(spy,.4),5)})
+    for regime in regimes:
+        if regime!="unknown": configs.append({"regimes":[regime],"spy_min":round(_v7_quantile(spy,.4),5),"qqq_min":round(_v7_quantile(qqq,.4),5)})
+    # Low exposure contexts.
+    configs.extend([{"position_count_max":0},{"position_count_max":1,"spy_min":round(_v7_quantile(spy,.4),5)}])
+    scored=[]; seen=set()
+    for cfg in configs:
+        sig=_v8_signature(cfg)
+        if sig in seen: continue
+        seen.add(sig); result=_v8_eval(rows,cfg)
+        if result["trades"]<V8_MIN_CONTEXT_SAMPLES: continue
+        context_score=(result["expectancyPct"]*.45+result["expectancyLower95Pct"]*.30+
+                       min(result["profitFactor"],3)*.20-result["maxDrawdownPct"]*.01)
+        scored.append({"config":cfg,"backtest":result,"contextScore":context_score,"signature":sig})
+    scored.sort(key=lambda x:(x["backtest"]["eligible"],x["contextScore"],x["backtest"]["expectancyPct"]),reverse=True)
+    return scored[:max(1,min(limit,30))]
+
+
+def v8_context_research(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, candidates: int = 12) -> Dict[str, Any]:
+    _v8_ensure_tables(); horizon=max(1,int(horizon_hours)); limit=max(1,min(int(candidates),30)); rows=_v7_valid_rows(horizon)
+    found=_v8_market_context_candidates(rows,limit); conn=db_connect(); now=datetime.now(UTC).isoformat()
+    existing={_v8_signature(json.loads(r[0])) for r in conn.execute("SELECT config_json FROM v7_brains").fetchall()}
+    generation=int(conn.execute("SELECT COALESCE(MAX(generation),0)+1 FROM v7_brains").fetchone()[0]); created=[]; skipped=0
+    for i,item in enumerate(found,1):
+        if item["signature"] in existing: skipped+=1; continue
+        cfg=dict(item["config"]); key=f"context_g{generation}_{secrets.token_hex(3)}"
+        cfg.update({"key":key,"name":f"Market Context G{generation}.{i}","research_only":True,"context_score":round(item["contextScore"],6)})
+        conn.execute("""INSERT INTO v7_brains(brain_key,brain_name,generation,parent_key,status,created_at,config_json,origin)
+                     VALUES(?,?,?,NULL,'ACTIVE',?,?,'market_context')""",(key,cfg["name"],generation,now,json.dumps(cfg,sort_keys=True)))
+        created.append({"brainKey":key,"brainName":cfg["name"],"config":cfg,"backtest":item["backtest"]})
+        existing.add(item["signature"])
+    conn.commit(); conn.close(); cleanup=v8_cleanup_population(horizon)
+    healthy=sum(1 for x in created if x["backtest"].get("eligible"))
+    payload={"ok":True,"version":V8_VERSION,"name":V8_NAME,"advisoryOnly":True,"automaticLiveChanges":False,
+             "horizonHours":horizon,"validObservations":len(rows),"generation":generation,
+             "candidatesCreated":len(created),"duplicatesSkipped":skipped,"healthyCandidates":healthy,
+             "candidates":created,"populationCleanup":cleanup,
+             "note":"Candidates use market context already captured at decision time. They remain shadow-only."}
+    conn=db_connect(); cur=conn.execute("""INSERT INTO v8_context_runs(created_at,horizon_hours,source_observations,valid_observations,candidates_created,duplicates_skipped,retired,payload_json)
+        VALUES(?,?,?,?,?,?,?,?)""",(now,horizon,len(_v6_source_rows(horizon,V6_AUTO_SYNC_LIMIT)),len(rows),len(created),skipped,cleanup["retired"],json.dumps(payload)))
+    payload["runId"]=int(cur.lastrowid); conn.commit(); conn.close(); return payload
+
+
+def v8_intelligence_report(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS) -> Dict[str, Any]:
+    horizon=max(1,int(horizon_hours)); rows=_v7_valid_rows(horizon)
+    dimensions=("market_regime","session_name","weekday","hour_utc")
+    report={}
+    for dim in dimensions:
+        groups={}
+        for r in rows: groups.setdefault(str(_v8_context_value(r,dim)),[]).append(r)
+        values=[]
+        for key,group in groups.items():
+            m=_v7_segment_metrics(group)
+            if m["trades"]>=5: values.append({dim:key,**m})
+        values.sort(key=lambda x:(x["expectancyPct"],x["profitFactor"],x["trades"]),reverse=True)
+        report[dim]=values
+    aligned=[r for r in rows if _v8_context_value(r,"spy_move")>=0 and _v8_context_value(r,"qqq_move")>=0]
+    opposed=[r for r in rows if _v8_context_value(r,"spy_move")<0 or _v8_context_value(r,"qqq_move")<0]
+    lab=v7_brain_lab(horizon)
+    # Correct research champion: zero-trade brains are excluded.
+    tested=[b for b in lab.get("brains",[]) if b.get("status")=="ACTIVE" and int(b.get("trades") or 0)>0]
+    tested.sort(key=lambda b:(bool(b.get("eligible")),float(b.get("expectancy_lower95_pct") or -999),float(b.get("research_score") or -999)),reverse=True)
+    return {"ok":True,"version":V8_VERSION,"name":V8_NAME,"advisoryOnly":True,"horizonHours":horizon,
+            "validObservations":len(rows),"marketAlignment":{"bothNonNegative":_v7_segment_metrics(aligned),"riskOffOrDivergent":_v7_segment_metrics(opposed)},
+            "contextBreakdown":report,"champion":next((b for b in tested if b.get("eligible")),None),
+            "researchChampion":tested[0] if tested else None,"zeroTradeBrainsExcluded":True,
+            "note":"This report uses only context recorded at the original decision timestamp."}
+
+
+def v8_maintenance(trigger: str = "manual", horizon_hours: int = V6_DEFAULT_HORIZON_HOURS) -> Dict[str, Any]:
+    horizon=max(1,int(horizon_hours)); repaired=errors=loops=0
+    while loops<100:
+        result=v6_repair_outcome_times(horizon,V6_REPAIR_BATCH_SIZE); repaired+=int(result.get("repaired") or 0); errors+=int(result.get("errors") or 0); loops+=1
+        if int(result.get("remaining") or 0)<=0: break
+    rebuild=v6_rebuild_validated(horizon,V6_AUTO_SYNC_LIMIT)
+    research=v8_context_research(horizon,V7_CHILDREN_PER_RUN)
+    return {"ok":bool(rebuild.get("ok")) and bool(research.get("ok")) and errors==0,"version":V8_VERSION,
+            "trigger":trigger,"repairLoops":loops,"repaired":repaired,"errors":errors,"rebuild":rebuild,
+            "marketIntelligence":research,"advisoryOnly":True,"automaticLiveChanges":False}
+
+
+def v8_status_payload() -> Dict[str, Any]:
+    _v8_ensure_tables(); intelligence=v8_intelligence_report(V6_DEFAULT_HORIZON_HOURS); lab=v7_brain_lab(V6_DEFAULT_HORIZON_HOURS)
+    return {"ok":True,"version":V8_VERSION,"name":V8_NAME,"enabled":True,"advisoryOnly":True,
+            "automaticLiveChanges":False,"automaticPromotion":False,"populationLimit":V8_POPULATION_LIMIT,
+            "activeBrains":lab.get("activeBrains",0),"retiredBrains":lab.get("retiredBrains",0),
+            "champion":intelligence.get("champion"),"researchChampion":intelligence.get("researchChampion"),
+            "features":{"marketAlignment":True,"sessionIntelligence":True,"timeOfDayIntelligence":True,
+                        "exposureContext":True,"zeroTradeChampionProtection":True,"duplicateCandidateProtection":True,
+                        "hardPopulationLimit":True,"shadowOnlyEvaluation":True,"humanApprovalRequired":True}}
+
+
+@app.get('/v8/status')
+def api_v8_status(): return v8_status_payload()
+
+@app.get('/v8/intelligence')
+def api_v8_intelligence(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS): return v8_intelligence_report(horizon_hours)
+
+@app.post('/v8/research')
+def api_v8_research(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request); return v8_context_research(int(payload.get('horizonHours') or V6_DEFAULT_HORIZON_HOURS),int(payload.get('candidates') or 12))
+
+@app.post('/v8/cleanup')
+def api_v8_cleanup(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request); return v8_cleanup_population(int(payload.get('horizonHours') or V6_DEFAULT_HORIZON_HOURS))
+
+@app.post('/v8/maintenance')
+def api_v8_maintenance(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request); return v8_maintenance('manual',int(payload.get('horizonHours') or V6_DEFAULT_HORIZON_HOURS))
