@@ -9384,3 +9384,432 @@ def api_v10_explain(symbol: str, request: Request):
     if not re.fullmatch(r'[A-Z.\-]{1,10}', sym):
         raise HTTPException(status_code=400, detail='Invalid symbol')
     return v10_explain_symbol(sym)
+
+# =========================
+# TRADEBOT V11.0 — EVIDENCE DISCOVERY ENGINE
+# Mines validated multi-factor market setups from explicit V10 lineage.
+# Shadow-only: never changes orders, thresholds, strategy settings, or live behaviour.
+# =========================
+V11_VERSION = "V11.0"
+V11_NAME = "Validated Evidence Discovery Engine"
+V11_SCHEMA_VERSION = "11.0"
+V11_ENABLED = os.getenv("V11_ENABLED", "true").lower() == "true"
+V11_DEFAULT_HORIZON_HOURS = max(1, int(os.getenv("V11_DEFAULT_HORIZON_HOURS", "1") or 1))
+V11_MIN_SAMPLES = max(8, int(os.getenv("V11_MIN_SAMPLES", "20") or 20))
+V11_MAX_DISCOVERIES = max(25, min(int(os.getenv("V11_MAX_DISCOVERIES", "300") or 300), 1500))
+V11_VALIDATION_FRACTION = min(0.40, max(0.20, float(os.getenv("V11_VALIDATION_FRACTION", "0.30") or 0.30)))
+
+
+def _v11_ensure_tables() -> None:
+    _v10_ensure_tables()
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_discovery_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        schema_version TEXT NOT NULL DEFAULT '11.0',
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        requested_horizon_hours INTEGER NOT NULL,
+        horizon_hours INTEGER NOT NULL,
+        minimum_samples INTEGER NOT NULL,
+        observations INTEGER NOT NULL DEFAULT 0,
+        rich_observations INTEGER NOT NULL DEFAULT 0,
+        candidates_tested INTEGER NOT NULL DEFAULT 0,
+        discoveries_found INTEGER NOT NULL DEFAULT 0,
+        validated_positive INTEGER NOT NULL DEFAULT 0,
+        validated_negative INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'RUNNING',
+        payload_json TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_discoveries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        horizon_hours INTEGER NOT NULL,
+        discovery_key TEXT NOT NULL,
+        discovery_name TEXT NOT NULL,
+        dimensions_json TEXT NOT NULL,
+        factor_count INTEGER NOT NULL,
+        samples INTEGER NOT NULL,
+        wins INTEGER NOT NULL,
+        losses INTEGER NOT NULL,
+        win_rate REAL NOT NULL,
+        expectancy_pct REAL NOT NULL,
+        profit_factor REAL NOT NULL,
+        median_return_pct REAL NOT NULL,
+        lower95_expectancy_pct REAL NOT NULL,
+        baseline_expectancy_pct REAL NOT NULL,
+        expectancy_lift_pct REAL NOT NULL,
+        train_samples INTEGER NOT NULL,
+        train_expectancy_pct REAL NOT NULL,
+        train_profit_factor REAL NOT NULL,
+        validation_samples INTEGER NOT NULL,
+        validation_expectancy_pct REAL NOT NULL,
+        validation_profit_factor REAL NOT NULL,
+        validation_win_rate REAL NOT NULL,
+        stability_score REAL NOT NULL,
+        evidence_score REAL NOT NULL,
+        classification TEXT NOT NULL,
+        explanation TEXT NOT NULL,
+        UNIQUE(run_id, discovery_key)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_discoveries_run_score ON v11_discoveries(run_id,evidence_score DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_discoveries_run_class ON v11_discoveries(run_id,classification)")
+    conn.commit(); conn.close()
+
+
+def _v11_bin(name: str, value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if name in ("market_regime", "sector", "session_name"):
+        text = str(value or "").strip()
+        if not text or text.lower() == "unknown":
+            return None
+        return text.upper() if name == "market_regime" else text
+    if name in ("opening_range_breakout", "sniper_pass", "a_plus_pass", "ready_to_buy"):
+        return f"{name}={'YES' if bool(value) else 'NO'}"
+    x = _v10_float(value, float("nan"))
+    if math.isnan(x):
+        return None
+    if name == "relative_volume":
+        return "RVOL <1" if x < 1 else "RVOL 1-2" if x < 2 else "RVOL 2-4" if x < 4 else "RVOL 4-8" if x < 8 else "RVOL 8+"
+    if name == "gap_pct":
+        return "Gap <-2%" if x < -2 else "Gap -2% to 0%" if x < 0 else "Gap 0-2%" if x < 2 else "Gap 2-5%" if x < 5 else "Gap 5%+"
+    if name == "distance_vwap_pct":
+        return "VWAP <-1%" if x < -1 else "Below VWAP" if x < 0 else "VWAP +0-1%" if x < 1 else "VWAP +1%+"
+    if name in ("ema9_distance_pct", "ema20_distance_pct", "ema50_distance_pct"):
+        label = name.replace("_distance_pct", "").upper()
+        return f"Below {label}" if x < 0 else f"Above {label} 0-1%" if x < 1 else f"Above {label} 1%+"
+    if name == "atr_pct":
+        return "ATR <2%" if x < 2 else "ATR 2-4%" if x < 4 else "ATR 4-7%" if x < 7 else "ATR 7%+"
+    if name == "day_range_position":
+        return "Range bottom" if x < .25 else "Range lower-middle" if x < .50 else "Range upper-middle" if x < .75 else "Range top"
+    if name == "sector_strength":
+        return "Sector weak" if x < -.25 else "Sector neutral" if x < .25 else "Sector strong"
+    if name == "confidence":
+        return "Confidence <0.60" if x < .60 else "Confidence 0.60-0.70" if x < .70 else "Confidence 0.70-0.80" if x < .80 else "Confidence 0.80-0.90" if x < .90 else "Confidence 0.90+"
+    if name == "momentum":
+        return "Momentum negative" if x < 0 else "Momentum 0-1%" if x < .01 else "Momentum 1-3%" if x < .03 else "Momentum 3%+"
+    if name == "pullback":
+        return "Pullback <0.5%" if x < .005 else "Pullback 0.5-1.5%" if x < .015 else "Pullback 1.5-3%" if x < .03 else "Pullback 3%+"
+    if name == "spread":
+        return "Spread <0.3%" if x < .003 else "Spread 0.3-0.8%" if x < .008 else "Spread 0.8-1.5%" if x < .015 else "Spread 1.5%+"
+    return None
+
+
+def _v11_stats(values: List[float]) -> Dict[str, Any]:
+    m = _v10_metrics(values)
+    clean = [float(x) for x in values if x is not None and math.isfinite(float(x))]
+    n = len(clean)
+    if n > 1:
+        mean = sum(clean) / n
+        variance = sum((x - mean) ** 2 for x in clean) / (n - 1)
+        se = math.sqrt(max(0.0, variance) / n)
+        lower95 = mean - 1.96 * se
+    else:
+        lower95 = clean[0] if clean else 0.0
+    return {**m, "lower95ExpectancyPct": lower95}
+
+
+def _v11_classify(all_m: Dict[str, Any], train_m: Dict[str, Any], val_m: Dict[str, Any], min_validation: int) -> str:
+    enough_val = val_m["samples"] >= min_validation
+    positive = (all_m["expectancyPct"] > 0 and all_m["profitFactor"] > 1.0 and
+                train_m["expectancyPct"] > 0 and train_m["profitFactor"] > 1.0 and
+                enough_val and val_m["expectancyPct"] > 0 and val_m["profitFactor"] > 1.0)
+    negative = (all_m["expectancyPct"] < 0 and all_m["profitFactor"] < 1.0 and
+                train_m["expectancyPct"] < 0 and train_m["profitFactor"] < 1.0 and
+                enough_val and val_m["expectancyPct"] < 0 and val_m["profitFactor"] < 1.0)
+    if positive:
+        return "VALIDATED_POSITIVE"
+    if negative:
+        return "VALIDATED_NEGATIVE"
+    return "UNSTABLE_OR_INSUFFICIENT"
+
+
+def _v11_evidence_score(all_m: Dict[str, Any], train_m: Dict[str, Any], val_m: Dict[str, Any], baseline: Dict[str, Any]) -> Dict[str, float]:
+    lift = all_m["expectancyPct"] - baseline["expectancyPct"]
+    same_direction = (train_m["expectancyPct"] == 0 or val_m["expectancyPct"] == 0 or
+                      (train_m["expectancyPct"] > 0) == (val_m["expectancyPct"] > 0))
+    gap = abs(train_m["expectancyPct"] - val_m["expectancyPct"])
+    stability = max(0.0, 1.0 - min(1.0, gap / max(.10, abs(all_m["expectancyPct"]) + .10)))
+    if not same_direction:
+        stability *= .25
+    sample_weight = min(1.0, math.sqrt(all_m["samples"] / 100.0))
+    validation_weight = min(1.0, math.sqrt(val_m["samples"] / 30.0)) if val_m["samples"] else 0.0
+    direction = 1.0 if all_m["expectancyPct"] >= 0 else -1.0
+    strength = (abs(all_m["expectancyPct"]) * 45.0 + abs(lift) * 25.0 +
+                abs(min(all_m["profitFactor"], 5.0) - 1.0) * 8.0 +
+                abs(all_m["winRate"] - .5) * 15.0)
+    score = direction * strength * sample_weight * (.45 + .55 * validation_weight) * (.35 + .65 * stability)
+    return {"evidenceScore": score, "stabilityScore": stability, "expectancyLiftPct": lift}
+
+
+def _v11_load_rows(conn, horizon_hours: int) -> List[Dict[str, Any]]:
+    rows = _v10_load_observations(conn, horizon_hours)
+    rows.sort(key=lambda r: str(r.get("observed_at") or ""))
+    return rows
+
+
+def v11_run_discovery(horizon_hours: int = V11_DEFAULT_HORIZON_HOURS,
+                      min_samples: int = V11_MIN_SAMPLES,
+                      max_factors: int = 3) -> Dict[str, Any]:
+    _v11_ensure_tables()
+    requested = max(1, min(int(horizon_hours), 168))
+    min_samples = max(8, min(int(min_samples), 1000))
+    max_factors = max(1, min(int(max_factors), 3))
+    now = datetime.now(UTC).isoformat()
+    conn = db_connect()
+    resolved = _v10_resolve_horizon(conn, requested)
+    effective = int(resolved["effective"])
+    cur = conn.execute("""INSERT INTO v11_discovery_runs(
+        schema_version,created_at,requested_horizon_hours,horizon_hours,minimum_samples,status)
+        VALUES(?,?,?,?,?,'RUNNING')""", (V11_SCHEMA_VERSION, now, requested, effective, min_samples))
+    run_id = int(cur.lastrowid); conn.commit()
+    try:
+        rows = _v11_load_rows(conn, effective)
+        returns = [_v10_float(r.get("v10_return_pct"), float("nan")) for r in rows]
+        returns = [x for x in returns if math.isfinite(x)]
+        baseline = _v11_stats(returns)
+        feature_names = [
+            "market_regime", "sector", "session_name", "relative_volume", "gap_pct",
+            "distance_vwap_pct", "ema9_distance_pct", "ema20_distance_pct", "ema50_distance_pct",
+            "atr_pct", "day_range_position", "opening_range_breakout", "sector_strength",
+            "confidence", "momentum", "pullback", "spread", "sniper_pass", "a_plus_pass"
+        ]
+        market_features = {
+            "market_regime", "sector", "relative_volume", "gap_pct", "distance_vwap_pct",
+            "ema9_distance_pct", "ema20_distance_pct", "ema50_distance_pct", "atr_pct",
+            "day_range_position", "opening_range_breakout", "sector_strength"
+        }
+        buckets: Dict[str, Dict[str, Any]] = {}
+        rich_count = 0
+        split_index = max(1, min(len(rows) - 1, int(len(rows) * (1.0 - V11_VALIDATION_FRACTION)))) if len(rows) > 1 else len(rows)
+        for idx, obs in enumerate(rows):
+            ret = _v10_float(obs.get("v10_return_pct"), float("nan"))
+            if not math.isfinite(ret):
+                continue
+            labels = {name: _v11_bin(name, obs.get(name)) for name in feature_names}
+            labels = {k: v for k, v in labels.items() if v is not None}
+            rich_here = sum(1 for k in market_features if k in labels)
+            if rich_here >= 2:
+                rich_count += 1
+            keys = list(labels.keys())
+            combinations: List[tuple] = []
+            for key in keys:
+                combinations.append((key,))
+            if max_factors >= 2:
+                for i in range(len(keys)):
+                    for j in range(i + 1, len(keys)):
+                        pair = (keys[i], keys[j])
+                        if any(k in market_features for k in pair):
+                            combinations.append(pair)
+            if max_factors >= 3:
+                important = [k for k in keys if k in market_features]
+                context = [k for k in keys if k in ("confidence", "session_name", "sniper_pass", "a_plus_pass")]
+                triple_pool = important + context
+                for i in range(len(triple_pool)):
+                    for j in range(i + 1, len(triple_pool)):
+                        for k in range(j + 1, len(triple_pool)):
+                            triple = (triple_pool[i], triple_pool[j], triple_pool[k])
+                            if sum(1 for x in triple if x in market_features) >= 2:
+                                combinations.append(triple)
+            seen = set()
+            for combo in combinations:
+                combo = tuple(sorted(combo))
+                if combo in seen:
+                    continue
+                seen.add(combo)
+                dims = {k: labels[k] for k in combo}
+                key = "|".join(f"{k}={dims[k]}" for k in combo)
+                item = buckets.setdefault(key, {"dimensions": dims, "all": [], "train": [], "validation": []})
+                item["all"].append(ret)
+                item["train" if idx < split_index else "validation"].append(ret)
+
+        discoveries = []
+        min_validation = max(5, int(math.ceil(min_samples * V11_VALIDATION_FRACTION * .60)))
+        for key, item in buckets.items():
+            all_m = _v11_stats(item["all"])
+            if all_m["samples"] < min_samples:
+                continue
+            train_m = _v11_stats(item["train"])
+            val_m = _v11_stats(item["validation"])
+            scoring = _v11_evidence_score(all_m, train_m, val_m, baseline)
+            classification = _v11_classify(all_m, train_m, val_m, min_validation)
+            dims = item["dimensions"]
+            name = " + ".join(str(v) for v in dims.values())
+            explanation = (
+                f"{name}: {all_m['samples']} observations, {all_m['winRate']*100:.1f}% win rate, "
+                f"{all_m['expectancyPct']:+.3f}% expectancy and PF {all_m['profitFactor']:.2f}. "
+                f"Validation: {val_m['samples']} observations, {val_m['expectancyPct']:+.3f}% expectancy, "
+                f"PF {val_m['profitFactor']:.2f}. Classification: {classification}. Advisory-only."
+            )
+            discoveries.append({
+                "key": key, "name": name, "dimensions": dims, "factorCount": len(dims),
+                **all_m, **scoring,
+                "baselineExpectancyPct": baseline["expectancyPct"],
+                "trainSamples": train_m["samples"], "trainExpectancyPct": train_m["expectancyPct"],
+                "trainProfitFactor": train_m["profitFactor"],
+                "validationSamples": val_m["samples"], "validationExpectancyPct": val_m["expectancyPct"],
+                "validationProfitFactor": val_m["profitFactor"], "validationWinRate": val_m["winRate"],
+                "classification": classification, "explanation": explanation
+            })
+        discoveries.sort(key=lambda d: (d["classification"] == "VALIDATED_POSITIVE", d["evidenceScore"], d["samples"]), reverse=True)
+        discoveries = discoveries[:V11_MAX_DISCOVERIES]
+        for d in discoveries:
+            conn.execute("""INSERT OR REPLACE INTO v11_discoveries(
+                run_id,created_at,horizon_hours,discovery_key,discovery_name,dimensions_json,factor_count,
+                samples,wins,losses,win_rate,expectancy_pct,profit_factor,median_return_pct,lower95_expectancy_pct,
+                baseline_expectancy_pct,expectancy_lift_pct,train_samples,train_expectancy_pct,train_profit_factor,
+                validation_samples,validation_expectancy_pct,validation_profit_factor,validation_win_rate,
+                stability_score,evidence_score,classification,explanation)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (run_id, now, effective, d["key"], d["name"], json.dumps(d["dimensions"]), d["factorCount"],
+                 d["samples"], d["wins"], d["losses"], d["winRate"], d["expectancyPct"], d["profitFactor"],
+                 d["medianReturnPct"], d["lower95ExpectancyPct"], d["baselineExpectancyPct"], d["expectancyLiftPct"],
+                 d["trainSamples"], d["trainExpectancyPct"], d["trainProfitFactor"], d["validationSamples"],
+                 d["validationExpectancyPct"], d["validationProfitFactor"], d["validationWinRate"],
+                 d["stabilityScore"], d["evidenceScore"], d["classification"], d["explanation"]))
+        positive = [d for d in discoveries if d["classification"] == "VALIDATED_POSITIVE"]
+        negative = [d for d in discoveries if d["classification"] == "VALIDATED_NEGATIVE"]
+        payload = {
+            "ok": True, "version": V11_VERSION, "runId": run_id,
+            "requestedHorizonHours": requested, "horizonHours": effective,
+            "horizonExactMatch": bool(resolved["exact"]), "availableHorizons": resolved["available"],
+            "observations": len(rows), "richObservations": rich_count, "candidatesTested": len(buckets),
+            "discoveriesFound": len(discoveries), "validatedPositive": len(positive),
+            "validatedNegative": len(negative), "minimumSamples": min_samples, "maxFactors": max_factors,
+            "baseline": baseline, "bestValidated": positive[:10],
+            "worstValidated": sorted(negative, key=lambda d: d["evidenceScore"])[:10],
+            "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False
+        }
+        conn.execute("""UPDATE v11_discovery_runs SET completed_at=?,observations=?,rich_observations=?,
+            candidates_tested=?,discoveries_found=?,validated_positive=?,validated_negative=?,status='COMPLETE',payload_json=?
+            WHERE id=?""", (datetime.now(UTC).isoformat(), len(rows), rich_count, len(buckets), len(discoveries),
+                            len(positive), len(negative), json.dumps(payload, default=str), run_id))
+        conn.commit(); conn.close(); return payload
+    except Exception as exc:
+        conn.execute("UPDATE v11_discovery_runs SET completed_at=?,status='ERROR',payload_json=? WHERE id=?",
+                     (datetime.now(UTC).isoformat(), json.dumps({"error": str(exc)}), run_id))
+        conn.commit(); conn.close(); raise
+
+
+def v11_latest_report(limit: int = 50, classification: Optional[str] = None) -> Dict[str, Any]:
+    _v11_ensure_tables(); limit = max(1, min(int(limit), 300)); conn = db_connect()
+    run = conn.execute("""SELECT id,created_at,completed_at,requested_horizon_hours,horizon_hours,minimum_samples,
+                          observations,rich_observations,candidates_tested,discoveries_found,validated_positive,
+                          validated_negative,status,payload_json FROM v11_discovery_runs ORDER BY id DESC LIMIT 1""").fetchone()
+    if not run:
+        conn.close(); return {"ok": True, "version": V11_VERSION, "hasReport": False, "message": "Run POST /v11/discover first."}
+    where = "run_id=?"; params: List[Any] = [int(run[0])]
+    valid_classes = {"VALIDATED_POSITIVE", "VALIDATED_NEGATIVE", "UNSTABLE_OR_INSUFFICIENT"}
+    if classification and classification.upper() in valid_classes:
+        where += " AND classification=?"; params.append(classification.upper())
+    params.append(limit)
+    rows = conn.execute(f"""SELECT discovery_key,discovery_name,dimensions_json,factor_count,samples,wins,losses,
+        win_rate,expectancy_pct,profit_factor,median_return_pct,lower95_expectancy_pct,baseline_expectancy_pct,
+        expectancy_lift_pct,train_samples,train_expectancy_pct,train_profit_factor,validation_samples,
+        validation_expectancy_pct,validation_profit_factor,validation_win_rate,stability_score,evidence_score,
+        classification,explanation FROM v11_discoveries WHERE {where}
+        ORDER BY CASE classification WHEN 'VALIDATED_POSITIVE' THEN 0 WHEN 'VALIDATED_NEGATIVE' THEN 1 ELSE 2 END,
+                 evidence_score DESC LIMIT ?""", tuple(params)).fetchall()
+    columns = ["key","name","dimensions","factorCount","samples","wins","losses","winRate","expectancyPct",
+               "profitFactor","medianReturnPct","lower95ExpectancyPct","baselineExpectancyPct","expectancyLiftPct",
+               "trainSamples","trainExpectancyPct","trainProfitFactor","validationSamples","validationExpectancyPct",
+               "validationProfitFactor","validationWinRate","stabilityScore","evidenceScore","classification","explanation"]
+    output = []
+    for row in rows:
+        item = dict(zip(columns, row)); item["dimensions"] = json.loads(item["dimensions"] or "{}")
+        output.append(item)
+    conn.close()
+    return {"ok": True, "version": V11_VERSION, "hasReport": True,
+            "run": {"id": run[0], "createdAt": run[1], "completedAt": run[2],
+                    "requestedHorizonHours": run[3], "horizonHours": run[4], "minimumSamples": run[5],
+                    "observations": run[6], "richObservations": run[7], "candidatesTested": run[8],
+                    "discoveriesFound": run[9], "validatedPositive": run[10], "validatedNegative": run[11],
+                    "status": run[12]}, "count": len(output), "discoveries": output,
+            "advisoryOnly": True, "automaticLiveChanges": False}
+
+
+def v11_explain_symbol(symbol: str) -> Dict[str, Any]:
+    _v11_ensure_tables(); sym = str(symbol or "").upper().strip()
+    quote = get_quote(sym)
+    intel = _v91_enrich_scan({"symbol": sym, "price": quote["mid"], "bid": quote["bid"], "ask": quote["ask"], "spread": quote["spread"]})
+    conn = db_connect()
+    run = conn.execute("SELECT id,horizon_hours FROM v11_discovery_runs WHERE status='COMPLETE' ORDER BY id DESC LIMIT 1").fetchone()
+    if not run:
+        conn.close(); return {"ok": True, "version": V11_VERSION, "symbol": sym, "verdict": "NO_DISCOVERY_RUN", "intelligence": intel, "matches": []}
+    rows = conn.execute("""SELECT discovery_name,dimensions_json,samples,win_rate,expectancy_pct,profit_factor,
+        validation_samples,validation_expectancy_pct,validation_profit_factor,evidence_score,classification,explanation
+        FROM v11_discoveries WHERE run_id=? ORDER BY evidence_score DESC""", (int(run[0]),)).fetchall()
+    matches = []
+    for row in rows:
+        dims = json.loads(row[1] or "{}")
+        if all(_v11_bin(feature, intel.get(feature)) == expected for feature, expected in dims.items()):
+            matches.append({"name": row[0], "dimensions": dims, "samples": row[2], "winRate": row[3],
+                            "expectancyPct": row[4], "profitFactor": row[5], "validationSamples": row[6],
+                            "validationExpectancyPct": row[7], "validationProfitFactor": row[8],
+                            "evidenceScore": row[9], "classification": row[10], "explanation": row[11]})
+        if len(matches) >= 15:
+            break
+    conn.close()
+    positives = [m for m in matches if m["classification"] == "VALIDATED_POSITIVE"]
+    negatives = [m for m in matches if m["classification"] == "VALIDATED_NEGATIVE"]
+    verdict = "INSUFFICIENT_VALIDATED_EVIDENCE"
+    if positives and not negatives:
+        verdict = "VALIDATED_FAVOURABLE"
+    elif negatives and not positives:
+        verdict = "VALIDATED_UNFAVOURABLE"
+    elif positives and negatives:
+        positive_weight = sum(max(0.0, float(m["evidenceScore"])) for m in positives)
+        negative_weight = abs(sum(min(0.0, float(m["evidenceScore"])) for m in negatives))
+        verdict = "MIXED_LEAN_FAVOURABLE" if positive_weight > negative_weight else "MIXED_LEAN_UNFAVOURABLE"
+    return {"ok": True, "version": V11_VERSION, "symbol": sym, "horizonHours": int(run[1]),
+            "verdict": verdict, "intelligence": intel, "matchCount": len(matches), "matches": matches,
+            "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False}
+
+
+def v11_status_payload() -> Dict[str, Any]:
+    _v11_ensure_tables(); conn = db_connect()
+    runs = int(conn.execute("SELECT COUNT(*) FROM v11_discovery_runs WHERE status='COMPLETE'").fetchone()[0])
+    latest = conn.execute("""SELECT id,observations,rich_observations,candidates_tested,discoveries_found,
+                              validated_positive,validated_negative,completed_at FROM v11_discovery_runs
+                              WHERE status='COMPLETE' ORDER BY id DESC LIMIT 1""").fetchone()
+    horizons = _v10_available_horizons(conn); conn.close()
+    return {"ok": True, "version": V11_VERSION, "name": V11_NAME, "schemaVersion": V11_SCHEMA_VERSION,
+            "enabled": V11_ENABLED, "availableHorizons": horizons, "discoveryRuns": runs,
+            "latestRun": None if not latest else {"id": latest[0], "observations": latest[1],
+                "richObservations": latest[2], "candidatesTested": latest[3], "discoveriesFound": latest[4],
+                "validatedPositive": latest[5], "validatedNegative": latest[6], "completedAt": latest[7]},
+            "features": {"singleFactorDiscovery": True, "twoFactorInteractions": True,
+                         "threeFactorInteractions": True, "chronologicalValidation": True,
+                         "baselineLift": True, "lower95Expectancy": True, "stabilityScoring": True,
+                         "liveSymbolExplanation": True, "shadowOnly": True},
+            "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False}
+
+
+@app.get('/v11/status')
+def api_v11_status(request: Request):
+    verify_api_key(request); return v11_status_payload()
+
+
+@app.post('/v11/discover')
+def api_v11_discover(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v11_run_discovery(int(payload.get('horizonHours') or V11_DEFAULT_HORIZON_HOURS),
+                             int(payload.get('minimumSamples') or V11_MIN_SAMPLES),
+                             int(payload.get('maxFactors') or 3))
+
+
+@app.get('/v11/report')
+def api_v11_report(request: Request, limit: int = 50, classification: Optional[str] = None):
+    verify_api_key(request); return v11_latest_report(limit, classification)
+
+
+@app.get('/v11/explain/{symbol}')
+def api_v11_explain(symbol: str, request: Request):
+    verify_api_key(request)
+    sym = str(symbol or '').upper().strip()
+    if not re.fullmatch(r'[A-Z.\-]{1,10}', sym):
+        raise HTTPException(status_code=400, detail='Invalid symbol')
+    return v11_explain_symbol(sym)
