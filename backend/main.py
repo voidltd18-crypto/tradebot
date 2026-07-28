@@ -386,6 +386,7 @@ emergency_stop = False
 bot_thread_started = False
 v6_sync_thread_started = False
 v7_weekend_thread_started = False
+v11_learning_thread_started = False
 v6_last_sync_result: Dict[str, Any] = {}
 bot_lock = threading.Lock()
 
@@ -5923,7 +5924,7 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started
     if not bot_thread_started:
         bot_thread_started = True
         threading.Thread(target=run_bot_loop, daemon=True).start()
@@ -5933,6 +5934,9 @@ def startup_event():
     if V7_ENABLED and V7_WEEKEND_MAINTENANCE_ENABLED and not v7_weekend_thread_started:
         v7_weekend_thread_started = True
         threading.Thread(target=v7_weekend_worker, daemon=True).start()
+    if V11_AUTO_LEARNING_ENABLED and not v11_learning_thread_started:
+        v11_learning_thread_started = True
+        threading.Thread(target=v11_auto_learning_worker, daemon=True).start()
 
 
 
@@ -9390,14 +9394,22 @@ def api_v10_explain(symbol: str, request: Request):
 # Mines validated multi-factor market setups from explicit V10 lineage.
 # Shadow-only: never changes orders, thresholds, strategy settings, or live behaviour.
 # =========================
-V11_VERSION = "V11.0"
-V11_NAME = "Validated Evidence Discovery Engine"
-V11_SCHEMA_VERSION = "11.0"
+V11_VERSION = "V11.1"
+V11_NAME = "Live Learning Integration"
+V11_SCHEMA_VERSION = "11.1"
 V11_ENABLED = os.getenv("V11_ENABLED", "true").lower() == "true"
 V11_DEFAULT_HORIZON_HOURS = max(1, int(os.getenv("V11_DEFAULT_HORIZON_HOURS", "1") or 1))
 V11_MIN_SAMPLES = max(8, int(os.getenv("V11_MIN_SAMPLES", "20") or 20))
 V11_MAX_DISCOVERIES = max(25, min(int(os.getenv("V11_MAX_DISCOVERIES", "300") or 300), 1500))
 V11_VALIDATION_FRACTION = min(0.40, max(0.20, float(os.getenv("V11_VALIDATION_FRACTION", "0.30") or 0.30)))
+V11_AUTO_LEARNING_ENABLED = os.getenv("V11_AUTO_LEARNING_ENABLED", "true").lower() == "true"
+V11_AUTO_INTERVAL_SECONDS = max(900, int(os.getenv("V11_AUTO_INTERVAL_SECONDS", "21600") or 21600))
+V11_AUTO_MIN_NEW_OBSERVATIONS = max(1, int(os.getenv("V11_AUTO_MIN_NEW_OBSERVATIONS", "25") or 25))
+V11_AUTO_MIN_NEW_RICH_OBSERVATIONS = max(1, int(os.getenv("V11_AUTO_MIN_NEW_RICH_OBSERVATIONS", "5") or 5))
+V11_AUTO_RUN_ON_STARTUP = os.getenv("V11_AUTO_RUN_ON_STARTUP", "false").lower() == "true"
+V11_RICH_TARGET_OBSERVATIONS = max(20, int(os.getenv("V11_RICH_TARGET_OBSERVATIONS", "100") or 100))
+V11_AUTO_MAX_FACTORS = max(1, min(int(os.getenv("V11_AUTO_MAX_FACTORS", "3") or 3), 3))
+v11_last_learning_result: Dict[str, Any] = {}
 
 
 def _v11_ensure_tables() -> None:
@@ -9456,6 +9468,34 @@ def _v11_ensure_tables() -> None:
     )""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_discoveries_run_score ON v11_discoveries(run_id,evidence_score DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_discoveries_run_class ON v11_discoveries(run_id,classification)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_learning_state (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        schema_version TEXT NOT NULL DEFAULT '11.1',
+        last_checked_at TEXT,
+        last_automatic_run_at TEXT,
+        last_run_id INTEGER,
+        last_observations INTEGER NOT NULL DEFAULT 0,
+        last_rich_observations INTEGER NOT NULL DEFAULT 0,
+        last_status TEXT NOT NULL DEFAULT 'NEVER_RUN',
+        last_reason TEXT,
+        last_error TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_learning_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        run_id INTEGER,
+        trigger_type TEXT NOT NULL,
+        observations INTEGER NOT NULL DEFAULT 0,
+        rich_observations INTEGER NOT NULL DEFAULT 0,
+        new_observations INTEGER NOT NULL DEFAULT 0,
+        new_rich_observations INTEGER NOT NULL DEFAULT 0,
+        validated_positive INTEGER NOT NULL DEFAULT 0,
+        validated_negative INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        reason TEXT,
+        payload_json TEXT
+    )""")
+    conn.execute("INSERT OR IGNORE INTO v11_learning_state(id,schema_version) VALUES(1,?)", (V11_SCHEMA_VERSION,))
     conn.commit(); conn.close()
 
 
@@ -9769,6 +9809,132 @@ def v11_explain_symbol(symbol: str) -> Dict[str, Any]:
             "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False}
 
 
+
+def _v11_current_evidence_counts(horizon_hours: int = V11_DEFAULT_HORIZON_HOURS) -> Dict[str, Any]:
+    _v11_ensure_tables()
+    conn = db_connect()
+    resolved = _v10_resolve_horizon(conn, max(1, int(horizon_hours)))
+    effective = int(resolved["effective"])
+    rows = _v11_load_rows(conn, effective)
+    market_features = {
+        "market_regime", "sector", "relative_volume", "gap_pct", "distance_vwap_pct",
+        "ema9_distance_pct", "ema20_distance_pct", "ema50_distance_pct", "atr_pct",
+        "day_range_position", "opening_range_breakout", "sector_strength"
+    }
+    rich = 0
+    for obs in rows:
+        labels = {name: _v11_bin(name, obs.get(name)) for name in market_features}
+        if sum(1 for value in labels.values() if value is not None) >= 2:
+            rich += 1
+    conn.close()
+    return {
+        "requestedHorizonHours": int(horizon_hours), "horizonHours": effective,
+        "horizonExactMatch": bool(resolved["exact"]), "availableHorizons": resolved["available"],
+        "observations": len(rows), "richObservations": rich
+    }
+
+
+def v11_learning_cycle(trigger_type: str = "manual", force: bool = False) -> Dict[str, Any]:
+    global v11_last_learning_result
+    _v11_ensure_tables()
+    now = datetime.now(UTC).isoformat()
+    counts = _v11_current_evidence_counts(V11_DEFAULT_HORIZON_HOURS)
+    conn = db_connect()
+    state = conn.execute("SELECT last_observations,last_rich_observations,last_automatic_run_at FROM v11_learning_state WHERE id=1").fetchone()
+    previous_obs = int(state[0] or 0) if state else 0
+    previous_rich = int(state[1] or 0) if state else 0
+    new_obs = max(0, int(counts["observations"]) - previous_obs)
+    new_rich = max(0, int(counts["richObservations"]) - previous_rich)
+    should_run = bool(force or trigger_type == "manual" or
+                      new_rich >= V11_AUTO_MIN_NEW_RICH_OBSERVATIONS or
+                      new_obs >= V11_AUTO_MIN_NEW_OBSERVATIONS)
+    reason = "forced/manual run" if (force or trigger_type == "manual") else (
+        f"new rich evidence threshold reached ({new_rich})" if new_rich >= V11_AUTO_MIN_NEW_RICH_OBSERVATIONS
+        else f"new evidence threshold reached ({new_obs})" if new_obs >= V11_AUTO_MIN_NEW_OBSERVATIONS
+        else "waiting for more evidence")
+    if not should_run:
+        result = {"ok": True, "version": V11_VERSION, "ranDiscovery": False, "trigger": trigger_type,
+                  **counts, "newObservations": new_obs, "newRichObservations": new_rich,
+                  "reason": reason, "nextCheckSeconds": V11_AUTO_INTERVAL_SECONDS,
+                  "richEvidenceProgressPct": min(100.0, counts["richObservations"] / V11_RICH_TARGET_OBSERVATIONS * 100.0),
+                  "advisoryOnly": True, "automaticLiveChanges": False}
+        conn.execute("UPDATE v11_learning_state SET schema_version=?,last_checked_at=?,last_status='WAITING',last_reason=?,last_error=NULL WHERE id=1",
+                     (V11_SCHEMA_VERSION, now, reason))
+        conn.commit(); conn.close(); v11_last_learning_result = result; return result
+    conn.close()
+    try:
+        discovery = v11_run_discovery(counts["horizonHours"], V11_MIN_SAMPLES, V11_AUTO_MAX_FACTORS)
+        conn = db_connect()
+        conn.execute("""UPDATE v11_learning_state SET schema_version=?,last_checked_at=?,last_automatic_run_at=?,
+            last_run_id=?,last_observations=?,last_rich_observations=?,last_status='COMPLETE',last_reason=?,last_error=NULL WHERE id=1""",
+            (V11_SCHEMA_VERSION, now, now, discovery.get("runId"), counts["observations"], counts["richObservations"], reason))
+        conn.execute("""INSERT INTO v11_learning_history(created_at,run_id,trigger_type,observations,rich_observations,
+            new_observations,new_rich_observations,validated_positive,validated_negative,status,reason,payload_json)
+            VALUES(?,?,?,?,?,?,?,?,?,'COMPLETE',?,?)""",
+            (now, discovery.get("runId"), trigger_type, counts["observations"], counts["richObservations"], new_obs, new_rich,
+             discovery.get("validatedPositive",0), discovery.get("validatedNegative",0), reason, json.dumps(discovery, default=str)))
+        conn.commit(); conn.close()
+        result = {"ok": True, "version": V11_VERSION, "ranDiscovery": True, "trigger": trigger_type,
+                  "newObservations": new_obs, "newRichObservations": new_rich,
+                  "richEvidenceProgressPct": min(100.0, counts["richObservations"] / V11_RICH_TARGET_OBSERVATIONS * 100.0),
+                  "reason": reason, "discovery": discovery,
+                  "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False}
+        v11_last_learning_result = result; return result
+    except Exception as exc:
+        conn = db_connect()
+        conn.execute("UPDATE v11_learning_state SET last_checked_at=?,last_status='ERROR',last_reason=?,last_error=? WHERE id=1",
+                     (now, reason, str(exc)))
+        conn.commit(); conn.close()
+        v11_last_learning_result = {"ok": False, "version": V11_VERSION, "ranDiscovery": False,
+                                    "trigger": trigger_type, "error": str(exc), "reason": reason}
+        return v11_last_learning_result
+
+
+def v11_auto_learning_worker() -> None:
+    first = True
+    while True:
+        try:
+            if not first or V11_AUTO_RUN_ON_STARTUP:
+                result = v11_learning_cycle("automatic", force=False)
+                if result.get("ranDiscovery"):
+                    print(f"V11.1 AUTO LEARNING | run={result.get('discovery',{}).get('runId')} "
+                          f"obs={result.get('discovery',{}).get('observations')} rich={result.get('discovery',{}).get('richObservations')}")
+            first = False
+        except Exception as exc:
+            print(f"V11.1 AUTO LEARNING ERROR: {exc}")
+        time.sleep(V11_AUTO_INTERVAL_SECONDS)
+
+
+def v11_learning_status_payload() -> Dict[str, Any]:
+    _v11_ensure_tables()
+    counts = _v11_current_evidence_counts(V11_DEFAULT_HORIZON_HOURS)
+    conn = db_connect()
+    state = conn.execute("SELECT schema_version,last_checked_at,last_automatic_run_at,last_run_id,last_observations,last_rich_observations,last_status,last_reason,last_error FROM v11_learning_state WHERE id=1").fetchone()
+    history = conn.execute("SELECT COUNT(*) FROM v11_learning_history WHERE status='COMPLETE'").fetchone()[0]
+    conn.close()
+    return {"ok": True, "version": V11_VERSION, "name": V11_NAME, "enabled": V11_AUTO_LEARNING_ENABLED,
+            "intervalSeconds": V11_AUTO_INTERVAL_SECONDS, "minimumNewObservations": V11_AUTO_MIN_NEW_OBSERVATIONS,
+            "minimumNewRichObservations": V11_AUTO_MIN_NEW_RICH_OBSERVATIONS,
+            "richEvidenceTarget": V11_RICH_TARGET_OBSERVATIONS,
+            "richEvidenceProgressPct": min(100.0, counts["richObservations"] / V11_RICH_TARGET_OBSERVATIONS * 100.0),
+            **counts, "learningRuns": int(history),
+            "state": None if not state else {"schemaVersion": state[0], "lastCheckedAt": state[1],
+                "lastAutomaticRunAt": state[2], "lastRunId": state[3], "lastObservations": state[4],
+                "lastRichObservations": state[5], "status": state[6], "reason": state[7], "error": state[8]},
+            "lastResult": v11_last_learning_result or None,
+            "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False}
+
+
+def v11_learning_history_payload(limit: int = 25) -> Dict[str, Any]:
+    _v11_ensure_tables(); limit = max(1, min(int(limit), 200)); conn = db_connect()
+    rows = conn.execute("""SELECT id,created_at,run_id,trigger_type,observations,rich_observations,new_observations,
+        new_rich_observations,validated_positive,validated_negative,status,reason FROM v11_learning_history
+        ORDER BY id DESC LIMIT ?""", (limit,)).fetchall(); conn.close()
+    cols = ["id","createdAt","runId","trigger","observations","richObservations","newObservations",
+            "newRichObservations","validatedPositive","validatedNegative","status","reason"]
+    return {"ok": True, "version": V11_VERSION, "count": len(rows),
+            "history": [dict(zip(cols,row)) for row in rows], "advisoryOnly": True}
+
 def v11_status_payload() -> Dict[str, Any]:
     _v11_ensure_tables(); conn = db_connect()
     runs = int(conn.execute("SELECT COUNT(*) FROM v11_discovery_runs WHERE status='COMPLETE'").fetchone()[0])
@@ -9784,7 +9950,12 @@ def v11_status_payload() -> Dict[str, Any]:
             "features": {"singleFactorDiscovery": True, "twoFactorInteractions": True,
                          "threeFactorInteractions": True, "chronologicalValidation": True,
                          "baselineLift": True, "lower95Expectancy": True, "stabilityScoring": True,
-                         "liveSymbolExplanation": True, "shadowOnly": True},
+                         "liveSymbolExplanation": True, "automaticLearning": True, "richEvidenceTracking": True,
+                         "thresholdTriggeredResearch": True, "learningHistory": True, "shadowOnly": True},
+            "autoLearning": {"enabled": V11_AUTO_LEARNING_ENABLED, "intervalSeconds": V11_AUTO_INTERVAL_SECONDS,
+                             "minimumNewObservations": V11_AUTO_MIN_NEW_OBSERVATIONS,
+                             "minimumNewRichObservations": V11_AUTO_MIN_NEW_RICH_OBSERVATIONS,
+                             "richEvidenceTarget": V11_RICH_TARGET_OBSERVATIONS},
             "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False}
 
 
@@ -9813,3 +9984,18 @@ def api_v11_explain(symbol: str, request: Request):
     if not re.fullmatch(r'[A-Z.\-]{1,10}', sym):
         raise HTTPException(status_code=400, detail='Invalid symbol')
     return v11_explain_symbol(sym)
+
+
+@app.get('/v11/learning/status')
+def api_v11_learning_status(request: Request):
+    verify_api_key(request); return v11_learning_status_payload()
+
+
+@app.post('/v11/learning/run')
+def api_v11_learning_run(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request); return v11_learning_cycle('manual', bool(payload.get('force', True)))
+
+
+@app.get('/v11/learning/history')
+def api_v11_learning_history(request: Request, limit: int = 25):
+    verify_api_key(request); return v11_learning_history_payload(limit)
