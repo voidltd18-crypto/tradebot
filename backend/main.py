@@ -8894,6 +8894,10 @@ def _v9_capture_snapshot(conn, decision_id: int, scan: Dict[str, Any], decision:
          fields["ema50_distance_pct"],fields["atr_pct"],fields["day_range_position"],fields["opening_range_breakout"],fields["premarket_volume"],
          fields["sector"],fields["sector_strength"],fields["news_score"],fields["earnings_days"],fields["float_shares"],fields["shares_outstanding"],
          json.dumps(payload,default=str),str(source)))
+    try:
+        _v112_audit_snapshot(conn, decision_id, symbol, source, fields)
+    except Exception as audit_error:
+        print(f"V11.2 SNAPSHOT AUDIT ERROR {symbol}: {audit_error}")
 
 
 def v9_backfill(limit: int = 5000) -> Dict[str, Any]:
@@ -9394,9 +9398,9 @@ def api_v10_explain(symbol: str, request: Request):
 # Mines validated multi-factor market setups from explicit V10 lineage.
 # Shadow-only: never changes orders, thresholds, strategy settings, or live behaviour.
 # =========================
-V11_VERSION = "V11.1"
-V11_NAME = "Live Learning Integration"
-V11_SCHEMA_VERSION = "11.1"
+V11_VERSION = "V11.2"
+V11_NAME = "Rich Evidence Pipeline Guardian"
+V11_SCHEMA_VERSION = "11.2"
 V11_ENABLED = os.getenv("V11_ENABLED", "true").lower() == "true"
 V11_DEFAULT_HORIZON_HOURS = max(1, int(os.getenv("V11_DEFAULT_HORIZON_HOURS", "1") or 1))
 V11_MIN_SAMPLES = max(8, int(os.getenv("V11_MIN_SAMPLES", "20") or 20))
@@ -9951,7 +9955,7 @@ def v11_status_payload() -> Dict[str, Any]:
                          "threeFactorInteractions": True, "chronologicalValidation": True,
                          "baselineLift": True, "lower95Expectancy": True, "stabilityScoring": True,
                          "liveSymbolExplanation": True, "automaticLearning": True, "richEvidenceTracking": True,
-                         "thresholdTriggeredResearch": True, "learningHistory": True, "shadowOnly": True},
+                         "thresholdTriggeredResearch": True, "learningHistory": True, "richCaptureAudit": True, "missingFieldDiagnostics": True, "pipelineReadiness": True, "shadowOnly": True},
             "autoLearning": {"enabled": V11_AUTO_LEARNING_ENABLED, "intervalSeconds": V11_AUTO_INTERVAL_SECONDS,
                              "minimumNewObservations": V11_AUTO_MIN_NEW_OBSERVATIONS,
                              "minimumNewRichObservations": V11_AUTO_MIN_NEW_RICH_OBSERVATIONS,
@@ -9999,3 +10003,148 @@ def api_v11_learning_run(request: Request, payload: Dict[str, Any] = Body(defaul
 @app.get('/v11/learning/history')
 def api_v11_learning_history(request: Request, limit: int = 25):
     verify_api_key(request); return v11_learning_history_payload(limit)
+
+
+# =========================
+# TRADEBOT V11.2 — RICH EVIDENCE PIPELINE GUARDIAN
+# Verifies live V9.2 capture quality and explains why evidence is not research-ready.
+# Shadow-only. It never changes trading decisions or historical snapshots.
+# =========================
+V112_CORE_RICH_FIELDS = (
+    "relative_volume", "gap_pct", "distance_vwap_pct", "ema20_distance_pct", "atr_pct"
+)
+V112_CONTEXT_FIELDS = (
+    "market_regime", "sector", "sector_strength", "day_range_position", "premarket_volume"
+)
+V112_MIN_CORE_FIELDS = max(2, min(int(os.getenv("V112_MIN_CORE_FIELDS", "4") or 4), len(V112_CORE_RICH_FIELDS)))
+V112_RECENT_HOURS = max(1, min(int(os.getenv("V112_RECENT_HOURS", "72") or 72), 720))
+
+
+def _v112_ensure_tables() -> None:
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_rich_capture_audit (
+        decision_id INTEGER PRIMARY KEY,
+        audited_at TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        source TEXT NOT NULL,
+        core_present INTEGER NOT NULL DEFAULT 0,
+        core_required INTEGER NOT NULL DEFAULT 4,
+        rich_ready INTEGER NOT NULL DEFAULT 0,
+        missing_fields_json TEXT NOT NULL,
+        present_fields_json TEXT NOT NULL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_rich_audit_ready ON v11_rich_capture_audit(rich_ready,audited_at)")
+    conn.commit(); conn.close()
+
+
+def _v112_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "unknown", "none", "null")
+    try:
+        return math.isfinite(float(value))
+    except Exception:
+        return True
+
+
+def _v112_audit_snapshot(conn, decision_id: int, symbol: str, source: str, fields: Dict[str, Any]) -> None:
+    core_present = [name for name in V112_CORE_RICH_FIELDS if _v112_present(fields.get(name))]
+    missing = [name for name in V112_CORE_RICH_FIELDS if name not in core_present]
+    contextual = [name for name in V112_CONTEXT_FIELDS if _v112_present(fields.get(name))]
+    present = core_present + contextual
+    ready = int(len(core_present) >= V112_MIN_CORE_FIELDS)
+    conn.execute("""INSERT OR REPLACE INTO v11_rich_capture_audit(
+        decision_id,audited_at,symbol,source,core_present,core_required,rich_ready,missing_fields_json,present_fields_json
+        ) VALUES(?,?,?,?,?,?,?,?,?)""",
+        (int(decision_id), datetime.now(UTC).isoformat(), str(symbol), str(source), len(core_present),
+         V112_MIN_CORE_FIELDS, ready, json.dumps(missing), json.dumps(present)))
+
+
+def _v112_backfill_audit(limit: int = 50000) -> Dict[str, int]:
+    _v112_ensure_tables(); limit=max(1,min(int(limit),100000)); conn=db_connect()
+    rows=conn.execute("""SELECT m.decision_id,m.symbol,m.source,m.relative_volume,m.gap_pct,m.distance_vwap_pct,
+        m.ema20_distance_pct,m.atr_pct,m.market_regime,m.sector,m.sector_strength,m.day_range_position,m.premarket_volume
+        FROM v9_market_memory m LEFT JOIN v11_rich_capture_audit a ON a.decision_id=m.decision_id
+        WHERE a.decision_id IS NULL ORDER BY m.decision_id DESC LIMIT ?""",(limit,)).fetchall()
+    for row in rows:
+        fields=dict(zip(("relative_volume","gap_pct","distance_vwap_pct","ema20_distance_pct","atr_pct",
+                         "market_regime","sector","sector_strength","day_range_position","premarket_volume"),row[3:]))
+        _v112_audit_snapshot(conn,int(row[0]),str(row[1]),str(row[2]),fields)
+    conn.commit(); conn.close(); return {"processed":len(rows)}
+
+
+def v112_pipeline_status(limit_examples: int = 10) -> Dict[str, Any]:
+    _v9_ensure_tables(); _v10_ensure_tables(); _v112_backfill_audit()
+    limit_examples=max(1,min(int(limit_examples),50)); conn=db_connect()
+    cutoff=(datetime.now(UTC)-timedelta(hours=V112_RECENT_HOURS)).isoformat()
+    total=int(conn.execute("SELECT COUNT(*) FROM v9_market_memory").fetchone()[0])
+    live=int(conn.execute("SELECT COUNT(*) FROM v9_market_memory WHERE source='live'").fetchone()[0])
+    recent_live=int(conn.execute("SELECT COUNT(*) FROM v9_market_memory WHERE source='live' AND captured_at>=?",(cutoff,)).fetchone()[0])
+    audited=int(conn.execute("SELECT COUNT(*) FROM v11_rich_capture_audit").fetchone()[0])
+    ready_all=int(conn.execute("SELECT COUNT(*) FROM v11_rich_capture_audit WHERE rich_ready=1").fetchone()[0])
+    ready_live=int(conn.execute("SELECT COUNT(*) FROM v11_rich_capture_audit WHERE rich_ready=1 AND source='live'").fetchone()[0])
+    ready_recent=int(conn.execute("SELECT COUNT(*) FROM v11_rich_capture_audit WHERE rich_ready=1 AND source='live' AND audited_at>=?",(cutoff,)).fetchone()[0])
+    completed_ready=int(conn.execute("""SELECT COUNT(*) FROM v11_rich_capture_audit a
+        JOIN v10_evidence_lineage l ON l.snapshot_id=a.decision_id
+        WHERE a.rich_ready=1 AND l.horizon_hours=? AND l.outcome_status='COMPLETE' AND l.net_return_pct IS NOT NULL""",
+        (V11_DEFAULT_HORIZON_HOURS,)).fetchone()[0])
+    pending_ready=int(conn.execute("""SELECT COUNT(*) FROM v11_rich_capture_audit a
+        JOIN v2_observation_outcomes o ON o.decision_id=a.decision_id
+        WHERE a.rich_ready=1 AND o.horizon_hours=? AND o.status='PENDING'""",(V11_DEFAULT_HORIZON_HOURS,)).fetchone()[0])
+    field_coverage={}
+    for field in V112_CORE_RICH_FIELDS + V112_CONTEXT_FIELDS:
+        if field in ("market_regime","sector"):
+            present=int(conn.execute(f"SELECT COUNT(*) FROM v9_market_memory WHERE source='live' AND {field} IS NOT NULL AND lower({field}) NOT IN ('','unknown')").fetchone()[0])
+        else:
+            present=int(conn.execute(f"SELECT COUNT(*) FROM v9_market_memory WHERE source='live' AND {field} IS NOT NULL").fetchone()[0])
+        field_coverage[field]={"present":present,"liveTotal":live,"coveragePct":round((present/live*100.0),2) if live else 0.0}
+    missing_counts={name:0 for name in V112_CORE_RICH_FIELDS}
+    for (payload,) in conn.execute("SELECT missing_fields_json FROM v11_rich_capture_audit WHERE source='live'").fetchall():
+        try:
+            for name in json.loads(payload or '[]'):
+                if name in missing_counts: missing_counts[name]+=1
+        except Exception: pass
+    examples=[]
+    rows=conn.execute("""SELECT a.decision_id,a.audited_at,a.symbol,a.core_present,a.core_required,a.missing_fields_json,
+        m.stage,m.decision,m.reason FROM v11_rich_capture_audit a JOIN v9_market_memory m ON m.decision_id=a.decision_id
+        WHERE a.source='live' AND a.rich_ready=0 ORDER BY a.decision_id DESC LIMIT ?""",(limit_examples,)).fetchall()
+    for r in rows:
+        examples.append({"decisionId":r[0],"auditedAt":r[1],"symbol":r[2],"corePresent":r[3],"coreRequired":r[4],
+                         "missingFields":json.loads(r[5] or '[]'),"stage":r[6],"decision":r[7],"reason":r[8]})
+    latest_live=conn.execute("SELECT MAX(captured_at) FROM v9_market_memory WHERE source='live'").fetchone()[0]
+    conn.close()
+    if live == 0:
+        diagnosis="NO_LIVE_SNAPSHOTS"
+    elif recent_live == 0:
+        diagnosis="NO_RECENT_LIVE_DECISIONS"
+    elif ready_recent == 0:
+        diagnosis="RECENT_LIVE_SNAPSHOTS_MISSING_CORE_FIELDS"
+    elif completed_ready == 0 and pending_ready > 0:
+        diagnosis="RICH_SNAPSHOTS_WAITING_FOR_OUTCOMES"
+    elif completed_ready == 0:
+        diagnosis="RICH_SNAPSHOTS_NOT_LINKED_TO_COMPLETED_OUTCOMES"
+    else:
+        diagnosis="RICH_PIPELINE_OPERATIONAL"
+    return {"ok":True,"version":V11_VERSION,"name":V11_NAME,"schemaVersion":V11_SCHEMA_VERSION,
+            "diagnosis":diagnosis,"coreFields":list(V112_CORE_RICH_FIELDS),"minimumCoreFields":V112_MIN_CORE_FIELDS,
+            "recentWindowHours":V112_RECENT_HOURS,"snapshots":{"total":total,"live":live,"recentLive":recent_live,
+            "audited":audited,"richReadyAll":ready_all,"richReadyLive":ready_live,"richReadyRecent":ready_recent,
+            "richCompletedAtHorizon":completed_ready,"richPendingAtHorizon":pending_ready,"horizonHours":V11_DEFAULT_HORIZON_HOURS,
+            "latestLiveCapturedAt":latest_live},"fieldCoverage":field_coverage,"missingCoreFieldCounts":missing_counts,
+            "recentIncompleteExamples":examples,"advisoryOnly":True,"automaticLiveChanges":False,"historicalSnapshotsRewritten":False}
+
+
+@app.get('/v11/pipeline/status')
+def api_v112_pipeline_status(request: Request, examples: int = 10):
+    verify_api_key(request); return v112_pipeline_status(examples)
+
+
+@app.post('/v11/pipeline/audit')
+def api_v112_pipeline_audit(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    result=_v112_backfill_audit(int(payload.get('limit') or 50000))
+    result.update(v112_pipeline_status(int(payload.get('examples') or 10)))
+    return result
