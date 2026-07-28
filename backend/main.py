@@ -388,6 +388,15 @@ v6_sync_thread_started = False
 v7_weekend_thread_started = False
 v11_learning_thread_started = False
 v6_last_sync_result: Dict[str, Any] = {}
+
+# Automatic closed-trade report reconciliation. Reporting-only: this never
+# changes entries, exits, sizing, scanner decisions, or order submission.
+AUTO_REPORT_SYNC_ENABLED = os.getenv("AUTO_REPORT_SYNC_ENABLED", "true").lower() == "true"
+AUTO_REPORT_SYNC_INTERVAL_SECONDS = max(30, int(os.getenv("AUTO_REPORT_SYNC_INTERVAL_SECONDS", "60") or 60))
+AUTO_REPORT_SYNC_ORDER_LIMIT = max(20, min(int(os.getenv("AUTO_REPORT_SYNC_ORDER_LIMIT", "500") or 500), 500))
+auto_report_last_sync_ts = 0.0
+auto_report_last_result: Dict[str, Any] = {}
+
 bot_lock = threading.Lock()
 
 starting_equity_today: Optional[float] = None
@@ -3275,6 +3284,8 @@ def rebuild_closed_trades_from_orders():
         WHERE symbol IS NOT NULL
           AND side IN ('BUY', 'SELL')
           AND qty > 0
+          AND alpaca_order_id IS NOT NULL
+          AND TRIM(alpaca_order_id) <> ''
         ORDER BY timestamp ASC, id ASC
     """).fetchall()
     conn.close()
@@ -3784,6 +3795,150 @@ def backfill_trades_from_alpaca():
         "skipped": skipped,
         **match_result,
     }
+
+
+
+def _trade_order_exists(alpaca_order_id: str) -> bool:
+    if not (SQLITE_ENABLED and alpaca_order_id):
+        return False
+    init_db()
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM trades WHERE alpaca_order_id=? LIMIT 1",
+            (str(alpaca_order_id),),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
+    """Import recent filled Alpaca orders and refresh FIFO closed trades.
+
+    This is deliberately reporting-only. It does not submit/cancel orders and
+    does not alter any live strategy setting. Alpaca order IDs make imports
+    idempotent, so repeated runs do not duplicate trades.
+    """
+    global auto_report_last_sync_ts, auto_report_last_result
+
+    if not AUTO_REPORT_SYNC_ENABLED:
+        return {"ok": False, "skipped": True, "reason": "automatic report sync disabled"}
+
+    now_ts = time.time()
+    if not force and (now_ts - auto_report_last_sync_ts) < AUTO_REPORT_SYNC_INTERVAL_SECONDS:
+        return {**auto_report_last_result, "skipped": True, "reason": "sync interval not due"}
+
+    auto_report_last_sync_ts = now_ts
+    imported = 0
+    existing = 0
+    skipped = 0
+    errors = 0
+
+    try:
+        init_db()
+        request = GetOrdersRequest(
+            status=get_query_order_status_all(),
+            limit=AUTO_REPORT_SYNC_ORDER_LIMIT,
+            direction="desc",
+        )
+        orders = trading_client.get_orders(filter=request)
+        rate = get_usd_to_gbp_rate()
+
+        for order in sorted(orders, key=lambda o: str(parse_order_timestamp(o))):
+            try:
+                if not order_is_filled(order):
+                    skipped += 1
+                    continue
+
+                oid = get_order_id(order)
+                symbol = get_order_symbol(order)
+                side = get_order_side(order)
+                qty = get_order_qty(order)
+                price = get_order_price(order)
+
+                if not oid or not symbol or side not in ("BUY", "SELL") or qty <= 0 or price <= 0:
+                    skipped += 1
+                    continue
+
+                if _trade_order_exists(oid):
+                    existing += 1
+                    continue
+
+                timestamp_obj = parse_order_timestamp(order)
+                if hasattr(timestamp_obj, "isoformat"):
+                    timestamp = timestamp_obj.isoformat()
+                    try:
+                        utc_timestamp = timestamp_obj.astimezone(UTC)
+                        day = utc_timestamp.strftime("%Y-%m-%d")
+                        tm = utc_timestamp.strftime("%H:%M:%S")
+                    except Exception:
+                        day = today_str()
+                        tm = now_time()
+                else:
+                    timestamp = str(timestamp_obj)
+                    day = today_str()
+                    tm = now_time()
+
+                amount = qty * price
+                event = {
+                    "alpacaOrderId": oid,
+                    "timestamp": timestamp,
+                    "day": day,
+                    "time": tm,
+                    "side": side,
+                    "symbol": symbol,
+                    "qty": qty,
+                    "price": price,
+                    "amount": amount if side == "BUY" else 0.0,
+                    "amountGbp": amount * rate if side == "BUY" else 0.0,
+                    "pnl": 0.0,
+                    "pnlGbp": 0.0,
+                    "pnlPct": 0.0,
+                    "reason": "AUTOMATIC ALPACA REPORT SYNC",
+                    "equity": 0.0,
+                    "equityGbp": 0.0,
+                    "fxRate": rate,
+                }
+                save_trade_to_db(event, source="alpaca_auto_sync")
+                imported += 1
+            except Exception as order_error:
+                errors += 1
+                print(f"AUTO REPORT SYNC ORDER ERROR: {order_error}")
+
+        rebuild_result = None
+        if imported > 0:
+            rebuild_result = rebuild_closed_trades_from_orders()
+            print(
+                f"AUTO REPORT SYNC | imported={imported} existing={existing} "
+                f"skipped={skipped} errors={errors} "
+                f"closed={rebuild_result.get('matchedClosedTrades', 0)}"
+            )
+
+        auto_report_last_result = {
+            "ok": True,
+            "automatic": True,
+            "ordersChecked": len(orders),
+            "imported": imported,
+            "existing": existing,
+            "skipped": skipped,
+            "errors": errors,
+            "rebuilt": bool(imported > 0),
+            "matchedClosedTrades": int((rebuild_result or {}).get("matchedClosedTrades", 0)),
+            "syncedAt": datetime.now(UTC).isoformat(),
+        }
+        return auto_report_last_result
+    except Exception as e:
+        auto_report_last_result = {
+            "ok": False,
+            "automatic": True,
+            "error": str(e),
+            "imported": imported,
+            "errors": errors + 1,
+            "syncedAt": datetime.now(UTC).isoformat(),
+        }
+        print(f"AUTO REPORT SYNC ERROR: {e}")
+        return auto_report_last_result
 
 
 
@@ -4538,6 +4693,11 @@ def build_status_payload(bot_name, scans):
         "closedTrades": closed_trades_from_db(1000),
         "stockMemory": stock_memory_from_closed_trades(),
         "dbSummary": {**db_summary_payload(), **closed_trade_summary_payload()},
+        "automaticReportSync": {
+            "enabled": AUTO_REPORT_SYNC_ENABLED,
+            "intervalSeconds": AUTO_REPORT_SYNC_INTERVAL_SECONDS,
+            **auto_report_last_result,
+        },
         "equityCurve": equity_curve[-240:],
         "alpacaRejectionEvents": alpaca_rejection_events[-50:],
         "pdtWarningEvents": pdt_warning_events[-50:],
@@ -5999,6 +6159,10 @@ def run_bot_loop():
     load_persistent_state()
     refresh_universe_if_needed(force=True)
     reset_daily_flags_if_needed()
+    try:
+        sync_recent_filled_orders_to_reports(force=True)
+    except Exception as e:
+        print(f"AUTO REPORT STARTUP SYNC ERROR: {e}")
     update_status(BOT_NAME, [])
 
     while True:
@@ -6011,6 +6175,10 @@ def run_bot_loop():
                 except Exception as e:
                     print(f"DYNAMIC SCANNER LOOP ERROR: {e}")
                 refresh_universe_if_needed()
+                try:
+                    sync_recent_filled_orders_to_reports()
+                except Exception as e:
+                    print(f"AUTO REPORT LOOP SYNC ERROR: {e}")
                 clock = trading_client.get_clock()
 
                 if not clock.is_open:
