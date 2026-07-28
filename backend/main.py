@@ -23,6 +23,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 
 
 # ============================================================
@@ -780,7 +781,7 @@ def get_market_status_payload():
 
 
 def get_quote(symbol: str):
-    req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+    req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
     quote = data_client.get_stock_latest_quote(req)[symbol]
     bid = quote.bid_price
     ask = quote.ask_price
@@ -8589,8 +8590,8 @@ def api_v8_maintenance(request: Request, payload: Dict[str, Any] = Body(default=
 # TRADEBOT V9.0 — MARKET MEMORY ENGINE
 # Rich decision-time observations. Shadow-only and unable to alter live trading.
 # =========================
-V9_VERSION = "V9.1"
-V9_NAME = "Live Market Intelligence Engine"
+V9_VERSION = "V9.2"
+V9_NAME = "Live Market Intelligence Engine (IEX Feed Fix)"
 V9_ENABLED = os.getenv("V9_ENABLED", "true").lower() == "true"
 V9_MIN_READY_OBSERVATIONS = max(100, int(os.getenv("V9_MIN_READY_OBSERVATIONS", "1000") or 1000))
 V9_MIN_FIELD_COVERAGE = max(0.50, min(float(os.getenv("V9_MIN_FIELD_COVERAGE", "0.80") or 0.80), 1.0))
@@ -8702,7 +8703,7 @@ V91_SECTOR_ETF = {
 }
 
 def _v91_bars(symbol: str, timeframe: Any, start: datetime, end: datetime) -> List[Any]:
-    req=StockBarsRequest(symbol_or_symbols=[symbol], timeframe=timeframe, start=start, end=end)
+    req=StockBarsRequest(symbol_or_symbols=[symbol], timeframe=timeframe, start=start, end=end, feed=DataFeed.IEX)
     response=data_client.get_stock_bars(req)
     try: return list(response[symbol])
     except Exception:
