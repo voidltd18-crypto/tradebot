@@ -3813,6 +3813,44 @@ def _trade_order_exists(alpaca_order_id: str) -> bool:
         conn.close()
 
 
+def restore_today_sell_locks_from_db() -> List[str]:
+    """Restore the existing sell-then-lock rule after a restart/redeploy.
+
+    Reporting rows are read only; no orders are submitted or changed. Any symbol
+    with a SELL recorded for the current UTC trading day is locked until the next
+    daily reset, exactly like a live sell handled by market_sell_qty().
+    """
+    if not (STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and SQLITE_ENABLED):
+        return []
+
+    restored: List[str] = []
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute(
+            """SELECT DISTINCT UPPER(symbol) AS symbol
+               FROM trades
+               WHERE side='SELL' AND day=? AND symbol IS NOT NULL""",
+            (today_str(),),
+        ).fetchall()
+        conn.close()
+
+        for row in rows:
+            symbol = str(row["symbol"] or "").upper().strip()
+            if not symbol:
+                continue
+            if not is_locked_today(symbol):
+                locked_today[symbol] = today_str()
+                restored.append(symbol)
+
+        if restored:
+            print(f"DAILY LOCK RESTORED | sold today: {', '.join(sorted(restored))}")
+        return sorted(restored)
+    except Exception as e:
+        print(f"DAILY LOCK RESTORE ERROR: {e}")
+        return []
+
+
 def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
     """Import recent filled Alpaca orders and refresh FIFO closed trades.
 
@@ -3837,6 +3875,9 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
 
     try:
         init_db()
+        # A Render restart clears the in-memory lock dictionary. Rebuild it from
+        # today's persisted SELL rows before the scanner can approve another buy.
+        restored_locks = restore_today_sell_locks_from_db()
         request = GetOrdersRequest(
             status=get_query_order_status_all(),
             limit=AUTO_REPORT_SYNC_ORDER_LIMIT,
@@ -3909,6 +3950,7 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
         rebuild_result = None
         if imported > 0:
             rebuild_result = rebuild_closed_trades_from_orders()
+            restored_locks = sorted(set(restored_locks + restore_today_sell_locks_from_db()))
             print(
                 f"AUTO REPORT SYNC | imported={imported} existing={existing} "
                 f"skipped={skipped} errors={errors} "
@@ -3925,6 +3967,7 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
             "errors": errors,
             "rebuilt": bool(imported > 0),
             "matchedClosedTrades": int((rebuild_result or {}).get("matchedClosedTrades", 0)),
+            "restoredSellLocks": restored_locks,
             "syncedAt": datetime.now(UTC).isoformat(),
         }
         return auto_report_last_result
