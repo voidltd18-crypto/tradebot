@@ -1753,11 +1753,114 @@ def _v2_decision_recently_logged(symbol: str, decision: str, stage: str) -> bool
         return False
 
 
-def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, reason: str, profile: Optional[Dict[str, Any]] = None):
-    if not (TRADEBOT_V2_ENABLED and V2_LOG_DECISIONS and SQLITE_ENABLED):
+# =========================
+# TRADEBOT V11.4 — UNIFIED DECISION PIPELINE
+# Every real scanner decision is traced through one persistence route.
+# Logging/research only: this cannot place or modify an order.
+# =========================
+def _v114_ensure_tables() -> None:
+    if not SQLITE_ENABLED:
         return
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_decision_trace (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trace_id TEXT NOT NULL,
+        decision_id INTEGER,
+        created_at TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        writer TEXT NOT NULL,
+        event TEXT NOT NULL,
+        stage TEXT,
+        decision TEXT,
+        success INTEGER NOT NULL DEFAULT 1,
+        detail TEXT,
+        payload_json TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_trace_trace_id ON v11_decision_trace(trace_id,id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_trace_decision ON v11_decision_trace(decision_id,id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_trace_time ON v11_decision_trace(created_at)")
+    conn.commit(); conn.close()
+
+
+def _v114_trace(trace_id: str, symbol: str, writer: str, event: str,
+                 stage: str = "", decision: str = "", decision_id: Optional[int] = None,
+                 success: bool = True, detail: str = "", payload: Optional[Dict[str, Any]] = None,
+                 conn: Optional[sqlite3.Connection] = None) -> None:
+    if not SQLITE_ENABLED:
+        return
+    own = conn is None
+    try:
+        if own:
+            _v114_ensure_tables(); conn = db_connect()
+        conn.execute("""INSERT INTO v11_decision_trace(
+            trace_id,decision_id,created_at,symbol,writer,event,stage,decision,success,detail,payload_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(trace_id), decision_id, datetime.now(UTC).isoformat(), str(symbol), str(writer), str(event),
+             str(stage), str(decision), int(bool(success)), str(detail)[:2000], json.dumps(payload or {}, default=str)))
+        if own:
+            conn.commit(); conn.close()
+    except Exception as e:
+        print(f"V11.4 TRACE ERROR {symbol} {event}: {e}")
+        if own and conn:
+            try: conn.close()
+            except Exception: pass
+
+
+def _v114_trace_id(symbol: str) -> str:
+    return f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}-{str(symbol).upper()}-{secrets.token_hex(4)}"
+
+
+def v114_trace_payload(decision_id: int) -> Dict[str, Any]:
+    _v114_ensure_tables(); conn = db_connect()
+    rows = conn.execute("""SELECT id,trace_id,decision_id,created_at,symbol,writer,event,stage,decision,success,detail,payload_json
+        FROM v11_decision_trace WHERE decision_id=? ORDER BY id ASC""", (int(decision_id),)).fetchall()
+    snapshot = conn.execute("""SELECT decision_id,captured_at,symbol,decision,stage,source,relative_volume,gap_pct,
+        distance_vwap_pct,ema20_distance_pct,atr_pct FROM v9_market_memory WHERE decision_id=?""", (int(decision_id),)).fetchone()
+    verification = conn.execute("""SELECT created_at,passed,core_present,missing_fields_json,error
+        FROM v11_capture_verification WHERE decision_id=? ORDER BY id DESC LIMIT 1""", (int(decision_id),)).fetchone()
+    conn.close()
+    events=[]
+    for r in rows:
+        try: payload=json.loads(r[11] or '{}')
+        except Exception: payload={}
+        events.append({"id":r[0],"traceId":r[1],"decisionId":r[2],"createdAt":r[3],"symbol":r[4],
+                       "writer":r[5],"event":r[6],"stage":r[7],"decision":r[8],"success":bool(r[9]),
+                       "detail":r[10],"payload":payload})
+    return {"ok":True,"version":V11_VERSION,"decisionId":int(decision_id),"events":events,
+            "snapshot":None if not snapshot else {"decisionId":snapshot[0],"capturedAt":snapshot[1],"symbol":snapshot[2],
+                "decision":snapshot[3],"stage":snapshot[4],"source":snapshot[5],"relativeVolume":snapshot[6],
+                "gapPct":snapshot[7],"distanceVwapPct":snapshot[8],"ema20DistancePct":snapshot[9],"atrPct":snapshot[10]},
+            "verification":None if not verification else {"createdAt":verification[0],"passed":bool(verification[1]),
+                "corePresent":verification[2],"missingFields":json.loads(verification[3] or '[]'),"error":verification[4]}}
+
+
+def v114_recent_traces(limit: int = 50) -> Dict[str, Any]:
+    _v114_ensure_tables(); limit=max(1,min(int(limit),500)); conn=db_connect()
+    rows=conn.execute("""SELECT d.id,d.timestamp,d.symbol,d.decision,d.stage,d.reason,
+        (SELECT COUNT(*) FROM v11_decision_trace t WHERE t.decision_id=d.id) AS trace_events,
+        (SELECT passed FROM v11_capture_verification v WHERE v.decision_id=d.id ORDER BY v.id DESC LIMIT 1) AS verified,
+        (SELECT core_present FROM v11_capture_verification v WHERE v.decision_id=d.id ORDER BY v.id DESC LIMIT 1) AS core_present
+        FROM v2_setup_decisions d ORDER BY d.id DESC LIMIT ?""",(limit,)).fetchall(); conn.close()
+    return {"ok":True,"version":V11_VERSION,"count":len(rows),"items":[{"decisionId":r[0],"timestamp":r[1],
+        "symbol":r[2],"decision":r[3],"stage":r[4],"reason":r[5],"traceEvents":r[6],
+        "captureVerified":None if r[7] is None else bool(r[7]),"corePresent":r[8]} for r in rows]}
+
+
+def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, reason: str, profile: Optional[Dict[str, Any]] = None):
     symbol = str(scan.get("symbol") or "").upper().strip()
-    if not symbol or _v2_decision_recently_logged(symbol, decision, stage):
+    trace_id = _v114_trace_id(symbol or "UNKNOWN")
+    writer = str(scan.get("decision_writer") or scan.get("source_module") or "scanner_unified")
+    if not (TRADEBOT_V2_ENABLED and V2_LOG_DECISIONS and SQLITE_ENABLED):
+        _v114_trace(trace_id, symbol or "UNKNOWN", writer, "SKIPPED_DISABLED", stage, decision, success=False,
+                    detail="V2 logging or SQLite disabled")
+        return
+    if not symbol:
+        _v114_trace(trace_id, "UNKNOWN", writer, "SKIPPED_INVALID_SYMBOL", stage, decision, success=False)
+        return
+    _v114_trace(trace_id, symbol, writer, "ENTER_UNIFIED_PIPELINE", stage, decision, detail=str(reason)[:1000])
+    if _v2_decision_recently_logged(symbol, decision, stage):
+        _v114_trace(trace_id, symbol, writer, "SKIPPED_DEDUPE", stage, decision, success=False,
+                    detail="matching decision/stage already logged inside dedupe window")
         return
     profile = profile or {}
 
@@ -1767,9 +1870,15 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
     if globals().get("V91_INTELLIGENCE_ENABLED", False) and globals().get("_v91_enrich_scan"):
         try:
             capture_scan = _v91_enrich_scan(capture_scan)
+            core_now = [k for k in globals().get("V112_CORE_RICH_FIELDS", ()) if _v112_present(capture_scan.get(k))]
+            _v114_trace(trace_id, symbol, writer, "INTELLIGENCE_ENRICHED", stage, decision,
+                        success=len(core_now) >= globals().get("V112_MIN_CORE_FIELDS", 4),
+                        detail=f"core fields present: {len(core_now)}", payload={"presentFields":core_now})
         except Exception as enrich_error:
             capture_scan["v113_capture_enrichment_error"] = str(enrich_error)[:500]
-            print(f"V11.3 CAPTURE ENRICHMENT ERROR {symbol}: {enrich_error}")
+            print(f"V11.4 CAPTURE ENRICHMENT ERROR {symbol}: {enrich_error}")
+            _v114_trace(trace_id, symbol, writer, "INTELLIGENCE_ENRICHMENT_FAILED", stage, decision,
+                        success=False, detail=str(enrich_error))
     scan = capture_scan
 
     payload = {
@@ -1801,6 +1910,8 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
             ),
         )
         decision_id = int(cur.lastrowid)
+        _v114_trace(trace_id, symbol, writer, "BASE_DECISION_WRITTEN", stage, decision, decision_id=decision_id,
+                    success=decision_id > 0, detail="v2_setup_decisions insert completed", conn=conn)
         observed_at = datetime.now(UTC)
         entry_price = float(scan.get("price") or 0.0)
         if decision_id > 0 and entry_price > 0:
@@ -1818,12 +1929,22 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
         if decision_id > 0 and globals().get("V9_ENABLED", False):
             try:
                 _v9_capture_snapshot(conn, decision_id, scan, decision, stage, reason, observed_at)
+                _v114_trace(trace_id, symbol, writer, "RICH_SNAPSHOT_WRITTEN", stage, decision,
+                            decision_id=decision_id, success=True, detail="v9_market_memory capture completed", conn=conn)
             except Exception as v9_error:
                 print(f"V9 SNAPSHOT ERROR {symbol}: {v9_error}")
+                _v114_trace(trace_id, symbol, writer, "RICH_SNAPSHOT_FAILED", stage, decision,
+                            decision_id=decision_id, success=False, detail=str(v9_error), conn=conn)
+        _v114_trace(trace_id, symbol, writer, "PIPELINE_COMMIT_PENDING", stage, decision,
+                    decision_id=decision_id, success=True, conn=conn)
         conn.commit()
         conn.close()
+        _v114_trace(trace_id, symbol, writer, "PIPELINE_COMMITTED", stage, decision,
+                    decision_id=decision_id, success=True, detail="all decision evidence committed")
     except Exception as e:
         print(f"V2 DECISION LOG ERROR {symbol}: {e}")
+        _v114_trace(trace_id, symbol or "UNKNOWN", writer, "PIPELINE_FAILED", stage, decision,
+                    success=False, detail=str(e))
 
 
 def v2_recent_decisions(limit: int = 100):
@@ -9412,9 +9533,9 @@ def api_v10_explain(symbol: str, request: Request):
 # Mines validated multi-factor market setups from explicit V10 lineage.
 # Shadow-only: never changes orders, thresholds, strategy settings, or live behaviour.
 # =========================
-V11_VERSION = "V11.3"
-V11_NAME = "Rich Snapshot Capture Repair"
-V11_SCHEMA_VERSION = "11.3"
+V11_VERSION = "V11.4"
+V11_NAME = "Unified Decision Pipeline"
+V11_SCHEMA_VERSION = "11.4"
 V11_ENABLED = os.getenv("V11_ENABLED", "true").lower() == "true"
 V11_DEFAULT_HORIZON_HOURS = max(1, int(os.getenv("V11_DEFAULT_HORIZON_HOURS", "1") or 1))
 V11_MIN_SAMPLES = max(8, int(os.getenv("V11_MIN_SAMPLES", "20") or 20))
@@ -9969,7 +10090,7 @@ def v11_status_payload() -> Dict[str, Any]:
                          "threeFactorInteractions": True, "chronologicalValidation": True,
                          "baselineLift": True, "lower95Expectancy": True, "stabilityScoring": True,
                          "liveSymbolExplanation": True, "automaticLearning": True, "richEvidenceTracking": True,
-                         "thresholdTriggeredResearch": True, "learningHistory": True, "richCaptureAudit": True, "missingFieldDiagnostics": True, "pipelineReadiness": True, "captureRepair": True, "postWriteVerification": True, "endToEndCaptureTest": True, "shadowOnly": True},
+                         "thresholdTriggeredResearch": True, "learningHistory": True, "richCaptureAudit": True, "missingFieldDiagnostics": True, "pipelineReadiness": True, "captureRepair": True, "postWriteVerification": True, "endToEndCaptureTest": True, "unifiedDecisionPipeline": True, "decisionTrace": True, "writerAttribution": True, "shadowOnly": True},
             "autoLearning": {"enabled": V11_AUTO_LEARNING_ENABLED, "intervalSeconds": V11_AUTO_INTERVAL_SECONDS,
                              "minimumNewObservations": V11_AUTO_MIN_NEW_OBSERVATIONS,
                              "minimumNewRichObservations": V11_AUTO_MIN_NEW_RICH_OBSERVATIONS,
@@ -10210,6 +10331,10 @@ def v112_pipeline_status(limit_examples: int = 10) -> Dict[str, Any]:
     verification_total=int(conn.execute("SELECT COUNT(*) FROM v11_capture_verification WHERE verification_type='LIVE_POST_WRITE'").fetchone()[0])
     verification_passed=int(conn.execute("SELECT COUNT(*) FROM v11_capture_verification WHERE verification_type='LIVE_POST_WRITE' AND passed=1").fetchone()[0])
     latest_test=conn.execute("SELECT id,created_at,symbol,passed,core_present,missing_fields_json FROM v11_capture_tests ORDER BY id DESC LIMIT 1").fetchone()
+    _v114_ensure_tables()
+    trace_events=int(conn.execute("SELECT COUNT(*) FROM v11_decision_trace").fetchone()[0])
+    traced_decisions=int(conn.execute("SELECT COUNT(DISTINCT decision_id) FROM v11_decision_trace WHERE decision_id IS NOT NULL").fetchone()[0])
+    latest_trace=conn.execute("SELECT created_at,decision_id,symbol,writer,event,success FROM v11_decision_trace ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
     if live == 0:
         diagnosis="NO_LIVE_SNAPSHOTS"
@@ -10233,7 +10358,24 @@ def v112_pipeline_status(limit_examples: int = 10) -> Dict[str, Any]:
             "failed":verification_total-verification_passed,"passRatePct":round(verification_passed/verification_total*100.0,2) if verification_total else 0.0},
             "latestEndToEndTest":None if not latest_test else {"id":latest_test[0],"createdAt":latest_test[1],"symbol":latest_test[2],
             "passed":bool(latest_test[3]),"corePresent":latest_test[4],"missingFields":json.loads(latest_test[5] or '[]')},
+            "unifiedPipeline":{"traceEvents":trace_events,"tracedDecisions":traced_decisions,
+                "latestTrace":None if not latest_trace else {"createdAt":latest_trace[0],"decisionId":latest_trace[1],
+                    "symbol":latest_trace[2],"writer":latest_trace[3],"event":latest_trace[4],"success":bool(latest_trace[5])}},
             "advisoryOnly":True,"automaticLiveChanges":False,"historicalSnapshotsRewritten":False}
+
+
+@app.get('/v11/pipeline/trace/{decision_id}')
+def api_v114_pipeline_trace(decision_id: int, request: Request):
+    verify_api_key(request)
+    if int(decision_id) <= 0:
+        raise HTTPException(status_code=400, detail='Invalid decision id')
+    return v114_trace_payload(int(decision_id))
+
+
+@app.get('/v11/pipeline/traces')
+def api_v114_pipeline_traces(request: Request, limit: int = 50):
+    verify_api_key(request)
+    return v114_recent_traces(limit)
 
 
 @app.get('/v11/pipeline/status')
