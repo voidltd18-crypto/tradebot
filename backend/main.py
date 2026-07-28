@@ -8996,10 +8996,11 @@ def api_v9_intelligence(symbol: str, request: Request):
 # Statistical research over V9 market memory. Shadow-only: never changes orders,
 # thresholds, strategy settings, or live trading behaviour.
 # =========================
-V10_VERSION = "V10.0"
-V10_NAME = "Explainable Research Engine"
+V10_VERSION = "V10.1"
+V10_NAME = "Evidence Lineage & Horizon Compatibility Engine"
+V10_SCHEMA_VERSION = "10.1"
 V10_ENABLED = os.getenv("V10_ENABLED", "true").lower() == "true"
-V10_DEFAULT_HORIZON_HOURS = max(1, int(os.getenv("V10_DEFAULT_HORIZON_HOURS", "4") or 4))
+V10_DEFAULT_HORIZON_HOURS = max(1, int(os.getenv("V10_DEFAULT_HORIZON_HOURS", "1") or 1))
 V10_MIN_PATTERN_SAMPLES = max(3, int(os.getenv("V10_MIN_PATTERN_SAMPLES", "8") or 8))
 V10_MAX_PATTERNS = max(25, min(int(os.getenv("V10_MAX_PATTERNS", "250") or 250), 1000))
 
@@ -9052,6 +9053,28 @@ def _v10_ensure_tables() -> None:
         summary TEXT NOT NULL,
         payload_json TEXT
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v10_evidence_lineage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        schema_version TEXT NOT NULL DEFAULT '10.1',
+        decision_id INTEGER NOT NULL,
+        snapshot_id INTEGER NOT NULL,
+        outcome_id INTEGER NOT NULL,
+        symbol TEXT NOT NULL,
+        observed_at TEXT,
+        horizon_hours INTEGER NOT NULL,
+        outcome_status TEXT NOT NULL,
+        net_return_pct REAL,
+        linked_at TEXT NOT NULL,
+        UNIQUE(snapshot_id, outcome_id)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_lineage_horizon_status ON v10_evidence_lineage(horizon_hours,outcome_status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_lineage_symbol_time ON v10_evidence_lineage(symbol,observed_at)")
+    # Backfill explicit evidence lineage from the already-stable decision_id relationship.
+    conn.execute("""INSERT OR IGNORE INTO v10_evidence_lineage(
+        schema_version,decision_id,snapshot_id,outcome_id,symbol,observed_at,horizon_hours,outcome_status,net_return_pct,linked_at)
+        SELECT ?,m.decision_id,m.decision_id,o.id,m.symbol,m.observed_at,o.horizon_hours,o.status,o.net_return_pct,?
+        FROM v9_market_memory m JOIN v2_observation_outcomes o ON o.decision_id=m.decision_id""",
+        (V10_SCHEMA_VERSION, datetime.now(UTC).isoformat()))
     conn.commit(); conn.close()
 
 
@@ -9129,12 +9152,28 @@ def _v10_metrics(returns: List[float]) -> Dict[str, Any]:
             "profitFactor": pf, "score": score, "grade": _v10_grade(n, pf, avg)}
 
 
+def _v10_available_horizons(conn) -> List[int]:
+    rows = conn.execute("""SELECT DISTINCT horizon_hours FROM v10_evidence_lineage
+                           WHERE outcome_status='COMPLETE' AND net_return_pct IS NOT NULL
+                           ORDER BY horizon_hours""").fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def _v10_resolve_horizon(conn, requested_horizon: int) -> Dict[str, Any]:
+    requested = max(1, min(int(requested_horizon), 168))
+    available = _v10_available_horizons(conn)
+    if not available:
+        return {"requested": requested, "effective": requested, "available": [], "exact": False}
+    effective = requested if requested in available else min(available, key=lambda h: (abs(h-requested), h))
+    return {"requested": requested, "effective": int(effective), "available": available, "exact": requested == effective}
+
+
 def _v10_load_observations(conn, horizon_hours: int) -> List[Dict[str, Any]]:
     columns = [x[1] for x in conn.execute("PRAGMA table_info(v9_market_memory)").fetchall()]
-    query = """SELECT m.*, o.net_return_pct AS v10_return_pct
-               FROM v9_market_memory m
-               JOIN v2_observation_outcomes o ON o.decision_id=m.decision_id
-               WHERE o.horizon_hours=? AND o.status='COMPLETE' AND o.net_return_pct IS NOT NULL
+    query = """SELECT m.*, l.net_return_pct AS v10_return_pct
+               FROM v10_evidence_lineage l
+               JOIN v9_market_memory m ON m.decision_id=l.snapshot_id
+               WHERE l.horizon_hours=? AND l.outcome_status='COMPLETE' AND l.net_return_pct IS NOT NULL
                ORDER BY m.decision_id ASC"""
     rows = conn.execute(query, (int(horizon_hours),)).fetchall()
     return [dict(zip(columns + ["v10_return_pct"], row)) for row in rows]
@@ -9143,10 +9182,12 @@ def _v10_load_observations(conn, horizon_hours: int) -> List[Dict[str, Any]]:
 def v10_run_research(horizon_hours: int = V10_DEFAULT_HORIZON_HOURS,
                      min_samples: int = V10_MIN_PATTERN_SAMPLES) -> Dict[str, Any]:
     _v10_ensure_tables()
-    horizon_hours = max(1, min(int(horizon_hours), 168))
+    requested_horizon = max(1, min(int(horizon_hours), 168))
     min_samples = max(3, min(int(min_samples), 500))
     now = datetime.now(UTC).isoformat()
     conn = db_connect()
+    horizon_resolution = _v10_resolve_horizon(conn, requested_horizon)
+    horizon_hours = int(horizon_resolution["effective"])
     cur = conn.execute("INSERT INTO v10_research_runs(created_at,horizon_hours,status) VALUES(?,?,'RUNNING')", (now, horizon_hours))
     run_id = int(cur.lastrowid)
     conn.commit()
@@ -9211,7 +9252,10 @@ def v10_run_research(horizon_hours: int = V10_DEFAULT_HORIZON_HOURS,
         conn.execute("INSERT INTO v10_research_notebook(run_id,created_at,title,summary,payload_json) VALUES(?,?,?,?,?)",
                      (run_id, now, f"V10 research — {horizon_hours}h horizon", summary, json.dumps(notebook_payload, default=str)))
         completed = datetime.now(UTC).isoformat()
-        run_payload = {"ok": True, "version": V10_VERSION, "runId": run_id, "horizonHours": horizon_hours,
+        run_payload = {"ok": True, "version": V10_VERSION, "runId": run_id,
+                       "requestedHorizonHours": requested_horizon, "horizonHours": horizon_hours,
+                       "horizonExactMatch": bool(horizon_resolution["exact"]),
+                       "availableHorizons": horizon_resolution["available"],
                        "observations": len(observations), "richObservations": rich_count,
                        "patternsFound": len(patterns), "minimumSamples": min_samples,
                        "bestPatterns": best, "worstPatterns": worst, "advisoryOnly": True,
@@ -9289,15 +9333,35 @@ def v10_status_payload() -> Dict[str, Any]:
     runs = int(conn.execute("SELECT COUNT(*) FROM v10_research_runs WHERE status='COMPLETE'").fetchone()[0])
     latest = conn.execute("SELECT id,observations,rich_observations,patterns_found,completed_at FROM v10_research_runs WHERE status='COMPLETE' ORDER BY id DESC LIMIT 1").fetchone()
     completed_outcomes = int(conn.execute("SELECT COUNT(*) FROM v2_observation_outcomes WHERE status='COMPLETE' AND net_return_pct IS NOT NULL").fetchone()[0])
+    lineage_links = int(conn.execute("SELECT COUNT(*) FROM v10_evidence_lineage").fetchone()[0])
+    linked_complete = int(conn.execute("SELECT COUNT(*) FROM v10_evidence_lineage WHERE outcome_status='COMPLETE' AND net_return_pct IS NOT NULL").fetchone()[0])
+    available_horizons = _v10_available_horizons(conn)
     conn.close()
     return {"ok": True, "version": V10_VERSION, "name": V10_NAME, "enabled": V10_ENABLED,
             "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False,
-            "completedOutcomes": completed_outcomes, "researchRuns": runs,
+            "completedOutcomes": completed_outcomes, "lineageLinks": lineage_links,
+            "linkedCompletedOutcomes": linked_complete, "availableHorizons": available_horizons,
+            "schemaVersion": V10_SCHEMA_VERSION, "researchRuns": runs,
             "latestRun": None if not latest else {"id": latest[0], "observations": latest[1], "richObservations": latest[2], "patternsFound": latest[3], "completedAt": latest[4]},
             "features": {"singleFactorResearch": True, "twoFactorInteractions": True, "profitFactor": True,
                          "expectancy": True, "researchNotebook": True, "symbolExplanation": True,
-                         "sampleSizeWeighting": True, "shadowOnly": True}}
+                         "sampleSizeWeighting": True, "explicitEvidenceLineage": True,
+                         "horizonCompatibility": True, "schemaVersioning": True, "shadowOnly": True}}
 
+
+@app.get('/v10/lineage/status')
+def api_v10_lineage_status(request: Request):
+    verify_api_key(request)
+    _v10_ensure_tables(); conn=db_connect()
+    total=int(conn.execute("SELECT COUNT(*) FROM v10_evidence_lineage").fetchone()[0])
+    complete=int(conn.execute("SELECT COUNT(*) FROM v10_evidence_lineage WHERE outcome_status='COMPLETE' AND net_return_pct IS NOT NULL").fetchone()[0])
+    by_horizon={str(r[0]): int(r[1]) for r in conn.execute("SELECT horizon_hours,COUNT(*) FROM v10_evidence_lineage WHERE outcome_status='COMPLETE' AND net_return_pct IS NOT NULL GROUP BY horizon_hours ORDER BY horizon_hours").fetchall()}
+    missing=int(conn.execute("""SELECT COUNT(*) FROM v2_observation_outcomes o JOIN v9_market_memory m ON m.decision_id=o.decision_id
+                                LEFT JOIN v10_evidence_lineage l ON l.outcome_id=o.id WHERE l.id IS NULL""").fetchone()[0])
+    conn.close()
+    return {"ok":True,"version":V10_VERSION,"schemaVersion":V10_SCHEMA_VERSION,"lineageLinks":total,
+            "linkedCompletedOutcomes":complete,"completedByHorizon":by_horizon,"missingEligibleLinks":missing,
+            "advisoryOnly":True}
 
 @app.get('/v10/status')
 def api_v10_status(request: Request):
