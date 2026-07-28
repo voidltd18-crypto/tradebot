@@ -1760,6 +1760,18 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
     if not symbol or _v2_decision_recently_logged(symbol, decision, stage):
         return
     profile = profile or {}
+
+    # V11.3 surgical repair: enrich the exact scan object that is persisted.
+    # This is logging-only and cannot alter the already-made trading decision.
+    capture_scan = dict(scan)
+    if globals().get("V91_INTELLIGENCE_ENABLED", False) and globals().get("_v91_enrich_scan"):
+        try:
+            capture_scan = _v91_enrich_scan(capture_scan)
+        except Exception as enrich_error:
+            capture_scan["v113_capture_enrichment_error"] = str(enrich_error)[:500]
+            print(f"V11.3 CAPTURE ENRICHMENT ERROR {symbol}: {enrich_error}")
+    scan = capture_scan
+
     payload = {
         "confidenceLabel": scan.get("confidence_label"),
         "sniperReason": scan.get("sniper_reason"),
@@ -8896,8 +8908,10 @@ def _v9_capture_snapshot(conn, decision_id: int, scan: Dict[str, Any], decision:
          json.dumps(payload,default=str),str(source)))
     try:
         _v112_audit_snapshot(conn, decision_id, symbol, source, fields)
+        if source == "live":
+            _v113_verify_persisted_snapshot(conn, decision_id, symbol)
     except Exception as audit_error:
-        print(f"V11.2 SNAPSHOT AUDIT ERROR {symbol}: {audit_error}")
+        print(f"V11.3 SNAPSHOT AUDIT/VERIFY ERROR {symbol}: {audit_error}")
 
 
 def v9_backfill(limit: int = 5000) -> Dict[str, Any]:
@@ -9398,9 +9412,9 @@ def api_v10_explain(symbol: str, request: Request):
 # Mines validated multi-factor market setups from explicit V10 lineage.
 # Shadow-only: never changes orders, thresholds, strategy settings, or live behaviour.
 # =========================
-V11_VERSION = "V11.2"
-V11_NAME = "Rich Evidence Pipeline Guardian"
-V11_SCHEMA_VERSION = "11.2"
+V11_VERSION = "V11.3"
+V11_NAME = "Rich Snapshot Capture Repair"
+V11_SCHEMA_VERSION = "11.3"
 V11_ENABLED = os.getenv("V11_ENABLED", "true").lower() == "true"
 V11_DEFAULT_HORIZON_HOURS = max(1, int(os.getenv("V11_DEFAULT_HORIZON_HOURS", "1") or 1))
 V11_MIN_SAMPLES = max(8, int(os.getenv("V11_MIN_SAMPLES", "20") or 20))
@@ -9955,7 +9969,7 @@ def v11_status_payload() -> Dict[str, Any]:
                          "threeFactorInteractions": True, "chronologicalValidation": True,
                          "baselineLift": True, "lower95Expectancy": True, "stabilityScoring": True,
                          "liveSymbolExplanation": True, "automaticLearning": True, "richEvidenceTracking": True,
-                         "thresholdTriggeredResearch": True, "learningHistory": True, "richCaptureAudit": True, "missingFieldDiagnostics": True, "pipelineReadiness": True, "shadowOnly": True},
+                         "thresholdTriggeredResearch": True, "learningHistory": True, "richCaptureAudit": True, "missingFieldDiagnostics": True, "pipelineReadiness": True, "captureRepair": True, "postWriteVerification": True, "endToEndCaptureTest": True, "shadowOnly": True},
             "autoLearning": {"enabled": V11_AUTO_LEARNING_ENABLED, "intervalSeconds": V11_AUTO_INTERVAL_SECONDS,
                              "minimumNewObservations": V11_AUTO_MIN_NEW_OBSERVATIONS,
                              "minimumNewRichObservations": V11_AUTO_MIN_NEW_RICH_OBSERVATIONS,
@@ -10036,6 +10050,29 @@ def _v112_ensure_tables() -> None:
         present_fields_json TEXT NOT NULL
     )""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_rich_audit_ready ON v11_rich_capture_audit(rich_ready,audited_at)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_capture_verification (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        decision_id INTEGER,
+        symbol TEXT NOT NULL,
+        verification_type TEXT NOT NULL,
+        passed INTEGER NOT NULL DEFAULT 0,
+        core_present INTEGER NOT NULL DEFAULT 0,
+        missing_fields_json TEXT NOT NULL,
+        error TEXT,
+        payload_json TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_capture_verify_time ON v11_capture_verification(created_at)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_capture_tests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        passed INTEGER NOT NULL DEFAULT 0,
+        core_present INTEGER NOT NULL DEFAULT 0,
+        missing_fields_json TEXT NOT NULL,
+        relative_volume REAL, gap_pct REAL, distance_vwap_pct REAL, ema20_distance_pct REAL, atr_pct REAL,
+        payload_json TEXT NOT NULL
+    )""")
     conn.commit(); conn.close()
 
 
@@ -10061,6 +10098,61 @@ def _v112_audit_snapshot(conn, decision_id: int, symbol: str, source: str, field
         ) VALUES(?,?,?,?,?,?,?,?,?)""",
         (int(decision_id), datetime.now(UTC).isoformat(), str(symbol), str(source), len(core_present),
          V112_MIN_CORE_FIELDS, ready, json.dumps(missing), json.dumps(present)))
+
+
+def _v113_verify_persisted_snapshot(conn, decision_id: int, symbol: str) -> Dict[str, Any]:
+    row = conn.execute("""SELECT relative_volume,gap_pct,distance_vwap_pct,ema20_distance_pct,atr_pct,payload_json
+        FROM v9_market_memory WHERE decision_id=?""", (int(decision_id),)).fetchone()
+    if not row:
+        result={"passed":False,"corePresent":0,"missingFields":list(V112_CORE_RICH_FIELDS),"error":"snapshot row missing after write"}
+    else:
+        values=dict(zip(V112_CORE_RICH_FIELDS,row[:5]))
+        present=[k for k,v in values.items() if _v112_present(v)]
+        missing=[k for k in V112_CORE_RICH_FIELDS if k not in present]
+        result={"passed":len(present)>=V112_MIN_CORE_FIELDS,"corePresent":len(present),"missingFields":missing,"error":None}
+    conn.execute("""INSERT INTO v11_capture_verification(created_at,decision_id,symbol,verification_type,passed,core_present,missing_fields_json,error,payload_json)
+        VALUES(?,?,?,?,?,?,?,?,?)""",(datetime.now(UTC).isoformat(),int(decision_id),str(symbol),"LIVE_POST_WRITE",int(result["passed"]),
+        int(result["corePresent"]),json.dumps(result["missingFields"]),result.get("error"),json.dumps(result,default=str)))
+    if not result["passed"]:
+        print(f"V11.3 RICH SNAPSHOT VERIFY FAILED {symbol} decision={decision_id} missing={','.join(result['missingFields'])}")
+    return result
+
+
+def _v113_capture_test(symbol: str) -> Dict[str, Any]:
+    _v9_ensure_tables(); _v112_ensure_tables()
+    sym=str(symbol or '').upper().strip()
+    if not re.fullmatch(r'[A-Z.\-]{1,10}',sym):
+        raise HTTPException(status_code=400,detail='Invalid symbol')
+    started=datetime.now(UTC)
+    try:
+        quote=get_quote(sym); price=float(quote.get('mid') or 0.0)
+        if price<=0: raise RuntimeError('No usable midpoint quote')
+        scan={"symbol":sym,"price":price,"confidence":0.5,"quality_score":0.0,"short_momentum":0.0,
+              "pullback":0.0,"spread":float(quote.get('spread') or 0.0),"ready_to_buy":False,"sniper_pass":False,"a_plus_pass":False}
+        enriched=_v91_enrich_scan(scan)
+        values={k:_v9_num(_v9_scan_value(enriched,k)) for k in V112_CORE_RICH_FIELDS}
+        present=[k for k,v in values.items() if _v112_present(v)]
+        missing=[k for k in V112_CORE_RICH_FIELDS if k not in present]
+        passed=len(present)>=V112_MIN_CORE_FIELDS
+        conn=db_connect()
+        cur=conn.execute("""INSERT INTO v11_capture_tests(created_at,symbol,passed,core_present,missing_fields_json,
+            relative_volume,gap_pct,distance_vwap_pct,ema20_distance_pct,atr_pct,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (started.isoformat(),sym,int(passed),len(present),json.dumps(missing),values.get('relative_volume'),values.get('gap_pct'),
+             values.get('distance_vwap_pct'),values.get('ema20_distance_pct'),values.get('atr_pct'),json.dumps(enriched,default=str)))
+        test_id=int(cur.lastrowid); conn.commit()
+        persisted=conn.execute("SELECT relative_volume,gap_pct,distance_vwap_pct,ema20_distance_pct,atr_pct FROM v11_capture_tests WHERE id=?",(test_id,)).fetchone()
+        conn.close()
+        persisted_values=dict(zip(V112_CORE_RICH_FIELDS,persisted)) if persisted else {}
+        persistence_ok=bool(persisted and all((persisted_values[k] is not None)==(values[k] is not None) for k in V112_CORE_RICH_FIELDS))
+        return {"ok":True,"version":V11_VERSION,"testId":test_id,"symbol":sym,"price":price,"passed":bool(passed and persistence_ok),
+                "intelligenceCaptured":passed,"persistenceVerified":persistence_ok,"corePresent":len(present),"coreRequired":V112_MIN_CORE_FIELDS,
+                "presentFields":present,"missingFields":missing,"values":values,"errors":{k:v for k,v in enriched.items() if str(k).endswith('_error')},
+                "contaminatedResearchData":False,"placedOrder":False}
+    except Exception as e:
+        conn=db_connect(); conn.execute("""INSERT INTO v11_capture_verification(created_at,decision_id,symbol,verification_type,passed,core_present,missing_fields_json,error,payload_json)
+            VALUES(?,?,?,?,0,0,?,?,?)""",(started.isoformat(),None,sym,"SYNTHETIC_END_TO_END",json.dumps(list(V112_CORE_RICH_FIELDS)),str(e)[:1000],json.dumps({"error":str(e)},default=str)))
+        conn.commit(); conn.close()
+        return {"ok":False,"version":V11_VERSION,"symbol":sym,"passed":False,"error":str(e),"placedOrder":False,"contaminatedResearchData":False}
 
 
 def _v112_backfill_audit(limit: int = 50000) -> Dict[str, int]:
@@ -10115,6 +10207,9 @@ def v112_pipeline_status(limit_examples: int = 10) -> Dict[str, Any]:
         examples.append({"decisionId":r[0],"auditedAt":r[1],"symbol":r[2],"corePresent":r[3],"coreRequired":r[4],
                          "missingFields":json.loads(r[5] or '[]'),"stage":r[6],"decision":r[7],"reason":r[8]})
     latest_live=conn.execute("SELECT MAX(captured_at) FROM v9_market_memory WHERE source='live'").fetchone()[0]
+    verification_total=int(conn.execute("SELECT COUNT(*) FROM v11_capture_verification WHERE verification_type='LIVE_POST_WRITE'").fetchone()[0])
+    verification_passed=int(conn.execute("SELECT COUNT(*) FROM v11_capture_verification WHERE verification_type='LIVE_POST_WRITE' AND passed=1").fetchone()[0])
+    latest_test=conn.execute("SELECT id,created_at,symbol,passed,core_present,missing_fields_json FROM v11_capture_tests ORDER BY id DESC LIMIT 1").fetchone()
     conn.close()
     if live == 0:
         diagnosis="NO_LIVE_SNAPSHOTS"
@@ -10134,7 +10229,11 @@ def v112_pipeline_status(limit_examples: int = 10) -> Dict[str, Any]:
             "audited":audited,"richReadyAll":ready_all,"richReadyLive":ready_live,"richReadyRecent":ready_recent,
             "richCompletedAtHorizon":completed_ready,"richPendingAtHorizon":pending_ready,"horizonHours":V11_DEFAULT_HORIZON_HOURS,
             "latestLiveCapturedAt":latest_live},"fieldCoverage":field_coverage,"missingCoreFieldCounts":missing_counts,
-            "recentIncompleteExamples":examples,"advisoryOnly":True,"automaticLiveChanges":False,"historicalSnapshotsRewritten":False}
+            "recentIncompleteExamples":examples,"captureVerification":{"total":verification_total,"passed":verification_passed,
+            "failed":verification_total-verification_passed,"passRatePct":round(verification_passed/verification_total*100.0,2) if verification_total else 0.0},
+            "latestEndToEndTest":None if not latest_test else {"id":latest_test[0],"createdAt":latest_test[1],"symbol":latest_test[2],
+            "passed":bool(latest_test[3]),"corePresent":latest_test[4],"missingFields":json.loads(latest_test[5] or '[]')},
+            "advisoryOnly":True,"automaticLiveChanges":False,"historicalSnapshotsRewritten":False}
 
 
 @app.get('/v11/pipeline/status')
@@ -10148,3 +10247,14 @@ def api_v112_pipeline_audit(request: Request, payload: Dict[str, Any] = Body(def
     result=_v112_backfill_audit(int(payload.get('limit') or 50000))
     result.update(v112_pipeline_status(int(payload.get('examples') or 10)))
     return result
+
+
+@app.post('/v11/pipeline/test')
+def api_v113_pipeline_test(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return _v113_capture_test(str(payload.get('symbol') or 'MSFT'))
+
+@app.get('/v11/pipeline/test/{symbol}')
+def api_v113_pipeline_test_get(symbol: str, request: Request):
+    verify_api_key(request)
+    return _v113_capture_test(symbol)
