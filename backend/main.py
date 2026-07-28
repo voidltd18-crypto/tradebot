@@ -8989,3 +8989,334 @@ def api_v9_intelligence(symbol: str, request: Request):
     scan={'symbol':sym,'price':quote['mid'],'bid':quote['bid'],'ask':quote['ask'],'spread':quote['spread']}
     enriched=_v91_enrich_scan(scan)
     return {'ok':True,'version':V9_VERSION,'symbol':sym,'intelligence':enriched}
+
+
+# =========================
+# TRADEBOT V10.0 — EXPLAINABLE RESEARCH ENGINE
+# Statistical research over V9 market memory. Shadow-only: never changes orders,
+# thresholds, strategy settings, or live trading behaviour.
+# =========================
+V10_VERSION = "V10.0"
+V10_NAME = "Explainable Research Engine"
+V10_ENABLED = os.getenv("V10_ENABLED", "true").lower() == "true"
+V10_DEFAULT_HORIZON_HOURS = max(1, int(os.getenv("V10_DEFAULT_HORIZON_HOURS", "4") or 4))
+V10_MIN_PATTERN_SAMPLES = max(3, int(os.getenv("V10_MIN_PATTERN_SAMPLES", "8") or 8))
+V10_MAX_PATTERNS = max(25, min(int(os.getenv("V10_MAX_PATTERNS", "250") or 250), 1000))
+
+
+def _v10_ensure_tables() -> None:
+    _v9_ensure_tables()
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v10_research_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        horizon_hours INTEGER NOT NULL,
+        observations INTEGER NOT NULL DEFAULT 0,
+        rich_observations INTEGER NOT NULL DEFAULT 0,
+        patterns_found INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'RUNNING',
+        payload_json TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v10_patterns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        horizon_hours INTEGER NOT NULL,
+        pattern_key TEXT NOT NULL,
+        pattern_name TEXT NOT NULL,
+        dimensions_json TEXT NOT NULL,
+        samples INTEGER NOT NULL,
+        wins INTEGER NOT NULL,
+        losses INTEGER NOT NULL,
+        win_rate REAL NOT NULL,
+        average_return_pct REAL NOT NULL,
+        median_return_pct REAL NOT NULL,
+        expectancy_pct REAL NOT NULL,
+        gross_profit_pct REAL NOT NULL,
+        gross_loss_pct REAL NOT NULL,
+        profit_factor REAL NOT NULL,
+        score REAL NOT NULL,
+        confidence_grade TEXT NOT NULL,
+        explanation TEXT NOT NULL,
+        UNIQUE(run_id, pattern_key)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_patterns_run_score ON v10_patterns(run_id, score DESC)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v10_research_notebook (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        title TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        payload_json TEXT
+    )""")
+    conn.commit(); conn.close()
+
+
+def _v10_float(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+        if math.isnan(number) or math.isinf(number):
+            return default
+        return number
+    except Exception:
+        return default
+
+
+def _v10_bin(name: str, value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if name == "market_regime":
+        v = str(value or "").strip().upper()
+        return None if v in ("", "UNKNOWN") else v
+    if name == "sector":
+        v = str(value or "").strip()
+        return None if v.lower() in ("", "unknown") else v
+    x = _v10_float(value, float("nan"))
+    if math.isnan(x):
+        return None
+    if name == "relative_volume":
+        return "RVOL <1" if x < 1 else "RVOL 1-2" if x < 2 else "RVOL 2-4" if x < 4 else "RVOL 4+"
+    if name == "gap_pct":
+        return "Gap <-2%" if x < -2 else "Gap -2% to 0%" if x < 0 else "Gap 0-2%" if x < 2 else "Gap 2-5%" if x < 5 else "Gap 5%+"
+    if name == "distance_vwap_pct":
+        return "Below VWAP >1%" if x < -1 else "Below VWAP" if x < 0 else "Above VWAP 0-1%" if x < 1 else "Above VWAP >1%"
+    if name == "ema20_distance_pct":
+        return "Below EMA20" if x < 0 else "Above EMA20 0-1%" if x < 1 else "Above EMA20 >1%"
+    if name == "atr_pct":
+        return "ATR <2%" if x < 2 else "ATR 2-4%" if x < 4 else "ATR 4-7%" if x < 7 else "ATR 7%+"
+    if name == "sector_strength":
+        return "Sector weak" if x < -0.25 else "Sector neutral" if x < 0.25 else "Sector strong"
+    if name == "confidence":
+        return "Confidence <0.60" if x < .60 else "Confidence 0.60-0.70" if x < .70 else "Confidence 0.70-0.80" if x < .80 else "Confidence 0.80-0.90" if x < .90 else "Confidence 0.90+"
+    if name == "session_name":
+        return str(value or "UNKNOWN")
+    return None
+
+
+def _v10_grade(samples: int, profit_factor: float, expectancy: float) -> str:
+    if samples >= 50 and profit_factor >= 1.5 and expectancy > 0:
+        return "A"
+    if samples >= 25 and profit_factor >= 1.2 and expectancy > 0:
+        return "B"
+    if samples >= V10_MIN_PATTERN_SAMPLES and profit_factor >= 1.0 and expectancy >= 0:
+        return "C"
+    if samples >= V10_MIN_PATTERN_SAMPLES:
+        return "D"
+    return "INSUFFICIENT"
+
+
+def _v10_metrics(returns: List[float]) -> Dict[str, Any]:
+    clean = [float(x) for x in returns if x is not None and not math.isnan(float(x)) and not math.isinf(float(x))]
+    n = len(clean)
+    wins = sum(1 for x in clean if x > 0)
+    losses = sum(1 for x in clean if x < 0)
+    gross_profit = sum(x for x in clean if x > 0)
+    gross_loss = abs(sum(x for x in clean if x < 0))
+    pf = gross_profit / gross_loss if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
+    avg = sum(clean) / n if n else 0.0
+    ordered = sorted(clean)
+    median = (ordered[n//2] if n % 2 else (ordered[n//2-1] + ordered[n//2]) / 2) if n else 0.0
+    win_rate = wins / n if n else 0.0
+    # Confidence-aware ranking: rewards positive evidence but limits tiny-sample dominance.
+    sample_weight = min(1.0, math.sqrt(n / 50.0)) if n else 0.0
+    score = (avg * 35.0 + min(pf, 5.0) * 5.0 + (win_rate - 0.5) * 20.0) * sample_weight
+    return {"samples": n, "wins": wins, "losses": losses, "winRate": win_rate,
+            "averageReturnPct": avg, "medianReturnPct": median, "expectancyPct": avg,
+            "grossProfitPct": gross_profit, "grossLossPct": gross_loss,
+            "profitFactor": pf, "score": score, "grade": _v10_grade(n, pf, avg)}
+
+
+def _v10_load_observations(conn, horizon_hours: int) -> List[Dict[str, Any]]:
+    columns = [x[1] for x in conn.execute("PRAGMA table_info(v9_market_memory)").fetchall()]
+    query = """SELECT m.*, o.net_return_pct AS v10_return_pct
+               FROM v9_market_memory m
+               JOIN v2_observation_outcomes o ON o.decision_id=m.decision_id
+               WHERE o.horizon_hours=? AND o.status='COMPLETE' AND o.net_return_pct IS NOT NULL
+               ORDER BY m.decision_id ASC"""
+    rows = conn.execute(query, (int(horizon_hours),)).fetchall()
+    return [dict(zip(columns + ["v10_return_pct"], row)) for row in rows]
+
+
+def v10_run_research(horizon_hours: int = V10_DEFAULT_HORIZON_HOURS,
+                     min_samples: int = V10_MIN_PATTERN_SAMPLES) -> Dict[str, Any]:
+    _v10_ensure_tables()
+    horizon_hours = max(1, min(int(horizon_hours), 168))
+    min_samples = max(3, min(int(min_samples), 500))
+    now = datetime.now(UTC).isoformat()
+    conn = db_connect()
+    cur = conn.execute("INSERT INTO v10_research_runs(created_at,horizon_hours,status) VALUES(?,?,'RUNNING')", (now, horizon_hours))
+    run_id = int(cur.lastrowid)
+    conn.commit()
+    try:
+        observations = _v10_load_observations(conn, horizon_hours)
+        feature_names = ["market_regime", "sector", "relative_volume", "gap_pct", "distance_vwap_pct",
+                         "ema20_distance_pct", "atr_pct", "sector_strength", "confidence", "session_name"]
+        buckets: Dict[str, Dict[str, Any]] = {}
+        rich_count = 0
+        for obs in observations:
+            ret = _v10_float(obs.get("v10_return_pct"), float("nan"))
+            if math.isnan(ret):
+                continue
+            labels = {name: _v10_bin(name, obs.get(name)) for name in feature_names}
+            labels = {k: v for k, v in labels.items() if v is not None}
+            if any(k in labels for k in ("relative_volume", "gap_pct", "distance_vwap_pct", "atr_pct")):
+                rich_count += 1
+            # Single-factor patterns.
+            combos = [((k,), (v,)) for k, v in labels.items()]
+            # Two-factor interactions provide useful combinations while avoiding overfitting explosion.
+            important = [k for k in ("market_regime", "sector", "relative_volume", "gap_pct", "distance_vwap_pct",
+                                      "ema20_distance_pct", "atr_pct", "sector_strength") if k in labels]
+            for i in range(len(important)):
+                for j in range(i + 1, len(important)):
+                    k1, k2 = important[i], important[j]
+                    combos.append(((k1, k2), (labels[k1], labels[k2])))
+            for keys, values in combos:
+                dimensions = dict(zip(keys, values))
+                key = "|".join(f"{k}={dimensions[k]}" for k in keys)
+                item = buckets.setdefault(key, {"dimensions": dimensions, "returns": []})
+                item["returns"].append(ret)
+
+        patterns = []
+        for key, item in buckets.items():
+            metrics = _v10_metrics(item["returns"])
+            if metrics["samples"] < min_samples:
+                continue
+            dims = item["dimensions"]
+            name = " + ".join(str(v) for v in dims.values())
+            direction = "positive" if metrics["expectancyPct"] > 0 else "negative"
+            explanation = (f"{name}: {metrics['samples']} completed observations, "
+                           f"{metrics['winRate']*100:.1f}% win rate, {metrics['expectancyPct']:+.3f}% average net return, "
+                           f"profit factor {metrics['profitFactor']:.2f}. Evidence is {direction} and remains advisory-only.")
+            patterns.append({"key": key, "name": name, "dimensions": dims, **metrics, "explanation": explanation})
+        patterns.sort(key=lambda p: (p["score"], p["samples"]), reverse=True)
+        patterns = patterns[:V10_MAX_PATTERNS]
+        for p in patterns:
+            conn.execute("""INSERT OR REPLACE INTO v10_patterns(
+                run_id,created_at,horizon_hours,pattern_key,pattern_name,dimensions_json,samples,wins,losses,win_rate,
+                average_return_pct,median_return_pct,expectancy_pct,gross_profit_pct,gross_loss_pct,profit_factor,
+                score,confidence_grade,explanation) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (run_id, now, horizon_hours, p["key"], p["name"], json.dumps(p["dimensions"]), p["samples"],
+                 p["wins"], p["losses"], p["winRate"], p["averageReturnPct"], p["medianReturnPct"],
+                 p["expectancyPct"], p["grossProfitPct"], p["grossLossPct"], p["profitFactor"], p["score"],
+                 p["grade"], p["explanation"]))
+        best = [p for p in patterns if p["expectancyPct"] > 0][:5]
+        worst = sorted([p for p in patterns if p["expectancyPct"] < 0], key=lambda p: p["score"])[:5]
+        summary = (f"Analysed {len(observations)} completed {horizon_hours}-hour outcomes, including {rich_count} rich V9.2 observations. "
+                   f"Found {len(patterns)} patterns meeting the {min_samples}-sample threshold. "
+                   f"No live settings or orders were changed.")
+        notebook_payload = {"bestPatterns": best, "worstPatterns": worst, "advisoryOnly": True}
+        conn.execute("INSERT INTO v10_research_notebook(run_id,created_at,title,summary,payload_json) VALUES(?,?,?,?,?)",
+                     (run_id, now, f"V10 research — {horizon_hours}h horizon", summary, json.dumps(notebook_payload, default=str)))
+        completed = datetime.now(UTC).isoformat()
+        run_payload = {"ok": True, "version": V10_VERSION, "runId": run_id, "horizonHours": horizon_hours,
+                       "observations": len(observations), "richObservations": rich_count,
+                       "patternsFound": len(patterns), "minimumSamples": min_samples,
+                       "bestPatterns": best, "worstPatterns": worst, "advisoryOnly": True,
+                       "automaticLiveChanges": False, "automaticPromotion": False}
+        conn.execute("""UPDATE v10_research_runs SET completed_at=?,observations=?,rich_observations=?,patterns_found=?,status='COMPLETE',payload_json=? WHERE id=?""",
+                     (completed, len(observations), rich_count, len(patterns), json.dumps(run_payload, default=str), run_id))
+        conn.commit(); conn.close()
+        return run_payload
+    except Exception as exc:
+        conn.execute("UPDATE v10_research_runs SET completed_at=?,status='ERROR',payload_json=? WHERE id=?",
+                     (datetime.now(UTC).isoformat(), json.dumps({"error": str(exc)}), run_id))
+        conn.commit(); conn.close()
+        raise
+
+
+def v10_latest_report(limit: int = 25) -> Dict[str, Any]:
+    _v10_ensure_tables(); limit = max(1, min(int(limit), 250)); conn = db_connect()
+    run = conn.execute("SELECT id,created_at,completed_at,horizon_hours,observations,rich_observations,patterns_found,status,payload_json FROM v10_research_runs ORDER BY id DESC LIMIT 1").fetchone()
+    if not run:
+        conn.close(); return {"ok": True, "version": V10_VERSION, "hasReport": False, "message": "Run POST /v10/research first."}
+    run_id = int(run[0])
+    rows = conn.execute("""SELECT pattern_key,pattern_name,dimensions_json,samples,wins,losses,win_rate,expectancy_pct,
+                           median_return_pct,profit_factor,score,confidence_grade,explanation
+                           FROM v10_patterns WHERE run_id=? ORDER BY score DESC LIMIT ?""", (run_id, limit)).fetchall()
+    patterns = []
+    for row in rows:
+        patterns.append({"patternKey": row[0], "name": row[1], "dimensions": json.loads(row[2] or "{}"),
+                         "samples": row[3], "wins": row[4], "losses": row[5], "winRate": row[6],
+                         "expectancyPct": row[7], "medianReturnPct": row[8], "profitFactor": row[9],
+                         "score": row[10], "grade": row[11], "explanation": row[12]})
+    conn.close()
+    return {"ok": True, "version": V10_VERSION, "hasReport": True,
+            "run": {"id": run[0], "createdAt": run[1], "completedAt": run[2], "horizonHours": run[3],
+                    "observations": run[4], "richObservations": run[5], "patternsFound": run[6], "status": run[7]},
+            "count": len(patterns), "patterns": patterns, "advisoryOnly": True}
+
+
+def v10_explain_symbol(symbol: str) -> Dict[str, Any]:
+    _v10_ensure_tables(); sym = str(symbol or "").upper().strip()
+    quote = get_quote(sym)
+    intel = _v91_enrich_scan({"symbol": sym, "price": quote["mid"], "bid": quote["bid"], "ask": quote["ask"], "spread": quote["spread"]})
+    conn = db_connect()
+    run = conn.execute("SELECT id,horizon_hours FROM v10_research_runs WHERE status='COMPLETE' ORDER BY id DESC LIMIT 1").fetchone()
+    if not run:
+        conn.close(); return {"ok": True, "version": V10_VERSION, "symbol": sym, "intelligence": intel,
+                              "matches": [], "message": "No V10 report exists yet. Run POST /v10/research."}
+    rows = conn.execute("SELECT pattern_name,dimensions_json,samples,win_rate,expectancy_pct,profit_factor,score,confidence_grade,explanation FROM v10_patterns WHERE run_id=? ORDER BY score DESC", (int(run[0]),)).fetchall()
+    matches = []
+    for row in rows:
+        dims = json.loads(row[1] or "{}")
+        matched = True
+        for feature, expected in dims.items():
+            if _v10_bin(feature, intel.get(feature)) != expected:
+                matched = False; break
+        if matched:
+            matches.append({"name": row[0], "dimensions": dims, "samples": row[2], "winRate": row[3],
+                            "expectancyPct": row[4], "profitFactor": row[5], "score": row[6], "grade": row[7],
+                            "explanation": row[8]})
+        if len(matches) >= 10:
+            break
+    conn.close()
+    positive = [m for m in matches if _v10_float(m.get("expectancyPct")) > 0]
+    negative = [m for m in matches if _v10_float(m.get("expectancyPct")) < 0]
+    verdict = "INSUFFICIENT_EVIDENCE"
+    if positive and not negative: verdict = "HISTORICALLY_FAVOURABLE"
+    elif negative and not positive: verdict = "HISTORICALLY_UNFAVOURABLE"
+    elif positive and negative: verdict = "MIXED_EVIDENCE"
+    return {"ok": True, "version": V10_VERSION, "symbol": sym, "horizonHours": int(run[1]),
+            "verdict": verdict, "intelligence": intel, "matchCount": len(matches), "matches": matches,
+            "advisoryOnly": True, "automaticLiveChanges": False}
+
+
+def v10_status_payload() -> Dict[str, Any]:
+    _v10_ensure_tables(); conn = db_connect()
+    runs = int(conn.execute("SELECT COUNT(*) FROM v10_research_runs WHERE status='COMPLETE'").fetchone()[0])
+    latest = conn.execute("SELECT id,observations,rich_observations,patterns_found,completed_at FROM v10_research_runs WHERE status='COMPLETE' ORDER BY id DESC LIMIT 1").fetchone()
+    completed_outcomes = int(conn.execute("SELECT COUNT(*) FROM v2_observation_outcomes WHERE status='COMPLETE' AND net_return_pct IS NOT NULL").fetchone()[0])
+    conn.close()
+    return {"ok": True, "version": V10_VERSION, "name": V10_NAME, "enabled": V10_ENABLED,
+            "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False,
+            "completedOutcomes": completed_outcomes, "researchRuns": runs,
+            "latestRun": None if not latest else {"id": latest[0], "observations": latest[1], "richObservations": latest[2], "patternsFound": latest[3], "completedAt": latest[4]},
+            "features": {"singleFactorResearch": True, "twoFactorInteractions": True, "profitFactor": True,
+                         "expectancy": True, "researchNotebook": True, "symbolExplanation": True,
+                         "sampleSizeWeighting": True, "shadowOnly": True}}
+
+
+@app.get('/v10/status')
+def api_v10_status(request: Request):
+    verify_api_key(request); return v10_status_payload()
+
+@app.post('/v10/research')
+def api_v10_research(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v10_run_research(int(payload.get('horizonHours') or V10_DEFAULT_HORIZON_HOURS),
+                            int(payload.get('minimumSamples') or V10_MIN_PATTERN_SAMPLES))
+
+@app.get('/v10/report')
+def api_v10_report(request: Request, limit: int = 25):
+    verify_api_key(request); return v10_latest_report(limit)
+
+@app.get('/v10/explain/{symbol}')
+def api_v10_explain(symbol: str, request: Request):
+    verify_api_key(request)
+    sym = str(symbol or '').upper().strip()
+    if not re.fullmatch(r'[A-Z.\-]{1,10}', sym):
+        raise HTTPException(status_code=400, detail='Invalid symbol')
+    return v10_explain_symbol(sym)
