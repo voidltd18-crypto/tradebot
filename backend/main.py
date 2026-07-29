@@ -310,7 +310,26 @@ MEMORY_GOOD_MULTIPLIER = 1.15
 
 # SQLite persistent trade memory
 SQLITE_ENABLED = True
-SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "trades.db")
+
+def persistent_data_dir() -> str:
+    """Choose a directory that survives Render redeploys when a disk is mounted.
+
+    Recommended Render disk mount path: /var/data
+    Override with PERSISTENT_DATA_DIR when using a different mount.
+    """
+    configured = os.getenv("PERSISTENT_DATA_DIR", "").strip()
+    if configured:
+        return configured
+    if os.path.isdir("/var/data"):
+        return "/var/data"
+    return os.path.join("backend", "state")
+
+
+def persistent_file(name: str) -> str:
+    return os.path.join(persistent_data_dir(), name)
+
+
+SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "").strip() or persistent_file("trades.db")
 BACKFILL_ORDER_LIMIT = 500
 BACKFILL_CHUNK_SIZE = 500
 BACKFILL_MAX_PAGES = 50
@@ -2443,6 +2462,123 @@ def v2_replay_rows(symbol: Optional[str] = None, limit: int = 200) -> List[Dict[
         return []
 
 # =========================
+# TRADEBOT V9.1 DECISION INTELLIGENCE
+# =========================
+def decision_intelligence_summary(days: int = 30) -> Dict[str, Any]:
+    """Summarise BOUGHT/BLOCKED/APPROVED/REJECTED evidence.
+
+    Outcome returns come from the existing historical checkpoint engine. This
+    endpoint is advisory only and cannot modify trading settings.
+    """
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+    days = max(1, min(int(days), 3650))
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    try:
+        init_db()
+        conn = db_connect()
+        totals = conn.execute(
+            """SELECT decision, COUNT(*) AS count, COUNT(DISTINCT symbol) AS symbols
+               FROM v2_setup_decisions
+               WHERE timestamp>=?
+               GROUP BY decision ORDER BY count DESC""",
+            (cutoff,),
+        ).fetchall()
+        outcomes = conn.execute(
+            """WITH ranked AS (
+                   SELECT d.decision,d.stage,d.symbol,d.timestamp,d.confidence,d.quality,
+                          o.horizon_hours,o.net_return_pct,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY COALESCE(o.sample_key,CAST(o.decision_id AS TEXT)),o.horizon_hours
+                              ORDER BY o.id ASC
+                          ) AS rn
+                   FROM v2_setup_decisions d
+                   JOIN v2_observation_outcomes o ON o.decision_id=d.id
+                   WHERE d.timestamp>=? AND o.status='COMPLETE' AND o.net_return_pct IS NOT NULL
+               )
+               SELECT decision,horizon_hours,COUNT(*) AS samples,
+                      SUM(CASE WHEN net_return_pct>0 THEN 1 ELSE 0 END) AS wins,
+                      SUM(CASE WHEN net_return_pct<0 THEN 1 ELSE 0 END) AS losses,
+                      AVG(net_return_pct) AS avg_return_pct,
+                      MAX(net_return_pct) AS best_return_pct,
+                      MIN(net_return_pct) AS worst_return_pct
+               FROM ranked WHERE rn=1
+               GROUP BY decision,horizon_hours
+               ORDER BY decision,horizon_hours""",
+            (cutoff,),
+        ).fetchall()
+        blocked = conn.execute(
+            """SELECT d.id,d.timestamp,d.symbol,d.reason,d.price,d.confidence,d.quality,
+                      d.sniper_pass,d.a_plus_pass,
+                      o.horizon_hours,o.status,o.net_return_pct,o.outcome_price,o.due_at,o.evaluated_at
+               FROM v2_setup_decisions d
+               LEFT JOIN v2_observation_outcomes o ON o.decision_id=d.id
+               WHERE d.timestamp>=? AND d.decision='BLOCKED'
+               ORDER BY d.id DESC,o.horizon_hours ASC LIMIT 500""",
+            (cutoff,),
+        ).fetchall()
+        conn.close()
+        return {
+            "ok": True,
+            "version": "V9.1",
+            "advisoryOnly": True,
+            "days": days,
+            "since": cutoff,
+            "totals": [dict(r) for r in totals],
+            "outcomesByDecision": [dict(r) for r in outcomes],
+            "blockedOpportunities": [dict(r) for r in blocked],
+            "note": "Decision evidence and historical outcomes only; live trading rules are unchanged.",
+        }
+    except Exception as e:
+        return {"ok": False, "version": "V9.1", "error": str(e)}
+
+
+def blocked_opportunities(limit: int = 100, horizon_hours: int = 24) -> List[Dict[str, Any]]:
+    if not SQLITE_ENABLED:
+        return []
+    limit = max(1, min(int(limit), 1000))
+    horizon_hours = max(1, int(horizon_hours))
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute(
+            """SELECT d.id AS decision_id,d.timestamp,d.symbol,d.reason,d.price,
+                      d.confidence,d.quality,d.momentum,d.pullback,d.spread,
+                      d.sniper_pass,d.a_plus_pass,o.status,o.horizon_hours,o.due_at,
+                      o.evaluated_at,o.outcome_price,o.return_pct,o.net_return_pct
+               FROM v2_setup_decisions d
+               LEFT JOIN v2_observation_outcomes o
+                 ON o.decision_id=d.id AND o.horizon_hours=?
+               WHERE d.decision='BLOCKED'
+               ORDER BY d.id DESC LIMIT ?""",
+            (horizon_hours, limit),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"BLOCKED OPPORTUNITIES ERROR: {e}")
+        return []
+
+
+@app.get("/decision-intelligence/summary")
+def api_decision_intelligence_summary(days: int = 30):
+    return decision_intelligence_summary(days)
+
+
+@app.get("/decision-intelligence/blocked")
+def api_decision_intelligence_blocked(limit: int = 100, horizon_hours: int = 24):
+    items = blocked_opportunities(limit=limit, horizon_hours=horizon_hours)
+    return {
+        "ok": True,
+        "version": "V9.1",
+        "advisoryOnly": True,
+        "count": len(items),
+        "horizonHours": int(horizon_hours),
+        "items": items,
+    }
+
+
+# =========================
 # STRATEGY
 # =========================
 def refresh_universe_if_needed(force=False):
@@ -2467,7 +2603,19 @@ def refresh_universe_if_needed(force=False):
     print(f"UNIVERSE REFRESHED: {', '.join(current_universe)}")
 
 
-def pick_money_mode_stocks(scans):
+def pick_money_mode_stocks(
+    scans,
+    approval_decision: str = "APPROVED",
+    approval_stage: str = "final_gate",
+    approval_reason: str = "all V2 gates passed",
+):
+    """Evaluate scans through the normal live gates and persist every decision.
+
+    The optional approval labels let the same exact gate pipeline record a
+    qualifying setup as BLOCKED when account-level rules (for example the
+    maximum-position limit) prevent a live order. This is research-only; it
+    does not alter which setups pass or place any order.
+    """
     candidates = []
     for scan in scans:
         symbol = scan["symbol"]
@@ -2498,7 +2646,13 @@ def pick_money_mode_stocks(scans):
             record_v2_setup_decision(scan, "REJECTED", "expectancy_gate", v2_profile.get("reason", "not approved"), v2_profile)
             continue
         scan["v2Expectancy"] = v2_profile
-        record_v2_setup_decision(scan, "APPROVED", "final_gate", "all V2 gates passed", v2_profile)
+        record_v2_setup_decision(
+            scan,
+            approval_decision,
+            approval_stage,
+            approval_reason,
+            v2_profile,
+        )
         candidates.append(scan)
     candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
     return candidates
@@ -2660,6 +2814,27 @@ def money_mode_buy(scans, manual=False):
     if blocked:
         return f"BUY BLOCKED | {reason}"
     if allowed_new_position_count() <= 0:
+        # Decision Intelligence: run the unchanged entry gates even though an
+        # account-level position rule prevents buying. Qualifying candidates
+        # are saved as BLOCKED and receive the same future outcome checkpoints
+        # as executed/approved decisions. No order can be submitted here.
+        try:
+            blocked_picks = pick_money_mode_stocks(
+                scans,
+                approval_decision="BLOCKED",
+                approval_stage="position_limit",
+                approval_reason=f"max positions reached ({MAX_POSITIONS})",
+            )
+            if blocked_picks:
+                best = blocked_picks[0]
+                print(
+                    "DECISION INTELLIGENCE | "
+                    f"blocked={len(blocked_picks)} best={best.get('symbol')} "
+                    f"confidence={float(best.get('confidence') or 0.0):.2f} "
+                    f"reason=max positions reached ({MAX_POSITIONS})"
+                )
+        except Exception as decision_error:
+            print(f"DECISION INTELLIGENCE BLOCKED LOG ERROR: {decision_error}")
         return f"BUY BLOCKED | max positions reached ({MAX_POSITIONS})"
     if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
         return f"BUY BLOCKED | PDT-aware max new buys today reached ({MAX_NEW_BUYS_PER_DAY_PDT_AWARE})"
@@ -2692,6 +2867,15 @@ def money_mode_buy(scans, manual=False):
         reason = f"{'MANUAL' if manual else 'AUTO'} SNIPER {label} BUY"
         try:
             market_buy_notional(symbol, notional, reason=reason)
+            # Preserve the final execution decision separately from the earlier
+            # APPROVED gate record so research can compare approved vs bought.
+            record_v2_setup_decision(
+                c,
+                "BOUGHT",
+                "order_submitted",
+                reason,
+                c.get("v2Expectancy") or {},
+            )
             state[symbol]["ref"] = c["price"]
             state[symbol]["highest_since_entry"] = c["price"]
             messages.append(f"{reason} ${notional:.2f} {symbol} confidence={confidence:.2f}")
@@ -2727,6 +2911,7 @@ def buy_custom_symbol(symbol: str):
 # SQLITE PERSISTENT STORAGE
 # =========================
 def db_connect():
+    os.makedirs(os.path.dirname(SQLITE_DB_FILE) or ".", exist_ok=True)
     conn = sqlite3.connect(SQLITE_DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
@@ -2772,6 +2957,28 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_trades_symbol
         ON trades(symbol)
     """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS performance_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            baseline_equity REAL NOT NULL DEFAULT 0,
+            total_deposited REAL NOT NULL DEFAULT 0,
+            total_withdrawn REAL NOT NULL DEFAULT 0,
+            lifetime_realised_pnl REAL NOT NULL DEFAULT 0,
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+            breakevens INTEGER NOT NULL DEFAULT 0,
+            total_closed_trades INTEGER NOT NULL DEFAULT 0,
+            best_trade REAL NOT NULL DEFAULT 0,
+            worst_trade REAL NOT NULL DEFAULT 0,
+            average_win REAL NOT NULL DEFAULT 0,
+            average_loss REAL NOT NULL DEFAULT 0,
+            profit_factor REAL NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""INSERT OR IGNORE INTO performance_state (id, updated_at) VALUES (1, ?)""",
+                (datetime.now(UTC).isoformat(),))
 
 
     cur.execute("""
@@ -4794,6 +5001,7 @@ def build_status_payload(bot_name, scans):
             } for s in scans
         ],
         "banking": banking_payload(),
+        "performanceEngine": performance_engine_payload(),
         "logs": [
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
@@ -6449,7 +6657,7 @@ def version():
     return BOT_VERSION_NOTES
 
 # ---------- baseline reporting ----------
-BASELINE_FILE = os.path.join("backend", "state", "equity_baseline.json")
+BASELINE_FILE = os.getenv("EQUITY_BASELINE_FILE", "").strip() or persistent_file("equity_baseline.json")
 
 def _safe_num(v, default=0.0):
     try:
@@ -6457,22 +6665,151 @@ def _safe_num(v, default=0.0):
     except Exception:
         return float(default)
 
+def _ensure_performance_state_table() -> None:
+    if not SQLITE_ENABLED:
+        return
+    os.makedirs(os.path.dirname(SQLITE_DB_FILE) or ".", exist_ok=True)
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS performance_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        baseline_equity REAL NOT NULL DEFAULT 0,
+        total_deposited REAL NOT NULL DEFAULT 0,
+        total_withdrawn REAL NOT NULL DEFAULT 0,
+        lifetime_realised_pnl REAL NOT NULL DEFAULT 0,
+        wins INTEGER NOT NULL DEFAULT 0,
+        losses INTEGER NOT NULL DEFAULT 0,
+        breakevens INTEGER NOT NULL DEFAULT 0,
+        total_closed_trades INTEGER NOT NULL DEFAULT 0,
+        best_trade REAL NOT NULL DEFAULT 0,
+        worst_trade REAL NOT NULL DEFAULT 0,
+        average_win REAL NOT NULL DEFAULT 0,
+        average_loss REAL NOT NULL DEFAULT 0,
+        profit_factor REAL NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    )""")
+    conn.execute("""INSERT OR IGNORE INTO performance_state
+        (id, updated_at) VALUES (1, ?)""", (datetime.now(UTC).isoformat(),))
+    conn.commit(); conn.close()
+
+
 def load_equity_baseline() -> float:
+    # SQLite on the Render disk is the primary source. The JSON copy is a
+    # human-readable backup and supports migration from older deployments.
+    try:
+        _ensure_performance_state_table()
+        conn = db_connect()
+        row = conn.execute("SELECT baseline_equity FROM performance_state WHERE id=1").fetchone()
+        conn.close()
+        value = float(row[0] or 0.0) if row else 0.0
+        if value > 0:
+            return value
+    except Exception as e:
+        print(f"BASELINE DB LOAD ERROR: {e}")
+
     try:
         if os.path.exists(BASELINE_FILE):
             with open(BASELINE_FILE, "r", encoding="utf-8") as f:
-                return float(json.load(f).get("baseline", 0) or 0)
+                value = float(json.load(f).get("baseline", 0) or 0)
+            if value > 0:
+                # Migrate the old file value into the persistent DB.
+                save_equity_baseline(value)
+                return value
     except Exception as e:
         print(f"BASELINE LOAD ERROR: {e}")
-    return 0.0
+
+    return _safe_num(os.getenv("TOTAL_DEPOSITED_USD", 0))
+
 
 def save_equity_baseline(value: float) -> None:
+    value = float(value or 0.0)
+    now = datetime.now(UTC).isoformat()
     try:
-        os.makedirs(os.path.dirname(BASELINE_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(BASELINE_FILE) or ".", exist_ok=True)
         with open(BASELINE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"baseline": float(value or 0), "resetAt": datetime.now(UTC).isoformat()}, f, indent=2)
+            json.dump({"baseline": value, "resetAt": now}, f, indent=2)
     except Exception as e:
         print(f"BASELINE SAVE ERROR: {e}")
+
+    try:
+        _ensure_performance_state_table()
+        conn = db_connect()
+        conn.execute("""UPDATE performance_state
+            SET baseline_equity=?, total_deposited=?, updated_at=? WHERE id=1""",
+            (value, value, now))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"BASELINE DB SAVE ERROR: {e}")
+
+
+def rebuild_performance_state() -> Dict[str, Any]:
+    """Recalculate lifetime realised statistics from persisted closed trades.
+
+    This is reporting-only. It never submits or changes an order.
+    """
+    closed = closed_trades_from_db(100000) if "closed_trades_from_db" in globals() else []
+    pnls = [float(t.get("pnl") or 0.0) for t in closed]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    breakevens = [p for p in pnls if p == 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    stats = {
+        "lifetimeRealisedPnl": sum(pnls),
+        "wins": len(wins),
+        "losses": len(losses),
+        "breakevens": len(breakevens),
+        "totalClosedTrades": len(pnls),
+        "bestTrade": max(pnls) if pnls else 0.0,
+        "worstTrade": min(pnls) if pnls else 0.0,
+        "averageWin": gross_profit / len(wins) if wins else 0.0,
+        "averageLoss": sum(losses) / len(losses) if losses else 0.0,
+        "profitFactor": gross_profit / gross_loss if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0),
+        "winRate": len(wins) / max(1, len(wins) + len(losses)),
+        "updatedAt": datetime.now(UTC).isoformat(),
+    }
+    try:
+        _ensure_performance_state_table()
+        conn = db_connect()
+        conn.execute("""UPDATE performance_state SET
+            lifetime_realised_pnl=?, wins=?, losses=?, breakevens=?,
+            total_closed_trades=?, best_trade=?, worst_trade=?, average_win=?,
+            average_loss=?, profit_factor=?, updated_at=? WHERE id=1""",
+            (stats["lifetimeRealisedPnl"], stats["wins"], stats["losses"], stats["breakevens"],
+             stats["totalClosedTrades"], stats["bestTrade"], stats["worstTrade"],
+             stats["averageWin"], stats["averageLoss"], stats["profitFactor"], stats["updatedAt"]))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"PERFORMANCE STATE SAVE ERROR: {e}")
+    return stats
+
+
+def performance_engine_payload() -> Dict[str, Any]:
+    stats = rebuild_performance_state()
+    baseline = load_equity_baseline()
+    try:
+        account = get_account()
+        equity = float(account.equity)
+    except Exception:
+        equity = _safe_num(latest_status.get("account", {}).get("equity", 0))
+    total_withdrawn = _safe_num(os.getenv("TOTAL_WITHDRAWN_USD", 0))
+    if baseline <= 0:
+        baseline = equity
+        if baseline > 0:
+            save_equity_baseline(baseline)
+    total_gain_loss = equity + total_withdrawn - baseline
+    return {
+        "ok": True,
+        "persistent": os.path.abspath(SQLITE_DB_FILE).startswith("/var/data") or bool(os.getenv("PERSISTENT_DATA_DIR")),
+        "databaseFile": SQLITE_DB_FILE,
+        "baselineFile": BASELINE_FILE,
+        "baselineEquity": baseline,
+        "totalDeposited": baseline,
+        "totalWithdrawn": total_withdrawn,
+        "currentEquity": equity,
+        "totalGainLoss": total_gain_loss,
+        "totalGainLossGbp": money_gbp(total_gain_loss),
+        **stats,
+    }
 
 @app.post("/reset-baseline")
 def reset_baseline(request: Request):
@@ -6486,7 +6823,18 @@ def reset_baseline(request: Request):
 
 @app.get("/baseline")
 def get_baseline():
-    return {"ok": True, "baseline": load_equity_baseline()}
+    return {"ok": True, "baseline": load_equity_baseline(), "file": BASELINE_FILE}
+
+
+@app.get("/performance-engine")
+def api_performance_engine():
+    return performance_engine_payload()
+
+
+@app.post("/performance-engine/rebuild")
+def api_rebuild_performance_engine(request: Request):
+    verify_api_key(request)
+    return {"ok": True, **performance_engine_payload(), "message": "Performance statistics rebuilt from closed trades."}
 
 @app.get("/reports")
 def reports():
@@ -6495,14 +6843,11 @@ def reports():
     db = status.get("dbSummary") or {}
     equity = _safe_num(account.get("equity"))
     equity_gbp = _safe_num(account.get("equityGbp"))
-    total_withdrawn = _safe_num(globals().get("TOTAL_WITHDRAWN_USD", 0))
-    baseline = load_equity_baseline()
-    total_deposited = baseline if baseline > 0 else _safe_num(globals().get("TOTAL_DEPOSITED_USD", 0))
-    deposit_source = "reset-baseline" if baseline > 0 else "env"
-    if total_deposited <= 0:
-        total_deposited = equity
-        deposit_source = "equity-baseline"
-    total_gain_loss = equity + total_withdrawn - total_deposited
+    performance = performance_engine_payload()
+    total_withdrawn = _safe_num(performance.get("totalWithdrawn"))
+    total_deposited = _safe_num(performance.get("totalDeposited"))
+    total_gain_loss = _safe_num(performance.get("totalGainLoss"))
+    deposit_source = "persistent-performance-engine"
     # Always read closed trades fresh from SQLite so Reports does not show stale April rows.
     closed = closed_trades_from_db(500) if "closed_trades_from_db" in globals() else (status.get("closedTrades") or [])
     timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
@@ -6533,7 +6878,8 @@ def reports():
         "earnedSinceDeposit": max(total_gain_loss, 0.0),
         "lostSinceDeposit": abs(min(total_gain_loss, 0.0)),
         "dayPnl": _safe_num(account.get("pnlDay")),
-        "realisedNet": _safe_num(db.get("totalPnl")),
+        "realisedNet": _safe_num(performance.get("lifetimeRealisedPnl", db.get("totalPnl"))),
+        "performanceEngine": performance,
         "closedTrades": closed[:200] if isinstance(closed, list) else [],
         "equityHistory": equity_history[-500:],
         "winRate": _safe_num(db.get("winRate")) * 100.0,
@@ -7732,9 +8078,9 @@ def api_backtest_replay(payload: dict = Body(default={}), request: Request = Non
 # Append-only: do not remove existing working routes.
 # ============================================================
 
-_COMPAT_STATE_DIR = os.path.join("backend", "state")
-_COMPAT_BASELINE_FILE = os.path.join(_COMPAT_STATE_DIR, "equity_baseline.json")
-_COMPAT_BUY_SIZE_FILE = os.path.join(_COMPAT_STATE_DIR, "buy_size_mode.json")
+_COMPAT_STATE_DIR = persistent_data_dir()
+_COMPAT_BASELINE_FILE = BASELINE_FILE
+_COMPAT_BUY_SIZE_FILE = persistent_file("buy_size_mode.json")
 
 def _compat_num(v, default=0.0):
     try:
@@ -7783,8 +8129,7 @@ def _compat_account_equity():
         return 0.0, 0.0
 
 def _compat_baseline_value():
-    data = _compat_read(_COMPAT_BASELINE_FILE, {})
-    return _compat_num(data.get("baseline"), 0.0)
+    return load_equity_baseline()
 
 @app.get("/baseline")
 def compat_get_baseline():
@@ -7802,7 +8147,7 @@ def compat_set_baseline(payload: dict = Body(...), request: Request = None):
     value = _compat_num(payload.get("baseline") or payload.get("value") or payload.get("amount"), 0.0)
     if value <= 0:
         raise HTTPException(status_code=400, detail="Invalid baseline")
-    _compat_write(_COMPAT_BASELINE_FILE, {"baseline": value})
+    save_equity_baseline(value)
     return {
         "ok": True,
         "message": f"Baseline saved at ${value:.2f}",
@@ -7817,7 +8162,7 @@ def compat_reset_baseline(request: Request = None):
     equity, _bp = _compat_account_equity()
     if equity <= 0:
         raise HTTPException(status_code=400, detail="Could not read current equity")
-    _compat_write(_COMPAT_BASELINE_FILE, {"baseline": equity})
+    save_equity_baseline(equity)
     return {
         "ok": True,
         "message": f"Baseline reset to current equity ${equity:.2f}",
