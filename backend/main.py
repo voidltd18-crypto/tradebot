@@ -215,6 +215,11 @@ V6_HISTORICAL_BAR_LOOKBACK_MINUTES = max(5, int(os.getenv("V6_HISTORICAL_BAR_LOO
 V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES = max(5, int(os.getenv("V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES", "45") or 45))
 V6_REPAIR_BATCH_SIZE = max(1, min(int(os.getenv("V6_REPAIR_BATCH_SIZE", "200") or 200), 1000))
 
+# Closed-market AI research scheduler. Live trading stays focused while the market is open.
+AI_RESEARCH_CLOSED_MARKET_ONLY = os.getenv("AI_RESEARCH_CLOSED_MARKET_ONLY", "true").lower() == "true"
+AI_RESEARCH_INTERVAL_SECONDS = max(300, int(os.getenv("AI_RESEARCH_INTERVAL_SECONDS", "1800") or 1800))
+AI_RESEARCH_STARTUP_DELAY_SECONDS = max(5, int(os.getenv("AI_RESEARCH_STARTUP_DELAY_SECONDS", "30") or 30))
+
 # TradeBot V7.1 Autonomous Research Lab. Shadow-only; never changes live trading.
 V7_ENABLED = os.getenv("V7_ENABLED", "true").lower() == "true"
 V7_AUTOMATIC_EVOLUTION = os.getenv("V7_AUTOMATIC_EVOLUTION", "true").lower() == "true"
@@ -387,6 +392,7 @@ bot_thread_started = False
 v6_sync_thread_started = False
 v7_weekend_thread_started = False
 v11_learning_thread_started = False
+ai_research_thread_started = False
 v6_last_sync_result: Dict[str, Any] = {}
 
 # Automatic closed-trade report reconciliation. Reporting-only: this never
@@ -6267,6 +6273,66 @@ def backfill_trades(request: Request):
 # =========================
 # LOOP
 # =========================
+def _ai_research_market_open() -> Optional[bool]:
+    """Return Alpaca market state, or None when the clock cannot be read safely."""
+    try:
+        return bool(trading_client.get_clock().is_open)
+    except Exception as exc:
+        print(f"AI RESEARCH CLOCK ERROR: {exc}")
+        return None
+
+
+def closed_market_ai_research_worker() -> None:
+    """Run outcome evaluation and advisory learning only while the market is closed.
+
+    This worker never places orders and never changes live thresholds automatically.
+    """
+    time.sleep(AI_RESEARCH_STARTUP_DELAY_SECONDS)
+    last_cycle_at = 0.0
+    last_state: Optional[str] = None
+    while True:
+        try:
+            is_open = _ai_research_market_open()
+            if is_open is None:
+                time.sleep(60)
+                continue
+
+            if is_open:
+                if last_state != "open":
+                    print("AI RESEARCH PAUSED | market open; live trader has priority")
+                last_state = "open"
+                time.sleep(60)
+                continue
+
+            if last_state != "closed":
+                print("AI RESEARCH ACTIVE | market closed; outcome and shadow learning enabled")
+            last_state = "closed"
+
+            now_mono = time.monotonic()
+            if last_cycle_at and (now_mono - last_cycle_at) < AI_RESEARCH_INTERVAL_SECONDS:
+                time.sleep(min(60, AI_RESEARCH_INTERVAL_SECONDS))
+                continue
+
+            started = datetime.now(UTC).isoformat()
+            seeded = v2_seed_missing_outcomes()
+            outcomes = v2_evaluate_due_outcomes()
+            v6_result = v6_sync_brains(V6_DEFAULT_HORIZON_HOURS, V6_AUTO_SYNC_LIMIT) if V6_BRAINS_ENABLED else {"ok": True, "skipped": True}
+            v11_result = v11_learning_cycle("closed_market", force=False) if V11_AUTO_LEARNING_ENABLED else {"ok": True, "skipped": True}
+            last_cycle_at = time.monotonic()
+            print(
+                "AI NIGHT RESEARCH | "
+                f"started={started} seeded={seeded} "
+                f"outcomes={outcomes.get('evaluated', outcomes.get('historical', 0))} "
+                f"errors={outcomes.get('errors', 0)} "
+                f"v6_new={v6_result.get('newShadowRows', 0)} "
+                f"v11_discovery={bool(v11_result.get('ranDiscovery'))} "
+                "live_changes=False"
+            )
+        except Exception as exc:
+            print(f"AI NIGHT RESEARCH ERROR: {exc}")
+        time.sleep(60)
+
+
 def run_bot_loop():
     print("Rebuilt Sniper Profit Bot started...")
     init_db()
@@ -6304,10 +6370,11 @@ def run_bot_loop():
                     time.sleep(CHECK_INTERVAL)
                     continue
 
-                try:
-                    v2_evaluate_due_outcomes()
-                except Exception as e:
-                    print(f"V2 OUTCOME LOOP ERROR: {e}")
+                if not AI_RESEARCH_CLOSED_MARKET_ONLY:
+                    try:
+                        v2_evaluate_due_outcomes()
+                    except Exception as e:
+                        print(f"V2 OUTCOME LOOP ERROR: {e}")
 
                 scans = []
                 for symbol in current_universe:
@@ -6342,19 +6409,22 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started
     if not bot_thread_started:
         bot_thread_started = True
         threading.Thread(target=run_bot_loop, daemon=True).start()
-    if V6_BRAINS_ENABLED and V6_AUTO_SYNC_ENABLED and not v6_sync_thread_started:
+    if V6_BRAINS_ENABLED and V6_AUTO_SYNC_ENABLED and not AI_RESEARCH_CLOSED_MARKET_ONLY and not v6_sync_thread_started:
         v6_sync_thread_started = True
         threading.Thread(target=v6_auto_sync_worker, daemon=True).start()
     if V7_ENABLED and V7_WEEKEND_MAINTENANCE_ENABLED and not v7_weekend_thread_started:
         v7_weekend_thread_started = True
         threading.Thread(target=v7_weekend_worker, daemon=True).start()
-    if V11_AUTO_LEARNING_ENABLED and not v11_learning_thread_started:
+    if V11_AUTO_LEARNING_ENABLED and not AI_RESEARCH_CLOSED_MARKET_ONLY and not v11_learning_thread_started:
         v11_learning_thread_started = True
         threading.Thread(target=v11_auto_learning_worker, daemon=True).start()
+    if AI_RESEARCH_CLOSED_MARKET_ONLY and not ai_research_thread_started:
+        ai_research_thread_started = True
+        threading.Thread(target=closed_market_ai_research_worker, daemon=True).start()
 
 
 
@@ -8222,6 +8292,9 @@ def v6_auto_sync_worker() -> None:
     first_run = True
     while True:
         try:
+            if AI_RESEARCH_CLOSED_MARKET_ONLY and _ai_research_market_open() is not False:
+                time.sleep(60)
+                continue
             result = v6_sync_brains(V6_DEFAULT_HORIZON_HOURS, V6_AUTO_SYNC_LIMIT)
             result["automatic"] = True; result["ranAt"] = datetime.now(UTC).isoformat()
             v6_last_sync_result = result
@@ -10318,6 +10391,9 @@ def v11_auto_learning_worker() -> None:
     first = True
     while True:
         try:
+            if AI_RESEARCH_CLOSED_MARKET_ONLY and _ai_research_market_open() is not False:
+                time.sleep(60)
+                continue
             if not first or V11_AUTO_RUN_ON_STARTUP:
                 result = v11_learning_cycle("automatic", force=False)
                 if result.get("ranDiscovery"):
