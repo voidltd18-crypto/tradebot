@@ -11202,3 +11202,108 @@ def api_v113_pipeline_test(request: Request, payload: Dict[str, Any] = Body(defa
 def api_v113_pipeline_test_get(symbol: str, request: Request):
     verify_api_key(request)
     return _v113_capture_test(symbol)
+
+# =========================
+# TRADEBOT V9.4 — AI ADVISOR DASHBOARD
+# Unified outcome-learning and evidence-based recommendations.
+# Advisory-only: it never changes live trading settings automatically.
+# =========================
+
+def ai_advisor_summary(limit: int = 10) -> Dict[str, Any]:
+    limit = max(1, min(int(limit), 50))
+    learning = v11_learning_status_payload()
+    report = v11_latest_report(limit=max(limit * 3, 30))
+    outcomes = v2_outcomes_summary()
+
+    discoveries = report.get("discoveries", []) if report.get("hasReport") else []
+    positive = [d for d in discoveries if d.get("classification") == "VALIDATED_POSITIVE"][:limit]
+    negative = [d for d in discoveries if d.get("classification") == "VALIDATED_NEGATIVE"][:limit]
+
+    completed = 0
+    pending = 0
+    try:
+        conn = db_connect()
+        completed = int(conn.execute(
+            "SELECT COUNT(*) FROM v2_observation_outcomes WHERE status='COMPLETE' AND net_return_pct IS NOT NULL"
+        ).fetchone()[0])
+        pending = int(conn.execute(
+            "SELECT COUNT(*) FROM v2_observation_outcomes WHERE status!='COMPLETE' OR net_return_pct IS NULL"
+        ).fetchone()[0])
+        conn.close()
+    except Exception:
+        pass
+
+    rich = int(learning.get("richObservations") or 0)
+    target = int(learning.get("richEvidenceTarget") or V11_RICH_TARGET_OBSERVATIONS)
+    validated = len(positive) + len(negative)
+
+    if completed < V11_MIN_SAMPLES:
+        readiness = "COLLECTING_OUTCOMES"
+        message = f"Collecting evidence: {completed}/{V11_MIN_SAMPLES} completed outcomes needed for a first reliable learning run."
+    elif rich < min(target, V11_MIN_SAMPLES):
+        readiness = "COLLECTING_RICH_EVIDENCE"
+        message = "Outcomes exist, but more market-context snapshots are needed before recommendations are reliable."
+    elif validated == 0:
+        readiness = "LEARNING_NO_VALIDATED_PATTERN_YET"
+        message = "The learner has enough data to test patterns, but none has passed validation yet."
+    else:
+        readiness = "RECOMMENDATIONS_AVAILABLE"
+        message = f"{validated} validated evidence pattern(s) are available for review."
+
+    return {
+        "ok": True,
+        "version": "V9.4",
+        "name": "AI Advisor",
+        "readiness": readiness,
+        "message": message,
+        "evidence": {
+            "completedOutcomes": completed,
+            "pendingOutcomes": pending,
+            "observations": int(learning.get("observations") or 0),
+            "richObservations": rich,
+            "richEvidenceTarget": target,
+            "richEvidenceProgressPct": float(learning.get("richEvidenceProgressPct") or 0.0),
+            "learningRuns": int(learning.get("learningRuns") or 0),
+            "validatedPositive": len(positive),
+            "validatedNegative": len(negative),
+        },
+        "recommendations": {
+            "favourablePatterns": positive,
+            "unfavourablePatterns": negative,
+        },
+        "learning": learning,
+        "outcomes": outcomes,
+        "advisoryOnly": True,
+        "automaticLiveChanges": False,
+        "requiresHumanApproval": True,
+    }
+
+
+def ai_advisor_run(force: bool = True, evaluate_limit: int = 500) -> Dict[str, Any]:
+    evaluation = v2_evaluate_due_outcomes(max(1, min(int(evaluate_limit), 5000)))
+    learning = v11_learning_cycle("manual", bool(force))
+    return {
+        "ok": bool(evaluation.get("ok", True) and learning.get("ok", True)),
+        "version": "V9.4",
+        "outcomeEvaluation": evaluation,
+        "learningRun": learning,
+        "advisor": ai_advisor_summary(),
+        "advisoryOnly": True,
+        "automaticLiveChanges": False,
+        "requiresHumanApproval": True,
+    }
+
+
+@app.get('/ai-advisor/summary')
+def api_ai_advisor_summary(request: Request, limit: int = 10):
+    verify_api_key(request)
+    return ai_advisor_summary(limit)
+
+
+@app.post('/ai-advisor/run')
+def api_ai_advisor_run(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return ai_advisor_run(
+        bool(payload.get('force', True)),
+        int(payload.get('evaluateLimit') or 500),
+    )
