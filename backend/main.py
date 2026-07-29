@@ -11203,6 +11203,157 @@ def api_v113_pipeline_test_get(symbol: str, request: Request):
     verify_api_key(request)
     return _v113_capture_test(symbol)
 
+
+# =========================
+# TRADEBOT V9.5 — SHADOW TRADING ENGINE
+# Research-only virtual trades for decisions that did not become live orders.
+# It reuses the existing forward outcome checkpoints and never submits an order.
+# =========================
+SHADOW_TRADE_NOTIONAL_GBP = max(1.0, float(os.getenv("SHADOW_TRADE_NOTIONAL_GBP", "100")))
+SHADOW_DECISIONS = ("BLOCKED", "REJECTED")
+
+
+def shadow_trading_summary(days: int = 30, horizon_hours: int = 24, notional_gbp: float = SHADOW_TRADE_NOTIONAL_GBP) -> Dict[str, Any]:
+    days = max(1, min(int(days), 3650))
+    horizon_hours = max(1, min(int(horizon_hours), 720))
+    notional_gbp = max(1.0, float(notional_gbp))
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+    try:
+        init_db()
+        conn = db_connect()
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        rows = conn.execute(
+            """SELECT d.id,d.timestamp,d.symbol,d.decision,d.stage,d.reason,d.price,
+                      d.confidence,d.quality,o.horizon_hours,o.status,o.outcome_price,
+                      o.return_pct,o.net_return_pct,o.evaluated_at
+               FROM v2_setup_decisions d
+               JOIN v2_observation_outcomes o ON o.decision_id=d.id
+               WHERE d.timestamp>=?
+                 AND d.decision IN ('BLOCKED','REJECTED')
+                 AND o.horizon_hours=?
+               ORDER BY d.id DESC""",
+            (cutoff, horizon_hours),
+        ).fetchall()
+        conn.close()
+        records = [dict(r) for r in rows]
+        complete = [r for r in records if r.get("status") == "COMPLETE" and r.get("net_return_pct") is not None]
+        pending = len(records) - len(complete)
+        returns = [float(r.get("net_return_pct") or 0.0) for r in complete]
+        wins = sum(1 for x in returns if x > 0)
+        losses = sum(1 for x in returns if x < 0)
+        breakeven = len(returns) - wins - losses
+        total_virtual_pnl = sum(notional_gbp * x / 100.0 for x in returns)
+        gross_profit = sum(notional_gbp * x / 100.0 for x in returns if x > 0)
+        gross_loss = abs(sum(notional_gbp * x / 100.0 for x in returns if x < 0))
+        by_decision = {}
+        by_stage = {}
+        for r in complete:
+            virtual_pnl = notional_gbp * float(r.get("net_return_pct") or 0.0) / 100.0
+            r["virtualNotionalGbp"] = round(notional_gbp, 2)
+            r["virtualPnlGbp"] = round(virtual_pnl, 2)
+            for bucket, key in ((by_decision, str(r.get("decision") or "UNKNOWN")), (by_stage, str(r.get("stage") or "UNKNOWN"))):
+                item = bucket.setdefault(key, {"samples": 0, "wins": 0, "virtualPnlGbp": 0.0, "returnSum": 0.0})
+                item["samples"] += 1
+                item["wins"] += int(float(r.get("net_return_pct") or 0.0) > 0)
+                item["virtualPnlGbp"] += virtual_pnl
+                item["returnSum"] += float(r.get("net_return_pct") or 0.0)
+        def finish(bucket):
+            result=[]
+            for name,item in bucket.items():
+                n=item["samples"]
+                result.append({"name":name,"samples":n,"wins":item["wins"],
+                    "winRate":round(item["wins"]/n,4) if n else 0.0,
+                    "averageReturnPct":round(item["returnSum"]/n,4) if n else 0.0,
+                    "virtualPnlGbp":round(item["virtualPnlGbp"],2)})
+            return sorted(result,key=lambda x:(-x["virtualPnlGbp"],-x["samples"],x["name"]))
+        best = sorted(complete, key=lambda r: float(r.get("net_return_pct") or 0.0), reverse=True)[:10]
+        worst = sorted(complete, key=lambda r: float(r.get("net_return_pct") or 0.0))[:10]
+        for group in (best, worst):
+            for r in group:
+                r["virtualNotionalGbp"] = round(notional_gbp,2)
+                r["virtualPnlGbp"] = round(notional_gbp*float(r.get("net_return_pct") or 0.0)/100.0,2)
+        return {
+            "ok": True,
+            "version": "V9.5",
+            "name": "Shadow Trading Engine",
+            "mode": "RESEARCH_ONLY",
+            "days": days,
+            "horizonHours": horizon_hours,
+            "virtualNotionalGbpPerTrade": round(notional_gbp,2),
+            "summary": {
+                "shadowTrades": len(records), "completed": len(complete), "pending": pending,
+                "wins": wins, "losses": losses, "breakeven": breakeven,
+                "winRate": round(wins/len(complete),4) if complete else 0.0,
+                "averageReturnPct": round(sum(returns)/len(returns),4) if returns else 0.0,
+                "virtualPnlGbp": round(total_virtual_pnl,2),
+                "grossVirtualProfitGbp": round(gross_profit,2),
+                "grossVirtualLossGbp": round(gross_loss,2),
+                "profitFactor": round(gross_profit/gross_loss,4) if gross_loss else (999.0 if gross_profit else 0.0),
+            },
+            "byDecision": finish(by_decision),
+            "byStage": finish(by_stage),
+            "bestMissedTrades": best,
+            "worstAvoidedTrades": worst,
+            "advisoryOnly": True,
+            "realOrdersPlaced": False,
+            "automaticLiveChanges": False,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "version": "V9.5"}
+
+
+def shadow_trading_recent(limit: int = 100, horizon_hours: int = 24, decision: str = "") -> Dict[str, Any]:
+    limit=max(1,min(int(limit),1000)); horizon_hours=max(1,min(int(horizon_hours),720))
+    decision=str(decision or "").upper().strip()
+    try:
+        init_db(); conn=db_connect()
+        params=[horizon_hours]
+        where="AND d.decision IN ('BLOCKED','REJECTED')"
+        if decision in SHADOW_DECISIONS:
+            where="AND d.decision=?"; params.append(decision)
+        params.append(limit)
+        rows=conn.execute(f"""SELECT d.id,d.timestamp,d.symbol,d.decision,d.stage,d.reason,d.price,
+            d.confidence,d.quality,o.status,o.horizon_hours,o.outcome_price,o.net_return_pct,o.due_at,o.evaluated_at
+            FROM v2_setup_decisions d JOIN v2_observation_outcomes o ON o.decision_id=d.id
+            WHERE o.horizon_hours=? {where} ORDER BY d.id DESC LIMIT ?""",tuple(params)).fetchall(); conn.close()
+        items=[]
+        for row in rows:
+            item=dict(row)
+            if item.get('net_return_pct') is not None:
+                item['virtualNotionalGbp']=round(SHADOW_TRADE_NOTIONAL_GBP,2)
+                item['virtualPnlGbp']=round(SHADOW_TRADE_NOTIONAL_GBP*float(item['net_return_pct'])/100.0,2)
+            items.append(item)
+        return {"ok":True,"version":"V9.5","count":len(items),"items":items,"realOrdersPlaced":False}
+    except Exception as e:
+        return {"ok":False,"error":str(e),"version":"V9.5"}
+
+
+def shadow_trading_run(evaluate_limit: int = 1000, horizon_hours: int = 24) -> Dict[str, Any]:
+    seeded=v2_seed_missing_outcomes(max(1,min(int(evaluate_limit)*10,50000)))
+    evaluation=v2_evaluate_due_outcomes(max(1,min(int(evaluate_limit),5000)))
+    return {"ok":bool(evaluation.get("ok",True)),"version":"V9.5","seededOutcomes":seeded,
+            "outcomeEvaluation":evaluation,"shadow":shadow_trading_summary(horizon_hours=horizon_hours),
+            "advisoryOnly":True,"realOrdersPlaced":False,"automaticLiveChanges":False}
+
+
+@app.get('/shadow-trading/summary')
+def api_shadow_trading_summary(request: Request, days: int = 30, horizon_hours: int = 24, notional_gbp: float = SHADOW_TRADE_NOTIONAL_GBP):
+    verify_api_key(request)
+    return shadow_trading_summary(days, horizon_hours, notional_gbp)
+
+
+@app.get('/shadow-trading/recent')
+def api_shadow_trading_recent(request: Request, limit: int = 100, horizon_hours: int = 24, decision: str = ''):
+    verify_api_key(request)
+    return shadow_trading_recent(limit, horizon_hours, decision)
+
+
+@app.post('/shadow-trading/run')
+def api_shadow_trading_run(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return shadow_trading_run(int(payload.get('evaluateLimit') or 1000), int(payload.get('horizonHours') or 24))
+
 # =========================
 # TRADEBOT V9.4 — AI ADVISOR DASHBOARD
 # Unified outcome-learning and evidence-based recommendations.
@@ -11252,8 +11403,8 @@ def ai_advisor_summary(limit: int = 10) -> Dict[str, Any]:
 
     return {
         "ok": True,
-        "version": "V9.4",
-        "name": "AI Advisor",
+        "version": "V9.5",
+        "name": "AI Advisor + Shadow Trading",
         "readiness": readiness,
         "message": message,
         "evidence": {
@@ -11273,6 +11424,7 @@ def ai_advisor_summary(limit: int = 10) -> Dict[str, Any]:
         },
         "learning": learning,
         "outcomes": outcomes,
+        "shadowTrading": shadow_trading_summary(days=30, horizon_hours=24),
         "advisoryOnly": True,
         "automaticLiveChanges": False,
         "requiresHumanApproval": True,
@@ -11284,7 +11436,7 @@ def ai_advisor_run(force: bool = True, evaluate_limit: int = 500) -> Dict[str, A
     learning = v11_learning_cycle("manual", bool(force))
     return {
         "ok": bool(evaluation.get("ok", True) and learning.get("ok", True)),
-        "version": "V9.4",
+        "version": "V9.5",
         "outcomeEvaluation": evaluation,
         "learningRun": learning,
         "advisor": ai_advisor_summary(),
