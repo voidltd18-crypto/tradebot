@@ -2570,12 +2570,108 @@ def api_decision_intelligence_blocked(limit: int = 100, horizon_hours: int = 24)
     items = blocked_opportunities(limit=limit, horizon_hours=horizon_hours)
     return {
         "ok": True,
-        "version": "V9.1",
+        "version": "V9.3",
         "advisoryOnly": True,
         "count": len(items),
         "horizonHours": int(horizon_hours),
         "items": items,
     }
+
+
+def decision_intelligence_recent(limit: int = 100, decision: str = "", stage: str = "") -> Dict[str, Any]:
+    """Return recent decision records for the dashboard table."""
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled", "items": []}
+    limit = max(1, min(int(limit), 1000))
+    decision = str(decision or "").upper().strip()
+    stage = str(stage or "").strip()
+    try:
+        init_db()
+        conn = db_connect()
+        clauses = []
+        params: List[Any] = []
+        if decision:
+            clauses.append("d.decision=?")
+            params.append(decision)
+        if stage:
+            clauses.append("d.stage=?")
+            params.append(stage)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = conn.execute(
+            f"""SELECT d.id AS decision_id,d.timestamp,d.symbol,d.decision,d.stage,d.reason,
+                       d.price,d.confidence,d.quality,d.momentum,d.pullback,d.spread,
+                       d.ready_to_buy,d.sniper_pass,d.a_plus_pass,
+                       o.status AS outcome_status,o.horizon_hours,o.due_at,o.evaluated_at,
+                       o.outcome_price,o.return_pct,o.net_return_pct
+                FROM v2_setup_decisions d
+                LEFT JOIN v2_observation_outcomes o
+                  ON o.decision_id=d.id AND o.horizon_hours=24
+                {where}
+                ORDER BY d.id DESC LIMIT ?""",
+            params,
+        ).fetchall()
+        conn.close()
+        return {
+            "ok": True, "version": "V9.3", "count": len(rows),
+            "decision": decision or "ALL", "stage": stage or "ALL",
+            "items": [dict(r) for r in rows],
+        }
+    except Exception as e:
+        return {"ok": False, "version": "V9.3", "error": str(e), "items": []}
+
+
+def decision_intelligence_today() -> Dict[str, Any]:
+    """Dashboard cards for the current UTC trading day."""
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+    start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    try:
+        init_db()
+        conn = db_connect()
+        counts = conn.execute(
+            """SELECT decision,COUNT(*) AS count FROM v2_setup_decisions
+               WHERE timestamp>=? GROUP BY decision""", (start,)
+        ).fetchall()
+        stages = conn.execute(
+            """SELECT stage,COUNT(*) AS count FROM v2_setup_decisions
+               WHERE timestamp>=? GROUP BY stage ORDER BY count DESC""", (start,)
+        ).fetchall()
+        best_blocked = conn.execute(
+            """SELECT d.id,d.timestamp,d.symbol,d.confidence,d.quality,d.reason,
+                      o.status AS outcome_status,o.net_return_pct
+               FROM v2_setup_decisions d
+               LEFT JOIN v2_observation_outcomes o
+                 ON o.decision_id=d.id AND o.horizon_hours=24
+               WHERE d.timestamp>=? AND d.decision='BLOCKED'
+               ORDER BY d.confidence DESC,d.quality DESC,d.id DESC LIMIT 1""", (start,)
+        ).fetchone()
+        conn.close()
+        mapped = {str(r["decision"]).upper(): int(r["count"] or 0) for r in counts}
+        return {
+            "ok": True, "version": "V9.3", "day": today_str(),
+            "total": sum(mapped.values()),
+            "bought": mapped.get("BOUGHT", 0),
+            "blocked": mapped.get("BLOCKED", 0),
+            "approved": mapped.get("APPROVED", 0),
+            "rejected": mapped.get("REJECTED", 0),
+            "counts": mapped,
+            "stages": [dict(r) for r in stages],
+            "bestBlocked": dict(best_blocked) if best_blocked else None,
+            "advisoryOnly": True,
+        }
+    except Exception as e:
+        return {"ok": False, "version": "V9.3", "error": str(e)}
+
+
+@app.get("/decision-intelligence/recent")
+def api_decision_intelligence_recent(limit: int = 100, decision: str = "", stage: str = ""):
+    return decision_intelligence_recent(limit=limit, decision=decision, stage=stage)
+
+
+@app.get("/decision-intelligence/today")
+def api_decision_intelligence_today():
+    return decision_intelligence_today()
 
 
 # =========================
