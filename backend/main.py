@@ -412,6 +412,10 @@ v6_sync_thread_started = False
 v7_weekend_thread_started = False
 v11_learning_thread_started = False
 ai_research_thread_started = False
+ai_summary_thread_started = False
+AI_SUMMARY_LOG_ENABLED = os.getenv("AI_SUMMARY_LOG_ENABLED", "true").lower() in ("1","true","yes","on")
+AI_SUMMARY_LOG_INTERVAL_SECONDS = max(300, int(os.getenv("AI_SUMMARY_LOG_INTERVAL_SECONDS", "3600")))
+AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS = max(30, int(os.getenv("AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS", "120")))
 v6_last_sync_result: Dict[str, Any] = {}
 
 # Automatic closed-trade report reconciliation. Reporting-only: this never
@@ -6713,7 +6717,7 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started
     if not bot_thread_started:
         bot_thread_started = True
         threading.Thread(target=run_bot_loop, daemon=True).start()
@@ -6729,6 +6733,9 @@ def startup_event():
     if AI_RESEARCH_CLOSED_MARKET_ONLY and not ai_research_thread_started:
         ai_research_thread_started = True
         threading.Thread(target=closed_market_ai_research_worker, daemon=True).start()
+    if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
+        ai_summary_thread_started = True
+        threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
 
 
 
@@ -11459,3 +11466,88 @@ def api_ai_advisor_run(request: Request, payload: Dict[str, Any] = Body(default=
         bool(payload.get('force', True)),
         int(payload.get('evaluateLimit') or 500),
     )
+
+
+# =========================
+# TRADEBOT V9.6 — PERIODIC AI SUMMARY LOG
+# Read-only operational visibility. Never places orders or changes settings.
+# =========================
+
+def ai_periodic_summary_payload() -> Dict[str, Any]:
+    """Build a compact operational summary from persistent decision and outcome data."""
+    counts = {"total": 0, "approved": 0, "bought": 0, "blocked": 0, "rejected": 0}
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute("""
+            SELECT UPPER(COALESCE(decision,'UNKNOWN')) AS decision_name, COUNT(*) AS decision_count
+            FROM v2_setup_decisions
+            WHERE date(timestamp) = date('now')
+            GROUP BY UPPER(COALESCE(decision,'UNKNOWN'))
+        """).fetchall()
+        conn.close()
+        for row in rows:
+            name = str(row[0] or "UNKNOWN").upper()
+            value = int(row[1] or 0)
+            counts["total"] += value
+            if name == "APPROVED": counts["approved"] = value
+            elif name == "BOUGHT": counts["bought"] = value
+            elif name == "BLOCKED": counts["blocked"] = value
+            elif name == "REJECTED": counts["rejected"] = value
+    except Exception as exc:
+        counts["decisionError"] = str(exc)
+
+    shadow = shadow_trading_summary(days=30, horizon_hours=24)
+    advisor = ai_advisor_summary(limit=5)
+    shadow_summary = shadow.get("summary", {}) if shadow.get("ok") else {}
+    evidence = advisor.get("evidence", {}) if advisor.get("ok") else {}
+    return {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "decisionsToday": counts,
+        "shadow": {
+            "completed": int(shadow_summary.get("completed") or 0),
+            "pending": int(shadow_summary.get("pending") or 0),
+            "winRate": float(shadow_summary.get("winRate") or 0.0),
+            "virtualPnlGbp": float(shadow_summary.get("virtualPnlGbp") or 0.0),
+        },
+        "advisor": {
+            "readiness": advisor.get("readiness", "UNKNOWN"),
+            "completedOutcomes": int(evidence.get("completedOutcomes") or 0),
+            "pendingOutcomes": int(evidence.get("pendingOutcomes") or 0),
+            "validatedPositive": int(evidence.get("validatedPositive") or 0),
+            "validatedNegative": int(evidence.get("validatedNegative") or 0),
+            "learningRuns": int(evidence.get("learningRuns") or 0),
+        },
+        "advisoryOnly": True,
+        "liveChanges": False,
+    }
+
+
+def ai_periodic_summary_worker() -> None:
+    time.sleep(AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            summary = ai_periodic_summary_payload()
+            d = summary["decisionsToday"]
+            sh = summary["shadow"]
+            adv = summary["advisor"]
+            print(
+                "AI ADVISOR SUMMARY | "
+                f"decisions_today={d.get('total',0)} "
+                f"approved={d.get('approved',0)} bought={d.get('bought',0)} "
+                f"blocked={d.get('blocked',0)} rejected={d.get('rejected',0)} | "
+                f"shadow_complete={sh.get('completed',0)} pending={sh.get('pending',0)} "
+                f"win_rate={sh.get('winRate',0.0):.1%} virtual_pnl=£{sh.get('virtualPnlGbp',0.0):.2f} | "
+                f"readiness={adv.get('readiness','UNKNOWN')} outcomes={adv.get('completedOutcomes',0)} "
+                f"validated=+{adv.get('validatedPositive',0)}/-{adv.get('validatedNegative',0)} "
+                f"learning_runs={adv.get('learningRuns',0)} live_changes=False"
+            )
+        except Exception as exc:
+            print(f"AI ADVISOR SUMMARY ERROR: {exc}")
+        time.sleep(AI_SUMMARY_LOG_INTERVAL_SECONDS)
+
+
+@app.get('/ai-advisor/periodic-summary')
+def api_ai_periodic_summary(request: Request):
+    verify_api_key(request)
+    return ai_periodic_summary_payload()
