@@ -11639,6 +11639,341 @@ def api_strategy_intelligence_recommendations(request: Request, limit: int = 20)
     verify_api_key(request)
     return strategy_intelligence_recommendations(limit)
 
+
+# =========================
+# TRADEBOT V9.8 — WEAKNESS INTELLIGENCE ENGINE
+# Fast, read-only analytics for symbols, rejection rules and data quality.
+# It does not alter live gates, position limits, risk or order execution.
+# =========================
+WEAKNESS_INTELLIGENCE_NOTIONAL_GBP = max(
+    1.0, float(os.getenv("WEAKNESS_INTELLIGENCE_NOTIONAL_GBP", "100"))
+)
+
+
+def _wi_safe_div(numerator: float, denominator: float) -> float:
+    return float(numerator) / float(denominator) if denominator else 0.0
+
+
+def _wi_profit_factor(returns: List[float]) -> float:
+    gross_profit = sum(x for x in returns if x > 0)
+    gross_loss = abs(sum(x for x in returns if x < 0))
+    if gross_loss:
+        return gross_profit / gross_loss
+    return 999.0 if gross_profit else 0.0
+
+
+def _wi_symbol_status(samples: int, expectancy_pct: float, profit_factor: float, win_rate: float) -> str:
+    if samples < 5:
+        return "INSUFFICIENT_DATA"
+    if expectancy_pct <= -0.20 and profit_factor < 0.85:
+        return "WEAK"
+    if expectancy_pct < 0 or profit_factor < 1.0 or win_rate < 0.45:
+        return "UNDER_REVIEW"
+    if expectancy_pct >= 0.20 and profit_factor >= 1.20 and win_rate >= 0.52:
+        return "STRONG"
+    return "NEUTRAL"
+
+
+def symbol_intelligence(days: int = 180, horizon_hours: int = 24, minimum_samples: int = 5, limit: int = 100) -> Dict[str, Any]:
+    days = max(1, min(int(days), 3650))
+    horizon_hours = max(1, min(int(horizon_hours), 720))
+    minimum_samples = max(1, min(int(minimum_samples), 1000))
+    limit = max(1, min(int(limit), 1000))
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled", "version": "V9.8"}
+    try:
+        init_db()
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        conn = db_connect()
+        decision_rows = conn.execute(
+            """SELECT d.symbol,d.decision,d.stage,d.reason,o.net_return_pct
+               FROM v2_setup_decisions d
+               JOIN v2_observation_outcomes o ON o.decision_id=d.id
+               WHERE d.timestamp>=? AND o.horizon_hours=?
+                 AND o.status='COMPLETE' AND o.net_return_pct IS NOT NULL""",
+            (cutoff, horizon_hours),
+        ).fetchall()
+        live_rows = conn.execute(
+            """SELECT symbol,pnl_gbp,pnl_pct,timestamp
+               FROM closed_trades
+               WHERE timestamp>=? AND COALESCE(qty,0)>0""",
+            (cutoff,),
+        ).fetchall()
+        conn.close()
+
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for row in decision_rows:
+            symbol = str(row[0] or "").upper().strip()
+            if not symbol:
+                continue
+            item = buckets.setdefault(symbol, {
+                "symbol": symbol, "outcomes": [], "takenOutcomes": [], "shadowOutcomes": [],
+                "actualPnlGbp": [], "actualPnlPct": [], "decisions": {}, "reasons": {}
+            })
+            decision = str(row[1] or "UNKNOWN").upper()
+            reason = str(row[3] or row[2] or "UNKNOWN").strip()
+            value = float(row[4] or 0.0)
+            item["outcomes"].append(value)
+            if decision in ("BOUGHT", "APPROVED"):
+                item["takenOutcomes"].append(value)
+            elif decision in ("BLOCKED", "REJECTED"):
+                item["shadowOutcomes"].append(value)
+            item["decisions"][decision] = int(item["decisions"].get(decision, 0)) + 1
+            item["reasons"][reason] = int(item["reasons"].get(reason, 0)) + 1
+
+        for row in live_rows:
+            symbol = str(row[0] or "").upper().strip()
+            if not symbol:
+                continue
+            item = buckets.setdefault(symbol, {
+                "symbol": symbol, "outcomes": [], "takenOutcomes": [], "shadowOutcomes": [],
+                "actualPnlGbp": [], "actualPnlPct": [], "decisions": {}, "reasons": {}
+            })
+            if row[1] is not None:
+                item["actualPnlGbp"].append(float(row[1]))
+            if row[2] is not None:
+                item["actualPnlPct"].append(float(row[2]))
+
+        results = []
+        for symbol, item in buckets.items():
+            returns = item["outcomes"]
+            actual_pct = item["actualPnlPct"]
+            evidence_returns = actual_pct if actual_pct else returns
+            samples = len(evidence_returns)
+            wins = sum(1 for x in evidence_returns if x > 0)
+            losses = sum(1 for x in evidence_returns if x < 0)
+            expectancy = _wi_safe_div(sum(evidence_returns), samples)
+            win_rate = _wi_safe_div(wins, samples)
+            pf = _wi_profit_factor(evidence_returns)
+            status = _wi_symbol_status(samples, expectancy, pf, win_rate)
+            top_reasons = sorted(item["reasons"].items(), key=lambda x: (-x[1], x[0]))[:5]
+            suggestion = "Keep collecting evidence."
+            if status == "WEAK":
+                suggestion = "Shadow-test a higher confidence requirement or temporary exclusion; do not change live rules automatically."
+            elif status == "UNDER_REVIEW":
+                suggestion = "Require stronger evidence before prioritising this symbol."
+            elif status == "STRONG":
+                suggestion = "Retain current handling and confirm performance remains stable out-of-sample."
+            results.append({
+                "symbol": symbol,
+                "status": status,
+                "samples": samples,
+                "wins": wins,
+                "losses": losses,
+                "winRate": round(win_rate, 4),
+                "averageReturnPct": round(expectancy, 4),
+                "profitFactor": round(pf, 4),
+                "actualTrades": len(item["actualPnlGbp"]) or len(actual_pct),
+                "actualPnlGbp": round(sum(item["actualPnlGbp"]), 2),
+                "actualAverageReturnPct": round(_wi_safe_div(sum(actual_pct), len(actual_pct)), 4),
+                "decisionOutcomes": len(returns),
+                "takenOutcomeSamples": len(item["takenOutcomes"]),
+                "shadowOutcomeSamples": len(item["shadowOutcomes"]),
+                "decisionCounts": item["decisions"],
+                "topReasons": [{"reason": k, "count": v} for k, v in top_reasons],
+                "suggestion": suggestion,
+                "requiresShadowTest": status in ("WEAK", "UNDER_REVIEW"),
+                "requiresHumanApproval": True,
+            })
+
+        results.sort(key=lambda x: (
+            0 if x["status"] == "WEAK" else 1 if x["status"] == "UNDER_REVIEW" else 2,
+            x["averageReturnPct"], -x["samples"]
+        ))
+        eligible = [x for x in results if x["samples"] >= minimum_samples]
+        return {
+            "ok": True, "version": "V9.8", "name": "Symbol Intelligence",
+            "days": days, "horizonHours": horizon_hours, "minimumSamples": minimum_samples,
+            "summary": {
+                "symbols": len(results), "eligible": len(eligible),
+                "weak": sum(1 for x in eligible if x["status"] == "WEAK"),
+                "underReview": sum(1 for x in eligible if x["status"] == "UNDER_REVIEW"),
+                "strong": sum(1 for x in eligible if x["status"] == "STRONG"),
+            },
+            "symbols": results[:limit],
+            "advisoryOnly": True, "automaticLiveChanges": False, "requiresHumanApproval": True,
+        }
+    except Exception as exc:
+        return {"ok": False, "version": "V9.8", "error": str(exc)}
+
+
+def _wi_normalise_rule(stage: Any, reason: Any) -> str:
+    stage_text = str(stage or "UNKNOWN").strip().lower()
+    reason_text = str(reason or "UNKNOWN").strip().lower()
+    if "max positions" in reason_text or "position_limit" in stage_text:
+        return "MAX_POSITIONS"
+    if "confidence" in reason_text:
+        return "CONFIDENCE_GATE"
+    if "quality" in reason_text:
+        return "QUALITY_GATE"
+    if "momentum" in reason_text:
+        return "MOMENTUM_FILTER"
+    if "spread" in reason_text:
+        return "SPREAD_FILTER"
+    if "sample" in reason_text or stage_text.startswith("v2"):
+        return "V2_SAMPLE_GATE"
+    if "pullback" in reason_text:
+        return "PULLBACK_FILTER"
+    if "cooldown" in reason_text:
+        return "COOLDOWN"
+    if "sold today" in reason_text or "already traded" in reason_text:
+        return "DAILY_LOCKOUT"
+    return (str(stage or reason or "OTHER").upper().strip().replace(" ", "_"))[:80]
+
+
+def rule_intelligence(days: int = 180, horizon_hours: int = 24, minimum_samples: int = 20, limit: int = 100) -> Dict[str, Any]:
+    days = max(1, min(int(days), 3650))
+    horizon_hours = max(1, min(int(horizon_hours), 720))
+    minimum_samples = max(1, min(int(minimum_samples), 10000))
+    limit = max(1, min(int(limit), 1000))
+    try:
+        init_db()
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        conn = db_connect()
+        rows = conn.execute(
+            """SELECT d.decision,d.stage,d.reason,d.symbol,o.net_return_pct
+               FROM v2_setup_decisions d
+               JOIN v2_observation_outcomes o ON o.decision_id=d.id
+               WHERE d.timestamp>=? AND d.decision IN ('BLOCKED','REJECTED')
+                 AND o.horizon_hours=? AND o.status='COMPLETE'
+                 AND o.net_return_pct IS NOT NULL""",
+            (cutoff, horizon_hours),
+        ).fetchall()
+        conn.close()
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            rule = _wi_normalise_rule(row[1], row[2])
+            item = buckets.setdefault(rule, {"returns": [], "symbols": {}, "reasons": {}, "decisions": {}})
+            value = float(row[4] or 0.0)
+            item["returns"].append(value)
+            symbol = str(row[3] or "UNKNOWN").upper()
+            reason = str(row[2] or "UNKNOWN")
+            decision = str(row[0] or "UNKNOWN").upper()
+            item["symbols"][symbol] = int(item["symbols"].get(symbol, 0)) + 1
+            item["reasons"][reason] = int(item["reasons"].get(reason, 0)) + 1
+            item["decisions"][decision] = int(item["decisions"].get(decision, 0)) + 1
+
+        results = []
+        for rule, item in buckets.items():
+            returns = item["returns"]
+            samples = len(returns)
+            missed_winners = sum(1 for x in returns if x > 0)
+            avoided_losers = sum(1 for x in returns if x < 0)
+            shadow_pnl = WEAKNESS_INTELLIGENCE_NOTIONAL_GBP * sum(returns) / 100.0
+            # A rejection rule adds value when rejected trades subsequently lose.
+            rule_net_benefit = -shadow_pnl
+            average_return = _wi_safe_div(sum(returns), samples)
+            helped_rate = _wi_safe_div(avoided_losers, samples)
+            rating = "INSUFFICIENT_DATA"
+            if samples >= minimum_samples:
+                if rule_net_benefit > 0 and helped_rate >= 0.52:
+                    rating = "HELPING"
+                elif rule_net_benefit < 0 and missed_winners > avoided_losers:
+                    rating = "HURTING"
+                else:
+                    rating = "MIXED"
+            confidence = min(99.0, 100.0 * min(1.0, (samples / max(50.0, minimum_samples * 2.0)) ** 0.5))
+            top_symbols = sorted(item["symbols"].items(), key=lambda x: (-x[1], x[0]))[:5]
+            top_reasons = sorted(item["reasons"].items(), key=lambda x: (-x[1], x[0]))[:5]
+            results.append({
+                "rule": rule, "rating": rating, "samples": samples,
+                "avoidedLosers": avoided_losers, "missedWinners": missed_winners,
+                "helpedRate": round(helped_rate, 4),
+                "rejectedTradeAverageReturnPct": round(average_return, 4),
+                "shadowPnlIfTakenGbp": round(shadow_pnl, 2),
+                "estimatedRuleNetBenefitGbp": round(rule_net_benefit, 2),
+                "evidenceConfidencePct": round(confidence, 1),
+                "decisionCounts": item["decisions"],
+                "topSymbols": [{"symbol": k, "count": v} for k, v in top_symbols],
+                "topReasons": [{"reason": k, "count": v} for k, v in top_reasons],
+                "interpretation": (
+                    "The rule appears to avoid more losses than gains." if rating == "HELPING" else
+                    "The rule appears to miss more profitable trades than losses it avoids." if rating == "HURTING" else
+                    "The evidence is mixed or still insufficient."
+                ),
+                "requiresShadowTest": rating == "HURTING",
+                "requiresHumanApproval": True,
+            })
+        results.sort(key=lambda x: (
+            0 if x["rating"] == "HURTING" else 1 if x["rating"] == "MIXED" else 2,
+            x["estimatedRuleNetBenefitGbp"], -x["samples"]
+        ))
+        eligible = [x for x in results if x["samples"] >= minimum_samples]
+        return {
+            "ok": True, "version": "V9.8", "name": "Rule Intelligence",
+            "days": days, "horizonHours": horizon_hours, "minimumSamples": minimum_samples,
+            "summary": {
+                "rules": len(results), "eligible": len(eligible),
+                "helping": sum(1 for x in eligible if x["rating"] == "HELPING"),
+                "hurting": sum(1 for x in eligible if x["rating"] == "HURTING"),
+                "mixed": sum(1 for x in eligible if x["rating"] == "MIXED"),
+            },
+            "rules": results[:limit],
+            "advisoryOnly": True, "automaticLiveChanges": False, "requiresHumanApproval": True,
+        }
+    except Exception as exc:
+        return {"ok": False, "version": "V9.8", "error": str(exc)}
+
+
+def weakness_intelligence_summary() -> Dict[str, Any]:
+    symbols = symbol_intelligence(days=180, horizon_hours=24, minimum_samples=5, limit=20)
+    rules = rule_intelligence(days=180, horizon_hours=24, minimum_samples=20, limit=20)
+    strategy = strategy_intelligence_summary(limit=10)
+    weak_symbols = [x for x in symbols.get("symbols", []) if x.get("status") in ("WEAK", "UNDER_REVIEW")][:5]
+    hurting_rules = [x for x in rules.get("rules", []) if x.get("rating") == "HURTING"][:5]
+    positive = int((strategy.get("summary") or {}).get("favourable") or 0)
+    negative = int((strategy.get("summary") or {}).get("unfavourable") or 0)
+    issues = []
+    if positive == 0 and negative > 0:
+        issues.append({
+            "area": "POSITIVE_PATTERN_DISCOVERY", "severity": "REVIEW",
+            "finding": f"The latest validated set contains {negative} negative patterns and no positive patterns.",
+            "action": "Keep live settings unchanged; inspect feature coverage and out-of-sample validation before relaxing thresholds."
+        })
+    if weak_symbols:
+        issues.append({
+            "area": "SYMBOL_PERFORMANCE", "severity": "REVIEW",
+            "finding": f"{len(weak_symbols)} weak or under-review symbols are visible in the current result window.",
+            "action": "Shadow-test symbol-specific confidence gates before any live exclusion."
+        })
+    if hurting_rules:
+        issues.append({
+            "area": "RULE_OPPORTUNITY_COST", "severity": "REVIEW",
+            "finding": f"{len(hurting_rules)} rules currently show negative historical net benefit.",
+            "action": "Run controlled shadow comparisons; do not remove gates during market hours."
+        })
+    return {
+        "ok": bool(symbols.get("ok") and rules.get("ok")), "version": "V9.8",
+        "name": "Weakness Intelligence Engine", "generatedAt": datetime.now(UTC).isoformat(),
+        "readiness": "READY_FOR_OBSERVATION",
+        "topWeakSymbols": weak_symbols,
+        "topHurtingRules": hurting_rules,
+        "issues": issues,
+        "symbolSummary": symbols.get("summary", {}),
+        "ruleSummary": rules.get("summary", {}),
+        "strategyValidation": {"positive": positive, "negative": negative},
+        "liveTradingChanged": False, "advisoryOnly": True,
+        "automaticLiveChanges": False, "requiresHumanApproval": True,
+    }
+
+
+@app.get('/symbol-intelligence/summary')
+def api_symbol_intelligence_summary(request: Request, days: int = 180, horizon_hours: int = 24, minimum_samples: int = 5, limit: int = 100):
+    verify_api_key(request)
+    return symbol_intelligence(days, horizon_hours, minimum_samples, limit)
+
+
+@app.get('/rule-intelligence/summary')
+def api_rule_intelligence_summary(request: Request, days: int = 180, horizon_hours: int = 24, minimum_samples: int = 20, limit: int = 100):
+    verify_api_key(request)
+    return rule_intelligence(days, horizon_hours, minimum_samples, limit)
+
+
+@app.get('/weakness-intelligence/summary')
+def api_weakness_intelligence_summary(request: Request):
+    verify_api_key(request)
+    return weakness_intelligence_summary()
+
 # =========================
 # TRADEBOT V9.6 — PERIODIC AI SUMMARY LOG
 # Read-only operational visibility. Never places orders or changes settings.
