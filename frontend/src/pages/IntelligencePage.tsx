@@ -154,23 +154,24 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const v7Status = sources.v7Status.data;
   const v8Status = sources.v8Status.data;
 
-  const learningProgress = pct(advisor.learningProgress ?? advisor.readiness?.progress ?? advisor.readiness ?? decision.learningProgress ?? decision.readiness);
+  const learningProgress = pct(advisor.evidence?.richEvidenceProgressPct ?? advisor.learning?.richEvidenceProgressPct ?? 0);
   const shadowAccuracy = pct(shadow.accuracy ?? shadow.winRate ?? shadow.summary?.winRate ?? shadow.metrics?.winRate);
   const calibration = pct(advisor.confidenceCalibration ?? decision.confidenceCalibration ?? decision.calibration?.score ?? strategy.confidenceCalibration);
-  const evidenceCount = num(advisor.observations ?? advisor.evidenceCount ?? decision.totalDecisions ?? decision.observations ?? shadow.total ?? shadow.trades);
-  const discoveryCount = num(advisor.discoveries ?? advisor.validatedPatterns ?? patterns.total ?? patterns.count ?? research.patternsFound ?? research.patternCount);
+  const evidenceCount = num(advisor.evidence?.completedOutcomes ?? advisor.evidence?.observations ?? decision.total ?? shadow.summary?.samples ?? 0);
+  const discoveryCount = num((advisor.evidence?.validatedPositive ?? 0)) + num((advisor.evidence?.validatedNegative ?? 0));
   const recommendation = firstObject(advisor.recommendation, advisor.latestRecommendation, strategy.recommendation, strategy.latestRecommendation);
+  const recommendationMessage = text(advisor.message, "The advisor is still collecting evidence.");
 
   const symbolRows = firstArray(symbols.symbols, symbols.rows, symbols.rankings, symbols.summary, symbols.topSymbols, symbols.data);
   const ruleRows = firstArray(rules.rules, rules.rows, rules.rankings, rules.summary, rules.data);
-  const weaknessRows = firstArray(weakness.weaknesses, weakness.rows, weakness.findings, weakness.summary, weakness.data);
+  const weaknessRows = firstArray(weakness.issues, weakness.weaknesses, weakness.rows, weakness.findings, weakness.data);
   const strategyRows = firstArray(strategy.strategies, strategy.rows, strategy.rankings, strategy.summary, strategy.data);
   const patternRows = firstArray(patterns.patterns, patterns.rows, patterns.discoveries, patterns.data, research.patterns, research.discoveries);
   const researchRows = firstArray(research.brains, research.rows, research.leaderboard, research.insights, v7Status.brains, v8Status.brains);
 
   const chartSymbolRows = symbolRows.slice(0, 12).map((row) => ({
     name: text(row.symbol ?? row.name ?? row.key, "?"),
-    expectancy: num(row.expectancyPct ?? row.expectancy ?? row.edgePct ?? row.edge),
+    expectancy: num(row.averageReturnPct ?? row.expectancyPct ?? row.expectancy ?? row.edgePct ?? row.edge),
     winRate: pct(row.winRate ?? row.accuracy ?? row.successRate),
     samples: num(row.trades ?? row.samples ?? row.observations),
   }));
@@ -238,6 +239,17 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <div><span>Current regime</span><b>{text(advisor.marketRegime ?? marketRegime)}</b></div>
         </div>
       </Card>
+      <Card title="When this intelligence updates" wide>
+        <div className="summary">
+          <div><span>Outcome evaluation</span><b>After market close</b></div>
+          <div><span>Default outcome horizon</span><b>24 hours</b></div>
+          <div><span>Research check interval</span><b>Every 30 minutes while closed</b></div>
+          <div><span>First reliable learning run</span><b>20 completed outcomes</b></div>
+          <div><span>Rich evidence target</span><b>{num(advisor.evidence?.richEvidenceTarget || 100)}</b></div>
+          <div><span>Completed / pending</span><b>{num(advisor.evidence?.completedOutcomes)} / {num(advisor.evidence?.pendingOutcomes)}</b></div>
+        </div>
+        <p className="muted">The live market worker deliberately pauses the research learner during market hours. Today’s decisions normally become eligible after their 24-hour checkpoint and are processed during a closed-market research cycle.</p>
+      </Card>
       <Card title="Confidence Calibration" wide>
         {confidenceRows.length ? <div className="chart"><ResponsiveContainer width="100%" height="100%"><LineChart data={confidenceRows}><CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,.16)" /><XAxis dataKey="name" stroke="#94a3b8" /><YAxis domain={[0, 100]} stroke="#94a3b8" /><Tooltip contentStyle={{ background: "#020617", border: "1px solid #263450", borderRadius: 12 }} /><Line type="monotone" dataKey="expected" stroke="#38bdf8" strokeWidth={3} name="Expected %" /><Line type="monotone" dataKey="actual" stroke="#22c55e" strokeWidth={3} name="Actual %" /></LineChart></ResponsiveContainer></div> : <EmptyState endpoint="decision confidence buckets" error={sources.decision.error} />}
       </Card>
@@ -246,7 +258,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           { key: "name", label: "Strategy", render: (row) => <b>{text(row.name ?? row.strategy ?? row.key)}</b> },
           { key: "trades", label: "Samples", render: (row) => num(row.trades ?? row.samples ?? row.observations).toLocaleString("en-GB") },
           { key: "winRate", label: "Win Rate", render: (row) => `${Math.round(pct(row.winRate ?? row.accuracy))}%` },
-          { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
+          { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.averageReturnPct ?? row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
           { key: "status", label: "Status", render: (row) => <span className="pill">{text(row.status ?? row.verdict ?? row.readiness, "Learning")}</span> },
         ]} />
       </Card>
@@ -270,9 +282,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="Discovered Market Patterns" wide>
         <DataTable rows={patternRows.slice(0, 20)} columns={[
           { key: "pattern", label: "Pattern", render: (row) => <b>{text(row.pattern ?? row.name ?? row.title ?? row.description)}</b> },
-          { key: "samples", label: "Samples", render: (row) => num(row.samples ?? row.trades ?? row.count).toLocaleString("en-GB") },
+          { key: "samples", label: "Samples", render: (row) => text(row.area ?? row.samples ?? row.trades ?? row.count, "—") },
           { key: "winRate", label: "Win Rate", render: (row) => `${Math.round(pct(row.winRate ?? row.accuracy))}%` },
-          { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
+          { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.rejectedTradeAverageReturnPct ?? row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
           { key: "confidence", label: "Confidence", render: (row) => `${Math.round(pct(row.confidence ?? row.score))}%` },
         ]} />
       </Card>
@@ -313,8 +325,8 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           { key: "samples", label: "Samples", render: (row) => num(row.trades ?? row.samples ?? row.observations).toLocaleString("en-GB") },
           { key: "winRate", label: "Win Rate", render: (row) => `${Math.round(pct(row.winRate ?? row.accuracy))}%` },
           { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
-          { key: "bestRegime", label: "Best Regime", render: (row) => text(row.bestRegime ?? row.regime ?? row.marketRegime, "Learning") },
-          { key: "confidence", label: "Confidence", render: (row) => `${Math.round(pct(row.confidence ?? row.reliability ?? row.score))}%` },
+          { key: "bestRegime", label: "Best Regime", render: (row) => text(row.status, "Learning") },
+          { key: "confidence", label: "Confidence", render: (row) => `${Math.round(num(row.samples) ? Math.min(99, Math.sqrt(num(row.samples) / 50) * 100) : 0)}%` },
         ]} />
       </Card>
     </div>}
@@ -324,17 +336,17 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         <DataTable rows={ruleRows.slice(0, 30)} columns={[
           { key: "rule", label: "Rule", render: (row) => <b>{text(row.rule ?? row.name ?? row.key)}</b> },
           { key: "triggered", label: "Triggered", render: (row) => num(row.triggered ?? row.samples ?? row.count).toLocaleString("en-GB") },
-          { key: "helped", label: "Helped", render: (row) => `${Math.round(pct(row.helpRate ?? row.successRate ?? row.winRate))}%` },
+          { key: "helped", label: "Helped", render: (row) => `${Math.round(pct(row.helpedRate ?? row.helpRate ?? row.successRate ?? row.winRate))}%` },
           { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
-          { key: "verdict", label: "Verdict", render: (row) => <span className="pill">{text(row.verdict ?? row.status ?? row.recommendation, "Learning")}</span> },
+          { key: "verdict", label: "Verdict", render: (row) => <span className="pill">{text(row.rating ?? row.verdict ?? row.status ?? row.recommendation, "Learning")}</span> },
         ]} />
       </Card>
       <Card title="Weakness Intelligence" wide>
         <DataTable rows={weaknessRows.slice(0, 30)} columns={[
-          { key: "weakness", label: "Weakness", render: (row) => <b>{text(row.weakness ?? row.name ?? row.title ?? row.rule)}</b> },
+          { key: "weakness", label: "Weakness", render: (row) => <b>{text(row.finding ?? row.weakness ?? row.name ?? row.title ?? row.rule)}</b> },
           { key: "severity", label: "Severity", render: (row) => text(row.severity ?? row.risk ?? row.level, "Unknown") },
           { key: "samples", label: "Evidence", render: (row) => num(row.samples ?? row.trades ?? row.count).toLocaleString("en-GB") },
-          { key: "impact", label: "Impact", render: (row) => `${num(row.impactPct ?? row.expectancyPct ?? row.impact).toFixed(2)}%` },
+          { key: "impact", label: "Impact", render: (row) => text(row.severity ?? row.impactPct ?? row.expectancyPct ?? row.impact, "—") },
           { key: "recommendation", label: "Recommendation", render: (row) => text(row.recommendation ?? row.action ?? row.note, "Observe") },
         ]} />
       </Card>
