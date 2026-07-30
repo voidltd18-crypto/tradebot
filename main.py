@@ -175,7 +175,7 @@ MIN_SELL_NOTIONAL = 1.00
 # V2 starts in validation-only mode. It will scan and explain trades, but it
 # will not place a new live buy until TRADEBOT_V2_LIVE_ENABLED=true is set.
 TRADEBOT_V2_ENABLED = os.getenv("TRADEBOT_V2_ENABLED", "true").lower() == "true"
-TRADEBOT_V2_LIVE_ENABLED = os.getenv("TRADEBOT_V2_LIVE_ENABLED", "false").lower() == "true"
+TRADEBOT_V2_LIVE_ENABLED = os.getenv("TRADEBOT_V2_LIVE_ENABLED", "true").lower() == "true"
 V2_MIN_SYMBOL_SAMPLES = int(os.getenv("V2_MIN_SYMBOL_SAMPLES", "8") or 8)
 V2_MIN_WIN_RATE = float(os.getenv("V2_MIN_WIN_RATE", "0.50") or 0.50)
 V2_MIN_PROFIT_FACTOR = float(os.getenv("V2_MIN_PROFIT_FACTOR", "1.10") or 1.10)
@@ -215,6 +215,11 @@ V6_HISTORICAL_BAR_LOOKBACK_MINUTES = max(5, int(os.getenv("V6_HISTORICAL_BAR_LOO
 V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES = max(5, int(os.getenv("V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES", "45") or 45))
 V6_REPAIR_BATCH_SIZE = max(1, min(int(os.getenv("V6_REPAIR_BATCH_SIZE", "200") or 200), 1000))
 
+# Closed-market AI research scheduler. Live trading stays focused while the market is open.
+AI_RESEARCH_CLOSED_MARKET_ONLY = os.getenv("AI_RESEARCH_CLOSED_MARKET_ONLY", "true").lower() == "true"
+AI_RESEARCH_INTERVAL_SECONDS = max(300, int(os.getenv("AI_RESEARCH_INTERVAL_SECONDS", "1800") or 1800))
+AI_RESEARCH_STARTUP_DELAY_SECONDS = max(5, int(os.getenv("AI_RESEARCH_STARTUP_DELAY_SECONDS", "30") or 30))
+
 # TradeBot V7.1 Autonomous Research Lab. Shadow-only; never changes live trading.
 V7_ENABLED = os.getenv("V7_ENABLED", "true").lower() == "true"
 V7_AUTOMATIC_EVOLUTION = os.getenv("V7_AUTOMATIC_EVOLUTION", "true").lower() == "true"
@@ -240,7 +245,7 @@ AUTO_IMPROVE_ENABLED = True
 
 DAILY_PROFIT_TARGET = 4.00
 DAILY_LOSS_LIMIT_OPTIMIZER = -100.00
-PAUSE_BUYS_AFTER_DAILY_TARGET = True
+PAUSE_BUYS_AFTER_DAILY_TARGET = False
 PAUSE_BUYS_AFTER_DAILY_LOSS = True
 
 OPTIMIZED_STOP_LOSS = 0.960
@@ -305,7 +310,26 @@ MEMORY_GOOD_MULTIPLIER = 1.15
 
 # SQLite persistent trade memory
 SQLITE_ENABLED = True
-SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "trades.db")
+
+def persistent_data_dir() -> str:
+    """Choose a directory that survives Render redeploys when a disk is mounted.
+
+    Recommended Render disk mount path: /var/data
+    Override with PERSISTENT_DATA_DIR when using a different mount.
+    """
+    configured = os.getenv("PERSISTENT_DATA_DIR", "").strip()
+    if configured:
+        return configured
+    if os.path.isdir("/var/data"):
+        return "/var/data"
+    return os.path.join("backend", "state")
+
+
+def persistent_file(name: str) -> str:
+    return os.path.join(persistent_data_dir(), name)
+
+
+SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "").strip() or persistent_file("trades.db")
 BACKFILL_ORDER_LIMIT = 500
 BACKFILL_CHUNK_SIZE = 500
 BACKFILL_MAX_PAGES = 50
@@ -386,7 +410,22 @@ emergency_stop = False
 bot_thread_started = False
 v6_sync_thread_started = False
 v7_weekend_thread_started = False
+v11_learning_thread_started = False
+ai_research_thread_started = False
+ai_summary_thread_started = False
+AI_SUMMARY_LOG_ENABLED = os.getenv("AI_SUMMARY_LOG_ENABLED", "true").lower() in ("1","true","yes","on")
+AI_SUMMARY_LOG_INTERVAL_SECONDS = max(300, int(os.getenv("AI_SUMMARY_LOG_INTERVAL_SECONDS", "3600")))
+AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS = max(30, int(os.getenv("AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS", "120")))
 v6_last_sync_result: Dict[str, Any] = {}
+
+# Automatic closed-trade report reconciliation. Reporting-only: this never
+# changes entries, exits, sizing, scanner decisions, or order submission.
+AUTO_REPORT_SYNC_ENABLED = os.getenv("AUTO_REPORT_SYNC_ENABLED", "true").lower() == "true"
+AUTO_REPORT_SYNC_INTERVAL_SECONDS = max(30, int(os.getenv("AUTO_REPORT_SYNC_INTERVAL_SECONDS", "60") or 60))
+AUTO_REPORT_SYNC_ORDER_LIMIT = max(20, min(int(os.getenv("AUTO_REPORT_SYNC_ORDER_LIMIT", "500") or 500), 500))
+auto_report_last_sync_ts = 0.0
+auto_report_last_result: Dict[str, Any] = {}
+
 bot_lock = threading.Lock()
 
 starting_equity_today: Optional[float] = None
@@ -1752,13 +1791,134 @@ def _v2_decision_recently_logged(symbol: str, decision: str, stage: str) -> bool
         return False
 
 
-def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, reason: str, profile: Optional[Dict[str, Any]] = None):
-    if not (TRADEBOT_V2_ENABLED and V2_LOG_DECISIONS and SQLITE_ENABLED):
+# =========================
+# TRADEBOT V11.4 — UNIFIED DECISION PIPELINE
+# Every real scanner decision is traced through one persistence route.
+# Logging/research only: this cannot place or modify an order.
+# =========================
+def _v114_ensure_tables() -> None:
+    if not SQLITE_ENABLED:
         return
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_decision_trace (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trace_id TEXT NOT NULL,
+        decision_id INTEGER,
+        created_at TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        writer TEXT NOT NULL,
+        event TEXT NOT NULL,
+        stage TEXT,
+        decision TEXT,
+        success INTEGER NOT NULL DEFAULT 1,
+        detail TEXT,
+        payload_json TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_trace_trace_id ON v11_decision_trace(trace_id,id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_trace_decision ON v11_decision_trace(decision_id,id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_trace_time ON v11_decision_trace(created_at)")
+    conn.commit(); conn.close()
+
+
+def _v114_trace(trace_id: str, symbol: str, writer: str, event: str,
+                 stage: str = "", decision: str = "", decision_id: Optional[int] = None,
+                 success: bool = True, detail: str = "", payload: Optional[Dict[str, Any]] = None,
+                 conn: Optional[sqlite3.Connection] = None) -> None:
+    if not SQLITE_ENABLED:
+        return
+    own = conn is None
+    try:
+        if own:
+            _v114_ensure_tables(); conn = db_connect()
+        conn.execute("""INSERT INTO v11_decision_trace(
+            trace_id,decision_id,created_at,symbol,writer,event,stage,decision,success,detail,payload_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(trace_id), decision_id, datetime.now(UTC).isoformat(), str(symbol), str(writer), str(event),
+             str(stage), str(decision), int(bool(success)), str(detail)[:2000], json.dumps(payload or {}, default=str)))
+        if own:
+            conn.commit(); conn.close()
+    except Exception as e:
+        print(f"V11.4 TRACE ERROR {symbol} {event}: {e}")
+        if own and conn:
+            try: conn.close()
+            except Exception: pass
+
+
+def _v114_trace_id(symbol: str) -> str:
+    return f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}-{str(symbol).upper()}-{secrets.token_hex(4)}"
+
+
+def v114_trace_payload(decision_id: int) -> Dict[str, Any]:
+    _v114_ensure_tables(); conn = db_connect()
+    rows = conn.execute("""SELECT id,trace_id,decision_id,created_at,symbol,writer,event,stage,decision,success,detail,payload_json
+        FROM v11_decision_trace WHERE decision_id=? ORDER BY id ASC""", (int(decision_id),)).fetchall()
+    snapshot = conn.execute("""SELECT decision_id,captured_at,symbol,decision,stage,source,relative_volume,gap_pct,
+        distance_vwap_pct,ema20_distance_pct,atr_pct FROM v9_market_memory WHERE decision_id=?""", (int(decision_id),)).fetchone()
+    verification = conn.execute("""SELECT created_at,passed,core_present,missing_fields_json,error
+        FROM v11_capture_verification WHERE decision_id=? ORDER BY id DESC LIMIT 1""", (int(decision_id),)).fetchone()
+    conn.close()
+    events=[]
+    for r in rows:
+        try: payload=json.loads(r[11] or '{}')
+        except Exception: payload={}
+        events.append({"id":r[0],"traceId":r[1],"decisionId":r[2],"createdAt":r[3],"symbol":r[4],
+                       "writer":r[5],"event":r[6],"stage":r[7],"decision":r[8],"success":bool(r[9]),
+                       "detail":r[10],"payload":payload})
+    return {"ok":True,"version":V11_VERSION,"decisionId":int(decision_id),"events":events,
+            "snapshot":None if not snapshot else {"decisionId":snapshot[0],"capturedAt":snapshot[1],"symbol":snapshot[2],
+                "decision":snapshot[3],"stage":snapshot[4],"source":snapshot[5],"relativeVolume":snapshot[6],
+                "gapPct":snapshot[7],"distanceVwapPct":snapshot[8],"ema20DistancePct":snapshot[9],"atrPct":snapshot[10]},
+            "verification":None if not verification else {"createdAt":verification[0],"passed":bool(verification[1]),
+                "corePresent":verification[2],"missingFields":json.loads(verification[3] or '[]'),"error":verification[4]}}
+
+
+def v114_recent_traces(limit: int = 50) -> Dict[str, Any]:
+    _v114_ensure_tables(); limit=max(1,min(int(limit),500)); conn=db_connect()
+    rows=conn.execute("""SELECT d.id,d.timestamp,d.symbol,d.decision,d.stage,d.reason,
+        (SELECT COUNT(*) FROM v11_decision_trace t WHERE t.decision_id=d.id) AS trace_events,
+        (SELECT passed FROM v11_capture_verification v WHERE v.decision_id=d.id ORDER BY v.id DESC LIMIT 1) AS verified,
+        (SELECT core_present FROM v11_capture_verification v WHERE v.decision_id=d.id ORDER BY v.id DESC LIMIT 1) AS core_present
+        FROM v2_setup_decisions d ORDER BY d.id DESC LIMIT ?""",(limit,)).fetchall(); conn.close()
+    return {"ok":True,"version":V11_VERSION,"count":len(rows),"items":[{"decisionId":r[0],"timestamp":r[1],
+        "symbol":r[2],"decision":r[3],"stage":r[4],"reason":r[5],"traceEvents":r[6],
+        "captureVerified":None if r[7] is None else bool(r[7]),"corePresent":r[8]} for r in rows]}
+
+
+def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, reason: str, profile: Optional[Dict[str, Any]] = None):
     symbol = str(scan.get("symbol") or "").upper().strip()
-    if not symbol or _v2_decision_recently_logged(symbol, decision, stage):
+    trace_id = _v114_trace_id(symbol or "UNKNOWN")
+    writer = str(scan.get("decision_writer") or scan.get("source_module") or "scanner_unified")
+    if not (TRADEBOT_V2_ENABLED and V2_LOG_DECISIONS and SQLITE_ENABLED):
+        _v114_trace(trace_id, symbol or "UNKNOWN", writer, "SKIPPED_DISABLED", stage, decision, success=False,
+                    detail="V2 logging or SQLite disabled")
+        return
+    if not symbol:
+        _v114_trace(trace_id, "UNKNOWN", writer, "SKIPPED_INVALID_SYMBOL", stage, decision, success=False)
+        return
+    _v114_trace(trace_id, symbol, writer, "ENTER_UNIFIED_PIPELINE", stage, decision, detail=str(reason)[:1000])
+    if _v2_decision_recently_logged(symbol, decision, stage):
+        _v114_trace(trace_id, symbol, writer, "SKIPPED_DEDUPE", stage, decision, success=False,
+                    detail="matching decision/stage already logged inside dedupe window")
         return
     profile = profile or {}
+
+    # V11.3 surgical repair: enrich the exact scan object that is persisted.
+    # This is logging-only and cannot alter the already-made trading decision.
+    capture_scan = dict(scan)
+    if globals().get("V91_INTELLIGENCE_ENABLED", False) and globals().get("_v91_enrich_scan"):
+        try:
+            capture_scan = _v91_enrich_scan(capture_scan)
+            core_now = [k for k in globals().get("V112_CORE_RICH_FIELDS", ()) if _v112_present(capture_scan.get(k))]
+            _v114_trace(trace_id, symbol, writer, "INTELLIGENCE_ENRICHED", stage, decision,
+                        success=len(core_now) >= globals().get("V112_MIN_CORE_FIELDS", 4),
+                        detail=f"core fields present: {len(core_now)}", payload={"presentFields":core_now})
+        except Exception as enrich_error:
+            capture_scan["v113_capture_enrichment_error"] = str(enrich_error)[:500]
+            print(f"V11.4 CAPTURE ENRICHMENT ERROR {symbol}: {enrich_error}")
+            _v114_trace(trace_id, symbol, writer, "INTELLIGENCE_ENRICHMENT_FAILED", stage, decision,
+                        success=False, detail=str(enrich_error))
+    scan = capture_scan
+
     payload = {
         "confidenceLabel": scan.get("confidence_label"),
         "sniperReason": scan.get("sniper_reason"),
@@ -1788,6 +1948,8 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
             ),
         )
         decision_id = int(cur.lastrowid)
+        _v114_trace(trace_id, symbol, writer, "BASE_DECISION_WRITTEN", stage, decision, decision_id=decision_id,
+                    success=decision_id > 0, detail="v2_setup_decisions insert completed", conn=conn)
         observed_at = datetime.now(UTC)
         entry_price = float(scan.get("price") or 0.0)
         if decision_id > 0 and entry_price > 0:
@@ -1805,12 +1967,22 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
         if decision_id > 0 and globals().get("V9_ENABLED", False):
             try:
                 _v9_capture_snapshot(conn, decision_id, scan, decision, stage, reason, observed_at)
+                _v114_trace(trace_id, symbol, writer, "RICH_SNAPSHOT_WRITTEN", stage, decision,
+                            decision_id=decision_id, success=True, detail="v9_market_memory capture completed", conn=conn)
             except Exception as v9_error:
                 print(f"V9 SNAPSHOT ERROR {symbol}: {v9_error}")
+                _v114_trace(trace_id, symbol, writer, "RICH_SNAPSHOT_FAILED", stage, decision,
+                            decision_id=decision_id, success=False, detail=str(v9_error), conn=conn)
+        _v114_trace(trace_id, symbol, writer, "PIPELINE_COMMIT_PENDING", stage, decision,
+                    decision_id=decision_id, success=True, conn=conn)
         conn.commit()
         conn.close()
+        _v114_trace(trace_id, symbol, writer, "PIPELINE_COMMITTED", stage, decision,
+                    decision_id=decision_id, success=True, detail="all decision evidence committed")
     except Exception as e:
         print(f"V2 DECISION LOG ERROR {symbol}: {e}")
+        _v114_trace(trace_id, symbol or "UNKNOWN", writer, "PIPELINE_FAILED", stage, decision,
+                    success=False, detail=str(e))
 
 
 def v2_recent_decisions(limit: int = 100):
@@ -1947,39 +2119,99 @@ def _v6_parse_utc(value: Any) -> datetime:
 
 
 def _v6_historical_checkpoint_price(symbol: str, due_at: Any) -> Dict[str, Any]:
-    """Return the first one-minute bar at/after the intended checkpoint.
+    """Return the first valid one-minute bar at/after the intended checkpoint.
 
-    A small look-back is requested to handle provider boundary behaviour, but a
-    bar before due_at is used only when no later bar exists inside the allowed
-    window. The selected timestamp and delay are always returned for validation.
+    The original V6.4 lookup only searched 45 minutes forward. That creates
+    repeated errors when a checkpoint lands after-hours, on a market holiday,
+    or when Alpaca has a small data gap. This research-only lookup progressively
+    expands forward to the next available trading session. Live order logic is
+    not involved.
     """
     due = _v6_parse_utc(due_at)
-    start = due - timedelta(minutes=V6_HISTORICAL_BAR_LOOKBACK_MINUTES)
-    end = due + timedelta(minutes=V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES)
-    request = StockBarsRequest(symbol_or_symbols=[symbol], timeframe=TimeFrame.Minute, start=start, end=end)
-    response = data_client.get_stock_bars(request)
-    try:
-        bars = list(response[symbol])
-    except Exception:
-        data = getattr(response, "data", {}) or {}
-        bars = list(data.get(symbol, []))
-    if not bars:
-        raise RuntimeError("historical_bar_unavailable")
-    candidates=[]
-    for bar in bars:
-        ts=getattr(bar,"timestamp",None)
-        close=getattr(bar,"close",None)
-        if ts is None or close is None:
-            continue
-        bar_at=_v6_parse_utc(ts)
-        candidates.append((bar_at,float(close)))
-    if not candidates:
-        raise RuntimeError("historical_bar_unavailable")
-    after=[item for item in candidates if item[0] >= due]
-    selected=min(after,key=lambda item:item[0]) if after else min(candidates,key=lambda item:abs((item[0]-due).total_seconds()))
-    bar_at, price = selected
-    delay_minutes=(bar_at-due).total_seconds()/60.0
-    return {"price":price,"barAt":bar_at.isoformat(),"delayMinutes":delay_minutes,"source":"alpaca_historical_1min_close"}
+    symbol = str(symbol or "").strip().upper()
+    if not symbol:
+        raise RuntimeError("missing_symbol")
+
+    # First keep the tight original window. If no checkpoint bar exists, widen
+    # across later sessions so weekends/holidays do not poison the learning set.
+    forward_windows_minutes = [
+        V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES,
+        180,       # remainder of a normal session
+        24 * 60,   # next calendar day
+        3 * 24 * 60,
+        7 * 24 * 60,
+    ]
+    last_error = None
+    before_candidates = []
+
+    for forward_minutes in sorted(set(max(5, int(v)) for v in forward_windows_minutes)):
+        start = due - timedelta(minutes=V6_HISTORICAL_BAR_LOOKBACK_MINUTES)
+        end = due + timedelta(minutes=forward_minutes)
+        try:
+            request = StockBarsRequest(
+                symbol_or_symbols=[symbol],
+                timeframe=TimeFrame.Minute,
+                start=start,
+                end=end,
+            )
+            response = data_client.get_stock_bars(request)
+            try:
+                bars = list(response[symbol])
+            except Exception:
+                data = getattr(response, "data", {}) or {}
+                bars = list(data.get(symbol, []))
+
+            candidates = []
+            for bar in bars:
+                ts = getattr(bar, "timestamp", None)
+                close = getattr(bar, "close", None)
+                if ts is None or close is None:
+                    continue
+                try:
+                    price = float(close)
+                    if price <= 0 or not math.isfinite(price):
+                        continue
+                    bar_at = _v6_parse_utc(ts)
+                    candidates.append((bar_at, price))
+                except Exception:
+                    continue
+
+            if not candidates:
+                last_error = "historical_bar_unavailable"
+                continue
+
+            after = [item for item in candidates if item[0] >= due]
+            if after:
+                bar_at, price = min(after, key=lambda item: item[0])
+                delay_minutes = (bar_at - due).total_seconds() / 60.0
+                return {
+                    "price": price,
+                    "barAt": bar_at.isoformat(),
+                    "delayMinutes": delay_minutes,
+                    "source": "alpaca_historical_1min_close",
+                    "lookupWindowMinutes": forward_minutes,
+                }
+
+            before_candidates.extend(item for item in candidates if item[0] < due)
+            last_error = "no_bar_at_or_after_checkpoint"
+        except Exception as exc:
+            last_error = str(exc) or exc.__class__.__name__
+
+    # A pre-checkpoint bar is acceptable only inside the explicitly permitted
+    # look-back. Never substitute a distant stale quote for an outcome.
+    if before_candidates:
+        bar_at, price = max(before_candidates, key=lambda item: item[0])
+        delay_minutes = (bar_at - due).total_seconds() / 60.0
+        if delay_minutes >= -float(V6_HISTORICAL_BAR_LOOKBACK_MINUTES):
+            return {
+                "price": price,
+                "barAt": bar_at.isoformat(),
+                "delayMinutes": delay_minutes,
+                "source": "alpaca_historical_1min_close",
+                "lookupWindowMinutes": max(forward_windows_minutes),
+            }
+
+    raise RuntimeError(f"historical_bar_unavailable:{last_error or 'unknown'}")
 
 
 def _v6_write_historical_outcome(conn: sqlite3.Connection, row: Any) -> Dict[str, Any]:
@@ -2011,15 +2243,29 @@ def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
         rows=conn.execute("""SELECT * FROM v2_observation_outcomes
             WHERE status='PENDING' AND due_at<=? ORDER BY due_at ASC LIMIT ?""",
             (datetime.now(UTC).isoformat(),batch)).fetchall()
+        error_reasons: Dict[str, int] = {}
+        error_samples: List[str] = []
         for row in rows:
             try:
                 _v6_write_historical_outcome(conn,row); evaluated += 1
             except Exception as row_error:
                 errors += 1
-                conn.execute("UPDATE v2_observation_outcomes SET error=? WHERE id=?",(str(row_error)[:500],int(row["id"])))
+                reason = str(row_error)[:500] or row_error.__class__.__name__
+                reason_key = reason.split(":", 1)[0]
+                error_reasons[reason_key] = error_reasons.get(reason_key, 0) + 1
+                if len(error_samples) < 5:
+                    error_samples.append(
+                        f"{str(row['symbol']).upper()}@{row['due_at']}={reason}"
+                    )
+                conn.execute("UPDATE v2_observation_outcomes SET error=? WHERE id=?",(reason,int(row["id"])))
         conn.commit(); conn.close()
-        if evaluated or errors: print(f"V6.4 OUTCOMES | historical={evaluated} errors={errors}")
-        return {"ok":True,"version":"V6.4","evaluated":evaluated,"errors":errors,"due":len(rows),
+        if evaluated or errors:
+            reason_text = ",".join(f"{k}:{v}" for k,v in sorted(error_reasons.items())) or "none"
+            print(f"V6.5 OUTCOMES | historical={evaluated} errors={errors} reasons={reason_text}")
+            if error_samples:
+                print("V6.5 OUTCOME SAMPLES | " + " | ".join(error_samples))
+        return {"ok":True,"version":"V6.5","evaluated":evaluated,"errors":errors,"due":len(rows),
+                "errorReasons":error_reasons,"errorSamples":error_samples,
                 "outcomeSource":"alpaca_historical_1min_close"}
     except Exception as e:
         try: conn.close()
@@ -2220,6 +2466,219 @@ def v2_replay_rows(symbol: Optional[str] = None, limit: int = 200) -> List[Dict[
         return []
 
 # =========================
+# TRADEBOT V9.1 DECISION INTELLIGENCE
+# =========================
+def decision_intelligence_summary(days: int = 30) -> Dict[str, Any]:
+    """Summarise BOUGHT/BLOCKED/APPROVED/REJECTED evidence.
+
+    Outcome returns come from the existing historical checkpoint engine. This
+    endpoint is advisory only and cannot modify trading settings.
+    """
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+    days = max(1, min(int(days), 3650))
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    try:
+        init_db()
+        conn = db_connect()
+        totals = conn.execute(
+            """SELECT decision, COUNT(*) AS count, COUNT(DISTINCT symbol) AS symbols
+               FROM v2_setup_decisions
+               WHERE timestamp>=?
+               GROUP BY decision ORDER BY count DESC""",
+            (cutoff,),
+        ).fetchall()
+        outcomes = conn.execute(
+            """WITH ranked AS (
+                   SELECT d.decision,d.stage,d.symbol,d.timestamp,d.confidence,d.quality,
+                          o.horizon_hours,o.net_return_pct,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY COALESCE(o.sample_key,CAST(o.decision_id AS TEXT)),o.horizon_hours
+                              ORDER BY o.id ASC
+                          ) AS rn
+                   FROM v2_setup_decisions d
+                   JOIN v2_observation_outcomes o ON o.decision_id=d.id
+                   WHERE d.timestamp>=? AND o.status='COMPLETE' AND o.net_return_pct IS NOT NULL
+               )
+               SELECT decision,horizon_hours,COUNT(*) AS samples,
+                      SUM(CASE WHEN net_return_pct>0 THEN 1 ELSE 0 END) AS wins,
+                      SUM(CASE WHEN net_return_pct<0 THEN 1 ELSE 0 END) AS losses,
+                      AVG(net_return_pct) AS avg_return_pct,
+                      MAX(net_return_pct) AS best_return_pct,
+                      MIN(net_return_pct) AS worst_return_pct
+               FROM ranked WHERE rn=1
+               GROUP BY decision,horizon_hours
+               ORDER BY decision,horizon_hours""",
+            (cutoff,),
+        ).fetchall()
+        blocked = conn.execute(
+            """SELECT d.id,d.timestamp,d.symbol,d.reason,d.price,d.confidence,d.quality,
+                      d.sniper_pass,d.a_plus_pass,
+                      o.horizon_hours,o.status,o.net_return_pct,o.outcome_price,o.due_at,o.evaluated_at
+               FROM v2_setup_decisions d
+               LEFT JOIN v2_observation_outcomes o ON o.decision_id=d.id
+               WHERE d.timestamp>=? AND d.decision='BLOCKED'
+               ORDER BY d.id DESC,o.horizon_hours ASC LIMIT 500""",
+            (cutoff,),
+        ).fetchall()
+        conn.close()
+        return {
+            "ok": True,
+            "version": "V9.1",
+            "advisoryOnly": True,
+            "days": days,
+            "since": cutoff,
+            "totals": [dict(r) for r in totals],
+            "outcomesByDecision": [dict(r) for r in outcomes],
+            "blockedOpportunities": [dict(r) for r in blocked],
+            "note": "Decision evidence and historical outcomes only; live trading rules are unchanged.",
+        }
+    except Exception as e:
+        return {"ok": False, "version": "V9.1", "error": str(e)}
+
+
+def blocked_opportunities(limit: int = 100, horizon_hours: int = 24) -> List[Dict[str, Any]]:
+    if not SQLITE_ENABLED:
+        return []
+    limit = max(1, min(int(limit), 1000))
+    horizon_hours = max(1, int(horizon_hours))
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute(
+            """SELECT d.id AS decision_id,d.timestamp,d.symbol,d.reason,d.price,
+                      d.confidence,d.quality,d.momentum,d.pullback,d.spread,
+                      d.sniper_pass,d.a_plus_pass,o.status,o.horizon_hours,o.due_at,
+                      o.evaluated_at,o.outcome_price,o.return_pct,o.net_return_pct
+               FROM v2_setup_decisions d
+               LEFT JOIN v2_observation_outcomes o
+                 ON o.decision_id=d.id AND o.horizon_hours=?
+               WHERE d.decision='BLOCKED'
+               ORDER BY d.id DESC LIMIT ?""",
+            (horizon_hours, limit),
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"BLOCKED OPPORTUNITIES ERROR: {e}")
+        return []
+
+
+@app.get("/decision-intelligence/summary")
+def api_decision_intelligence_summary(days: int = 30):
+    return decision_intelligence_summary(days)
+
+
+@app.get("/decision-intelligence/blocked")
+def api_decision_intelligence_blocked(limit: int = 100, horizon_hours: int = 24):
+    items = blocked_opportunities(limit=limit, horizon_hours=horizon_hours)
+    return {
+        "ok": True,
+        "version": "V9.3",
+        "advisoryOnly": True,
+        "count": len(items),
+        "horizonHours": int(horizon_hours),
+        "items": items,
+    }
+
+
+def decision_intelligence_recent(limit: int = 100, decision: str = "", stage: str = "") -> Dict[str, Any]:
+    """Return recent decision records for the dashboard table."""
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled", "items": []}
+    limit = max(1, min(int(limit), 1000))
+    decision = str(decision or "").upper().strip()
+    stage = str(stage or "").strip()
+    try:
+        init_db()
+        conn = db_connect()
+        clauses = []
+        params: List[Any] = []
+        if decision:
+            clauses.append("d.decision=?")
+            params.append(decision)
+        if stage:
+            clauses.append("d.stage=?")
+            params.append(stage)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = conn.execute(
+            f"""SELECT d.id AS decision_id,d.timestamp,d.symbol,d.decision,d.stage,d.reason,
+                       d.price,d.confidence,d.quality,d.momentum,d.pullback,d.spread,
+                       d.ready_to_buy,d.sniper_pass,d.a_plus_pass,
+                       o.status AS outcome_status,o.horizon_hours,o.due_at,o.evaluated_at,
+                       o.outcome_price,o.return_pct,o.net_return_pct
+                FROM v2_setup_decisions d
+                LEFT JOIN v2_observation_outcomes o
+                  ON o.decision_id=d.id AND o.horizon_hours=24
+                {where}
+                ORDER BY d.id DESC LIMIT ?""",
+            params,
+        ).fetchall()
+        conn.close()
+        return {
+            "ok": True, "version": "V9.3", "count": len(rows),
+            "decision": decision or "ALL", "stage": stage or "ALL",
+            "items": [dict(r) for r in rows],
+        }
+    except Exception as e:
+        return {"ok": False, "version": "V9.3", "error": str(e), "items": []}
+
+
+def decision_intelligence_today() -> Dict[str, Any]:
+    """Dashboard cards for the current UTC trading day."""
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+    start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    try:
+        init_db()
+        conn = db_connect()
+        counts = conn.execute(
+            """SELECT decision,COUNT(*) AS count FROM v2_setup_decisions
+               WHERE timestamp>=? GROUP BY decision""", (start,)
+        ).fetchall()
+        stages = conn.execute(
+            """SELECT stage,COUNT(*) AS count FROM v2_setup_decisions
+               WHERE timestamp>=? GROUP BY stage ORDER BY count DESC""", (start,)
+        ).fetchall()
+        best_blocked = conn.execute(
+            """SELECT d.id,d.timestamp,d.symbol,d.confidence,d.quality,d.reason,
+                      o.status AS outcome_status,o.net_return_pct
+               FROM v2_setup_decisions d
+               LEFT JOIN v2_observation_outcomes o
+                 ON o.decision_id=d.id AND o.horizon_hours=24
+               WHERE d.timestamp>=? AND d.decision='BLOCKED'
+               ORDER BY d.confidence DESC,d.quality DESC,d.id DESC LIMIT 1""", (start,)
+        ).fetchone()
+        conn.close()
+        mapped = {str(r["decision"]).upper(): int(r["count"] or 0) for r in counts}
+        return {
+            "ok": True, "version": "V9.3", "day": today_str(),
+            "total": sum(mapped.values()),
+            "bought": mapped.get("BOUGHT", 0),
+            "blocked": mapped.get("BLOCKED", 0),
+            "approved": mapped.get("APPROVED", 0),
+            "rejected": mapped.get("REJECTED", 0),
+            "counts": mapped,
+            "stages": [dict(r) for r in stages],
+            "bestBlocked": dict(best_blocked) if best_blocked else None,
+            "advisoryOnly": True,
+        }
+    except Exception as e:
+        return {"ok": False, "version": "V9.3", "error": str(e)}
+
+
+@app.get("/decision-intelligence/recent")
+def api_decision_intelligence_recent(limit: int = 100, decision: str = "", stage: str = ""):
+    return decision_intelligence_recent(limit=limit, decision=decision, stage=stage)
+
+
+@app.get("/decision-intelligence/today")
+def api_decision_intelligence_today():
+    return decision_intelligence_today()
+
+
+# =========================
 # STRATEGY
 # =========================
 def refresh_universe_if_needed(force=False):
@@ -2244,7 +2703,19 @@ def refresh_universe_if_needed(force=False):
     print(f"UNIVERSE REFRESHED: {', '.join(current_universe)}")
 
 
-def pick_money_mode_stocks(scans):
+def pick_money_mode_stocks(
+    scans,
+    approval_decision: str = "APPROVED",
+    approval_stage: str = "final_gate",
+    approval_reason: str = "all V2 gates passed",
+):
+    """Evaluate scans through the normal live gates and persist every decision.
+
+    The optional approval labels let the same exact gate pipeline record a
+    qualifying setup as BLOCKED when account-level rules (for example the
+    maximum-position limit) prevent a live order. This is research-only; it
+    does not alter which setups pass or place any order.
+    """
     candidates = []
     for scan in scans:
         symbol = scan["symbol"]
@@ -2275,7 +2746,13 @@ def pick_money_mode_stocks(scans):
             record_v2_setup_decision(scan, "REJECTED", "expectancy_gate", v2_profile.get("reason", "not approved"), v2_profile)
             continue
         scan["v2Expectancy"] = v2_profile
-        record_v2_setup_decision(scan, "APPROVED", "final_gate", "all V2 gates passed", v2_profile)
+        record_v2_setup_decision(
+            scan,
+            approval_decision,
+            approval_stage,
+            approval_reason,
+            v2_profile,
+        )
         candidates.append(scan)
     candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
     return candidates
@@ -2437,6 +2914,27 @@ def money_mode_buy(scans, manual=False):
     if blocked:
         return f"BUY BLOCKED | {reason}"
     if allowed_new_position_count() <= 0:
+        # Decision Intelligence: run the unchanged entry gates even though an
+        # account-level position rule prevents buying. Qualifying candidates
+        # are saved as BLOCKED and receive the same future outcome checkpoints
+        # as executed/approved decisions. No order can be submitted here.
+        try:
+            blocked_picks = pick_money_mode_stocks(
+                scans,
+                approval_decision="BLOCKED",
+                approval_stage="position_limit",
+                approval_reason=f"max positions reached ({MAX_POSITIONS})",
+            )
+            if blocked_picks:
+                best = blocked_picks[0]
+                print(
+                    "DECISION INTELLIGENCE | "
+                    f"blocked={len(blocked_picks)} best={best.get('symbol')} "
+                    f"confidence={float(best.get('confidence') or 0.0):.2f} "
+                    f"reason=max positions reached ({MAX_POSITIONS})"
+                )
+        except Exception as decision_error:
+            print(f"DECISION INTELLIGENCE BLOCKED LOG ERROR: {decision_error}")
         return f"BUY BLOCKED | max positions reached ({MAX_POSITIONS})"
     if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
         return f"BUY BLOCKED | PDT-aware max new buys today reached ({MAX_NEW_BUYS_PER_DAY_PDT_AWARE})"
@@ -2469,6 +2967,15 @@ def money_mode_buy(scans, manual=False):
         reason = f"{'MANUAL' if manual else 'AUTO'} SNIPER {label} BUY"
         try:
             market_buy_notional(symbol, notional, reason=reason)
+            # Preserve the final execution decision separately from the earlier
+            # APPROVED gate record so research can compare approved vs bought.
+            record_v2_setup_decision(
+                c,
+                "BOUGHT",
+                "order_submitted",
+                reason,
+                c.get("v2Expectancy") or {},
+            )
             state[symbol]["ref"] = c["price"]
             state[symbol]["highest_since_entry"] = c["price"]
             messages.append(f"{reason} ${notional:.2f} {symbol} confidence={confidence:.2f}")
@@ -2504,6 +3011,7 @@ def buy_custom_symbol(symbol: str):
 # SQLITE PERSISTENT STORAGE
 # =========================
 def db_connect():
+    os.makedirs(os.path.dirname(SQLITE_DB_FILE) or ".", exist_ok=True)
     conn = sqlite3.connect(SQLITE_DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
@@ -2549,6 +3057,28 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_trades_symbol
         ON trades(symbol)
     """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS performance_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            baseline_equity REAL NOT NULL DEFAULT 0,
+            total_deposited REAL NOT NULL DEFAULT 0,
+            total_withdrawn REAL NOT NULL DEFAULT 0,
+            lifetime_realised_pnl REAL NOT NULL DEFAULT 0,
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+            breakevens INTEGER NOT NULL DEFAULT 0,
+            total_closed_trades INTEGER NOT NULL DEFAULT 0,
+            best_trade REAL NOT NULL DEFAULT 0,
+            worst_trade REAL NOT NULL DEFAULT 0,
+            average_win REAL NOT NULL DEFAULT 0,
+            average_loss REAL NOT NULL DEFAULT 0,
+            profit_factor REAL NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""INSERT OR IGNORE INTO performance_state (id, updated_at) VALUES (1, ?)""",
+                (datetime.now(UTC).isoformat(),))
 
 
     cur.execute("""
@@ -3141,6 +3671,8 @@ def rebuild_closed_trades_from_orders():
         WHERE symbol IS NOT NULL
           AND side IN ('BUY', 'SELL')
           AND qty > 0
+          AND alpaca_order_id IS NOT NULL
+          AND TRIM(alpaca_order_id) <> ''
         ORDER BY timestamp ASC, id ASC
     """).fetchall()
     conn.close()
@@ -3650,6 +4182,193 @@ def backfill_trades_from_alpaca():
         "skipped": skipped,
         **match_result,
     }
+
+
+
+def _trade_order_exists(alpaca_order_id: str) -> bool:
+    if not (SQLITE_ENABLED and alpaca_order_id):
+        return False
+    init_db()
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM trades WHERE alpaca_order_id=? LIMIT 1",
+            (str(alpaca_order_id),),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def restore_today_sell_locks_from_db() -> List[str]:
+    """Restore the existing sell-then-lock rule after a restart/redeploy.
+
+    Reporting rows are read only; no orders are submitted or changed. Any symbol
+    with a SELL recorded for the current UTC trading day is locked until the next
+    daily reset, exactly like a live sell handled by market_sell_qty().
+    """
+    if not (STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and SQLITE_ENABLED):
+        return []
+
+    restored: List[str] = []
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute(
+            """SELECT DISTINCT UPPER(symbol) AS symbol
+               FROM trades
+               WHERE side='SELL' AND day=? AND symbol IS NOT NULL""",
+            (today_str(),),
+        ).fetchall()
+        conn.close()
+
+        for row in rows:
+            symbol = str(row["symbol"] or "").upper().strip()
+            if not symbol:
+                continue
+            if not is_locked_today(symbol):
+                locked_today[symbol] = today_str()
+                restored.append(symbol)
+
+        if restored:
+            print(f"DAILY LOCK RESTORED | sold today: {', '.join(sorted(restored))}")
+        return sorted(restored)
+    except Exception as e:
+        print(f"DAILY LOCK RESTORE ERROR: {e}")
+        return []
+
+
+def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
+    """Import recent filled Alpaca orders and refresh FIFO closed trades.
+
+    This is deliberately reporting-only. It does not submit/cancel orders and
+    does not alter any live strategy setting. Alpaca order IDs make imports
+    idempotent, so repeated runs do not duplicate trades.
+    """
+    global auto_report_last_sync_ts, auto_report_last_result
+
+    if not AUTO_REPORT_SYNC_ENABLED:
+        return {"ok": False, "skipped": True, "reason": "automatic report sync disabled"}
+
+    now_ts = time.time()
+    if not force and (now_ts - auto_report_last_sync_ts) < AUTO_REPORT_SYNC_INTERVAL_SECONDS:
+        return {**auto_report_last_result, "skipped": True, "reason": "sync interval not due"}
+
+    auto_report_last_sync_ts = now_ts
+    imported = 0
+    existing = 0
+    skipped = 0
+    errors = 0
+
+    try:
+        init_db()
+        # A Render restart clears the in-memory lock dictionary. Rebuild it from
+        # today's persisted SELL rows before the scanner can approve another buy.
+        restored_locks = restore_today_sell_locks_from_db()
+        request = GetOrdersRequest(
+            status=get_query_order_status_all(),
+            limit=AUTO_REPORT_SYNC_ORDER_LIMIT,
+            direction="desc",
+        )
+        orders = trading_client.get_orders(filter=request)
+        rate = get_usd_to_gbp_rate()
+
+        for order in sorted(orders, key=lambda o: str(parse_order_timestamp(o))):
+            try:
+                if not order_is_filled(order):
+                    skipped += 1
+                    continue
+
+                oid = get_order_id(order)
+                symbol = get_order_symbol(order)
+                side = get_order_side(order)
+                qty = get_order_qty(order)
+                price = get_order_price(order)
+
+                if not oid or not symbol or side not in ("BUY", "SELL") or qty <= 0 or price <= 0:
+                    skipped += 1
+                    continue
+
+                if _trade_order_exists(oid):
+                    existing += 1
+                    continue
+
+                timestamp_obj = parse_order_timestamp(order)
+                if hasattr(timestamp_obj, "isoformat"):
+                    timestamp = timestamp_obj.isoformat()
+                    try:
+                        utc_timestamp = timestamp_obj.astimezone(UTC)
+                        day = utc_timestamp.strftime("%Y-%m-%d")
+                        tm = utc_timestamp.strftime("%H:%M:%S")
+                    except Exception:
+                        day = today_str()
+                        tm = now_time()
+                else:
+                    timestamp = str(timestamp_obj)
+                    day = today_str()
+                    tm = now_time()
+
+                amount = qty * price
+                event = {
+                    "alpacaOrderId": oid,
+                    "timestamp": timestamp,
+                    "day": day,
+                    "time": tm,
+                    "side": side,
+                    "symbol": symbol,
+                    "qty": qty,
+                    "price": price,
+                    "amount": amount if side == "BUY" else 0.0,
+                    "amountGbp": amount * rate if side == "BUY" else 0.0,
+                    "pnl": 0.0,
+                    "pnlGbp": 0.0,
+                    "pnlPct": 0.0,
+                    "reason": "AUTOMATIC ALPACA REPORT SYNC",
+                    "equity": 0.0,
+                    "equityGbp": 0.0,
+                    "fxRate": rate,
+                }
+                save_trade_to_db(event, source="alpaca_auto_sync")
+                imported += 1
+            except Exception as order_error:
+                errors += 1
+                print(f"AUTO REPORT SYNC ORDER ERROR: {order_error}")
+
+        rebuild_result = None
+        if imported > 0:
+            rebuild_result = rebuild_closed_trades_from_orders()
+            restored_locks = sorted(set(restored_locks + restore_today_sell_locks_from_db()))
+            print(
+                f"AUTO REPORT SYNC | imported={imported} existing={existing} "
+                f"skipped={skipped} errors={errors} "
+                f"closed={rebuild_result.get('matchedClosedTrades', 0)}"
+            )
+
+        auto_report_last_result = {
+            "ok": True,
+            "automatic": True,
+            "ordersChecked": len(orders),
+            "imported": imported,
+            "existing": existing,
+            "skipped": skipped,
+            "errors": errors,
+            "rebuilt": bool(imported > 0),
+            "matchedClosedTrades": int((rebuild_result or {}).get("matchedClosedTrades", 0)),
+            "restoredSellLocks": restored_locks,
+            "syncedAt": datetime.now(UTC).isoformat(),
+        }
+        return auto_report_last_result
+    except Exception as e:
+        auto_report_last_result = {
+            "ok": False,
+            "automatic": True,
+            "error": str(e),
+            "imported": imported,
+            "errors": errors + 1,
+            "syncedAt": datetime.now(UTC).isoformat(),
+        }
+        print(f"AUTO REPORT SYNC ERROR: {e}")
+        return auto_report_last_result
 
 
 
@@ -4382,6 +5101,7 @@ def build_status_payload(bot_name, scans):
             } for s in scans
         ],
         "banking": banking_payload(),
+        "performanceEngine": performance_engine_payload(),
         "logs": [
             f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
@@ -4404,6 +5124,11 @@ def build_status_payload(bot_name, scans):
         "closedTrades": closed_trades_from_db(1000),
         "stockMemory": stock_memory_from_closed_trades(),
         "dbSummary": {**db_summary_payload(), **closed_trade_summary_payload()},
+        "automaticReportSync": {
+            "enabled": AUTO_REPORT_SYNC_ENABLED,
+            "intervalSeconds": AUTO_REPORT_SYNC_INTERVAL_SECONDS,
+            **auto_report_last_result,
+        },
         "equityCurve": equity_curve[-240:],
         "alpacaRejectionEvents": alpaca_rejection_events[-50:],
         "pdtWarningEvents": pdt_warning_events[-50:],
@@ -5856,6 +6581,66 @@ def backfill_trades(request: Request):
 # =========================
 # LOOP
 # =========================
+def _ai_research_market_open() -> Optional[bool]:
+    """Return Alpaca market state, or None when the clock cannot be read safely."""
+    try:
+        return bool(trading_client.get_clock().is_open)
+    except Exception as exc:
+        print(f"AI RESEARCH CLOCK ERROR: {exc}")
+        return None
+
+
+def closed_market_ai_research_worker() -> None:
+    """Run outcome evaluation and advisory learning only while the market is closed.
+
+    This worker never places orders and never changes live thresholds automatically.
+    """
+    time.sleep(AI_RESEARCH_STARTUP_DELAY_SECONDS)
+    last_cycle_at = 0.0
+    last_state: Optional[str] = None
+    while True:
+        try:
+            is_open = _ai_research_market_open()
+            if is_open is None:
+                time.sleep(60)
+                continue
+
+            if is_open:
+                if last_state != "open":
+                    print("AI RESEARCH PAUSED | market open; live trader has priority")
+                last_state = "open"
+                time.sleep(60)
+                continue
+
+            if last_state != "closed":
+                print("AI RESEARCH ACTIVE | market closed; outcome and shadow learning enabled")
+            last_state = "closed"
+
+            now_mono = time.monotonic()
+            if last_cycle_at and (now_mono - last_cycle_at) < AI_RESEARCH_INTERVAL_SECONDS:
+                time.sleep(min(60, AI_RESEARCH_INTERVAL_SECONDS))
+                continue
+
+            started = datetime.now(UTC).isoformat()
+            seeded = v2_seed_missing_outcomes()
+            outcomes = v2_evaluate_due_outcomes()
+            v6_result = v6_sync_brains(V6_DEFAULT_HORIZON_HOURS, V6_AUTO_SYNC_LIMIT) if V6_BRAINS_ENABLED else {"ok": True, "skipped": True}
+            v11_result = v11_learning_cycle("closed_market", force=False) if V11_AUTO_LEARNING_ENABLED else {"ok": True, "skipped": True}
+            last_cycle_at = time.monotonic()
+            print(
+                "AI NIGHT RESEARCH | "
+                f"started={started} seeded={seeded} "
+                f"outcomes={outcomes.get('evaluated', outcomes.get('historical', 0))} "
+                f"errors={outcomes.get('errors', 0)} "
+                f"v6_new={v6_result.get('newShadowRows', 0)} "
+                f"v11_discovery={bool(v11_result.get('ranDiscovery'))} "
+                "live_changes=False"
+            )
+        except Exception as exc:
+            print(f"AI NIGHT RESEARCH ERROR: {exc}")
+        time.sleep(60)
+
+
 def run_bot_loop():
     print("Rebuilt Sniper Profit Bot started...")
     init_db()
@@ -5865,6 +6650,10 @@ def run_bot_loop():
     load_persistent_state()
     refresh_universe_if_needed(force=True)
     reset_daily_flags_if_needed()
+    try:
+        sync_recent_filled_orders_to_reports(force=True)
+    except Exception as e:
+        print(f"AUTO REPORT STARTUP SYNC ERROR: {e}")
     update_status(BOT_NAME, [])
 
     while True:
@@ -5877,6 +6666,10 @@ def run_bot_loop():
                 except Exception as e:
                     print(f"DYNAMIC SCANNER LOOP ERROR: {e}")
                 refresh_universe_if_needed()
+                try:
+                    sync_recent_filled_orders_to_reports()
+                except Exception as e:
+                    print(f"AUTO REPORT LOOP SYNC ERROR: {e}")
                 clock = trading_client.get_clock()
 
                 if not clock.is_open:
@@ -5885,10 +6678,11 @@ def run_bot_loop():
                     time.sleep(CHECK_INTERVAL)
                     continue
 
-                try:
-                    v2_evaluate_due_outcomes()
-                except Exception as e:
-                    print(f"V2 OUTCOME LOOP ERROR: {e}")
+                if not AI_RESEARCH_CLOSED_MARKET_ONLY:
+                    try:
+                        v2_evaluate_due_outcomes()
+                    except Exception as e:
+                        print(f"V2 OUTCOME LOOP ERROR: {e}")
 
                 scans = []
                 for symbol in current_universe:
@@ -5923,16 +6717,25 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started
     if not bot_thread_started:
         bot_thread_started = True
         threading.Thread(target=run_bot_loop, daemon=True).start()
-    if V6_BRAINS_ENABLED and V6_AUTO_SYNC_ENABLED and not v6_sync_thread_started:
+    if V6_BRAINS_ENABLED and V6_AUTO_SYNC_ENABLED and not AI_RESEARCH_CLOSED_MARKET_ONLY and not v6_sync_thread_started:
         v6_sync_thread_started = True
         threading.Thread(target=v6_auto_sync_worker, daemon=True).start()
     if V7_ENABLED and V7_WEEKEND_MAINTENANCE_ENABLED and not v7_weekend_thread_started:
         v7_weekend_thread_started = True
         threading.Thread(target=v7_weekend_worker, daemon=True).start()
+    if V11_AUTO_LEARNING_ENABLED and not AI_RESEARCH_CLOSED_MARKET_ONLY and not v11_learning_thread_started:
+        v11_learning_thread_started = True
+        threading.Thread(target=v11_auto_learning_worker, daemon=True).start()
+    if AI_RESEARCH_CLOSED_MARKET_ONLY and not ai_research_thread_started:
+        ai_research_thread_started = True
+        threading.Thread(target=closed_market_ai_research_worker, daemon=True).start()
+    if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
+        ai_summary_thread_started = True
+        threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
 
 
 
@@ -5957,7 +6760,7 @@ def version():
     return BOT_VERSION_NOTES
 
 # ---------- baseline reporting ----------
-BASELINE_FILE = os.path.join("backend", "state", "equity_baseline.json")
+BASELINE_FILE = os.getenv("EQUITY_BASELINE_FILE", "").strip() or persistent_file("equity_baseline.json")
 
 def _safe_num(v, default=0.0):
     try:
@@ -5965,22 +6768,151 @@ def _safe_num(v, default=0.0):
     except Exception:
         return float(default)
 
+def _ensure_performance_state_table() -> None:
+    if not SQLITE_ENABLED:
+        return
+    os.makedirs(os.path.dirname(SQLITE_DB_FILE) or ".", exist_ok=True)
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS performance_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        baseline_equity REAL NOT NULL DEFAULT 0,
+        total_deposited REAL NOT NULL DEFAULT 0,
+        total_withdrawn REAL NOT NULL DEFAULT 0,
+        lifetime_realised_pnl REAL NOT NULL DEFAULT 0,
+        wins INTEGER NOT NULL DEFAULT 0,
+        losses INTEGER NOT NULL DEFAULT 0,
+        breakevens INTEGER NOT NULL DEFAULT 0,
+        total_closed_trades INTEGER NOT NULL DEFAULT 0,
+        best_trade REAL NOT NULL DEFAULT 0,
+        worst_trade REAL NOT NULL DEFAULT 0,
+        average_win REAL NOT NULL DEFAULT 0,
+        average_loss REAL NOT NULL DEFAULT 0,
+        profit_factor REAL NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL
+    )""")
+    conn.execute("""INSERT OR IGNORE INTO performance_state
+        (id, updated_at) VALUES (1, ?)""", (datetime.now(UTC).isoformat(),))
+    conn.commit(); conn.close()
+
+
 def load_equity_baseline() -> float:
+    # SQLite on the Render disk is the primary source. The JSON copy is a
+    # human-readable backup and supports migration from older deployments.
+    try:
+        _ensure_performance_state_table()
+        conn = db_connect()
+        row = conn.execute("SELECT baseline_equity FROM performance_state WHERE id=1").fetchone()
+        conn.close()
+        value = float(row[0] or 0.0) if row else 0.0
+        if value > 0:
+            return value
+    except Exception as e:
+        print(f"BASELINE DB LOAD ERROR: {e}")
+
     try:
         if os.path.exists(BASELINE_FILE):
             with open(BASELINE_FILE, "r", encoding="utf-8") as f:
-                return float(json.load(f).get("baseline", 0) or 0)
+                value = float(json.load(f).get("baseline", 0) or 0)
+            if value > 0:
+                # Migrate the old file value into the persistent DB.
+                save_equity_baseline(value)
+                return value
     except Exception as e:
         print(f"BASELINE LOAD ERROR: {e}")
-    return 0.0
+
+    return _safe_num(os.getenv("TOTAL_DEPOSITED_USD", 0))
+
 
 def save_equity_baseline(value: float) -> None:
+    value = float(value or 0.0)
+    now = datetime.now(UTC).isoformat()
     try:
-        os.makedirs(os.path.dirname(BASELINE_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(BASELINE_FILE) or ".", exist_ok=True)
         with open(BASELINE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"baseline": float(value or 0), "resetAt": datetime.now(UTC).isoformat()}, f, indent=2)
+            json.dump({"baseline": value, "resetAt": now}, f, indent=2)
     except Exception as e:
         print(f"BASELINE SAVE ERROR: {e}")
+
+    try:
+        _ensure_performance_state_table()
+        conn = db_connect()
+        conn.execute("""UPDATE performance_state
+            SET baseline_equity=?, total_deposited=?, updated_at=? WHERE id=1""",
+            (value, value, now))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"BASELINE DB SAVE ERROR: {e}")
+
+
+def rebuild_performance_state() -> Dict[str, Any]:
+    """Recalculate lifetime realised statistics from persisted closed trades.
+
+    This is reporting-only. It never submits or changes an order.
+    """
+    closed = closed_trades_from_db(100000) if "closed_trades_from_db" in globals() else []
+    pnls = [float(t.get("pnl") or 0.0) for t in closed]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    breakevens = [p for p in pnls if p == 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    stats = {
+        "lifetimeRealisedPnl": sum(pnls),
+        "wins": len(wins),
+        "losses": len(losses),
+        "breakevens": len(breakevens),
+        "totalClosedTrades": len(pnls),
+        "bestTrade": max(pnls) if pnls else 0.0,
+        "worstTrade": min(pnls) if pnls else 0.0,
+        "averageWin": gross_profit / len(wins) if wins else 0.0,
+        "averageLoss": sum(losses) / len(losses) if losses else 0.0,
+        "profitFactor": gross_profit / gross_loss if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0),
+        "winRate": len(wins) / max(1, len(wins) + len(losses)),
+        "updatedAt": datetime.now(UTC).isoformat(),
+    }
+    try:
+        _ensure_performance_state_table()
+        conn = db_connect()
+        conn.execute("""UPDATE performance_state SET
+            lifetime_realised_pnl=?, wins=?, losses=?, breakevens=?,
+            total_closed_trades=?, best_trade=?, worst_trade=?, average_win=?,
+            average_loss=?, profit_factor=?, updated_at=? WHERE id=1""",
+            (stats["lifetimeRealisedPnl"], stats["wins"], stats["losses"], stats["breakevens"],
+             stats["totalClosedTrades"], stats["bestTrade"], stats["worstTrade"],
+             stats["averageWin"], stats["averageLoss"], stats["profitFactor"], stats["updatedAt"]))
+        conn.commit(); conn.close()
+    except Exception as e:
+        print(f"PERFORMANCE STATE SAVE ERROR: {e}")
+    return stats
+
+
+def performance_engine_payload() -> Dict[str, Any]:
+    stats = rebuild_performance_state()
+    baseline = load_equity_baseline()
+    try:
+        account = get_account()
+        equity = float(account.equity)
+    except Exception:
+        equity = _safe_num(latest_status.get("account", {}).get("equity", 0))
+    total_withdrawn = _safe_num(os.getenv("TOTAL_WITHDRAWN_USD", 0))
+    if baseline <= 0:
+        baseline = equity
+        if baseline > 0:
+            save_equity_baseline(baseline)
+    total_gain_loss = equity + total_withdrawn - baseline
+    return {
+        "ok": True,
+        "persistent": os.path.abspath(SQLITE_DB_FILE).startswith("/var/data") or bool(os.getenv("PERSISTENT_DATA_DIR")),
+        "databaseFile": SQLITE_DB_FILE,
+        "baselineFile": BASELINE_FILE,
+        "baselineEquity": baseline,
+        "totalDeposited": baseline,
+        "totalWithdrawn": total_withdrawn,
+        "currentEquity": equity,
+        "totalGainLoss": total_gain_loss,
+        "totalGainLossGbp": money_gbp(total_gain_loss),
+        **stats,
+    }
 
 @app.post("/reset-baseline")
 def reset_baseline(request: Request):
@@ -5994,7 +6926,18 @@ def reset_baseline(request: Request):
 
 @app.get("/baseline")
 def get_baseline():
-    return {"ok": True, "baseline": load_equity_baseline()}
+    return {"ok": True, "baseline": load_equity_baseline(), "file": BASELINE_FILE}
+
+
+@app.get("/performance-engine")
+def api_performance_engine():
+    return performance_engine_payload()
+
+
+@app.post("/performance-engine/rebuild")
+def api_rebuild_performance_engine(request: Request):
+    verify_api_key(request)
+    return {"ok": True, **performance_engine_payload(), "message": "Performance statistics rebuilt from closed trades."}
 
 @app.get("/reports")
 def reports():
@@ -6003,14 +6946,11 @@ def reports():
     db = status.get("dbSummary") or {}
     equity = _safe_num(account.get("equity"))
     equity_gbp = _safe_num(account.get("equityGbp"))
-    total_withdrawn = _safe_num(globals().get("TOTAL_WITHDRAWN_USD", 0))
-    baseline = load_equity_baseline()
-    total_deposited = baseline if baseline > 0 else _safe_num(globals().get("TOTAL_DEPOSITED_USD", 0))
-    deposit_source = "reset-baseline" if baseline > 0 else "env"
-    if total_deposited <= 0:
-        total_deposited = equity
-        deposit_source = "equity-baseline"
-    total_gain_loss = equity + total_withdrawn - total_deposited
+    performance = performance_engine_payload()
+    total_withdrawn = _safe_num(performance.get("totalWithdrawn"))
+    total_deposited = _safe_num(performance.get("totalDeposited"))
+    total_gain_loss = _safe_num(performance.get("totalGainLoss"))
+    deposit_source = "persistent-performance-engine"
     # Always read closed trades fresh from SQLite so Reports does not show stale April rows.
     closed = closed_trades_from_db(500) if "closed_trades_from_db" in globals() else (status.get("closedTrades") or [])
     timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
@@ -6041,7 +6981,8 @@ def reports():
         "earnedSinceDeposit": max(total_gain_loss, 0.0),
         "lostSinceDeposit": abs(min(total_gain_loss, 0.0)),
         "dayPnl": _safe_num(account.get("pnlDay")),
-        "realisedNet": _safe_num(db.get("totalPnl")),
+        "realisedNet": _safe_num(performance.get("lifetimeRealisedPnl", db.get("totalPnl"))),
+        "performanceEngine": performance,
         "closedTrades": closed[:200] if isinstance(closed, list) else [],
         "equityHistory": equity_history[-500:],
         "winRate": _safe_num(db.get("winRate")) * 100.0,
@@ -7240,9 +8181,9 @@ def api_backtest_replay(payload: dict = Body(default={}), request: Request = Non
 # Append-only: do not remove existing working routes.
 # ============================================================
 
-_COMPAT_STATE_DIR = os.path.join("backend", "state")
-_COMPAT_BASELINE_FILE = os.path.join(_COMPAT_STATE_DIR, "equity_baseline.json")
-_COMPAT_BUY_SIZE_FILE = os.path.join(_COMPAT_STATE_DIR, "buy_size_mode.json")
+_COMPAT_STATE_DIR = persistent_data_dir()
+_COMPAT_BASELINE_FILE = BASELINE_FILE
+_COMPAT_BUY_SIZE_FILE = persistent_file("buy_size_mode.json")
 
 def _compat_num(v, default=0.0):
     try:
@@ -7291,8 +8232,7 @@ def _compat_account_equity():
         return 0.0, 0.0
 
 def _compat_baseline_value():
-    data = _compat_read(_COMPAT_BASELINE_FILE, {})
-    return _compat_num(data.get("baseline"), 0.0)
+    return load_equity_baseline()
 
 @app.get("/baseline")
 def compat_get_baseline():
@@ -7310,7 +8250,7 @@ def compat_set_baseline(payload: dict = Body(...), request: Request = None):
     value = _compat_num(payload.get("baseline") or payload.get("value") or payload.get("amount"), 0.0)
     if value <= 0:
         raise HTTPException(status_code=400, detail="Invalid baseline")
-    _compat_write(_COMPAT_BASELINE_FILE, {"baseline": value})
+    save_equity_baseline(value)
     return {
         "ok": True,
         "message": f"Baseline saved at ${value:.2f}",
@@ -7325,7 +8265,7 @@ def compat_reset_baseline(request: Request = None):
     equity, _bp = _compat_account_equity()
     if equity <= 0:
         raise HTTPException(status_code=400, detail="Could not read current equity")
-    _compat_write(_COMPAT_BASELINE_FILE, {"baseline": equity})
+    save_equity_baseline(equity)
     return {
         "ok": True,
         "message": f"Baseline reset to current equity ${equity:.2f}",
@@ -7800,6 +8740,9 @@ def v6_auto_sync_worker() -> None:
     first_run = True
     while True:
         try:
+            if AI_RESEARCH_CLOSED_MARKET_ONLY and _ai_research_market_open() is not False:
+                time.sleep(60)
+                continue
             result = v6_sync_brains(V6_DEFAULT_HORIZON_HOURS, V6_AUTO_SYNC_LIMIT)
             result["automatic"] = True; result["ranAt"] = datetime.now(UTC).isoformat()
             v6_last_sync_result = result
@@ -8890,6 +9833,12 @@ def _v9_capture_snapshot(conn, decision_id: int, scan: Dict[str, Any], decision:
          fields["ema50_distance_pct"],fields["atr_pct"],fields["day_range_position"],fields["opening_range_breakout"],fields["premarket_volume"],
          fields["sector"],fields["sector_strength"],fields["news_score"],fields["earnings_days"],fields["float_shares"],fields["shares_outstanding"],
          json.dumps(payload,default=str),str(source)))
+    try:
+        _v112_audit_snapshot(conn, decision_id, symbol, source, fields)
+        if source == "live":
+            _v113_verify_persisted_snapshot(conn, decision_id, symbol)
+    except Exception as audit_error:
+        print(f"V11.3 SNAPSHOT AUDIT/VERIFY ERROR {symbol}: {audit_error}")
 
 
 def v9_backfill(limit: int = 5000) -> Dict[str, Any]:
@@ -8996,10 +9945,11 @@ def api_v9_intelligence(symbol: str, request: Request):
 # Statistical research over V9 market memory. Shadow-only: never changes orders,
 # thresholds, strategy settings, or live trading behaviour.
 # =========================
-V10_VERSION = "V10.0"
-V10_NAME = "Explainable Research Engine"
+V10_VERSION = "V10.1"
+V10_NAME = "Evidence Lineage & Horizon Compatibility Engine"
+V10_SCHEMA_VERSION = "10.1"
 V10_ENABLED = os.getenv("V10_ENABLED", "true").lower() == "true"
-V10_DEFAULT_HORIZON_HOURS = max(1, int(os.getenv("V10_DEFAULT_HORIZON_HOURS", "4") or 4))
+V10_DEFAULT_HORIZON_HOURS = max(1, int(os.getenv("V10_DEFAULT_HORIZON_HOURS", "1") or 1))
 V10_MIN_PATTERN_SAMPLES = max(3, int(os.getenv("V10_MIN_PATTERN_SAMPLES", "8") or 8))
 V10_MAX_PATTERNS = max(25, min(int(os.getenv("V10_MAX_PATTERNS", "250") or 250), 1000))
 
@@ -9052,6 +10002,28 @@ def _v10_ensure_tables() -> None:
         summary TEXT NOT NULL,
         payload_json TEXT
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v10_evidence_lineage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        schema_version TEXT NOT NULL DEFAULT '10.1',
+        decision_id INTEGER NOT NULL,
+        snapshot_id INTEGER NOT NULL,
+        outcome_id INTEGER NOT NULL,
+        symbol TEXT NOT NULL,
+        observed_at TEXT,
+        horizon_hours INTEGER NOT NULL,
+        outcome_status TEXT NOT NULL,
+        net_return_pct REAL,
+        linked_at TEXT NOT NULL,
+        UNIQUE(snapshot_id, outcome_id)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_lineage_horizon_status ON v10_evidence_lineage(horizon_hours,outcome_status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_lineage_symbol_time ON v10_evidence_lineage(symbol,observed_at)")
+    # Backfill explicit evidence lineage from the already-stable decision_id relationship.
+    conn.execute("""INSERT OR IGNORE INTO v10_evidence_lineage(
+        schema_version,decision_id,snapshot_id,outcome_id,symbol,observed_at,horizon_hours,outcome_status,net_return_pct,linked_at)
+        SELECT ?,m.decision_id,m.decision_id,o.id,m.symbol,m.observed_at,o.horizon_hours,o.status,o.net_return_pct,?
+        FROM v9_market_memory m JOIN v2_observation_outcomes o ON o.decision_id=m.decision_id""",
+        (V10_SCHEMA_VERSION, datetime.now(UTC).isoformat()))
     conn.commit(); conn.close()
 
 
@@ -9129,12 +10101,28 @@ def _v10_metrics(returns: List[float]) -> Dict[str, Any]:
             "profitFactor": pf, "score": score, "grade": _v10_grade(n, pf, avg)}
 
 
+def _v10_available_horizons(conn) -> List[int]:
+    rows = conn.execute("""SELECT DISTINCT horizon_hours FROM v10_evidence_lineage
+                           WHERE outcome_status='COMPLETE' AND net_return_pct IS NOT NULL
+                           ORDER BY horizon_hours""").fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def _v10_resolve_horizon(conn, requested_horizon: int) -> Dict[str, Any]:
+    requested = max(1, min(int(requested_horizon), 168))
+    available = _v10_available_horizons(conn)
+    if not available:
+        return {"requested": requested, "effective": requested, "available": [], "exact": False}
+    effective = requested if requested in available else min(available, key=lambda h: (abs(h-requested), h))
+    return {"requested": requested, "effective": int(effective), "available": available, "exact": requested == effective}
+
+
 def _v10_load_observations(conn, horizon_hours: int) -> List[Dict[str, Any]]:
     columns = [x[1] for x in conn.execute("PRAGMA table_info(v9_market_memory)").fetchall()]
-    query = """SELECT m.*, o.net_return_pct AS v10_return_pct
-               FROM v9_market_memory m
-               JOIN v2_observation_outcomes o ON o.decision_id=m.decision_id
-               WHERE o.horizon_hours=? AND o.status='COMPLETE' AND o.net_return_pct IS NOT NULL
+    query = """SELECT m.*, l.net_return_pct AS v10_return_pct
+               FROM v10_evidence_lineage l
+               JOIN v9_market_memory m ON m.decision_id=l.snapshot_id
+               WHERE l.horizon_hours=? AND l.outcome_status='COMPLETE' AND l.net_return_pct IS NOT NULL
                ORDER BY m.decision_id ASC"""
     rows = conn.execute(query, (int(horizon_hours),)).fetchall()
     return [dict(zip(columns + ["v10_return_pct"], row)) for row in rows]
@@ -9143,10 +10131,12 @@ def _v10_load_observations(conn, horizon_hours: int) -> List[Dict[str, Any]]:
 def v10_run_research(horizon_hours: int = V10_DEFAULT_HORIZON_HOURS,
                      min_samples: int = V10_MIN_PATTERN_SAMPLES) -> Dict[str, Any]:
     _v10_ensure_tables()
-    horizon_hours = max(1, min(int(horizon_hours), 168))
+    requested_horizon = max(1, min(int(horizon_hours), 168))
     min_samples = max(3, min(int(min_samples), 500))
     now = datetime.now(UTC).isoformat()
     conn = db_connect()
+    horizon_resolution = _v10_resolve_horizon(conn, requested_horizon)
+    horizon_hours = int(horizon_resolution["effective"])
     cur = conn.execute("INSERT INTO v10_research_runs(created_at,horizon_hours,status) VALUES(?,?,'RUNNING')", (now, horizon_hours))
     run_id = int(cur.lastrowid)
     conn.commit()
@@ -9211,7 +10201,10 @@ def v10_run_research(horizon_hours: int = V10_DEFAULT_HORIZON_HOURS,
         conn.execute("INSERT INTO v10_research_notebook(run_id,created_at,title,summary,payload_json) VALUES(?,?,?,?,?)",
                      (run_id, now, f"V10 research — {horizon_hours}h horizon", summary, json.dumps(notebook_payload, default=str)))
         completed = datetime.now(UTC).isoformat()
-        run_payload = {"ok": True, "version": V10_VERSION, "runId": run_id, "horizonHours": horizon_hours,
+        run_payload = {"ok": True, "version": V10_VERSION, "runId": run_id,
+                       "requestedHorizonHours": requested_horizon, "horizonHours": horizon_hours,
+                       "horizonExactMatch": bool(horizon_resolution["exact"]),
+                       "availableHorizons": horizon_resolution["available"],
                        "observations": len(observations), "richObservations": rich_count,
                        "patternsFound": len(patterns), "minimumSamples": min_samples,
                        "bestPatterns": best, "worstPatterns": worst, "advisoryOnly": True,
@@ -9289,15 +10282,35 @@ def v10_status_payload() -> Dict[str, Any]:
     runs = int(conn.execute("SELECT COUNT(*) FROM v10_research_runs WHERE status='COMPLETE'").fetchone()[0])
     latest = conn.execute("SELECT id,observations,rich_observations,patterns_found,completed_at FROM v10_research_runs WHERE status='COMPLETE' ORDER BY id DESC LIMIT 1").fetchone()
     completed_outcomes = int(conn.execute("SELECT COUNT(*) FROM v2_observation_outcomes WHERE status='COMPLETE' AND net_return_pct IS NOT NULL").fetchone()[0])
+    lineage_links = int(conn.execute("SELECT COUNT(*) FROM v10_evidence_lineage").fetchone()[0])
+    linked_complete = int(conn.execute("SELECT COUNT(*) FROM v10_evidence_lineage WHERE outcome_status='COMPLETE' AND net_return_pct IS NOT NULL").fetchone()[0])
+    available_horizons = _v10_available_horizons(conn)
     conn.close()
     return {"ok": True, "version": V10_VERSION, "name": V10_NAME, "enabled": V10_ENABLED,
             "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False,
-            "completedOutcomes": completed_outcomes, "researchRuns": runs,
+            "completedOutcomes": completed_outcomes, "lineageLinks": lineage_links,
+            "linkedCompletedOutcomes": linked_complete, "availableHorizons": available_horizons,
+            "schemaVersion": V10_SCHEMA_VERSION, "researchRuns": runs,
             "latestRun": None if not latest else {"id": latest[0], "observations": latest[1], "richObservations": latest[2], "patternsFound": latest[3], "completedAt": latest[4]},
             "features": {"singleFactorResearch": True, "twoFactorInteractions": True, "profitFactor": True,
                          "expectancy": True, "researchNotebook": True, "symbolExplanation": True,
-                         "sampleSizeWeighting": True, "shadowOnly": True}}
+                         "sampleSizeWeighting": True, "explicitEvidenceLineage": True,
+                         "horizonCompatibility": True, "schemaVersioning": True, "shadowOnly": True}}
 
+
+@app.get('/v10/lineage/status')
+def api_v10_lineage_status(request: Request):
+    verify_api_key(request)
+    _v10_ensure_tables(); conn=db_connect()
+    total=int(conn.execute("SELECT COUNT(*) FROM v10_evidence_lineage").fetchone()[0])
+    complete=int(conn.execute("SELECT COUNT(*) FROM v10_evidence_lineage WHERE outcome_status='COMPLETE' AND net_return_pct IS NOT NULL").fetchone()[0])
+    by_horizon={str(r[0]): int(r[1]) for r in conn.execute("SELECT horizon_hours,COUNT(*) FROM v10_evidence_lineage WHERE outcome_status='COMPLETE' AND net_return_pct IS NOT NULL GROUP BY horizon_hours ORDER BY horizon_hours").fetchall()}
+    missing=int(conn.execute("""SELECT COUNT(*) FROM v2_observation_outcomes o JOIN v9_market_memory m ON m.decision_id=o.decision_id
+                                LEFT JOIN v10_evidence_lineage l ON l.outcome_id=o.id WHERE l.id IS NULL""").fetchone()[0])
+    conn.close()
+    return {"ok":True,"version":V10_VERSION,"schemaVersion":V10_SCHEMA_VERSION,"lineageLinks":total,
+            "linkedCompletedOutcomes":complete,"completedByHorizon":by_horizon,"missingEligibleLinks":missing,
+            "advisoryOnly":True}
 
 @app.get('/v10/status')
 def api_v10_status(request: Request):
@@ -9320,3 +10333,1727 @@ def api_v10_explain(symbol: str, request: Request):
     if not re.fullmatch(r'[A-Z.\-]{1,10}', sym):
         raise HTTPException(status_code=400, detail='Invalid symbol')
     return v10_explain_symbol(sym)
+
+# =========================
+# TRADEBOT V11.0 — EVIDENCE DISCOVERY ENGINE
+# Mines validated multi-factor market setups from explicit V10 lineage.
+# Shadow-only: never changes orders, thresholds, strategy settings, or live behaviour.
+# =========================
+V11_VERSION = "V11.4"
+V11_NAME = "Unified Decision Pipeline"
+V11_SCHEMA_VERSION = "11.4"
+V11_ENABLED = os.getenv("V11_ENABLED", "true").lower() == "true"
+V11_DEFAULT_HORIZON_HOURS = max(1, int(os.getenv("V11_DEFAULT_HORIZON_HOURS", "1") or 1))
+V11_MIN_SAMPLES = max(8, int(os.getenv("V11_MIN_SAMPLES", "20") or 20))
+V11_MAX_DISCOVERIES = max(25, min(int(os.getenv("V11_MAX_DISCOVERIES", "300") or 300), 1500))
+V11_VALIDATION_FRACTION = min(0.40, max(0.20, float(os.getenv("V11_VALIDATION_FRACTION", "0.30") or 0.30)))
+V11_AUTO_LEARNING_ENABLED = os.getenv("V11_AUTO_LEARNING_ENABLED", "true").lower() == "true"
+V11_AUTO_INTERVAL_SECONDS = max(900, int(os.getenv("V11_AUTO_INTERVAL_SECONDS", "21600") or 21600))
+V11_AUTO_MIN_NEW_OBSERVATIONS = max(1, int(os.getenv("V11_AUTO_MIN_NEW_OBSERVATIONS", "25") or 25))
+V11_AUTO_MIN_NEW_RICH_OBSERVATIONS = max(1, int(os.getenv("V11_AUTO_MIN_NEW_RICH_OBSERVATIONS", "5") or 5))
+V11_AUTO_RUN_ON_STARTUP = os.getenv("V11_AUTO_RUN_ON_STARTUP", "false").lower() == "true"
+V11_RICH_TARGET_OBSERVATIONS = max(20, int(os.getenv("V11_RICH_TARGET_OBSERVATIONS", "100") or 100))
+V11_AUTO_MAX_FACTORS = max(1, min(int(os.getenv("V11_AUTO_MAX_FACTORS", "3") or 3), 3))
+v11_last_learning_result: Dict[str, Any] = {}
+
+
+def _v11_ensure_tables() -> None:
+    _v10_ensure_tables()
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_discovery_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        schema_version TEXT NOT NULL DEFAULT '11.0',
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        requested_horizon_hours INTEGER NOT NULL,
+        horizon_hours INTEGER NOT NULL,
+        minimum_samples INTEGER NOT NULL,
+        observations INTEGER NOT NULL DEFAULT 0,
+        rich_observations INTEGER NOT NULL DEFAULT 0,
+        candidates_tested INTEGER NOT NULL DEFAULT 0,
+        discoveries_found INTEGER NOT NULL DEFAULT 0,
+        validated_positive INTEGER NOT NULL DEFAULT 0,
+        validated_negative INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'RUNNING',
+        payload_json TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_discoveries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        horizon_hours INTEGER NOT NULL,
+        discovery_key TEXT NOT NULL,
+        discovery_name TEXT NOT NULL,
+        dimensions_json TEXT NOT NULL,
+        factor_count INTEGER NOT NULL,
+        samples INTEGER NOT NULL,
+        wins INTEGER NOT NULL,
+        losses INTEGER NOT NULL,
+        win_rate REAL NOT NULL,
+        expectancy_pct REAL NOT NULL,
+        profit_factor REAL NOT NULL,
+        median_return_pct REAL NOT NULL,
+        lower95_expectancy_pct REAL NOT NULL,
+        baseline_expectancy_pct REAL NOT NULL,
+        expectancy_lift_pct REAL NOT NULL,
+        train_samples INTEGER NOT NULL,
+        train_expectancy_pct REAL NOT NULL,
+        train_profit_factor REAL NOT NULL,
+        validation_samples INTEGER NOT NULL,
+        validation_expectancy_pct REAL NOT NULL,
+        validation_profit_factor REAL NOT NULL,
+        validation_win_rate REAL NOT NULL,
+        stability_score REAL NOT NULL,
+        evidence_score REAL NOT NULL,
+        classification TEXT NOT NULL,
+        explanation TEXT NOT NULL,
+        UNIQUE(run_id, discovery_key)
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_discoveries_run_score ON v11_discoveries(run_id,evidence_score DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_discoveries_run_class ON v11_discoveries(run_id,classification)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_learning_state (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        schema_version TEXT NOT NULL DEFAULT '11.1',
+        last_checked_at TEXT,
+        last_automatic_run_at TEXT,
+        last_run_id INTEGER,
+        last_observations INTEGER NOT NULL DEFAULT 0,
+        last_rich_observations INTEGER NOT NULL DEFAULT 0,
+        last_status TEXT NOT NULL DEFAULT 'NEVER_RUN',
+        last_reason TEXT,
+        last_error TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_learning_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        run_id INTEGER,
+        trigger_type TEXT NOT NULL,
+        observations INTEGER NOT NULL DEFAULT 0,
+        rich_observations INTEGER NOT NULL DEFAULT 0,
+        new_observations INTEGER NOT NULL DEFAULT 0,
+        new_rich_observations INTEGER NOT NULL DEFAULT 0,
+        validated_positive INTEGER NOT NULL DEFAULT 0,
+        validated_negative INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        reason TEXT,
+        payload_json TEXT
+    )""")
+    conn.execute("INSERT OR IGNORE INTO v11_learning_state(id,schema_version) VALUES(1,?)", (V11_SCHEMA_VERSION,))
+    conn.commit(); conn.close()
+
+
+def _v11_bin(name: str, value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if name in ("market_regime", "sector", "session_name"):
+        text = str(value or "").strip()
+        if not text or text.lower() == "unknown":
+            return None
+        return text.upper() if name == "market_regime" else text
+    if name in ("opening_range_breakout", "sniper_pass", "a_plus_pass", "ready_to_buy"):
+        return f"{name}={'YES' if bool(value) else 'NO'}"
+    x = _v10_float(value, float("nan"))
+    if math.isnan(x):
+        return None
+    if name == "relative_volume":
+        return "RVOL <1" if x < 1 else "RVOL 1-2" if x < 2 else "RVOL 2-4" if x < 4 else "RVOL 4-8" if x < 8 else "RVOL 8+"
+    if name == "gap_pct":
+        return "Gap <-2%" if x < -2 else "Gap -2% to 0%" if x < 0 else "Gap 0-2%" if x < 2 else "Gap 2-5%" if x < 5 else "Gap 5%+"
+    if name == "distance_vwap_pct":
+        return "VWAP <-1%" if x < -1 else "Below VWAP" if x < 0 else "VWAP +0-1%" if x < 1 else "VWAP +1%+"
+    if name in ("ema9_distance_pct", "ema20_distance_pct", "ema50_distance_pct"):
+        label = name.replace("_distance_pct", "").upper()
+        return f"Below {label}" if x < 0 else f"Above {label} 0-1%" if x < 1 else f"Above {label} 1%+"
+    if name == "atr_pct":
+        return "ATR <2%" if x < 2 else "ATR 2-4%" if x < 4 else "ATR 4-7%" if x < 7 else "ATR 7%+"
+    if name == "day_range_position":
+        return "Range bottom" if x < .25 else "Range lower-middle" if x < .50 else "Range upper-middle" if x < .75 else "Range top"
+    if name == "sector_strength":
+        return "Sector weak" if x < -.25 else "Sector neutral" if x < .25 else "Sector strong"
+    if name == "confidence":
+        return "Confidence <0.60" if x < .60 else "Confidence 0.60-0.70" if x < .70 else "Confidence 0.70-0.80" if x < .80 else "Confidence 0.80-0.90" if x < .90 else "Confidence 0.90+"
+    if name == "momentum":
+        return "Momentum negative" if x < 0 else "Momentum 0-1%" if x < .01 else "Momentum 1-3%" if x < .03 else "Momentum 3%+"
+    if name == "pullback":
+        return "Pullback <0.5%" if x < .005 else "Pullback 0.5-1.5%" if x < .015 else "Pullback 1.5-3%" if x < .03 else "Pullback 3%+"
+    if name == "spread":
+        return "Spread <0.3%" if x < .003 else "Spread 0.3-0.8%" if x < .008 else "Spread 0.8-1.5%" if x < .015 else "Spread 1.5%+"
+    return None
+
+
+def _v11_stats(values: List[float]) -> Dict[str, Any]:
+    m = _v10_metrics(values)
+    clean = [float(x) for x in values if x is not None and math.isfinite(float(x))]
+    n = len(clean)
+    if n > 1:
+        mean = sum(clean) / n
+        variance = sum((x - mean) ** 2 for x in clean) / (n - 1)
+        se = math.sqrt(max(0.0, variance) / n)
+        lower95 = mean - 1.96 * se
+    else:
+        lower95 = clean[0] if clean else 0.0
+    return {**m, "lower95ExpectancyPct": lower95}
+
+
+def _v11_classify(all_m: Dict[str, Any], train_m: Dict[str, Any], val_m: Dict[str, Any], min_validation: int) -> str:
+    enough_val = val_m["samples"] >= min_validation
+    positive = (all_m["expectancyPct"] > 0 and all_m["profitFactor"] > 1.0 and
+                train_m["expectancyPct"] > 0 and train_m["profitFactor"] > 1.0 and
+                enough_val and val_m["expectancyPct"] > 0 and val_m["profitFactor"] > 1.0)
+    negative = (all_m["expectancyPct"] < 0 and all_m["profitFactor"] < 1.0 and
+                train_m["expectancyPct"] < 0 and train_m["profitFactor"] < 1.0 and
+                enough_val and val_m["expectancyPct"] < 0 and val_m["profitFactor"] < 1.0)
+    if positive:
+        return "VALIDATED_POSITIVE"
+    if negative:
+        return "VALIDATED_NEGATIVE"
+    return "UNSTABLE_OR_INSUFFICIENT"
+
+
+def _v11_evidence_score(all_m: Dict[str, Any], train_m: Dict[str, Any], val_m: Dict[str, Any], baseline: Dict[str, Any]) -> Dict[str, float]:
+    lift = all_m["expectancyPct"] - baseline["expectancyPct"]
+    same_direction = (train_m["expectancyPct"] == 0 or val_m["expectancyPct"] == 0 or
+                      (train_m["expectancyPct"] > 0) == (val_m["expectancyPct"] > 0))
+    gap = abs(train_m["expectancyPct"] - val_m["expectancyPct"])
+    stability = max(0.0, 1.0 - min(1.0, gap / max(.10, abs(all_m["expectancyPct"]) + .10)))
+    if not same_direction:
+        stability *= .25
+    sample_weight = min(1.0, math.sqrt(all_m["samples"] / 100.0))
+    validation_weight = min(1.0, math.sqrt(val_m["samples"] / 30.0)) if val_m["samples"] else 0.0
+    direction = 1.0 if all_m["expectancyPct"] >= 0 else -1.0
+    strength = (abs(all_m["expectancyPct"]) * 45.0 + abs(lift) * 25.0 +
+                abs(min(all_m["profitFactor"], 5.0) - 1.0) * 8.0 +
+                abs(all_m["winRate"] - .5) * 15.0)
+    score = direction * strength * sample_weight * (.45 + .55 * validation_weight) * (.35 + .65 * stability)
+    return {"evidenceScore": score, "stabilityScore": stability, "expectancyLiftPct": lift}
+
+
+def _v11_load_rows(conn, horizon_hours: int) -> List[Dict[str, Any]]:
+    rows = _v10_load_observations(conn, horizon_hours)
+    rows.sort(key=lambda r: str(r.get("observed_at") or ""))
+    return rows
+
+
+def v11_run_discovery(horizon_hours: int = V11_DEFAULT_HORIZON_HOURS,
+                      min_samples: int = V11_MIN_SAMPLES,
+                      max_factors: int = 3) -> Dict[str, Any]:
+    _v11_ensure_tables()
+    requested = max(1, min(int(horizon_hours), 168))
+    min_samples = max(8, min(int(min_samples), 1000))
+    max_factors = max(1, min(int(max_factors), 3))
+    now = datetime.now(UTC).isoformat()
+    conn = db_connect()
+    resolved = _v10_resolve_horizon(conn, requested)
+    effective = int(resolved["effective"])
+    cur = conn.execute("""INSERT INTO v11_discovery_runs(
+        schema_version,created_at,requested_horizon_hours,horizon_hours,minimum_samples,status)
+        VALUES(?,?,?,?,?,'RUNNING')""", (V11_SCHEMA_VERSION, now, requested, effective, min_samples))
+    run_id = int(cur.lastrowid); conn.commit()
+    try:
+        rows = _v11_load_rows(conn, effective)
+        returns = [_v10_float(r.get("v10_return_pct"), float("nan")) for r in rows]
+        returns = [x for x in returns if math.isfinite(x)]
+        baseline = _v11_stats(returns)
+        feature_names = [
+            "market_regime", "sector", "session_name", "relative_volume", "gap_pct",
+            "distance_vwap_pct", "ema9_distance_pct", "ema20_distance_pct", "ema50_distance_pct",
+            "atr_pct", "day_range_position", "opening_range_breakout", "sector_strength",
+            "confidence", "momentum", "pullback", "spread", "sniper_pass", "a_plus_pass"
+        ]
+        market_features = {
+            "market_regime", "sector", "relative_volume", "gap_pct", "distance_vwap_pct",
+            "ema9_distance_pct", "ema20_distance_pct", "ema50_distance_pct", "atr_pct",
+            "day_range_position", "opening_range_breakout", "sector_strength"
+        }
+        buckets: Dict[str, Dict[str, Any]] = {}
+        rich_count = 0
+        split_index = max(1, min(len(rows) - 1, int(len(rows) * (1.0 - V11_VALIDATION_FRACTION)))) if len(rows) > 1 else len(rows)
+        for idx, obs in enumerate(rows):
+            ret = _v10_float(obs.get("v10_return_pct"), float("nan"))
+            if not math.isfinite(ret):
+                continue
+            labels = {name: _v11_bin(name, obs.get(name)) for name in feature_names}
+            labels = {k: v for k, v in labels.items() if v is not None}
+            rich_here = sum(1 for k in market_features if k in labels)
+            if rich_here >= 2:
+                rich_count += 1
+            keys = list(labels.keys())
+            combinations: List[tuple] = []
+            for key in keys:
+                combinations.append((key,))
+            if max_factors >= 2:
+                for i in range(len(keys)):
+                    for j in range(i + 1, len(keys)):
+                        pair = (keys[i], keys[j])
+                        if any(k in market_features for k in pair):
+                            combinations.append(pair)
+            if max_factors >= 3:
+                important = [k for k in keys if k in market_features]
+                context = [k for k in keys if k in ("confidence", "session_name", "sniper_pass", "a_plus_pass")]
+                triple_pool = important + context
+                for i in range(len(triple_pool)):
+                    for j in range(i + 1, len(triple_pool)):
+                        for k in range(j + 1, len(triple_pool)):
+                            triple = (triple_pool[i], triple_pool[j], triple_pool[k])
+                            if sum(1 for x in triple if x in market_features) >= 2:
+                                combinations.append(triple)
+            seen = set()
+            for combo in combinations:
+                combo = tuple(sorted(combo))
+                if combo in seen:
+                    continue
+                seen.add(combo)
+                dims = {k: labels[k] for k in combo}
+                key = "|".join(f"{k}={dims[k]}" for k in combo)
+                item = buckets.setdefault(key, {"dimensions": dims, "all": [], "train": [], "validation": []})
+                item["all"].append(ret)
+                item["train" if idx < split_index else "validation"].append(ret)
+
+        discoveries = []
+        min_validation = max(5, int(math.ceil(min_samples * V11_VALIDATION_FRACTION * .60)))
+        for key, item in buckets.items():
+            all_m = _v11_stats(item["all"])
+            if all_m["samples"] < min_samples:
+                continue
+            train_m = _v11_stats(item["train"])
+            val_m = _v11_stats(item["validation"])
+            scoring = _v11_evidence_score(all_m, train_m, val_m, baseline)
+            classification = _v11_classify(all_m, train_m, val_m, min_validation)
+            dims = item["dimensions"]
+            name = " + ".join(str(v) for v in dims.values())
+            explanation = (
+                f"{name}: {all_m['samples']} observations, {all_m['winRate']*100:.1f}% win rate, "
+                f"{all_m['expectancyPct']:+.3f}% expectancy and PF {all_m['profitFactor']:.2f}. "
+                f"Validation: {val_m['samples']} observations, {val_m['expectancyPct']:+.3f}% expectancy, "
+                f"PF {val_m['profitFactor']:.2f}. Classification: {classification}. Advisory-only."
+            )
+            discoveries.append({
+                "key": key, "name": name, "dimensions": dims, "factorCount": len(dims),
+                **all_m, **scoring,
+                "baselineExpectancyPct": baseline["expectancyPct"],
+                "trainSamples": train_m["samples"], "trainExpectancyPct": train_m["expectancyPct"],
+                "trainProfitFactor": train_m["profitFactor"],
+                "validationSamples": val_m["samples"], "validationExpectancyPct": val_m["expectancyPct"],
+                "validationProfitFactor": val_m["profitFactor"], "validationWinRate": val_m["winRate"],
+                "classification": classification, "explanation": explanation
+            })
+        discoveries.sort(key=lambda d: (d["classification"] == "VALIDATED_POSITIVE", d["evidenceScore"], d["samples"]), reverse=True)
+        discoveries = discoveries[:V11_MAX_DISCOVERIES]
+        for d in discoveries:
+            conn.execute("""INSERT OR REPLACE INTO v11_discoveries(
+                run_id,created_at,horizon_hours,discovery_key,discovery_name,dimensions_json,factor_count,
+                samples,wins,losses,win_rate,expectancy_pct,profit_factor,median_return_pct,lower95_expectancy_pct,
+                baseline_expectancy_pct,expectancy_lift_pct,train_samples,train_expectancy_pct,train_profit_factor,
+                validation_samples,validation_expectancy_pct,validation_profit_factor,validation_win_rate,
+                stability_score,evidence_score,classification,explanation)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (run_id, now, effective, d["key"], d["name"], json.dumps(d["dimensions"]), d["factorCount"],
+                 d["samples"], d["wins"], d["losses"], d["winRate"], d["expectancyPct"], d["profitFactor"],
+                 d["medianReturnPct"], d["lower95ExpectancyPct"], d["baselineExpectancyPct"], d["expectancyLiftPct"],
+                 d["trainSamples"], d["trainExpectancyPct"], d["trainProfitFactor"], d["validationSamples"],
+                 d["validationExpectancyPct"], d["validationProfitFactor"], d["validationWinRate"],
+                 d["stabilityScore"], d["evidenceScore"], d["classification"], d["explanation"]))
+        positive = [d for d in discoveries if d["classification"] == "VALIDATED_POSITIVE"]
+        negative = [d for d in discoveries if d["classification"] == "VALIDATED_NEGATIVE"]
+        payload = {
+            "ok": True, "version": V11_VERSION, "runId": run_id,
+            "requestedHorizonHours": requested, "horizonHours": effective,
+            "horizonExactMatch": bool(resolved["exact"]), "availableHorizons": resolved["available"],
+            "observations": len(rows), "richObservations": rich_count, "candidatesTested": len(buckets),
+            "discoveriesFound": len(discoveries), "validatedPositive": len(positive),
+            "validatedNegative": len(negative), "minimumSamples": min_samples, "maxFactors": max_factors,
+            "baseline": baseline, "bestValidated": positive[:10],
+            "worstValidated": sorted(negative, key=lambda d: d["evidenceScore"])[:10],
+            "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False
+        }
+        conn.execute("""UPDATE v11_discovery_runs SET completed_at=?,observations=?,rich_observations=?,
+            candidates_tested=?,discoveries_found=?,validated_positive=?,validated_negative=?,status='COMPLETE',payload_json=?
+            WHERE id=?""", (datetime.now(UTC).isoformat(), len(rows), rich_count, len(buckets), len(discoveries),
+                            len(positive), len(negative), json.dumps(payload, default=str), run_id))
+        conn.commit(); conn.close(); return payload
+    except Exception as exc:
+        conn.execute("UPDATE v11_discovery_runs SET completed_at=?,status='ERROR',payload_json=? WHERE id=?",
+                     (datetime.now(UTC).isoformat(), json.dumps({"error": str(exc)}), run_id))
+        conn.commit(); conn.close(); raise
+
+
+def v11_latest_report(limit: int = 50, classification: Optional[str] = None) -> Dict[str, Any]:
+    _v11_ensure_tables(); limit = max(1, min(int(limit), 300)); conn = db_connect()
+    run = conn.execute("""SELECT id,created_at,completed_at,requested_horizon_hours,horizon_hours,minimum_samples,
+                          observations,rich_observations,candidates_tested,discoveries_found,validated_positive,
+                          validated_negative,status,payload_json FROM v11_discovery_runs ORDER BY id DESC LIMIT 1""").fetchone()
+    if not run:
+        conn.close(); return {"ok": True, "version": V11_VERSION, "hasReport": False, "message": "Run POST /v11/discover first."}
+    where = "run_id=?"; params: List[Any] = [int(run[0])]
+    valid_classes = {"VALIDATED_POSITIVE", "VALIDATED_NEGATIVE", "UNSTABLE_OR_INSUFFICIENT"}
+    if classification and classification.upper() in valid_classes:
+        where += " AND classification=?"; params.append(classification.upper())
+    params.append(limit)
+    rows = conn.execute(f"""SELECT discovery_key,discovery_name,dimensions_json,factor_count,samples,wins,losses,
+        win_rate,expectancy_pct,profit_factor,median_return_pct,lower95_expectancy_pct,baseline_expectancy_pct,
+        expectancy_lift_pct,train_samples,train_expectancy_pct,train_profit_factor,validation_samples,
+        validation_expectancy_pct,validation_profit_factor,validation_win_rate,stability_score,evidence_score,
+        classification,explanation FROM v11_discoveries WHERE {where}
+        ORDER BY CASE classification WHEN 'VALIDATED_POSITIVE' THEN 0 WHEN 'VALIDATED_NEGATIVE' THEN 1 ELSE 2 END,
+                 evidence_score DESC LIMIT ?""", tuple(params)).fetchall()
+    columns = ["key","name","dimensions","factorCount","samples","wins","losses","winRate","expectancyPct",
+               "profitFactor","medianReturnPct","lower95ExpectancyPct","baselineExpectancyPct","expectancyLiftPct",
+               "trainSamples","trainExpectancyPct","trainProfitFactor","validationSamples","validationExpectancyPct",
+               "validationProfitFactor","validationWinRate","stabilityScore","evidenceScore","classification","explanation"]
+    output = []
+    for row in rows:
+        item = dict(zip(columns, row)); item["dimensions"] = json.loads(item["dimensions"] or "{}")
+        output.append(item)
+    conn.close()
+    return {"ok": True, "version": V11_VERSION, "hasReport": True,
+            "run": {"id": run[0], "createdAt": run[1], "completedAt": run[2],
+                    "requestedHorizonHours": run[3], "horizonHours": run[4], "minimumSamples": run[5],
+                    "observations": run[6], "richObservations": run[7], "candidatesTested": run[8],
+                    "discoveriesFound": run[9], "validatedPositive": run[10], "validatedNegative": run[11],
+                    "status": run[12]}, "count": len(output), "discoveries": output,
+            "advisoryOnly": True, "automaticLiveChanges": False}
+
+
+def v11_explain_symbol(symbol: str) -> Dict[str, Any]:
+    _v11_ensure_tables(); sym = str(symbol or "").upper().strip()
+    quote = get_quote(sym)
+    intel = _v91_enrich_scan({"symbol": sym, "price": quote["mid"], "bid": quote["bid"], "ask": quote["ask"], "spread": quote["spread"]})
+    conn = db_connect()
+    run = conn.execute("SELECT id,horizon_hours FROM v11_discovery_runs WHERE status='COMPLETE' ORDER BY id DESC LIMIT 1").fetchone()
+    if not run:
+        conn.close(); return {"ok": True, "version": V11_VERSION, "symbol": sym, "verdict": "NO_DISCOVERY_RUN", "intelligence": intel, "matches": []}
+    rows = conn.execute("""SELECT discovery_name,dimensions_json,samples,win_rate,expectancy_pct,profit_factor,
+        validation_samples,validation_expectancy_pct,validation_profit_factor,evidence_score,classification,explanation
+        FROM v11_discoveries WHERE run_id=? ORDER BY evidence_score DESC""", (int(run[0]),)).fetchall()
+    matches = []
+    for row in rows:
+        dims = json.loads(row[1] or "{}")
+        if all(_v11_bin(feature, intel.get(feature)) == expected for feature, expected in dims.items()):
+            matches.append({"name": row[0], "dimensions": dims, "samples": row[2], "winRate": row[3],
+                            "expectancyPct": row[4], "profitFactor": row[5], "validationSamples": row[6],
+                            "validationExpectancyPct": row[7], "validationProfitFactor": row[8],
+                            "evidenceScore": row[9], "classification": row[10], "explanation": row[11]})
+        if len(matches) >= 15:
+            break
+    conn.close()
+    positives = [m for m in matches if m["classification"] == "VALIDATED_POSITIVE"]
+    negatives = [m for m in matches if m["classification"] == "VALIDATED_NEGATIVE"]
+    verdict = "INSUFFICIENT_VALIDATED_EVIDENCE"
+    if positives and not negatives:
+        verdict = "VALIDATED_FAVOURABLE"
+    elif negatives and not positives:
+        verdict = "VALIDATED_UNFAVOURABLE"
+    elif positives and negatives:
+        positive_weight = sum(max(0.0, float(m["evidenceScore"])) for m in positives)
+        negative_weight = abs(sum(min(0.0, float(m["evidenceScore"])) for m in negatives))
+        verdict = "MIXED_LEAN_FAVOURABLE" if positive_weight > negative_weight else "MIXED_LEAN_UNFAVOURABLE"
+    return {"ok": True, "version": V11_VERSION, "symbol": sym, "horizonHours": int(run[1]),
+            "verdict": verdict, "intelligence": intel, "matchCount": len(matches), "matches": matches,
+            "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False}
+
+
+
+def _v11_current_evidence_counts(horizon_hours: int = V11_DEFAULT_HORIZON_HOURS) -> Dict[str, Any]:
+    _v11_ensure_tables()
+    conn = db_connect()
+    resolved = _v10_resolve_horizon(conn, max(1, int(horizon_hours)))
+    effective = int(resolved["effective"])
+    rows = _v11_load_rows(conn, effective)
+    market_features = {
+        "market_regime", "sector", "relative_volume", "gap_pct", "distance_vwap_pct",
+        "ema9_distance_pct", "ema20_distance_pct", "ema50_distance_pct", "atr_pct",
+        "day_range_position", "opening_range_breakout", "sector_strength"
+    }
+    rich = 0
+    for obs in rows:
+        labels = {name: _v11_bin(name, obs.get(name)) for name in market_features}
+        if sum(1 for value in labels.values() if value is not None) >= 2:
+            rich += 1
+    conn.close()
+    return {
+        "requestedHorizonHours": int(horizon_hours), "horizonHours": effective,
+        "horizonExactMatch": bool(resolved["exact"]), "availableHorizons": resolved["available"],
+        "observations": len(rows), "richObservations": rich
+    }
+
+
+def v11_learning_cycle(trigger_type: str = "manual", force: bool = False) -> Dict[str, Any]:
+    global v11_last_learning_result
+    _v11_ensure_tables()
+    now = datetime.now(UTC).isoformat()
+    counts = _v11_current_evidence_counts(V11_DEFAULT_HORIZON_HOURS)
+    conn = db_connect()
+    state = conn.execute("SELECT last_observations,last_rich_observations,last_automatic_run_at FROM v11_learning_state WHERE id=1").fetchone()
+    previous_obs = int(state[0] or 0) if state else 0
+    previous_rich = int(state[1] or 0) if state else 0
+    new_obs = max(0, int(counts["observations"]) - previous_obs)
+    new_rich = max(0, int(counts["richObservations"]) - previous_rich)
+    should_run = bool(force or trigger_type == "manual" or
+                      new_rich >= V11_AUTO_MIN_NEW_RICH_OBSERVATIONS or
+                      new_obs >= V11_AUTO_MIN_NEW_OBSERVATIONS)
+    reason = "forced/manual run" if (force or trigger_type == "manual") else (
+        f"new rich evidence threshold reached ({new_rich})" if new_rich >= V11_AUTO_MIN_NEW_RICH_OBSERVATIONS
+        else f"new evidence threshold reached ({new_obs})" if new_obs >= V11_AUTO_MIN_NEW_OBSERVATIONS
+        else "waiting for more evidence")
+    if not should_run:
+        result = {"ok": True, "version": V11_VERSION, "ranDiscovery": False, "trigger": trigger_type,
+                  **counts, "newObservations": new_obs, "newRichObservations": new_rich,
+                  "reason": reason, "nextCheckSeconds": V11_AUTO_INTERVAL_SECONDS,
+                  "richEvidenceProgressPct": min(100.0, counts["richObservations"] / V11_RICH_TARGET_OBSERVATIONS * 100.0),
+                  "advisoryOnly": True, "automaticLiveChanges": False}
+        conn.execute("UPDATE v11_learning_state SET schema_version=?,last_checked_at=?,last_status='WAITING',last_reason=?,last_error=NULL WHERE id=1",
+                     (V11_SCHEMA_VERSION, now, reason))
+        conn.commit(); conn.close(); v11_last_learning_result = result; return result
+    conn.close()
+    try:
+        discovery = v11_run_discovery(counts["horizonHours"], V11_MIN_SAMPLES, V11_AUTO_MAX_FACTORS)
+        conn = db_connect()
+        conn.execute("""UPDATE v11_learning_state SET schema_version=?,last_checked_at=?,last_automatic_run_at=?,
+            last_run_id=?,last_observations=?,last_rich_observations=?,last_status='COMPLETE',last_reason=?,last_error=NULL WHERE id=1""",
+            (V11_SCHEMA_VERSION, now, now, discovery.get("runId"), counts["observations"], counts["richObservations"], reason))
+        conn.execute("""INSERT INTO v11_learning_history(created_at,run_id,trigger_type,observations,rich_observations,
+            new_observations,new_rich_observations,validated_positive,validated_negative,status,reason,payload_json)
+            VALUES(?,?,?,?,?,?,?,?,?,'COMPLETE',?,?)""",
+            (now, discovery.get("runId"), trigger_type, counts["observations"], counts["richObservations"], new_obs, new_rich,
+             discovery.get("validatedPositive",0), discovery.get("validatedNegative",0), reason, json.dumps(discovery, default=str)))
+        conn.commit(); conn.close()
+        result = {"ok": True, "version": V11_VERSION, "ranDiscovery": True, "trigger": trigger_type,
+                  "newObservations": new_obs, "newRichObservations": new_rich,
+                  "richEvidenceProgressPct": min(100.0, counts["richObservations"] / V11_RICH_TARGET_OBSERVATIONS * 100.0),
+                  "reason": reason, "discovery": discovery,
+                  "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False}
+        v11_last_learning_result = result; return result
+    except Exception as exc:
+        conn = db_connect()
+        conn.execute("UPDATE v11_learning_state SET last_checked_at=?,last_status='ERROR',last_reason=?,last_error=? WHERE id=1",
+                     (now, reason, str(exc)))
+        conn.commit(); conn.close()
+        v11_last_learning_result = {"ok": False, "version": V11_VERSION, "ranDiscovery": False,
+                                    "trigger": trigger_type, "error": str(exc), "reason": reason}
+        return v11_last_learning_result
+
+
+def v11_auto_learning_worker() -> None:
+    first = True
+    while True:
+        try:
+            if AI_RESEARCH_CLOSED_MARKET_ONLY and _ai_research_market_open() is not False:
+                time.sleep(60)
+                continue
+            if not first or V11_AUTO_RUN_ON_STARTUP:
+                result = v11_learning_cycle("automatic", force=False)
+                if result.get("ranDiscovery"):
+                    print(f"V11.1 AUTO LEARNING | run={result.get('discovery',{}).get('runId')} "
+                          f"obs={result.get('discovery',{}).get('observations')} rich={result.get('discovery',{}).get('richObservations')}")
+            first = False
+        except Exception as exc:
+            print(f"V11.1 AUTO LEARNING ERROR: {exc}")
+        time.sleep(V11_AUTO_INTERVAL_SECONDS)
+
+
+def v11_learning_status_payload() -> Dict[str, Any]:
+    _v11_ensure_tables()
+    counts = _v11_current_evidence_counts(V11_DEFAULT_HORIZON_HOURS)
+    conn = db_connect()
+    state = conn.execute("SELECT schema_version,last_checked_at,last_automatic_run_at,last_run_id,last_observations,last_rich_observations,last_status,last_reason,last_error FROM v11_learning_state WHERE id=1").fetchone()
+    history = conn.execute("SELECT COUNT(*) FROM v11_learning_history WHERE status='COMPLETE'").fetchone()[0]
+    conn.close()
+    return {"ok": True, "version": V11_VERSION, "name": V11_NAME, "enabled": V11_AUTO_LEARNING_ENABLED,
+            "intervalSeconds": V11_AUTO_INTERVAL_SECONDS, "minimumNewObservations": V11_AUTO_MIN_NEW_OBSERVATIONS,
+            "minimumNewRichObservations": V11_AUTO_MIN_NEW_RICH_OBSERVATIONS,
+            "richEvidenceTarget": V11_RICH_TARGET_OBSERVATIONS,
+            "richEvidenceProgressPct": min(100.0, counts["richObservations"] / V11_RICH_TARGET_OBSERVATIONS * 100.0),
+            **counts, "learningRuns": int(history),
+            "state": None if not state else {"schemaVersion": state[0], "lastCheckedAt": state[1],
+                "lastAutomaticRunAt": state[2], "lastRunId": state[3], "lastObservations": state[4],
+                "lastRichObservations": state[5], "status": state[6], "reason": state[7], "error": state[8]},
+            "lastResult": v11_last_learning_result or None,
+            "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False}
+
+
+def v11_learning_history_payload(limit: int = 25) -> Dict[str, Any]:
+    _v11_ensure_tables(); limit = max(1, min(int(limit), 200)); conn = db_connect()
+    rows = conn.execute("""SELECT id,created_at,run_id,trigger_type,observations,rich_observations,new_observations,
+        new_rich_observations,validated_positive,validated_negative,status,reason FROM v11_learning_history
+        ORDER BY id DESC LIMIT ?""", (limit,)).fetchall(); conn.close()
+    cols = ["id","createdAt","runId","trigger","observations","richObservations","newObservations",
+            "newRichObservations","validatedPositive","validatedNegative","status","reason"]
+    return {"ok": True, "version": V11_VERSION, "count": len(rows),
+            "history": [dict(zip(cols,row)) for row in rows], "advisoryOnly": True}
+
+def v11_status_payload() -> Dict[str, Any]:
+    _v11_ensure_tables(); conn = db_connect()
+    runs = int(conn.execute("SELECT COUNT(*) FROM v11_discovery_runs WHERE status='COMPLETE'").fetchone()[0])
+    latest = conn.execute("""SELECT id,observations,rich_observations,candidates_tested,discoveries_found,
+                              validated_positive,validated_negative,completed_at FROM v11_discovery_runs
+                              WHERE status='COMPLETE' ORDER BY id DESC LIMIT 1""").fetchone()
+    horizons = _v10_available_horizons(conn); conn.close()
+    return {"ok": True, "version": V11_VERSION, "name": V11_NAME, "schemaVersion": V11_SCHEMA_VERSION,
+            "enabled": V11_ENABLED, "availableHorizons": horizons, "discoveryRuns": runs,
+            "latestRun": None if not latest else {"id": latest[0], "observations": latest[1],
+                "richObservations": latest[2], "candidatesTested": latest[3], "discoveriesFound": latest[4],
+                "validatedPositive": latest[5], "validatedNegative": latest[6], "completedAt": latest[7]},
+            "features": {"singleFactorDiscovery": True, "twoFactorInteractions": True,
+                         "threeFactorInteractions": True, "chronologicalValidation": True,
+                         "baselineLift": True, "lower95Expectancy": True, "stabilityScoring": True,
+                         "liveSymbolExplanation": True, "automaticLearning": True, "richEvidenceTracking": True,
+                         "thresholdTriggeredResearch": True, "learningHistory": True, "richCaptureAudit": True, "missingFieldDiagnostics": True, "pipelineReadiness": True, "captureRepair": True, "postWriteVerification": True, "endToEndCaptureTest": True, "unifiedDecisionPipeline": True, "decisionTrace": True, "writerAttribution": True, "shadowOnly": True},
+            "autoLearning": {"enabled": V11_AUTO_LEARNING_ENABLED, "intervalSeconds": V11_AUTO_INTERVAL_SECONDS,
+                             "minimumNewObservations": V11_AUTO_MIN_NEW_OBSERVATIONS,
+                             "minimumNewRichObservations": V11_AUTO_MIN_NEW_RICH_OBSERVATIONS,
+                             "richEvidenceTarget": V11_RICH_TARGET_OBSERVATIONS},
+            "advisoryOnly": True, "automaticLiveChanges": False, "automaticPromotion": False}
+
+
+@app.get('/v11/status')
+def api_v11_status(request: Request):
+    verify_api_key(request); return v11_status_payload()
+
+
+@app.post('/v11/discover')
+def api_v11_discover(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v11_run_discovery(int(payload.get('horizonHours') or V11_DEFAULT_HORIZON_HOURS),
+                             int(payload.get('minimumSamples') or V11_MIN_SAMPLES),
+                             int(payload.get('maxFactors') or 3))
+
+
+@app.get('/v11/report')
+def api_v11_report(request: Request, limit: int = 50, classification: Optional[str] = None):
+    verify_api_key(request); return v11_latest_report(limit, classification)
+
+
+@app.get('/v11/explain/{symbol}')
+def api_v11_explain(symbol: str, request: Request):
+    verify_api_key(request)
+    sym = str(symbol or '').upper().strip()
+    if not re.fullmatch(r'[A-Z.\-]{1,10}', sym):
+        raise HTTPException(status_code=400, detail='Invalid symbol')
+    return v11_explain_symbol(sym)
+
+
+@app.get('/v11/learning/status')
+def api_v11_learning_status(request: Request):
+    verify_api_key(request); return v11_learning_status_payload()
+
+
+@app.post('/v11/learning/run')
+def api_v11_learning_run(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request); return v11_learning_cycle('manual', bool(payload.get('force', True)))
+
+
+@app.get('/v11/learning/history')
+def api_v11_learning_history(request: Request, limit: int = 25):
+    verify_api_key(request); return v11_learning_history_payload(limit)
+
+
+# =========================
+# TRADEBOT V11.2 — RICH EVIDENCE PIPELINE GUARDIAN
+# Verifies live V9.2 capture quality and explains why evidence is not research-ready.
+# Shadow-only. It never changes trading decisions or historical snapshots.
+# =========================
+V112_CORE_RICH_FIELDS = (
+    "relative_volume", "gap_pct", "distance_vwap_pct", "ema20_distance_pct", "atr_pct"
+)
+V112_CONTEXT_FIELDS = (
+    "market_regime", "sector", "sector_strength", "day_range_position", "premarket_volume"
+)
+V112_MIN_CORE_FIELDS = max(2, min(int(os.getenv("V112_MIN_CORE_FIELDS", "4") or 4), len(V112_CORE_RICH_FIELDS)))
+V112_RECENT_HOURS = max(1, min(int(os.getenv("V112_RECENT_HOURS", "72") or 72), 720))
+
+
+def _v112_ensure_tables() -> None:
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_rich_capture_audit (
+        decision_id INTEGER PRIMARY KEY,
+        audited_at TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        source TEXT NOT NULL,
+        core_present INTEGER NOT NULL DEFAULT 0,
+        core_required INTEGER NOT NULL DEFAULT 4,
+        rich_ready INTEGER NOT NULL DEFAULT 0,
+        missing_fields_json TEXT NOT NULL,
+        present_fields_json TEXT NOT NULL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_rich_audit_ready ON v11_rich_capture_audit(rich_ready,audited_at)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_capture_verification (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        decision_id INTEGER,
+        symbol TEXT NOT NULL,
+        verification_type TEXT NOT NULL,
+        passed INTEGER NOT NULL DEFAULT 0,
+        core_present INTEGER NOT NULL DEFAULT 0,
+        missing_fields_json TEXT NOT NULL,
+        error TEXT,
+        payload_json TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_capture_verify_time ON v11_capture_verification(created_at)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v11_capture_tests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        passed INTEGER NOT NULL DEFAULT 0,
+        core_present INTEGER NOT NULL DEFAULT 0,
+        missing_fields_json TEXT NOT NULL,
+        relative_volume REAL, gap_pct REAL, distance_vwap_pct REAL, ema20_distance_pct REAL, atr_pct REAL,
+        payload_json TEXT NOT NULL
+    )""")
+    conn.commit(); conn.close()
+
+
+def _v112_present(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "unknown", "none", "null")
+    try:
+        return math.isfinite(float(value))
+    except Exception:
+        return True
+
+
+def _v112_audit_snapshot(conn, decision_id: int, symbol: str, source: str, fields: Dict[str, Any]) -> None:
+    core_present = [name for name in V112_CORE_RICH_FIELDS if _v112_present(fields.get(name))]
+    missing = [name for name in V112_CORE_RICH_FIELDS if name not in core_present]
+    contextual = [name for name in V112_CONTEXT_FIELDS if _v112_present(fields.get(name))]
+    present = core_present + contextual
+    ready = int(len(core_present) >= V112_MIN_CORE_FIELDS)
+    conn.execute("""INSERT OR REPLACE INTO v11_rich_capture_audit(
+        decision_id,audited_at,symbol,source,core_present,core_required,rich_ready,missing_fields_json,present_fields_json
+        ) VALUES(?,?,?,?,?,?,?,?,?)""",
+        (int(decision_id), datetime.now(UTC).isoformat(), str(symbol), str(source), len(core_present),
+         V112_MIN_CORE_FIELDS, ready, json.dumps(missing), json.dumps(present)))
+
+
+def _v113_verify_persisted_snapshot(conn, decision_id: int, symbol: str) -> Dict[str, Any]:
+    row = conn.execute("""SELECT relative_volume,gap_pct,distance_vwap_pct,ema20_distance_pct,atr_pct,payload_json
+        FROM v9_market_memory WHERE decision_id=?""", (int(decision_id),)).fetchone()
+    if not row:
+        result={"passed":False,"corePresent":0,"missingFields":list(V112_CORE_RICH_FIELDS),"error":"snapshot row missing after write"}
+    else:
+        values=dict(zip(V112_CORE_RICH_FIELDS,row[:5]))
+        present=[k for k,v in values.items() if _v112_present(v)]
+        missing=[k for k in V112_CORE_RICH_FIELDS if k not in present]
+        result={"passed":len(present)>=V112_MIN_CORE_FIELDS,"corePresent":len(present),"missingFields":missing,"error":None}
+    conn.execute("""INSERT INTO v11_capture_verification(created_at,decision_id,symbol,verification_type,passed,core_present,missing_fields_json,error,payload_json)
+        VALUES(?,?,?,?,?,?,?,?,?)""",(datetime.now(UTC).isoformat(),int(decision_id),str(symbol),"LIVE_POST_WRITE",int(result["passed"]),
+        int(result["corePresent"]),json.dumps(result["missingFields"]),result.get("error"),json.dumps(result,default=str)))
+    if not result["passed"]:
+        print(f"V11.3 RICH SNAPSHOT VERIFY FAILED {symbol} decision={decision_id} missing={','.join(result['missingFields'])}")
+    return result
+
+
+def _v113_capture_test(symbol: str) -> Dict[str, Any]:
+    _v9_ensure_tables(); _v112_ensure_tables()
+    sym=str(symbol or '').upper().strip()
+    if not re.fullmatch(r'[A-Z.\-]{1,10}',sym):
+        raise HTTPException(status_code=400,detail='Invalid symbol')
+    started=datetime.now(UTC)
+    try:
+        quote=get_quote(sym); price=float(quote.get('mid') or 0.0)
+        if price<=0: raise RuntimeError('No usable midpoint quote')
+        scan={"symbol":sym,"price":price,"confidence":0.5,"quality_score":0.0,"short_momentum":0.0,
+              "pullback":0.0,"spread":float(quote.get('spread') or 0.0),"ready_to_buy":False,"sniper_pass":False,"a_plus_pass":False}
+        enriched=_v91_enrich_scan(scan)
+        values={k:_v9_num(_v9_scan_value(enriched,k)) for k in V112_CORE_RICH_FIELDS}
+        present=[k for k,v in values.items() if _v112_present(v)]
+        missing=[k for k in V112_CORE_RICH_FIELDS if k not in present]
+        passed=len(present)>=V112_MIN_CORE_FIELDS
+        conn=db_connect()
+        cur=conn.execute("""INSERT INTO v11_capture_tests(created_at,symbol,passed,core_present,missing_fields_json,
+            relative_volume,gap_pct,distance_vwap_pct,ema20_distance_pct,atr_pct,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (started.isoformat(),sym,int(passed),len(present),json.dumps(missing),values.get('relative_volume'),values.get('gap_pct'),
+             values.get('distance_vwap_pct'),values.get('ema20_distance_pct'),values.get('atr_pct'),json.dumps(enriched,default=str)))
+        test_id=int(cur.lastrowid); conn.commit()
+        persisted=conn.execute("SELECT relative_volume,gap_pct,distance_vwap_pct,ema20_distance_pct,atr_pct FROM v11_capture_tests WHERE id=?",(test_id,)).fetchone()
+        conn.close()
+        persisted_values=dict(zip(V112_CORE_RICH_FIELDS,persisted)) if persisted else {}
+        persistence_ok=bool(persisted and all((persisted_values[k] is not None)==(values[k] is not None) for k in V112_CORE_RICH_FIELDS))
+        return {"ok":True,"version":V11_VERSION,"testId":test_id,"symbol":sym,"price":price,"passed":bool(passed and persistence_ok),
+                "intelligenceCaptured":passed,"persistenceVerified":persistence_ok,"corePresent":len(present),"coreRequired":V112_MIN_CORE_FIELDS,
+                "presentFields":present,"missingFields":missing,"values":values,"errors":{k:v for k,v in enriched.items() if str(k).endswith('_error')},
+                "contaminatedResearchData":False,"placedOrder":False}
+    except Exception as e:
+        conn=db_connect(); conn.execute("""INSERT INTO v11_capture_verification(created_at,decision_id,symbol,verification_type,passed,core_present,missing_fields_json,error,payload_json)
+            VALUES(?,?,?,?,0,0,?,?,?)""",(started.isoformat(),None,sym,"SYNTHETIC_END_TO_END",json.dumps(list(V112_CORE_RICH_FIELDS)),str(e)[:1000],json.dumps({"error":str(e)},default=str)))
+        conn.commit(); conn.close()
+        return {"ok":False,"version":V11_VERSION,"symbol":sym,"passed":False,"error":str(e),"placedOrder":False,"contaminatedResearchData":False}
+
+
+def _v112_backfill_audit(limit: int = 50000) -> Dict[str, int]:
+    _v112_ensure_tables(); limit=max(1,min(int(limit),100000)); conn=db_connect()
+    rows=conn.execute("""SELECT m.decision_id,m.symbol,m.source,m.relative_volume,m.gap_pct,m.distance_vwap_pct,
+        m.ema20_distance_pct,m.atr_pct,m.market_regime,m.sector,m.sector_strength,m.day_range_position,m.premarket_volume
+        FROM v9_market_memory m LEFT JOIN v11_rich_capture_audit a ON a.decision_id=m.decision_id
+        WHERE a.decision_id IS NULL ORDER BY m.decision_id DESC LIMIT ?""",(limit,)).fetchall()
+    for row in rows:
+        fields=dict(zip(("relative_volume","gap_pct","distance_vwap_pct","ema20_distance_pct","atr_pct",
+                         "market_regime","sector","sector_strength","day_range_position","premarket_volume"),row[3:]))
+        _v112_audit_snapshot(conn,int(row[0]),str(row[1]),str(row[2]),fields)
+    conn.commit(); conn.close(); return {"processed":len(rows)}
+
+
+def v112_pipeline_status(limit_examples: int = 10) -> Dict[str, Any]:
+    _v9_ensure_tables(); _v10_ensure_tables(); _v112_backfill_audit()
+    limit_examples=max(1,min(int(limit_examples),50)); conn=db_connect()
+    cutoff=(datetime.now(UTC)-timedelta(hours=V112_RECENT_HOURS)).isoformat()
+    total=int(conn.execute("SELECT COUNT(*) FROM v9_market_memory").fetchone()[0])
+    live=int(conn.execute("SELECT COUNT(*) FROM v9_market_memory WHERE source='live'").fetchone()[0])
+    recent_live=int(conn.execute("SELECT COUNT(*) FROM v9_market_memory WHERE source='live' AND captured_at>=?",(cutoff,)).fetchone()[0])
+    audited=int(conn.execute("SELECT COUNT(*) FROM v11_rich_capture_audit").fetchone()[0])
+    ready_all=int(conn.execute("SELECT COUNT(*) FROM v11_rich_capture_audit WHERE rich_ready=1").fetchone()[0])
+    ready_live=int(conn.execute("SELECT COUNT(*) FROM v11_rich_capture_audit WHERE rich_ready=1 AND source='live'").fetchone()[0])
+    ready_recent=int(conn.execute("SELECT COUNT(*) FROM v11_rich_capture_audit WHERE rich_ready=1 AND source='live' AND audited_at>=?",(cutoff,)).fetchone()[0])
+    completed_ready=int(conn.execute("""SELECT COUNT(*) FROM v11_rich_capture_audit a
+        JOIN v10_evidence_lineage l ON l.snapshot_id=a.decision_id
+        WHERE a.rich_ready=1 AND l.horizon_hours=? AND l.outcome_status='COMPLETE' AND l.net_return_pct IS NOT NULL""",
+        (V11_DEFAULT_HORIZON_HOURS,)).fetchone()[0])
+    pending_ready=int(conn.execute("""SELECT COUNT(*) FROM v11_rich_capture_audit a
+        JOIN v2_observation_outcomes o ON o.decision_id=a.decision_id
+        WHERE a.rich_ready=1 AND o.horizon_hours=? AND o.status='PENDING'""",(V11_DEFAULT_HORIZON_HOURS,)).fetchone()[0])
+    field_coverage={}
+    for field in V112_CORE_RICH_FIELDS + V112_CONTEXT_FIELDS:
+        if field in ("market_regime","sector"):
+            present=int(conn.execute(f"SELECT COUNT(*) FROM v9_market_memory WHERE source='live' AND {field} IS NOT NULL AND lower({field}) NOT IN ('','unknown')").fetchone()[0])
+        else:
+            present=int(conn.execute(f"SELECT COUNT(*) FROM v9_market_memory WHERE source='live' AND {field} IS NOT NULL").fetchone()[0])
+        field_coverage[field]={"present":present,"liveTotal":live,"coveragePct":round((present/live*100.0),2) if live else 0.0}
+    missing_counts={name:0 for name in V112_CORE_RICH_FIELDS}
+    for (payload,) in conn.execute("SELECT missing_fields_json FROM v11_rich_capture_audit WHERE source='live'").fetchall():
+        try:
+            for name in json.loads(payload or '[]'):
+                if name in missing_counts: missing_counts[name]+=1
+        except Exception: pass
+    examples=[]
+    rows=conn.execute("""SELECT a.decision_id,a.audited_at,a.symbol,a.core_present,a.core_required,a.missing_fields_json,
+        m.stage,m.decision,m.reason FROM v11_rich_capture_audit a JOIN v9_market_memory m ON m.decision_id=a.decision_id
+        WHERE a.source='live' AND a.rich_ready=0 ORDER BY a.decision_id DESC LIMIT ?""",(limit_examples,)).fetchall()
+    for r in rows:
+        examples.append({"decisionId":r[0],"auditedAt":r[1],"symbol":r[2],"corePresent":r[3],"coreRequired":r[4],
+                         "missingFields":json.loads(r[5] or '[]'),"stage":r[6],"decision":r[7],"reason":r[8]})
+    latest_live=conn.execute("SELECT MAX(captured_at) FROM v9_market_memory WHERE source='live'").fetchone()[0]
+    verification_total=int(conn.execute("SELECT COUNT(*) FROM v11_capture_verification WHERE verification_type='LIVE_POST_WRITE'").fetchone()[0])
+    verification_passed=int(conn.execute("SELECT COUNT(*) FROM v11_capture_verification WHERE verification_type='LIVE_POST_WRITE' AND passed=1").fetchone()[0])
+    latest_test=conn.execute("SELECT id,created_at,symbol,passed,core_present,missing_fields_json FROM v11_capture_tests ORDER BY id DESC LIMIT 1").fetchone()
+    _v114_ensure_tables()
+    trace_events=int(conn.execute("SELECT COUNT(*) FROM v11_decision_trace").fetchone()[0])
+    traced_decisions=int(conn.execute("SELECT COUNT(DISTINCT decision_id) FROM v11_decision_trace WHERE decision_id IS NOT NULL").fetchone()[0])
+    latest_trace=conn.execute("SELECT created_at,decision_id,symbol,writer,event,success FROM v11_decision_trace ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    if live == 0:
+        diagnosis="NO_LIVE_SNAPSHOTS"
+    elif recent_live == 0:
+        diagnosis="NO_RECENT_LIVE_DECISIONS"
+    elif ready_recent == 0:
+        diagnosis="RECENT_LIVE_SNAPSHOTS_MISSING_CORE_FIELDS"
+    elif completed_ready == 0 and pending_ready > 0:
+        diagnosis="RICH_SNAPSHOTS_WAITING_FOR_OUTCOMES"
+    elif completed_ready == 0:
+        diagnosis="RICH_SNAPSHOTS_NOT_LINKED_TO_COMPLETED_OUTCOMES"
+    else:
+        diagnosis="RICH_PIPELINE_OPERATIONAL"
+    return {"ok":True,"version":V11_VERSION,"name":V11_NAME,"schemaVersion":V11_SCHEMA_VERSION,
+            "diagnosis":diagnosis,"coreFields":list(V112_CORE_RICH_FIELDS),"minimumCoreFields":V112_MIN_CORE_FIELDS,
+            "recentWindowHours":V112_RECENT_HOURS,"snapshots":{"total":total,"live":live,"recentLive":recent_live,
+            "audited":audited,"richReadyAll":ready_all,"richReadyLive":ready_live,"richReadyRecent":ready_recent,
+            "richCompletedAtHorizon":completed_ready,"richPendingAtHorizon":pending_ready,"horizonHours":V11_DEFAULT_HORIZON_HOURS,
+            "latestLiveCapturedAt":latest_live},"fieldCoverage":field_coverage,"missingCoreFieldCounts":missing_counts,
+            "recentIncompleteExamples":examples,"captureVerification":{"total":verification_total,"passed":verification_passed,
+            "failed":verification_total-verification_passed,"passRatePct":round(verification_passed/verification_total*100.0,2) if verification_total else 0.0},
+            "latestEndToEndTest":None if not latest_test else {"id":latest_test[0],"createdAt":latest_test[1],"symbol":latest_test[2],
+            "passed":bool(latest_test[3]),"corePresent":latest_test[4],"missingFields":json.loads(latest_test[5] or '[]')},
+            "unifiedPipeline":{"traceEvents":trace_events,"tracedDecisions":traced_decisions,
+                "latestTrace":None if not latest_trace else {"createdAt":latest_trace[0],"decisionId":latest_trace[1],
+                    "symbol":latest_trace[2],"writer":latest_trace[3],"event":latest_trace[4],"success":bool(latest_trace[5])}},
+            "advisoryOnly":True,"automaticLiveChanges":False,"historicalSnapshotsRewritten":False}
+
+
+@app.get('/v11/pipeline/trace/{decision_id}')
+def api_v114_pipeline_trace(decision_id: int, request: Request):
+    verify_api_key(request)
+    if int(decision_id) <= 0:
+        raise HTTPException(status_code=400, detail='Invalid decision id')
+    return v114_trace_payload(int(decision_id))
+
+
+@app.get('/v11/pipeline/traces')
+def api_v114_pipeline_traces(request: Request, limit: int = 50):
+    verify_api_key(request)
+    return v114_recent_traces(limit)
+
+
+@app.get('/v11/pipeline/status')
+def api_v112_pipeline_status(request: Request, examples: int = 10):
+    verify_api_key(request); return v112_pipeline_status(examples)
+
+
+@app.post('/v11/pipeline/audit')
+def api_v112_pipeline_audit(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    result=_v112_backfill_audit(int(payload.get('limit') or 50000))
+    result.update(v112_pipeline_status(int(payload.get('examples') or 10)))
+    return result
+
+
+@app.post('/v11/pipeline/test')
+def api_v113_pipeline_test(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return _v113_capture_test(str(payload.get('symbol') or 'MSFT'))
+
+@app.get('/v11/pipeline/test/{symbol}')
+def api_v113_pipeline_test_get(symbol: str, request: Request):
+    verify_api_key(request)
+    return _v113_capture_test(symbol)
+
+
+# =========================
+# TRADEBOT V9.5 — SHADOW TRADING ENGINE
+# Research-only virtual trades for decisions that did not become live orders.
+# It reuses the existing forward outcome checkpoints and never submits an order.
+# =========================
+SHADOW_TRADE_NOTIONAL_GBP = max(1.0, float(os.getenv("SHADOW_TRADE_NOTIONAL_GBP", "100")))
+SHADOW_DECISIONS = ("BLOCKED", "REJECTED")
+
+
+def shadow_trading_summary(days: int = 30, horizon_hours: int = 24, notional_gbp: float = SHADOW_TRADE_NOTIONAL_GBP) -> Dict[str, Any]:
+    days = max(1, min(int(days), 3650))
+    horizon_hours = max(1, min(int(horizon_hours), 720))
+    notional_gbp = max(1.0, float(notional_gbp))
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+    try:
+        init_db()
+        conn = db_connect()
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        rows = conn.execute(
+            """SELECT d.id,d.timestamp,d.symbol,d.decision,d.stage,d.reason,d.price,
+                      d.confidence,d.quality,o.horizon_hours,o.status,o.outcome_price,
+                      o.return_pct,o.net_return_pct,o.evaluated_at
+               FROM v2_setup_decisions d
+               JOIN v2_observation_outcomes o ON o.decision_id=d.id
+               WHERE d.timestamp>=?
+                 AND d.decision IN ('BLOCKED','REJECTED')
+                 AND o.horizon_hours=?
+               ORDER BY d.id DESC""",
+            (cutoff, horizon_hours),
+        ).fetchall()
+        conn.close()
+        records = [dict(r) for r in rows]
+        complete = [r for r in records if r.get("status") == "COMPLETE" and r.get("net_return_pct") is not None]
+        pending = len(records) - len(complete)
+        returns = [float(r.get("net_return_pct") or 0.0) for r in complete]
+        wins = sum(1 for x in returns if x > 0)
+        losses = sum(1 for x in returns if x < 0)
+        breakeven = len(returns) - wins - losses
+        total_virtual_pnl = sum(notional_gbp * x / 100.0 for x in returns)
+        gross_profit = sum(notional_gbp * x / 100.0 for x in returns if x > 0)
+        gross_loss = abs(sum(notional_gbp * x / 100.0 for x in returns if x < 0))
+        by_decision = {}
+        by_stage = {}
+        for r in complete:
+            virtual_pnl = notional_gbp * float(r.get("net_return_pct") or 0.0) / 100.0
+            r["virtualNotionalGbp"] = round(notional_gbp, 2)
+            r["virtualPnlGbp"] = round(virtual_pnl, 2)
+            for bucket, key in ((by_decision, str(r.get("decision") or "UNKNOWN")), (by_stage, str(r.get("stage") or "UNKNOWN"))):
+                item = bucket.setdefault(key, {"samples": 0, "wins": 0, "virtualPnlGbp": 0.0, "returnSum": 0.0})
+                item["samples"] += 1
+                item["wins"] += int(float(r.get("net_return_pct") or 0.0) > 0)
+                item["virtualPnlGbp"] += virtual_pnl
+                item["returnSum"] += float(r.get("net_return_pct") or 0.0)
+        def finish(bucket):
+            result=[]
+            for name,item in bucket.items():
+                n=item["samples"]
+                result.append({"name":name,"samples":n,"wins":item["wins"],
+                    "winRate":round(item["wins"]/n,4) if n else 0.0,
+                    "averageReturnPct":round(item["returnSum"]/n,4) if n else 0.0,
+                    "virtualPnlGbp":round(item["virtualPnlGbp"],2)})
+            return sorted(result,key=lambda x:(-x["virtualPnlGbp"],-x["samples"],x["name"]))
+        best = sorted(complete, key=lambda r: float(r.get("net_return_pct") or 0.0), reverse=True)[:10]
+        worst = sorted(complete, key=lambda r: float(r.get("net_return_pct") or 0.0))[:10]
+        for group in (best, worst):
+            for r in group:
+                r["virtualNotionalGbp"] = round(notional_gbp,2)
+                r["virtualPnlGbp"] = round(notional_gbp*float(r.get("net_return_pct") or 0.0)/100.0,2)
+        return {
+            "ok": True,
+            "version": "V9.5",
+            "name": "Shadow Trading Engine",
+            "mode": "RESEARCH_ONLY",
+            "days": days,
+            "horizonHours": horizon_hours,
+            "virtualNotionalGbpPerTrade": round(notional_gbp,2),
+            "summary": {
+                "shadowTrades": len(records), "completed": len(complete), "pending": pending,
+                "wins": wins, "losses": losses, "breakeven": breakeven,
+                "winRate": round(wins/len(complete),4) if complete else 0.0,
+                "averageReturnPct": round(sum(returns)/len(returns),4) if returns else 0.0,
+                "virtualPnlGbp": round(total_virtual_pnl,2),
+                "grossVirtualProfitGbp": round(gross_profit,2),
+                "grossVirtualLossGbp": round(gross_loss,2),
+                "profitFactor": round(gross_profit/gross_loss,4) if gross_loss else (999.0 if gross_profit else 0.0),
+            },
+            "byDecision": finish(by_decision),
+            "byStage": finish(by_stage),
+            "bestMissedTrades": best,
+            "worstAvoidedTrades": worst,
+            "advisoryOnly": True,
+            "realOrdersPlaced": False,
+            "automaticLiveChanges": False,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "version": "V9.5"}
+
+
+def shadow_trading_recent(limit: int = 100, horizon_hours: int = 24, decision: str = "") -> Dict[str, Any]:
+    limit=max(1,min(int(limit),1000)); horizon_hours=max(1,min(int(horizon_hours),720))
+    decision=str(decision or "").upper().strip()
+    try:
+        init_db(); conn=db_connect()
+        params=[horizon_hours]
+        where="AND d.decision IN ('BLOCKED','REJECTED')"
+        if decision in SHADOW_DECISIONS:
+            where="AND d.decision=?"; params.append(decision)
+        params.append(limit)
+        rows=conn.execute(f"""SELECT d.id,d.timestamp,d.symbol,d.decision,d.stage,d.reason,d.price,
+            d.confidence,d.quality,o.status,o.horizon_hours,o.outcome_price,o.net_return_pct,o.due_at,o.evaluated_at
+            FROM v2_setup_decisions d JOIN v2_observation_outcomes o ON o.decision_id=d.id
+            WHERE o.horizon_hours=? {where} ORDER BY d.id DESC LIMIT ?""",tuple(params)).fetchall(); conn.close()
+        items=[]
+        for row in rows:
+            item=dict(row)
+            if item.get('net_return_pct') is not None:
+                item['virtualNotionalGbp']=round(SHADOW_TRADE_NOTIONAL_GBP,2)
+                item['virtualPnlGbp']=round(SHADOW_TRADE_NOTIONAL_GBP*float(item['net_return_pct'])/100.0,2)
+            items.append(item)
+        return {"ok":True,"version":"V9.5","count":len(items),"items":items,"realOrdersPlaced":False}
+    except Exception as e:
+        return {"ok":False,"error":str(e),"version":"V9.5"}
+
+
+def shadow_trading_run(evaluate_limit: int = 1000, horizon_hours: int = 24) -> Dict[str, Any]:
+    seeded=v2_seed_missing_outcomes(max(1,min(int(evaluate_limit)*10,50000)))
+    evaluation=v2_evaluate_due_outcomes(max(1,min(int(evaluate_limit),5000)))
+    return {"ok":bool(evaluation.get("ok",True)),"version":"V9.5","seededOutcomes":seeded,
+            "outcomeEvaluation":evaluation,"shadow":shadow_trading_summary(horizon_hours=horizon_hours),
+            "advisoryOnly":True,"realOrdersPlaced":False,"automaticLiveChanges":False}
+
+
+@app.get('/shadow-trading/summary')
+def api_shadow_trading_summary(request: Request, days: int = 30, horizon_hours: int = 24, notional_gbp: float = SHADOW_TRADE_NOTIONAL_GBP):
+    verify_api_key(request)
+    return shadow_trading_summary(days, horizon_hours, notional_gbp)
+
+
+@app.get('/shadow-trading/recent')
+def api_shadow_trading_recent(request: Request, limit: int = 100, horizon_hours: int = 24, decision: str = ''):
+    verify_api_key(request)
+    return shadow_trading_recent(limit, horizon_hours, decision)
+
+
+@app.post('/shadow-trading/run')
+def api_shadow_trading_run(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return shadow_trading_run(int(payload.get('evaluateLimit') or 1000), int(payload.get('horizonHours') or 24))
+
+# =========================
+# TRADEBOT V9.4 — AI ADVISOR DASHBOARD
+# Unified outcome-learning and evidence-based recommendations.
+# Advisory-only: it never changes live trading settings automatically.
+# =========================
+
+def ai_advisor_summary(limit: int = 10) -> Dict[str, Any]:
+    limit = max(1, min(int(limit), 50))
+    learning = v11_learning_status_payload()
+    report = v11_latest_report(limit=max(limit * 3, 30))
+    outcomes = v2_outcomes_summary()
+
+    discoveries = report.get("discoveries", []) if report.get("hasReport") else []
+    positive = [d for d in discoveries if d.get("classification") == "VALIDATED_POSITIVE"][:limit]
+    negative = [d for d in discoveries if d.get("classification") == "VALIDATED_NEGATIVE"][:limit]
+
+    completed = 0
+    pending = 0
+    try:
+        conn = db_connect()
+        completed = int(conn.execute(
+            "SELECT COUNT(*) FROM v2_observation_outcomes WHERE status='COMPLETE' AND net_return_pct IS NOT NULL"
+        ).fetchone()[0])
+        pending = int(conn.execute(
+            "SELECT COUNT(*) FROM v2_observation_outcomes WHERE status!='COMPLETE' OR net_return_pct IS NULL"
+        ).fetchone()[0])
+        conn.close()
+    except Exception:
+        pass
+
+    rich = int(learning.get("richObservations") or 0)
+    target = int(learning.get("richEvidenceTarget") or V11_RICH_TARGET_OBSERVATIONS)
+    validated = len(positive) + len(negative)
+
+    if completed < V11_MIN_SAMPLES:
+        readiness = "COLLECTING_OUTCOMES"
+        message = f"Collecting evidence: {completed}/{V11_MIN_SAMPLES} completed outcomes needed for a first reliable learning run."
+    elif rich < min(target, V11_MIN_SAMPLES):
+        readiness = "COLLECTING_RICH_EVIDENCE"
+        message = "Outcomes exist, but more market-context snapshots are needed before recommendations are reliable."
+    elif validated == 0:
+        readiness = "LEARNING_NO_VALIDATED_PATTERN_YET"
+        message = "The learner has enough data to test patterns, but none has passed validation yet."
+    else:
+        readiness = "RECOMMENDATIONS_AVAILABLE"
+        message = f"{validated} validated evidence pattern(s) are available for review."
+
+    return {
+        "ok": True,
+        "version": "V9.5",
+        "name": "AI Advisor + Shadow Trading",
+        "readiness": readiness,
+        "message": message,
+        "evidence": {
+            "completedOutcomes": completed,
+            "pendingOutcomes": pending,
+            "observations": int(learning.get("observations") or 0),
+            "richObservations": rich,
+            "richEvidenceTarget": target,
+            "richEvidenceProgressPct": float(learning.get("richEvidenceProgressPct") or 0.0),
+            "learningRuns": int(learning.get("learningRuns") or 0),
+            "validatedPositive": len(positive),
+            "validatedNegative": len(negative),
+        },
+        "recommendations": {
+            "favourablePatterns": positive,
+            "unfavourablePatterns": negative,
+        },
+        "strategyIntelligence": strategy_intelligence_summary(limit),
+        "learning": learning,
+        "outcomes": outcomes,
+        "shadowTrading": shadow_trading_summary(days=30, horizon_hours=24),
+        "advisoryOnly": True,
+        "automaticLiveChanges": False,
+        "requiresHumanApproval": True,
+    }
+
+
+def ai_advisor_run(force: bool = True, evaluate_limit: int = 500) -> Dict[str, Any]:
+    evaluation = v2_evaluate_due_outcomes(max(1, min(int(evaluate_limit), 5000)))
+    learning = v11_learning_cycle("manual", bool(force))
+    return {
+        "ok": bool(evaluation.get("ok", True) and learning.get("ok", True)),
+        "version": "V9.5",
+        "outcomeEvaluation": evaluation,
+        "learningRun": learning,
+        "advisor": ai_advisor_summary(),
+        "advisoryOnly": True,
+        "automaticLiveChanges": False,
+        "requiresHumanApproval": True,
+    }
+
+
+@app.get('/ai-advisor/summary')
+def api_ai_advisor_summary(request: Request, limit: int = 10):
+    verify_api_key(request)
+    return ai_advisor_summary(limit)
+
+
+@app.post('/ai-advisor/run')
+def api_ai_advisor_run(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return ai_advisor_run(
+        bool(payload.get('force', True)),
+        int(payload.get('evaluateLimit') or 500),
+    )
+
+
+
+# =========================
+# TRADEBOT V9.7 — EXPLAINABLE STRATEGY INTELLIGENCE
+# Converts validated discoveries into transparent, evidence-backed advisory cards.
+# Advisory-only: no live setting or trading rule is changed automatically.
+# =========================
+
+STRATEGY_INTELLIGENCE_NOTIONAL_GBP = max(1.0, float(os.getenv("STRATEGY_INTELLIGENCE_NOTIONAL_GBP", "100")))
+
+
+def _strategy_intelligence_period(horizon_hours: int) -> Dict[str, Any]:
+    """Return the actual observation period used by the latest evidence set."""
+    result = {"start": None, "end": None, "days": 0}
+    try:
+        conn = db_connect()
+        rows = _v11_load_rows(conn, int(horizon_hours))
+        conn.close()
+        stamps = [str(r.get("observed_at") or "") for r in rows if r.get("observed_at")]
+        if stamps:
+            start, end = min(stamps), max(stamps)
+            result["start"], result["end"] = start, end
+            try:
+                a = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                b = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                result["days"] = max(1, int((b - a).total_seconds() // 86400) + 1)
+            except Exception:
+                pass
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def _strategy_recommendation_confidence(item: Dict[str, Any]) -> float:
+    """Conservative 0-100 confidence based on validation size, stability and evidence strength."""
+    samples = max(0, int(item.get("samples") or 0))
+    validation = max(0, int(item.get("validationSamples") or 0))
+    stability = max(0.0, min(1.0, float(item.get("stabilityScore") or 0.0)))
+    score = abs(float(item.get("evidenceScore") or 0.0))
+    sample_component = min(1.0, (samples / 150.0) ** 0.5)
+    validation_component = min(1.0, (validation / 50.0) ** 0.5)
+    strength_component = min(1.0, score / 25.0)
+    confidence = 100.0 * (
+        0.25 * sample_component +
+        0.30 * validation_component +
+        0.30 * stability +
+        0.15 * strength_component
+    )
+    return round(max(0.0, min(99.0, confidence)), 1)
+
+
+def _strategy_action(item: Dict[str, Any]) -> Dict[str, str]:
+    dims = item.get("dimensions") or {}
+    classification = str(item.get("classification") or "")
+    label = " + ".join(str(v) for v in dims.values()) or str(item.get("name") or "pattern")
+    if classification == "VALIDATED_NEGATIVE":
+        return {
+            "action": "REQUIRE_STRONGER_ENTRY_OR_AVOID",
+            "headline": f"Reduce exposure to: {label}",
+            "suggestion": "Test a stricter confidence gate or exclusion for this setup in shadow mode before any live change.",
+        }
+    return {
+        "action": "FAVOUR_IN_SHADOW_TEST",
+        "headline": f"Favour in testing: {label}",
+        "suggestion": "Give this setup higher shadow priority and confirm it remains profitable before changing live rules.",
+    }
+
+
+def strategy_intelligence_recommendations(limit: int = 20) -> Dict[str, Any]:
+    limit = max(1, min(int(limit), 100))
+    report = v11_latest_report(limit=max(limit * 4, 100))
+    if not report.get("hasReport"):
+        return {
+            "ok": True, "version": "V9.7", "hasReport": False,
+            "message": "No completed discovery report is available yet.",
+            "recommendations": [], "advisoryOnly": True,
+            "automaticLiveChanges": False, "requiresHumanApproval": True,
+        }
+
+    run = report.get("run") or {}
+    period = _strategy_intelligence_period(int(run.get("horizonHours") or 24))
+    cards = []
+    for item in report.get("discoveries", []):
+        classification = str(item.get("classification") or "")
+        if classification not in ("VALIDATED_POSITIVE", "VALIDATED_NEGATIVE"):
+            continue
+        samples = int(item.get("samples") or 0)
+        validation_samples = int(item.get("validationSamples") or 0)
+        expectancy = float(item.get("expectancyPct") or 0.0)
+        baseline = float(item.get("baselineExpectancyPct") or 0.0)
+        lift = float(item.get("expectancyLiftPct") or (expectancy - baseline))
+        historical_effect = STRATEGY_INTELLIGENCE_NOTIONAL_GBP * samples * lift / 100.0
+        validation_effect = STRATEGY_INTELLIGENCE_NOTIONAL_GBP * validation_samples * float(item.get("validationExpectancyPct") or 0.0) / 100.0
+        action = _strategy_action(item)
+        cards.append({
+            "id": item.get("key"),
+            "classification": classification,
+            "rating": "FAVOURABLE" if classification == "VALIDATED_POSITIVE" else "UNFAVOURABLE",
+            **action,
+            "pattern": item.get("name"),
+            "dimensions": item.get("dimensions") or {},
+            "evidence": {
+                "samples": samples,
+                "wins": int(item.get("wins") or 0),
+                "losses": int(item.get("losses") or 0),
+                "winRate": float(item.get("winRate") or 0.0),
+                "expectancyPct": expectancy,
+                "profitFactor": float(item.get("profitFactor") or 0.0),
+                "medianReturnPct": float(item.get("medianReturnPct") or 0.0),
+                "validationSamples": validation_samples,
+                "validationWinRate": float(item.get("validationWinRate") or 0.0),
+                "validationExpectancyPct": float(item.get("validationExpectancyPct") or 0.0),
+                "validationProfitFactor": float(item.get("validationProfitFactor") or 0.0),
+                "stabilityScore": float(item.get("stabilityScore") or 0.0),
+            },
+            "period": period,
+            "estimatedEffect": {
+                "basis": f"£{STRATEGY_INTELLIGENCE_NOTIONAL_GBP:.2f} per historical observation",
+                "expectancyLiftPct": lift,
+                "historicalNetEffectGbp": round(historical_effect, 2),
+                "validationNetEffectGbp": round(validation_effect, 2),
+                "note": "This is a historical evidence estimate, not a forecast or guaranteed return.",
+            },
+            "recommendationConfidencePct": _strategy_recommendation_confidence(item),
+            "explanation": item.get("explanation"),
+            "requiresShadowTest": True,
+            "requiresHumanApproval": True,
+        })
+        if len(cards) >= limit:
+            break
+
+    cards.sort(key=lambda x: (x["classification"] == "VALIDATED_POSITIVE", x["recommendationConfidencePct"]), reverse=True)
+    return {
+        "ok": True,
+        "version": "V9.7",
+        "name": "Explainable Strategy Intelligence",
+        "hasReport": True,
+        "run": run,
+        "period": period,
+        "summary": {
+            "recommendations": len(cards),
+            "favourable": sum(1 for x in cards if x["classification"] == "VALIDATED_POSITIVE"),
+            "unfavourable": sum(1 for x in cards if x["classification"] == "VALIDATED_NEGATIVE"),
+            "minimumSamples": int(run.get("minimumSamples") or 0),
+        },
+        "recommendations": cards,
+        "advisoryOnly": True,
+        "automaticLiveChanges": False,
+        "requiresHumanApproval": True,
+    }
+
+
+def strategy_intelligence_summary(limit: int = 10) -> Dict[str, Any]:
+    data = strategy_intelligence_recommendations(limit)
+    recommendations = data.get("recommendations", [])
+    data["topFavourable"] = [x for x in recommendations if x.get("classification") == "VALIDATED_POSITIVE"][:5]
+    data["topUnfavourable"] = [x for x in recommendations if x.get("classification") == "VALIDATED_NEGATIVE"][:5]
+    return data
+
+
+@app.get('/strategy-intelligence/summary')
+def api_strategy_intelligence_summary(request: Request, limit: int = 10):
+    verify_api_key(request)
+    return strategy_intelligence_summary(limit)
+
+
+@app.get('/strategy-intelligence/recommendations')
+def api_strategy_intelligence_recommendations(request: Request, limit: int = 20):
+    verify_api_key(request)
+    return strategy_intelligence_recommendations(limit)
+
+
+# =========================
+# TRADEBOT V9.8 — WEAKNESS INTELLIGENCE ENGINE
+# Fast, read-only analytics for symbols, rejection rules and data quality.
+# It does not alter live gates, position limits, risk or order execution.
+# =========================
+WEAKNESS_INTELLIGENCE_NOTIONAL_GBP = max(
+    1.0, float(os.getenv("WEAKNESS_INTELLIGENCE_NOTIONAL_GBP", "100"))
+)
+
+
+def _wi_safe_div(numerator: float, denominator: float) -> float:
+    return float(numerator) / float(denominator) if denominator else 0.0
+
+
+def _wi_profit_factor(returns: List[float]) -> float:
+    gross_profit = sum(x for x in returns if x > 0)
+    gross_loss = abs(sum(x for x in returns if x < 0))
+    if gross_loss:
+        return gross_profit / gross_loss
+    return 999.0 if gross_profit else 0.0
+
+
+def _wi_symbol_status(samples: int, expectancy_pct: float, profit_factor: float, win_rate: float) -> str:
+    if samples < 5:
+        return "INSUFFICIENT_DATA"
+    if expectancy_pct <= -0.20 and profit_factor < 0.85:
+        return "WEAK"
+    if expectancy_pct < 0 or profit_factor < 1.0 or win_rate < 0.45:
+        return "UNDER_REVIEW"
+    if expectancy_pct >= 0.20 and profit_factor >= 1.20 and win_rate >= 0.52:
+        return "STRONG"
+    return "NEUTRAL"
+
+
+def symbol_intelligence(days: int = 180, horizon_hours: int = 24, minimum_samples: int = 5, limit: int = 100) -> Dict[str, Any]:
+    days = max(1, min(int(days), 3650))
+    horizon_hours = max(1, min(int(horizon_hours), 720))
+    minimum_samples = max(1, min(int(minimum_samples), 1000))
+    limit = max(1, min(int(limit), 1000))
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled", "version": "V9.8"}
+    try:
+        init_db()
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        conn = db_connect()
+        decision_rows = conn.execute(
+            """SELECT d.symbol,d.decision,d.stage,d.reason,o.net_return_pct
+               FROM v2_setup_decisions d
+               JOIN v2_observation_outcomes o ON o.decision_id=d.id
+               WHERE d.timestamp>=? AND o.horizon_hours=?
+                 AND o.status='COMPLETE' AND o.net_return_pct IS NOT NULL""",
+            (cutoff, horizon_hours),
+        ).fetchall()
+        live_rows = conn.execute(
+            """SELECT symbol,pnl_gbp,pnl_pct,timestamp
+               FROM closed_trades
+               WHERE timestamp>=? AND COALESCE(qty,0)>0""",
+            (cutoff,),
+        ).fetchall()
+        conn.close()
+
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for row in decision_rows:
+            symbol = str(row[0] or "").upper().strip()
+            if not symbol:
+                continue
+            item = buckets.setdefault(symbol, {
+                "symbol": symbol, "outcomes": [], "takenOutcomes": [], "shadowOutcomes": [],
+                "actualPnlGbp": [], "actualPnlPct": [], "decisions": {}, "reasons": {}
+            })
+            decision = str(row[1] or "UNKNOWN").upper()
+            reason = str(row[3] or row[2] or "UNKNOWN").strip()
+            value = float(row[4] or 0.0)
+            item["outcomes"].append(value)
+            if decision in ("BOUGHT", "APPROVED"):
+                item["takenOutcomes"].append(value)
+            elif decision in ("BLOCKED", "REJECTED"):
+                item["shadowOutcomes"].append(value)
+            item["decisions"][decision] = int(item["decisions"].get(decision, 0)) + 1
+            item["reasons"][reason] = int(item["reasons"].get(reason, 0)) + 1
+
+        for row in live_rows:
+            symbol = str(row[0] or "").upper().strip()
+            if not symbol:
+                continue
+            item = buckets.setdefault(symbol, {
+                "symbol": symbol, "outcomes": [], "takenOutcomes": [], "shadowOutcomes": [],
+                "actualPnlGbp": [], "actualPnlPct": [], "decisions": {}, "reasons": {}
+            })
+            if row[1] is not None:
+                item["actualPnlGbp"].append(float(row[1]))
+            if row[2] is not None:
+                item["actualPnlPct"].append(float(row[2]))
+
+        results = []
+        for symbol, item in buckets.items():
+            returns = item["outcomes"]
+            actual_pct = item["actualPnlPct"]
+            evidence_returns = actual_pct if actual_pct else returns
+            samples = len(evidence_returns)
+            wins = sum(1 for x in evidence_returns if x > 0)
+            losses = sum(1 for x in evidence_returns if x < 0)
+            expectancy = _wi_safe_div(sum(evidence_returns), samples)
+            win_rate = _wi_safe_div(wins, samples)
+            pf = _wi_profit_factor(evidence_returns)
+            status = _wi_symbol_status(samples, expectancy, pf, win_rate)
+            top_reasons = sorted(item["reasons"].items(), key=lambda x: (-x[1], x[0]))[:5]
+            suggestion = "Keep collecting evidence."
+            if status == "WEAK":
+                suggestion = "Shadow-test a higher confidence requirement or temporary exclusion; do not change live rules automatically."
+            elif status == "UNDER_REVIEW":
+                suggestion = "Require stronger evidence before prioritising this symbol."
+            elif status == "STRONG":
+                suggestion = "Retain current handling and confirm performance remains stable out-of-sample."
+            results.append({
+                "symbol": symbol,
+                "status": status,
+                "samples": samples,
+                "wins": wins,
+                "losses": losses,
+                "winRate": round(win_rate, 4),
+                "averageReturnPct": round(expectancy, 4),
+                "profitFactor": round(pf, 4),
+                "actualTrades": len(item["actualPnlGbp"]) or len(actual_pct),
+                "actualPnlGbp": round(sum(item["actualPnlGbp"]), 2),
+                "actualAverageReturnPct": round(_wi_safe_div(sum(actual_pct), len(actual_pct)), 4),
+                "decisionOutcomes": len(returns),
+                "takenOutcomeSamples": len(item["takenOutcomes"]),
+                "shadowOutcomeSamples": len(item["shadowOutcomes"]),
+                "decisionCounts": item["decisions"],
+                "topReasons": [{"reason": k, "count": v} for k, v in top_reasons],
+                "suggestion": suggestion,
+                "requiresShadowTest": status in ("WEAK", "UNDER_REVIEW"),
+                "requiresHumanApproval": True,
+            })
+
+        results.sort(key=lambda x: (
+            0 if x["status"] == "WEAK" else 1 if x["status"] == "UNDER_REVIEW" else 2,
+            x["averageReturnPct"], -x["samples"]
+        ))
+        eligible = [x for x in results if x["samples"] >= minimum_samples]
+        return {
+            "ok": True, "version": "V9.8", "name": "Symbol Intelligence",
+            "days": days, "horizonHours": horizon_hours, "minimumSamples": minimum_samples,
+            "summary": {
+                "symbols": len(results), "eligible": len(eligible),
+                "weak": sum(1 for x in eligible if x["status"] == "WEAK"),
+                "underReview": sum(1 for x in eligible if x["status"] == "UNDER_REVIEW"),
+                "strong": sum(1 for x in eligible if x["status"] == "STRONG"),
+            },
+            "symbols": results[:limit],
+            "advisoryOnly": True, "automaticLiveChanges": False, "requiresHumanApproval": True,
+        }
+    except Exception as exc:
+        return {"ok": False, "version": "V9.8", "error": str(exc)}
+
+
+def _wi_normalise_rule(stage: Any, reason: Any) -> str:
+    stage_text = str(stage or "UNKNOWN").strip().lower()
+    reason_text = str(reason or "UNKNOWN").strip().lower()
+    if "max positions" in reason_text or "position_limit" in stage_text:
+        return "MAX_POSITIONS"
+    if "confidence" in reason_text:
+        return "CONFIDENCE_GATE"
+    if "quality" in reason_text:
+        return "QUALITY_GATE"
+    if "momentum" in reason_text:
+        return "MOMENTUM_FILTER"
+    if "spread" in reason_text:
+        return "SPREAD_FILTER"
+    if "sample" in reason_text or stage_text.startswith("v2"):
+        return "V2_SAMPLE_GATE"
+    if "pullback" in reason_text:
+        return "PULLBACK_FILTER"
+    if "cooldown" in reason_text:
+        return "COOLDOWN"
+    if "sold today" in reason_text or "already traded" in reason_text:
+        return "DAILY_LOCKOUT"
+    return (str(stage or reason or "OTHER").upper().strip().replace(" ", "_"))[:80]
+
+
+def rule_intelligence(days: int = 180, horizon_hours: int = 24, minimum_samples: int = 20, limit: int = 100) -> Dict[str, Any]:
+    days = max(1, min(int(days), 3650))
+    horizon_hours = max(1, min(int(horizon_hours), 720))
+    minimum_samples = max(1, min(int(minimum_samples), 10000))
+    limit = max(1, min(int(limit), 1000))
+    try:
+        init_db()
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+        conn = db_connect()
+        rows = conn.execute(
+            """SELECT d.decision,d.stage,d.reason,d.symbol,o.net_return_pct
+               FROM v2_setup_decisions d
+               JOIN v2_observation_outcomes o ON o.decision_id=d.id
+               WHERE d.timestamp>=? AND d.decision IN ('BLOCKED','REJECTED')
+                 AND o.horizon_hours=? AND o.status='COMPLETE'
+                 AND o.net_return_pct IS NOT NULL""",
+            (cutoff, horizon_hours),
+        ).fetchall()
+        conn.close()
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            rule = _wi_normalise_rule(row[1], row[2])
+            item = buckets.setdefault(rule, {"returns": [], "symbols": {}, "reasons": {}, "decisions": {}})
+            value = float(row[4] or 0.0)
+            item["returns"].append(value)
+            symbol = str(row[3] or "UNKNOWN").upper()
+            reason = str(row[2] or "UNKNOWN")
+            decision = str(row[0] or "UNKNOWN").upper()
+            item["symbols"][symbol] = int(item["symbols"].get(symbol, 0)) + 1
+            item["reasons"][reason] = int(item["reasons"].get(reason, 0)) + 1
+            item["decisions"][decision] = int(item["decisions"].get(decision, 0)) + 1
+
+        results = []
+        for rule, item in buckets.items():
+            returns = item["returns"]
+            samples = len(returns)
+            missed_winners = sum(1 for x in returns if x > 0)
+            avoided_losers = sum(1 for x in returns if x < 0)
+            shadow_pnl = WEAKNESS_INTELLIGENCE_NOTIONAL_GBP * sum(returns) / 100.0
+            # A rejection rule adds value when rejected trades subsequently lose.
+            rule_net_benefit = -shadow_pnl
+            average_return = _wi_safe_div(sum(returns), samples)
+            helped_rate = _wi_safe_div(avoided_losers, samples)
+            rating = "INSUFFICIENT_DATA"
+            if samples >= minimum_samples:
+                if rule_net_benefit > 0 and helped_rate >= 0.52:
+                    rating = "HELPING"
+                elif rule_net_benefit < 0 and missed_winners > avoided_losers:
+                    rating = "HURTING"
+                else:
+                    rating = "MIXED"
+            confidence = min(99.0, 100.0 * min(1.0, (samples / max(50.0, minimum_samples * 2.0)) ** 0.5))
+            top_symbols = sorted(item["symbols"].items(), key=lambda x: (-x[1], x[0]))[:5]
+            top_reasons = sorted(item["reasons"].items(), key=lambda x: (-x[1], x[0]))[:5]
+            results.append({
+                "rule": rule, "rating": rating, "samples": samples,
+                "avoidedLosers": avoided_losers, "missedWinners": missed_winners,
+                "helpedRate": round(helped_rate, 4),
+                "rejectedTradeAverageReturnPct": round(average_return, 4),
+                "shadowPnlIfTakenGbp": round(shadow_pnl, 2),
+                "estimatedRuleNetBenefitGbp": round(rule_net_benefit, 2),
+                "evidenceConfidencePct": round(confidence, 1),
+                "decisionCounts": item["decisions"],
+                "topSymbols": [{"symbol": k, "count": v} for k, v in top_symbols],
+                "topReasons": [{"reason": k, "count": v} for k, v in top_reasons],
+                "interpretation": (
+                    "The rule appears to avoid more losses than gains." if rating == "HELPING" else
+                    "The rule appears to miss more profitable trades than losses it avoids." if rating == "HURTING" else
+                    "The evidence is mixed or still insufficient."
+                ),
+                "requiresShadowTest": rating == "HURTING",
+                "requiresHumanApproval": True,
+            })
+        results.sort(key=lambda x: (
+            0 if x["rating"] == "HURTING" else 1 if x["rating"] == "MIXED" else 2,
+            x["estimatedRuleNetBenefitGbp"], -x["samples"]
+        ))
+        eligible = [x for x in results if x["samples"] >= minimum_samples]
+        return {
+            "ok": True, "version": "V9.8", "name": "Rule Intelligence",
+            "days": days, "horizonHours": horizon_hours, "minimumSamples": minimum_samples,
+            "summary": {
+                "rules": len(results), "eligible": len(eligible),
+                "helping": sum(1 for x in eligible if x["rating"] == "HELPING"),
+                "hurting": sum(1 for x in eligible if x["rating"] == "HURTING"),
+                "mixed": sum(1 for x in eligible if x["rating"] == "MIXED"),
+            },
+            "rules": results[:limit],
+            "advisoryOnly": True, "automaticLiveChanges": False, "requiresHumanApproval": True,
+        }
+    except Exception as exc:
+        return {"ok": False, "version": "V9.8", "error": str(exc)}
+
+
+def weakness_intelligence_summary() -> Dict[str, Any]:
+    symbols = symbol_intelligence(days=180, horizon_hours=24, minimum_samples=5, limit=20)
+    rules = rule_intelligence(days=180, horizon_hours=24, minimum_samples=20, limit=20)
+    strategy = strategy_intelligence_summary(limit=10)
+    weak_symbols = [x for x in symbols.get("symbols", []) if x.get("status") in ("WEAK", "UNDER_REVIEW")][:5]
+    hurting_rules = [x for x in rules.get("rules", []) if x.get("rating") == "HURTING"][:5]
+    positive = int((strategy.get("summary") or {}).get("favourable") or 0)
+    negative = int((strategy.get("summary") or {}).get("unfavourable") or 0)
+    issues = []
+    if positive == 0 and negative > 0:
+        issues.append({
+            "area": "POSITIVE_PATTERN_DISCOVERY", "severity": "REVIEW",
+            "finding": f"The latest validated set contains {negative} negative patterns and no positive patterns.",
+            "action": "Keep live settings unchanged; inspect feature coverage and out-of-sample validation before relaxing thresholds."
+        })
+    if weak_symbols:
+        issues.append({
+            "area": "SYMBOL_PERFORMANCE", "severity": "REVIEW",
+            "finding": f"{len(weak_symbols)} weak or under-review symbols are visible in the current result window.",
+            "action": "Shadow-test symbol-specific confidence gates before any live exclusion."
+        })
+    if hurting_rules:
+        issues.append({
+            "area": "RULE_OPPORTUNITY_COST", "severity": "REVIEW",
+            "finding": f"{len(hurting_rules)} rules currently show negative historical net benefit.",
+            "action": "Run controlled shadow comparisons; do not remove gates during market hours."
+        })
+    return {
+        "ok": bool(symbols.get("ok") and rules.get("ok")), "version": "V9.8",
+        "name": "Weakness Intelligence Engine", "generatedAt": datetime.now(UTC).isoformat(),
+        "readiness": "READY_FOR_OBSERVATION",
+        "topWeakSymbols": weak_symbols,
+        "topHurtingRules": hurting_rules,
+        "issues": issues,
+        "symbolSummary": symbols.get("summary", {}),
+        "ruleSummary": rules.get("summary", {}),
+        "strategyValidation": {"positive": positive, "negative": negative},
+        "liveTradingChanged": False, "advisoryOnly": True,
+        "automaticLiveChanges": False, "requiresHumanApproval": True,
+    }
+
+
+@app.get('/symbol-intelligence/summary')
+def api_symbol_intelligence_summary(request: Request, days: int = 180, horizon_hours: int = 24, minimum_samples: int = 5, limit: int = 100):
+    verify_api_key(request)
+    return symbol_intelligence(days, horizon_hours, minimum_samples, limit)
+
+
+@app.get('/rule-intelligence/summary')
+def api_rule_intelligence_summary(request: Request, days: int = 180, horizon_hours: int = 24, minimum_samples: int = 20, limit: int = 100):
+    verify_api_key(request)
+    return rule_intelligence(days, horizon_hours, minimum_samples, limit)
+
+
+@app.get('/weakness-intelligence/summary')
+def api_weakness_intelligence_summary(request: Request):
+    verify_api_key(request)
+    return weakness_intelligence_summary()
+
+# =========================
+# TRADEBOT V9.6 — PERIODIC AI SUMMARY LOG
+# Read-only operational visibility. Never places orders or changes settings.
+# =========================
+
+def ai_periodic_summary_payload() -> Dict[str, Any]:
+    """Build a compact operational summary from persistent decision and outcome data."""
+    counts = {"total": 0, "approved": 0, "bought": 0, "blocked": 0, "rejected": 0}
+    try:
+        init_db()
+        conn = db_connect()
+        rows = conn.execute("""
+            SELECT UPPER(COALESCE(decision,'UNKNOWN')) AS decision_name, COUNT(*) AS decision_count
+            FROM v2_setup_decisions
+            WHERE date(timestamp) = date('now')
+            GROUP BY UPPER(COALESCE(decision,'UNKNOWN'))
+        """).fetchall()
+        conn.close()
+        for row in rows:
+            name = str(row[0] or "UNKNOWN").upper()
+            value = int(row[1] or 0)
+            counts["total"] += value
+            if name == "APPROVED": counts["approved"] = value
+            elif name == "BOUGHT": counts["bought"] = value
+            elif name == "BLOCKED": counts["blocked"] = value
+            elif name == "REJECTED": counts["rejected"] = value
+    except Exception as exc:
+        counts["decisionError"] = str(exc)
+
+    shadow = shadow_trading_summary(days=30, horizon_hours=24)
+    advisor = ai_advisor_summary(limit=5)
+    shadow_summary = shadow.get("summary", {}) if shadow.get("ok") else {}
+    evidence = advisor.get("evidence", {}) if advisor.get("ok") else {}
+    return {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "decisionsToday": counts,
+        "shadow": {
+            "completed": int(shadow_summary.get("completed") or 0),
+            "pending": int(shadow_summary.get("pending") or 0),
+            "winRate": float(shadow_summary.get("winRate") or 0.0),
+            "virtualPnlGbp": float(shadow_summary.get("virtualPnlGbp") or 0.0),
+        },
+        "advisor": {
+            "readiness": advisor.get("readiness", "UNKNOWN"),
+            "completedOutcomes": int(evidence.get("completedOutcomes") or 0),
+            "pendingOutcomes": int(evidence.get("pendingOutcomes") or 0),
+            "validatedPositive": int(evidence.get("validatedPositive") or 0),
+            "validatedNegative": int(evidence.get("validatedNegative") or 0),
+            "learningRuns": int(evidence.get("learningRuns") or 0),
+        },
+        "advisoryOnly": True,
+        "liveChanges": False,
+    }
+
+
+def ai_periodic_summary_worker() -> None:
+    time.sleep(AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            summary = ai_periodic_summary_payload()
+            d = summary["decisionsToday"]
+            sh = summary["shadow"]
+            adv = summary["advisor"]
+            print(
+                "AI ADVISOR SUMMARY | "
+                f"decisions_today={d.get('total',0)} "
+                f"approved={d.get('approved',0)} bought={d.get('bought',0)} "
+                f"blocked={d.get('blocked',0)} rejected={d.get('rejected',0)} | "
+                f"shadow_complete={sh.get('completed',0)} pending={sh.get('pending',0)} "
+                f"win_rate={sh.get('winRate',0.0):.1%} virtual_pnl=£{sh.get('virtualPnlGbp',0.0):.2f} | "
+                f"readiness={adv.get('readiness','UNKNOWN')} outcomes={adv.get('completedOutcomes',0)} "
+                f"validated=+{adv.get('validatedPositive',0)}/-{adv.get('validatedNegative',0)} "
+                f"learning_runs={adv.get('learningRuns',0)} live_changes=False"
+            )
+        except Exception as exc:
+            print(f"AI ADVISOR SUMMARY ERROR: {exc}")
+        time.sleep(AI_SUMMARY_LOG_INTERVAL_SECONDS)
+
+
+@app.get('/ai-advisor/periodic-summary')
+def api_ai_periodic_summary(request: Request):
+    verify_api_key(request)
+    return ai_periodic_summary_payload()
