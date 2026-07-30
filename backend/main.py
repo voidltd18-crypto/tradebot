@@ -11429,6 +11429,7 @@ def ai_advisor_summary(limit: int = 10) -> Dict[str, Any]:
             "favourablePatterns": positive,
             "unfavourablePatterns": negative,
         },
+        "strategyIntelligence": strategy_intelligence_summary(limit),
         "learning": learning,
         "outcomes": outcomes,
         "shadowTrading": shadow_trading_summary(days=30, horizon_hours=24),
@@ -11467,6 +11468,176 @@ def api_ai_advisor_run(request: Request, payload: Dict[str, Any] = Body(default=
         int(payload.get('evaluateLimit') or 500),
     )
 
+
+
+# =========================
+# TRADEBOT V9.7 — EXPLAINABLE STRATEGY INTELLIGENCE
+# Converts validated discoveries into transparent, evidence-backed advisory cards.
+# Advisory-only: no live setting or trading rule is changed automatically.
+# =========================
+
+STRATEGY_INTELLIGENCE_NOTIONAL_GBP = max(1.0, float(os.getenv("STRATEGY_INTELLIGENCE_NOTIONAL_GBP", "100")))
+
+
+def _strategy_intelligence_period(horizon_hours: int) -> Dict[str, Any]:
+    """Return the actual observation period used by the latest evidence set."""
+    result = {"start": None, "end": None, "days": 0}
+    try:
+        conn = db_connect()
+        rows = _v11_load_rows(conn, int(horizon_hours))
+        conn.close()
+        stamps = [str(r.get("observed_at") or "") for r in rows if r.get("observed_at")]
+        if stamps:
+            start, end = min(stamps), max(stamps)
+            result["start"], result["end"] = start, end
+            try:
+                a = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                b = datetime.fromisoformat(end.replace("Z", "+00:00"))
+                result["days"] = max(1, int((b - a).total_seconds() // 86400) + 1)
+            except Exception:
+                pass
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def _strategy_recommendation_confidence(item: Dict[str, Any]) -> float:
+    """Conservative 0-100 confidence based on validation size, stability and evidence strength."""
+    samples = max(0, int(item.get("samples") or 0))
+    validation = max(0, int(item.get("validationSamples") or 0))
+    stability = max(0.0, min(1.0, float(item.get("stabilityScore") or 0.0)))
+    score = abs(float(item.get("evidenceScore") or 0.0))
+    sample_component = min(1.0, (samples / 150.0) ** 0.5)
+    validation_component = min(1.0, (validation / 50.0) ** 0.5)
+    strength_component = min(1.0, score / 25.0)
+    confidence = 100.0 * (
+        0.25 * sample_component +
+        0.30 * validation_component +
+        0.30 * stability +
+        0.15 * strength_component
+    )
+    return round(max(0.0, min(99.0, confidence)), 1)
+
+
+def _strategy_action(item: Dict[str, Any]) -> Dict[str, str]:
+    dims = item.get("dimensions") or {}
+    classification = str(item.get("classification") or "")
+    label = " + ".join(str(v) for v in dims.values()) or str(item.get("name") or "pattern")
+    if classification == "VALIDATED_NEGATIVE":
+        return {
+            "action": "REQUIRE_STRONGER_ENTRY_OR_AVOID",
+            "headline": f"Reduce exposure to: {label}",
+            "suggestion": "Test a stricter confidence gate or exclusion for this setup in shadow mode before any live change.",
+        }
+    return {
+        "action": "FAVOUR_IN_SHADOW_TEST",
+        "headline": f"Favour in testing: {label}",
+        "suggestion": "Give this setup higher shadow priority and confirm it remains profitable before changing live rules.",
+    }
+
+
+def strategy_intelligence_recommendations(limit: int = 20) -> Dict[str, Any]:
+    limit = max(1, min(int(limit), 100))
+    report = v11_latest_report(limit=max(limit * 4, 100))
+    if not report.get("hasReport"):
+        return {
+            "ok": True, "version": "V9.7", "hasReport": False,
+            "message": "No completed discovery report is available yet.",
+            "recommendations": [], "advisoryOnly": True,
+            "automaticLiveChanges": False, "requiresHumanApproval": True,
+        }
+
+    run = report.get("run") or {}
+    period = _strategy_intelligence_period(int(run.get("horizonHours") or 24))
+    cards = []
+    for item in report.get("discoveries", []):
+        classification = str(item.get("classification") or "")
+        if classification not in ("VALIDATED_POSITIVE", "VALIDATED_NEGATIVE"):
+            continue
+        samples = int(item.get("samples") or 0)
+        validation_samples = int(item.get("validationSamples") or 0)
+        expectancy = float(item.get("expectancyPct") or 0.0)
+        baseline = float(item.get("baselineExpectancyPct") or 0.0)
+        lift = float(item.get("expectancyLiftPct") or (expectancy - baseline))
+        historical_effect = STRATEGY_INTELLIGENCE_NOTIONAL_GBP * samples * lift / 100.0
+        validation_effect = STRATEGY_INTELLIGENCE_NOTIONAL_GBP * validation_samples * float(item.get("validationExpectancyPct") or 0.0) / 100.0
+        action = _strategy_action(item)
+        cards.append({
+            "id": item.get("key"),
+            "classification": classification,
+            "rating": "FAVOURABLE" if classification == "VALIDATED_POSITIVE" else "UNFAVOURABLE",
+            **action,
+            "pattern": item.get("name"),
+            "dimensions": item.get("dimensions") or {},
+            "evidence": {
+                "samples": samples,
+                "wins": int(item.get("wins") or 0),
+                "losses": int(item.get("losses") or 0),
+                "winRate": float(item.get("winRate") or 0.0),
+                "expectancyPct": expectancy,
+                "profitFactor": float(item.get("profitFactor") or 0.0),
+                "medianReturnPct": float(item.get("medianReturnPct") or 0.0),
+                "validationSamples": validation_samples,
+                "validationWinRate": float(item.get("validationWinRate") or 0.0),
+                "validationExpectancyPct": float(item.get("validationExpectancyPct") or 0.0),
+                "validationProfitFactor": float(item.get("validationProfitFactor") or 0.0),
+                "stabilityScore": float(item.get("stabilityScore") or 0.0),
+            },
+            "period": period,
+            "estimatedEffect": {
+                "basis": f"£{STRATEGY_INTELLIGENCE_NOTIONAL_GBP:.2f} per historical observation",
+                "expectancyLiftPct": lift,
+                "historicalNetEffectGbp": round(historical_effect, 2),
+                "validationNetEffectGbp": round(validation_effect, 2),
+                "note": "This is a historical evidence estimate, not a forecast or guaranteed return.",
+            },
+            "recommendationConfidencePct": _strategy_recommendation_confidence(item),
+            "explanation": item.get("explanation"),
+            "requiresShadowTest": True,
+            "requiresHumanApproval": True,
+        })
+        if len(cards) >= limit:
+            break
+
+    cards.sort(key=lambda x: (x["classification"] == "VALIDATED_POSITIVE", x["recommendationConfidencePct"]), reverse=True)
+    return {
+        "ok": True,
+        "version": "V9.7",
+        "name": "Explainable Strategy Intelligence",
+        "hasReport": True,
+        "run": run,
+        "period": period,
+        "summary": {
+            "recommendations": len(cards),
+            "favourable": sum(1 for x in cards if x["classification"] == "VALIDATED_POSITIVE"),
+            "unfavourable": sum(1 for x in cards if x["classification"] == "VALIDATED_NEGATIVE"),
+            "minimumSamples": int(run.get("minimumSamples") or 0),
+        },
+        "recommendations": cards,
+        "advisoryOnly": True,
+        "automaticLiveChanges": False,
+        "requiresHumanApproval": True,
+    }
+
+
+def strategy_intelligence_summary(limit: int = 10) -> Dict[str, Any]:
+    data = strategy_intelligence_recommendations(limit)
+    recommendations = data.get("recommendations", [])
+    data["topFavourable"] = [x for x in recommendations if x.get("classification") == "VALIDATED_POSITIVE"][:5]
+    data["topUnfavourable"] = [x for x in recommendations if x.get("classification") == "VALIDATED_NEGATIVE"][:5]
+    return data
+
+
+@app.get('/strategy-intelligence/summary')
+def api_strategy_intelligence_summary(request: Request, limit: int = 10):
+    verify_api_key(request)
+    return strategy_intelligence_summary(limit)
+
+
+@app.get('/strategy-intelligence/recommendations')
+def api_strategy_intelligence_recommendations(request: Request, limit: int = 20):
+    verify_api_key(request)
+    return strategy_intelligence_recommendations(limit)
 
 # =========================
 # TRADEBOT V9.6 — PERIODIC AI SUMMARY LOG
