@@ -13937,3 +13937,333 @@ def api_v12_ceo_constitution(request: Request):
             "Record executive reviews and recommendations in an auditable journal.",
         ],
     }
+
+
+# ============================================================
+# TRADEBOT V12.1 — AI BOARD OF DIRECTORS
+# Automatic, evidence-backed governance above the CEO layer.
+# Advisory-only: the board cannot place orders or alter live settings.
+# ============================================================
+V12_BOARD_VERSION = "V12.1"
+V12_BOARD_ENABLED = os.getenv("V12_BOARD_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+V12_BOARD_INTERVAL_SECONDS = max(300, int(os.getenv("V12_BOARD_INTERVAL_SECONDS", "1800") or 1800))
+V12_BOARD_STARTUP_DELAY_SECONDS = max(20, int(os.getenv("V12_BOARD_STARTUP_DELAY_SECONDS", "75") or 75))
+v12_board_thread_started = False
+
+
+def _v121_board_ensure_tables() -> None:
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v121_board_meetings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        meeting_type TEXT NOT NULL,
+        final_decision TEXT NOT NULL,
+        final_reason TEXT NOT NULL,
+        risk_level TEXT,
+        ceo_grade REAL NOT NULL DEFAULT 0,
+        payload_json TEXT NOT NULL
+    )""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_v121_board_meetings_time
+                    ON v121_board_meetings(created_at DESC)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v121_board_votes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        meeting_id INTEGER NOT NULL,
+        director TEXT NOT NULL,
+        vote TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0,
+        reason TEXT NOT NULL,
+        evidence_json TEXT,
+        FOREIGN KEY(meeting_id) REFERENCES v121_board_meetings(id)
+    )""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_v121_board_votes_meeting
+                    ON v121_board_votes(meeting_id, id)""")
+    conn.commit()
+    conn.close()
+
+
+def _v121_vote(director: str, vote: str, confidence: float, reason: str,
+               evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        "director": director,
+        "vote": vote,
+        "confidence": round(max(0.0, min(1.0, _v12_num(confidence))), 3),
+        "reason": str(reason),
+        "evidence": evidence or {},
+    }
+
+
+def _v121_director_votes(ceo: Dict[str, Any]) -> List[Dict[str, Any]]:
+    risk = str(ceo.get("riskLevel") or "MODERATE").upper()
+    health = first_object = ceo.get("health") if isinstance(ceo.get("health"), dict) else {}
+    learning = ceo.get("learning") if isinstance(ceo.get("learning"), dict) else {}
+    evolution = ceo.get("evolution") if isinstance(ceo.get("evolution"), dict) else {}
+    performance = ceo.get("performance") if isinstance(ceo.get("performance"), dict) else {}
+    account = ceo.get("account") if isinstance(ceo.get("account"), dict) else {}
+
+    grade = _v12_num(ceo.get("grade"))
+    today_pnl = _v12_num(account.get("todayRealisedPnl"))
+    pf = _v12_num(performance.get("profitFactor"))
+    closed = int(performance.get("closedTrades") or 0)
+    completed = int(learning.get("completedOutcomes") or 0)
+    ready = int(learning.get("readyOutcomes") or 0)
+    errors = int(learning.get("outcomeErrors") or 0)
+    calibration = _v12_num(learning.get("confidenceCalibration"))
+    mode = str(evolution.get("mode") or "OFF").upper()
+    stable = int(evolution.get("stableRuns") or 0)
+    required = max(1, int(evolution.get("requiredStableRuns") or 1))
+    stability = _v12_num(health.get("stability"), 50.0)
+
+    votes: List[Dict[str, Any]] = []
+
+    if risk == "HIGH" or bool(ceo.get("manualActionRequired")):
+        votes.append(_v121_vote("Risk Director", "VETO", 0.98,
+            "Capital protection conditions are active; no expansion or promotion should proceed.",
+            {"riskLevel": risk, "todayRealisedPnl": today_pnl, "manualActionRequired": ceo.get("manualActionRequired")}))
+    elif risk == "MODERATE":
+        votes.append(_v121_vote("Risk Director", "CAUTION", 0.82,
+            "Risk is moderate. Continue only inside current exposure and loss limits.",
+            {"riskLevel": risk, "todayRealisedPnl": today_pnl}))
+    else:
+        votes.append(_v121_vote("Risk Director", "APPROVE", 0.9,
+            "No elevated capital-protection trigger is active.",
+            {"riskLevel": risk, "todayRealisedPnl": today_pnl}))
+
+    if completed >= 500 and calibration >= 0.70 and errors == 0:
+        votes.append(_v121_vote("Research Director", "APPROVE", 0.9,
+            "The evidence base and confidence calibration are sufficient for continued autonomous research.",
+            {"completedOutcomes": completed, "confidenceCalibration": calibration, "outcomeErrors": errors}))
+    elif completed >= 150 and errors <= 5:
+        votes.append(_v121_vote("Research Director", "WAIT", 0.72,
+            "Useful evidence exists, but additional mature outcomes are required before stronger conclusions.",
+            {"completedOutcomes": completed, "confidenceCalibration": calibration, "readyOutcomes": ready, "outcomeErrors": errors}))
+    else:
+        votes.append(_v121_vote("Research Director", "WAIT", 0.88,
+            "The evidence base is not yet mature enough for a board-level promotion decision.",
+            {"completedOutcomes": completed, "confidenceCalibration": calibration, "outcomeErrors": errors}))
+
+    if errors > 0 or stability < 70:
+        votes.append(_v121_vote("Execution Director", "WAIT", 0.9,
+            "Operational reliability must improve before execution-related changes are endorsed.",
+            {"stabilityScore": stability, "outcomeErrors": errors, "readyOutcomes": ready}))
+    elif ready > 500:
+        votes.append(_v121_vote("Execution Director", "CAUTION", 0.78,
+            "The outcome-processing backlog is elevated; retain current execution controls while it drains.",
+            {"stabilityScore": stability, "readyOutcomes": ready}))
+    else:
+        votes.append(_v121_vote("Execution Director", "APPROVE", 0.84,
+            "Execution and evidence-processing health are within acceptable limits.",
+            {"stabilityScore": stability, "readyOutcomes": ready, "outcomeErrors": errors}))
+
+    if V12_CEO_ADVISORY_ONLY:
+        votes.append(_v121_vote("Compliance Director", "APPROVE", 1.0,
+            "The CEO and board remain advisory-only and cannot bypass existing trading safeguards.",
+            {"ceoAdvisoryOnly": V12_CEO_ADVISORY_ONLY, "boardAdvisoryOnly": True}))
+    else:
+        votes.append(_v121_vote("Compliance Director", "VETO", 1.0,
+            "The CEO layer is not advisory-only; board approval is withheld until governance is restored.",
+            {"ceoAdvisoryOnly": V12_CEO_ADVISORY_ONLY}))
+
+    if mode == "AUTO" and stable >= required and grade >= 70:
+        votes.append(_v121_vote("Evolution Director", "APPROVE", 0.88,
+            "The autonomous operator is active and has met its stability requirement.",
+            {"mode": mode, "stableRuns": stable, "requiredStableRuns": required, "ceoGrade": grade}))
+    elif mode in ("AUTO", "SHADOW"):
+        votes.append(_v121_vote("Evolution Director", "WAIT", 0.86,
+            "Evolution should continue observing until all stability requirements are met.",
+            {"mode": mode, "stableRuns": stable, "requiredStableRuns": required, "ceoGrade": grade}))
+    else:
+        votes.append(_v121_vote("Evolution Director", "WAIT", 0.95,
+            "Autonomous evolution is not active, so no promotion can be endorsed.",
+            {"mode": mode, "stableRuns": stable, "requiredStableRuns": required}))
+
+    if risk == "HIGH":
+        votes.append(_v121_vote("Chief Executive", "VETO", 0.97,
+            "The executive recommendation is capital protection rather than expansion.",
+            {"ceoRecommendation": ceo.get("recommendation"), "ceoGrade": grade}))
+    elif grade >= 75 and mode == "AUTO":
+        votes.append(_v121_vote("Chief Executive", "APPROVE", 0.9,
+            "Company health supports continued autonomous supervision within existing bounds.",
+            {"ceoRecommendation": ceo.get("recommendation"), "ceoGrade": grade, "mode": mode, "profitFactor": pf, "closedTrades": closed}))
+    else:
+        votes.append(_v121_vote("Chief Executive", "WAIT", 0.8,
+            "Continue collecting evidence without expanding authority or risk.",
+            {"ceoRecommendation": ceo.get("recommendation"), "ceoGrade": grade, "mode": mode, "profitFactor": pf, "closedTrades": closed}))
+    return votes
+
+
+def v121_board_build_meeting(meeting_type: str = "AUTOMATIC", persist: bool = True) -> Dict[str, Any]:
+    meeting_type = str(meeting_type or "AUTOMATIC").upper()
+    ceo = v12_ceo_status(False, 0)
+    votes = _v121_director_votes(ceo)
+    vote_names = [str(v.get("vote") or "WAIT").upper() for v in votes]
+
+    if "VETO" in vote_names:
+        final_decision = "VETO"
+        vetoes = [v["director"] for v in votes if v["vote"] == "VETO"]
+        final_reason = f"Board veto issued by {', '.join(vetoes)}. Existing safeguards remain unchanged."
+    elif vote_names.count("WAIT") + vote_names.count("CAUTION") >= 2:
+        final_decision = "DELAY"
+        final_reason = "The board requires more evidence or improved operating conditions before endorsing change."
+    else:
+        final_decision = "APPROVE CONTINUATION"
+        final_reason = "The board approves continued operation under the current bounded configuration; no new authority is granted."
+
+    confidence = round(sum(_v12_num(v.get("confidence")) for v in votes) / max(1, len(votes)), 3)
+    now = datetime.now(UTC)
+    payload = {
+        "ok": True,
+        "version": V12_BOARD_VERSION,
+        "enabled": V12_BOARD_ENABLED,
+        "advisoryOnly": True,
+        "createdAt": now.isoformat(),
+        "meetingType": meeting_type,
+        "finalDecision": final_decision,
+        "finalReason": final_reason,
+        "confidence": confidence,
+        "riskLevel": ceo.get("riskLevel"),
+        "ceoGrade": ceo.get("grade"),
+        "ceoGradeLetter": ceo.get("gradeLetter"),
+        "votes": votes,
+        "consensus": {
+            "approve": sum(1 for v in vote_names if v == "APPROVE"),
+            "wait": sum(1 for v in vote_names if v == "WAIT"),
+            "caution": sum(1 for v in vote_names if v == "CAUTION"),
+            "veto": sum(1 for v in vote_names if v == "VETO"),
+            "total": len(votes),
+        },
+        "nextAction": (
+            "Protect capital and investigate the veto condition."
+            if final_decision == "VETO" else
+            "Continue evidence collection; the board will review automatically."
+            if final_decision == "DELAY" else
+            "Continue the current bounded autonomous configuration."
+        ),
+    }
+
+    if persist and SQLITE_ENABLED:
+        _v121_board_ensure_tables()
+        conn = db_connect()
+        cur = conn.execute("""INSERT INTO v121_board_meetings
+            (created_at,meeting_type,final_decision,final_reason,risk_level,ceo_grade,payload_json)
+            VALUES(?,?,?,?,?,?,?)""", (
+            now.isoformat(), meeting_type, final_decision, final_reason,
+            str(ceo.get("riskLevel") or ""), _v12_num(ceo.get("grade")),
+            json.dumps(payload, default=str),
+        ))
+        meeting_id = int(cur.lastrowid)
+        for vote in votes:
+            conn.execute("""INSERT INTO v121_board_votes
+                (meeting_id,director,vote,confidence,reason,evidence_json)
+                VALUES(?,?,?,?,?,?)""", (
+                meeting_id, vote["director"], vote["vote"], vote["confidence"],
+                vote["reason"], json.dumps(vote.get("evidence") or {}, default=str),
+            ))
+        conn.commit()
+        conn.close()
+        payload["meetingId"] = meeting_id
+        _v12_journal_write(
+            "BOARD", f"AI Board decision: {final_decision}", final_reason,
+            "WARNING" if final_decision == "VETO" else "INFO",
+            f"BOARD:{now.strftime('%Y-%m-%dT%H')}",
+            {"meetingId": meeting_id, "decision": final_decision, "consensus": payload["consensus"]},
+        )
+    return payload
+
+
+def v121_board_status() -> Dict[str, Any]:
+    latest = None
+    if SQLITE_ENABLED:
+        _v121_board_ensure_tables()
+        conn = db_connect()
+        row = conn.execute("SELECT payload_json FROM v121_board_meetings ORDER BY id DESC LIMIT 1").fetchone()
+        conn.close()
+        if row and row[0]:
+            try:
+                latest = json.loads(row[0])
+            except Exception:
+                latest = None
+    if not latest:
+        latest = v121_board_build_meeting("STARTUP", persist=True)
+    latest["enabled"] = V12_BOARD_ENABLED
+    latest["advisoryOnly"] = True
+    return latest
+
+
+def v121_board_history(limit: int = 50) -> List[Dict[str, Any]]:
+    if not SQLITE_ENABLED:
+        return []
+    _v121_board_ensure_tables()
+    limit = max(1, min(int(limit), 500))
+    conn = db_connect()
+    rows = conn.execute("""SELECT id,created_at,meeting_type,final_decision,
+        final_reason,risk_level,ceo_grade FROM v121_board_meetings
+        ORDER BY id DESC LIMIT ?""", (limit,)).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def _v121_board_worker() -> None:
+    time.sleep(V12_BOARD_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            market = get_market_status_payload()
+            meeting_type = "MARKET_OPEN" if market.get("isOpen") else "CLOSED_MARKET"
+            result = v121_board_build_meeting(meeting_type, persist=True)
+            print(f"V12.1 BOARD | {result.get('finalDecision')} confidence={result.get('confidence')} votes={result.get('consensus')}")
+        except Exception as exc:
+            print(f"V12.1 BOARD WORKER ERROR: {exc}")
+        time.sleep(V12_BOARD_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+def v121_board_startup_event():
+    global v12_board_thread_started
+    if not V12_BOARD_ENABLED:
+        return
+    _v121_board_ensure_tables()
+    if not v12_board_thread_started:
+        v12_board_thread_started = True
+        threading.Thread(target=_v121_board_worker, daemon=True).start()
+        print("V12.1 BOARD | enabled advisory_only=True automatic_reviews=True")
+
+
+@app.get("/v12/board/status")
+def api_v121_board_status(request: Request):
+    verify_api_key(request)
+    return v121_board_status()
+
+
+@app.get("/v12/board/history")
+def api_v121_board_history(request: Request, limit: int = 50):
+    verify_api_key(request)
+    items = v121_board_history(limit)
+    return {"ok": True, "version": V12_BOARD_VERSION, "count": len(items), "items": items}
+
+
+@app.get("/v12/board/constitution")
+def api_v121_board_constitution(request: Request):
+    verify_api_key(request)
+    return {
+        "ok": True,
+        "version": V12_BOARD_VERSION,
+        "advisoryOnly": True,
+        "automaticReviews": True,
+        "directors": [
+            "Chief Executive",
+            "Risk Director",
+            "Research Director",
+            "Execution Director",
+            "Compliance Director",
+            "Evolution Director",
+        ],
+        "rules": [
+            "Any Risk or Compliance veto overrides all approvals.",
+            "The board cannot place, cancel or alter orders.",
+            "The board cannot bypass the bounded autonomous operator.",
+            "Insufficient evidence results in DELAY, not forced approval.",
+            "Every meeting and director vote is persisted for audit.",
+            "Reviews run automatically; no manual review is required.",
+        ],
+    }
