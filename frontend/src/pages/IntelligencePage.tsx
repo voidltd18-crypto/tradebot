@@ -17,7 +17,7 @@ import { API_URL, readJson } from "../lib/api";
 import { clamp } from "../lib/format";
 import type { AnyObj } from "../lib/types";
 
-type IntelligenceSection = "brain" | "market" | "research" | "symbols" | "rules";
+type IntelligenceSection = "brain" | "market" | "research" | "symbols" | "rules" | "evolution";
 
 type EndpointState = {
   data: AnyObj;
@@ -188,6 +188,43 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         ? "READY FOR CLOSED-MARKET APPLY"
         : "COLLECTING STABLE EVIDENCE";
   const operatorLastRun = operator.lastRunAt ? new Date(String(operator.lastRunAt)).toLocaleString("en-GB") : "Not run yet";
+  const operatorHistory = firstArray(operator.history);
+  const evolutionActions = [...operatorHistory].reverse().map((row, index) => {
+    const before = firstObject(row.before);
+    const after = firstObject(row.after);
+    const proposal = firstObject(row.proposal);
+    const changed = firstObject(proposal.changed);
+    const derivedChanged = Object.keys(changed).length ? changed : Object.fromEntries(
+      Object.keys(after).filter((key) => JSON.stringify(before[key]) !== JSON.stringify(after[key])).map((key) => [key, { before: before[key], after: after[key] }])
+    );
+    return {
+      ...row,
+      id: row.id,
+      generation: index + 1,
+      before,
+      after,
+      proposal,
+      changed: derivedChanged,
+      equity: num(row.account_equity ?? row.accountEquity),
+      samples: num(row.evidence_samples ?? row.evidenceSamples),
+      createdAt: text(row.created_at ?? row.createdAt, ""),
+      actionType: text(row.action_type ?? row.actionType, "UNKNOWN"),
+      status: text(row.status, "UNKNOWN"),
+      reason: text(row.reason ?? row.note, "No reason recorded."),
+    };
+  });
+  const promotionActions = evolutionActions.filter((row) => row.actionType.includes("PROMOTION"));
+  const currentGeneration = Math.max(1, promotionActions.length + 1);
+  const evolutionChartRows = evolutionActions.filter((row) => row.equity > 0).map((row) => ({
+    name: `G${row.generation}`,
+    equity: row.equity,
+    samples: row.samples,
+    action: keyLabel(row.actionType),
+  }));
+  const evolutionLessons = Array.from(new Set([
+    ...operatorReasons,
+    ...evolutionActions.slice(-8).flatMap((row) => String(row.reason || "").split(";").map((item) => item.trim()).filter(Boolean)),
+  ])).slice(0, 10);
   const promotionLatest = firstObject(promotion.latest);
   const promotionCandidate = firstObject(promotionLatest.candidate, promotionLatest.payload?.candidate);
   const promotionOptimizer = firstObject(promotionLatest.optimizer, promotionLatest.payload?.optimizer);
@@ -303,7 +340,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     </Card>
 
     <nav className="intelligence-tabs">
-      {(["brain", "market", "research", "symbols", "rules"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "brain" ? "AI BRAIN" : item.toUpperCase()}</button>)}
+      {(["brain", "market", "research", "symbols", "rules", "evolution"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "brain" ? "AI BRAIN" : item.toUpperCase()}</button>)}
     </nav>
 
     {section === "brain" && <div className="grid two">
@@ -504,6 +541,52 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           { key: "bestRegime", label: "Best Regime", render: (row) => text(row.status, "Learning") },
           { key: "confidence", label: "Confidence", render: (row) => `${Math.round(num(row.samples) ? Math.min(99, Math.sqrt(num(row.samples) / 50) * 100) : 0)}%` },
         ]} />
+      </Card>
+    </div>}
+
+    {section === "evolution" && <div className="grid two evolution-view">
+      <Card title="Current Evolution State">
+        <div className="evolution-current">
+          <span className="pill ok">GENERATION {currentGeneration}</span>
+          <strong>{text(operator.mode, "OFF") === "AUTO" ? "AUTONOMOUS EVOLUTION ACTIVE" : `${text(operator.mode, "OFF")} MODE`}</strong>
+          <p className="muted">The next generation is created only when a stable, constitution-bounded proposal is applied while the market is closed.</p>
+        </div>
+        <div className="summary">
+          <div><span>Promotions recorded</span><b>{promotionActions.length}</b></div>
+          <div><span>Rollbacks recorded</span><b>{evolutionActions.filter((row) => row.actionType.includes("ROLLBACK")).length}</b></div>
+          <div><span>Current stability</span><b>{operatorStableRuns} / {operatorRequiredRuns}</b></div>
+          <div><span>Last applied</span><b>{operator.lastApplyAt ? new Date(String(operator.lastApplyAt)).toLocaleString("en-GB") : "No promotion yet"}</b></div>
+          <div><span>Rollback protection</span><b>{operator.history?.length ? "ACTIVE" : "ARMED"}</b></div>
+        </div>
+      </Card>
+
+      <Card title="Next Candidate">
+        <div className="operator-progress-block">
+          <div className="operator-progress-label"><b>{operatorStatus}</b><b>{operatorStableRuns} / {operatorRequiredRuns}</b></div>
+          <div className="operator-progress-track"><span style={{ width: `${operatorProgress}%` }} /></div>
+          <small>{operatorChangeCount ? `${Math.max(0, operatorRequiredRuns - operatorStableRuns)} matching reviews remain.` : "No evidence-backed change is currently required."}</small>
+        </div>
+        {operatorChangeCount ? <div className="evolution-candidate-list">{Object.entries(operatorChanged).map(([key, change]) => { const item = firstObject(change); return <div key={key}><span>{keyLabel(key)}</span><b>{formatOperatorValue(key, item.before)} → {formatOperatorValue(key, item.after)}</b></div>; })}</div> : <EmptyState endpoint="autonomous candidate" />}
+        <p className="muted">Evidence: {num(operatorProposal.evidenceSamples).toLocaleString("en-GB")} completed observations. Apply window: market closed only.</p>
+      </Card>
+
+      <Card title="Evolution Equity Checkpoints" wide>
+        {evolutionChartRows.length ? <div className="chart"><ResponsiveContainer width="100%" height="100%"><LineChart data={evolutionChartRows}><CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,.16)" /><XAxis dataKey="name" stroke="#94a3b8" /><YAxis stroke="#94a3b8" /><Tooltip contentStyle={{ background: "#020617", border: "1px solid #263450", borderRadius: 12 }} formatter={(value: any) => `$${num(value).toFixed(2)}`} /><Line type="monotone" dataKey="equity" stroke="#38bdf8" strokeWidth={3} name="Account equity at action" /></LineChart></ResponsiveContainer></div> : <EmptyState endpoint="operator promotion history" />}
+        <p className="muted">This chart shows account equity captured when each operator action was recorded. It is an audit checkpoint, not proof that a parameter change caused the subsequent result.</p>
+      </Card>
+
+      <Card title="What the AI has learned" wide>
+        {evolutionLessons.length ? <div className="evolution-lessons">{evolutionLessons.map((lesson, index) => <div key={`${lesson}-${index}`}><span>✓</span><p>{lesson}</p></div>)}</div> : <EmptyState endpoint="operator learning reasons" />}
+      </Card>
+
+      <Card title="Evolution Timeline" wide>
+        {evolutionActions.length ? <div className="evolution-timeline">{[...evolutionActions].reverse().map((row) => <article key={String(row.id ?? `${row.createdAt}-${row.generation}`)} className={`evolution-entry ${row.actionType.includes("ROLLBACK") ? "rollback" : "promotion"}`}>
+          <div className="evolution-node" />
+          <div className="evolution-entry-head"><div><span className="pill">G{row.generation}</span><b>{keyLabel(row.actionType)}</b></div><time>{row.createdAt ? new Date(row.createdAt).toLocaleString("en-GB") : "Unknown time"}</time></div>
+          <p>{row.reason}</p>
+          <div className="evolution-meta"><span>Evidence <b>{row.samples.toLocaleString("en-GB")}</b></span><span>Status <b>{row.status}</b></span>{row.equity > 0 && <span>Equity <b>${row.equity.toFixed(2)}</b></span>}</div>
+          {Object.keys(row.changed).length > 0 && <div className="evolution-change-list">{Object.entries(row.changed).map(([key, value]) => { const change = firstObject(value); return <div key={key}><span>{keyLabel(key)}</span><b>{formatOperatorValue(key, change.before)} → {formatOperatorValue(key, change.after)}</b></div>; })}</div>}
+        </article>)}</div> : <EmptyState endpoint="autonomous promotion history" />}
       </Card>
     </div>}
 
