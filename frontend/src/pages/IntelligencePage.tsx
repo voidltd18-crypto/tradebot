@@ -86,6 +86,8 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const [section, setSection] = useState<IntelligenceSection>("brain");
   const [lastUpdated, setLastUpdated] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  const [promotionBusy, setPromotionBusy] = useState(false);
+  const [promotionMessage, setPromotionMessage] = useState("");
   const [sources, setSources] = useState<Record<string, EndpointState>>({
     advisor: EMPTY_ENDPOINT,
     shadow: EMPTY_ENDPOINT,
@@ -100,6 +102,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     research: EMPTY_ENDPOINT,
     v7Status: EMPTY_ENDPOINT,
     v8Status: EMPTY_ENDPOINT,
+    promotion: EMPTY_ENDPOINT,
   });
 
   const endpoints = useMemo(() => ({
@@ -116,6 +119,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     research: "/v7/research/insights",
     v7Status: "/v7/status",
     v8Status: "/v8/status",
+    promotion: "/v10/promotion/status",
   }), []);
 
   const load = useCallback(async () => {
@@ -153,6 +157,10 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const research = sources.research.data;
   const v7Status = sources.v7Status.data;
   const v8Status = sources.v8Status.data;
+  const promotion = sources.promotion.data;
+  const promotionLatest = firstObject(promotion.latest);
+  const promotionCandidate = firstObject(promotionLatest.candidate, promotionLatest.payload?.candidate);
+  const promotionOptimizer = firstObject(promotionLatest.optimizer, promotionLatest.payload?.optimizer);
 
   const learningProgress = pct(advisor.evidence?.richEvidenceProgressPct ?? advisor.learning?.richEvidenceProgressPct ?? 0);
   const shadowAccuracy = pct(shadow.accuracy ?? shadow.winRate ?? shadow.summary?.winRate ?? shadow.metrics?.winRate);
@@ -199,6 +207,44 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     await Promise.all([load(), fetchData(true)]);
   };
 
+  const promotionPost = async (endpoint: string, body: AnyObj) => {
+    if (!authToken) return;
+    setPromotionBusy(true);
+    setPromotionMessage("");
+    try {
+      const response = await fetch(`${API_URL}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Auth-Token": authToken, "x-api-key": authToken },
+        body: JSON.stringify(body),
+      });
+      const json = await readJson(response);
+      if (!response.ok || json?.ok === false) throw new Error(json?.detail || json?.message || `${response.status}`);
+      setPromotionMessage(text(json?.message, "Promotion workflow updated."));
+      await refreshAll();
+    } catch (error: any) {
+      setPromotionMessage(error?.message || "Promotion action failed.");
+    } finally {
+      setPromotionBusy(false);
+    }
+  };
+
+  const evaluatePromotion = () => promotionPost("/v10/promotion/evaluate", { horizonHours: 24, minimumSamples: 100 });
+  const approvePromotion = () => {
+    const key = text(promotionLatest.candidate_key ?? promotionLatest.candidateKey, "");
+    if (!key) return setPromotionMessage("No promotion candidate is available.");
+    const confirmation = window.prompt("Type PROMOTE to apply this staged strategy change.", "");
+    if (confirmation !== null) promotionPost("/v10/promotion/approve", { candidateKey: key, confirmation });
+  };
+  const rejectPromotion = () => {
+    const key = text(promotionLatest.candidate_key ?? promotionLatest.candidateKey, "");
+    if (!key) return setPromotionMessage("No promotion candidate is available.");
+    if (window.confirm("Reject this promotion candidate?")) promotionPost("/v10/promotion/reject", { candidateKey: key, note: "Rejected from Intelligence dashboard" });
+  };
+  const rollbackPromotion = () => {
+    const confirmation = window.prompt("Type ROLLBACK to restore the previous promoted thresholds.", "");
+    if (confirmation !== null) promotionPost("/v10/promotion/rollback", { confirmation });
+  };
+
   return <div className="intelligence-page">
     <Card wide className="intelligence-hero">
       <div className="intelligence-hero-head">
@@ -239,6 +285,28 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <div><span>Live changes</span><b>{advisor.automaticLiveChanges === true ? "Enabled" : "Human approval required"}</b></div>
           <div><span>Current regime</span><b>{text(advisor.marketRegime ?? marketRegime)}</b></div>
         </div>
+      </Card>
+      <Card title="Human-Gated Strategy Promotion" wide className="recommendation-card">
+        <div className="summary">
+          <div><span>Status</span><b>{text(promotionLatest.status ?? promotionOptimizer.recommendation, "No candidate evaluated")}</b></div>
+          <div><span>Current confidence gate</span><b>{num(promotion.current?.confidence).toFixed(2)}</b></div>
+          <div><span>Proposed confidence gate</span><b>{Object.keys(promotionCandidate).length ? num(promotionCandidate.confidence).toFixed(2) : "—"}</b></div>
+          <div><span>Current quality gate</span><b>{num(promotion.current?.quality).toFixed(3)}</b></div>
+          <div><span>Proposed quality gate</span><b>{Object.keys(promotionCandidate).length ? num(promotionCandidate.quality).toFixed(3) : "—"}</b></div>
+          <div><span>Samples</span><b>{num(promotionCandidate.samples).toLocaleString("en-GB")}</b></div>
+          <div><span>Candidate expectancy</span><b>{num(promotionCandidate.expectancyPct).toFixed(2)}%</b></div>
+          <div><span>Profit factor</span><b>{num(promotionCandidate.profitFactor).toFixed(2)}</b></div>
+          <div><span>Stability</span><b>{num(promotionLatest.matching_runs ?? promotionOptimizer.stability?.matchingRuns)} / {num(promotionLatest.required_runs ?? promotionOptimizer.stability?.requiredRuns)}</b></div>
+          <div><span>Automatic live changes</span><b>No — approval required</b></div>
+        </div>
+        <div className="actions admin-section">
+          <button onClick={evaluatePromotion} disabled={promotionBusy}>{promotionBusy ? "WORKING..." : "EVALUATE CANDIDATE"}</button>
+          <button onClick={approvePromotion} disabled={promotionBusy || text(promotionLatest.status, "") !== "READY_FOR_APPROVAL"}>APPROVE & APPLY</button>
+          <button className="ghost" onClick={rejectPromotion} disabled={promotionBusy || !Object.keys(promotionLatest).length}>REJECT</button>
+          <button className="danger" onClick={rollbackPromotion} disabled={promotionBusy || !promotion.rollbackAvailable}>ROLL BACK LAST CHANGE</button>
+        </div>
+        <p className="muted">The bot never applies a candidate automatically. Approval re-runs the evidence checks, requires the same stable candidate, then changes only the staged A+ confidence and quality thresholds. Rollback restores the previous thresholds.</p>
+        {promotionMessage && <p><b>{promotionMessage}</b></p>}
       </Card>
       <Card title="When this intelligence updates" wide>
         <div className="summary">
