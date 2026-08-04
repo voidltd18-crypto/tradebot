@@ -63,6 +63,16 @@ function keyLabel(value: string): string {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+function formatOperatorValue(key: string, value: unknown): string {
+  if (value === null || value === undefined || value === "") return "—";
+  if (key === "tradingCapUsd") return `$${num(value).toFixed(2)}`;
+  if (key === "targetPositionValuePct" || key === "maxPositionValuePct") return `${pct(value).toFixed(0)}%`;
+  if (["stopLossPct", "fastStopLossPct", "trailStartPct", "trailGivebackPct"].includes(key)) return `${num(value).toFixed(2)}%`;
+  if (key === "symbolExclusions") return Array.isArray(value) ? (value.length ? value.join(", ") : "None") : text(value, "None");
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  return text(value, "—");
+}
+
 function StatTile({ label, value, sub, tone = "" }: { label: string; value: string; sub?: string; tone?: string }) {
   return <div className={`intelligence-stat ${tone}`.trim()}><span>{label}</span><strong>{value}</strong>{sub && <small>{sub}</small>}</div>;
 }
@@ -163,6 +173,21 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const operator = sources.operator.data;
   const operatorCurrent = firstObject(operator.current);
   const operatorProposal = firstObject(operator.lastProposal);
+  const operatorChanged = firstObject(operatorProposal.changed);
+  const operatorReasons = Array.isArray(operatorProposal.reasons) ? operatorProposal.reasons.map((item) => text(item, "")).filter(Boolean) : [];
+  const operatorStableRuns = num(operator.stableRuns);
+  const operatorRequiredRuns = Math.max(1, num(operator.requiredStableRuns, 5));
+  const operatorProgress = clamp((operatorStableRuns / operatorRequiredRuns) * 100);
+  const operatorEligible = operatorProposal.eligible === true;
+  const operatorChangeCount = Object.keys(operatorChanged).length;
+  const operatorStatus = operatorChangeCount === 0
+    ? "NO CHANGE NEEDED"
+    : !operatorEligible
+      ? "EVIDENCE NOT ELIGIBLE"
+      : operatorStableRuns >= operatorRequiredRuns
+        ? "READY FOR CLOSED-MARKET APPLY"
+        : "COLLECTING STABLE EVIDENCE";
+  const operatorLastRun = operator.lastRunAt ? new Date(String(operator.lastRunAt)).toLocaleString("en-GB") : "Not run yet";
   const promotionLatest = firstObject(promotion.latest);
   const promotionCandidate = firstObject(promotionLatest.candidate, promotionLatest.payload?.candidate);
   const promotionOptimizer = firstObject(promotionLatest.optimizer, promotionLatest.payload?.optimizer);
@@ -297,19 +322,66 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <div><span>Current regime</span><b>{text(advisor.marketRegime ?? marketRegime)}</b></div>
         </div>
       </Card>
-      <Card title="Autonomous AI Operator" wide className="recommendation-card">
-        <div className="summary">
-          <div><span>Mode</span><b>{text(operator.mode, "SHADOW")}</b></div>
-          <div><span>Stable evidence</span><b>{num(operator.stableRuns)} / {num(operator.requiredStableRuns)}</b></div>
-          <div><span>Max positions</span><b>{num(operatorCurrent.maxPositions)}</b></div>
-          <div><span>Trading cap</span><b>${num(operatorCurrent.tradingCapUsd).toFixed(2)}</b></div>
-          <div><span>Position size</span><b>{pct(operatorCurrent.targetPositionValuePct).toFixed(0)}%</b></div>
-          <div><span>Stop loss</span><b>{num(operatorCurrent.stopLossPct).toFixed(2)}%</b></div>
-          <div><span>Trail start</span><b>{num(operatorCurrent.trailStartPct).toFixed(2)}%</b></div>
-          <div><span>Trail giveback</span><b>{num(operatorCurrent.trailGivebackPct).toFixed(2)}%</b></div>
-          <div><span>Excluded symbols</span><b>{firstArray(operatorCurrent.symbolExclusions).length || (Array.isArray(operatorCurrent.symbolExclusions) ? operatorCurrent.symbolExclusions.length : 0)}</b></div>
-          <div><span>Order execution</span><b>{text(operatorCurrent.orderExecution, "MARKET")}</b></div>
+      <Card title="Autonomous AI Operator" wide className="recommendation-card operator-card">
+        <div className="operator-headline">
+          <div>
+            <span className={`pill ${text(operator.mode, "SHADOW") === "AUTO" ? "ok" : "warn"}`}>{text(operator.mode, "SHADOW")}</span>
+            <h3>{operatorStatus}</h3>
+            <p className="muted">{operatorChangeCount
+              ? `${operatorChangeCount} bounded setting${operatorChangeCount === 1 ? "" : "s"} currently under review.`
+              : "The current live configuration remains the best eligible configuration."}</p>
+          </div>
+          <div className="operator-window">
+            <span>Apply window</span>
+            <b>Market closed only</b>
+            <small>Last review: {operatorLastRun}</small>
+          </div>
         </div>
+
+        <div className="operator-progress-block">
+          <div className="operator-progress-label"><span>Stable evidence</span><b>{operatorStableRuns} / {operatorRequiredRuns}</b></div>
+          <div className="operator-progress-track"><span style={{ width: `${operatorProgress}%` }} /></div>
+          <small>{operatorStableRuns >= operatorRequiredRuns
+            ? "Stability requirement met. An eligible proposal may apply while the market is closed, subject to cooldown and constitution checks."
+            : `${operatorRequiredRuns - operatorStableRuns} matching review${operatorRequiredRuns - operatorStableRuns === 1 ? "" : "s"} still required.`}</small>
+        </div>
+
+        {operatorChangeCount > 0 ? <div className="operator-change-grid">
+          {Object.entries(operatorChanged).map(([key, raw]) => {
+            const change = firstObject(raw);
+            return <div className="operator-change" key={key}>
+              <span>{keyLabel(key)}</span>
+              <div><b>{formatOperatorValue(key, change.before)}</b><strong>→</strong><b>{formatOperatorValue(key, change.after)}</b></div>
+            </div>;
+          })}
+        </div> : <div className="operator-no-change">No parameter change is currently proposed.</div>}
+
+        <div className="operator-evidence-grid">
+          <div><span>Evidence samples</span><b>{num(operatorProposal.evidenceSamples).toLocaleString("en-GB")}</b></div>
+          <div><span>Eligible</span><b>{operatorEligible ? "YES" : "NO"}</b></div>
+          <div><span>Automatic changes</span><b>{text(operator.mode, "SHADOW") === "AUTO" ? "ENABLED" : "DISABLED"}</b></div>
+          <div><span>Rollback protection</span><b>ACTIVE</b></div>
+        </div>
+
+        {operatorReasons.length > 0 && <div className="operator-reasons">
+          <h4>Why the AI is proposing this</h4>
+          {operatorReasons.map((reason, index) => <p key={`${reason}-${index}`}>✓ {reason}</p>)}
+        </div>}
+
+        <details className="operator-current">
+          <summary>View current live settings</summary>
+          <div className="summary">
+            <div><span>Max positions</span><b>{num(operatorCurrent.maxPositions)}</b></div>
+            <div><span>Trading cap</span><b>${num(operatorCurrent.tradingCapUsd).toFixed(2)}</b></div>
+            <div><span>Position size</span><b>{pct(operatorCurrent.targetPositionValuePct).toFixed(0)}%</b></div>
+            <div><span>Stop loss</span><b>{num(operatorCurrent.stopLossPct).toFixed(2)}%</b></div>
+            <div><span>Trail start</span><b>{num(operatorCurrent.trailStartPct).toFixed(2)}%</b></div>
+            <div><span>Trail giveback</span><b>{num(operatorCurrent.trailGivebackPct).toFixed(2)}%</b></div>
+            <div><span>Excluded symbols</span><b>{Array.isArray(operatorCurrent.symbolExclusions) ? operatorCurrent.symbolExclusions.length : 0}</b></div>
+            <div><span>Order execution</span><b>{text(operatorCurrent.orderExecution, "MARKET")}</b></div>
+          </div>
+        </details>
+
         <div className="actions admin-section">
           <button onClick={() => setOperatorMode("AUTO")} disabled={promotionBusy}>ENABLE AUTO</button>
           <button className="ghost" onClick={() => setOperatorMode("SHADOW")} disabled={promotionBusy}>SHADOW ONLY</button>
@@ -317,8 +389,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <button onClick={runOperator} disabled={promotionBusy}>{promotionBusy ? "WORKING..." : "RUN REVIEW NOW"}</button>
           <button className="danger" onClick={rollbackOperator} disabled={promotionBusy || !operator.history?.length}>ROLL BACK</button>
         </div>
-        <p className="muted">AUTO needs no recurring approval. It changes only constitution-bounded settings while the market is closed, after the same proposal remains stable for the required runs. It automatically rolls back after excessive post-change drawdown or daily loss.</p>
-        {Object.keys(operatorProposal).length > 0 && <pre>{JSON.stringify(operatorProposal.changed ?? operatorProposal, null, 2)}</pre>}
+        <p className="muted">AUTO requires no recurring approval. It only applies constitution-bounded settings while the market is closed, after the same eligible proposal remains stable for all required reviews. Automatic rollback remains active.</p>
         {promotionMessage && <p><b>{promotionMessage}</b></p>}
       </Card>
 
