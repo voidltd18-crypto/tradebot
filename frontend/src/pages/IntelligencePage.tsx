@@ -17,7 +17,7 @@ import { API_URL, readJson } from "../lib/api";
 import { clamp } from "../lib/format";
 import type { AnyObj } from "../lib/types";
 
-type IntelligenceSection = "ceo" | "brain" | "market" | "research" | "symbols" | "rules" | "evolution";
+type IntelligenceSection = "ceo" | "board" | "brain" | "market" | "research" | "symbols" | "rules" | "evolution";
 
 type EndpointState = {
   data: AnyObj;
@@ -121,6 +121,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     ceoJournal: EMPTY_ENDPOINT,
     ceoReviews: EMPTY_ENDPOINT,
     ceoConstitution: EMPTY_ENDPOINT,
+    boardStatus: EMPTY_ENDPOINT,
+    boardHistory: EMPTY_ENDPOINT,
+    boardConstitution: EMPTY_ENDPOINT,
   });
 
   const endpoints = useMemo(() => ({
@@ -146,6 +149,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     ceoJournal: "/v12/ceo/journal?limit=100",
     ceoReviews: "/v12/ceo/reviews?limit=30",
     ceoConstitution: "/v12/ceo/constitution",
+    boardStatus: "/v12/board/status",
+    boardHistory: "/v12/board/history?limit=30",
+    boardConstitution: "/v12/board/constitution",
   }), []);
 
   const load = useCallback(async () => {
@@ -192,6 +198,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const ceoJournalData = sources.ceoJournal.data;
   const ceoReviewsData = sources.ceoReviews.data;
   const ceoConstitution = sources.ceoConstitution.data;
+  const boardStatus = sources.boardStatus.data;
+  const boardHistoryData = sources.boardHistory.data;
+  const boardConstitution = sources.boardConstitution.data;
   const operatorCurrent = firstObject(operator.current);
   const operatorProposal = firstObject(operator.lastProposal);
   const operatorChanged = firstObject(operatorProposal.changed);
@@ -406,7 +415,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     </Card>
 
     <nav className="intelligence-tabs">
-      {(["ceo", "brain", "market", "research", "symbols", "rules", "evolution"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "ceo" ? "AI CEO" : item === "brain" ? "AI BRAIN" : item.toUpperCase()}</button>)}
+      {(["ceo", "board", "brain", "market", "research", "symbols", "rules", "evolution"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "ceo" ? "AI CEO" : item === "board" ? "AI BOARD" : item === "brain" ? "AI BRAIN" : item.toUpperCase()}</button>)}
     </nav>
 
 
@@ -485,6 +494,62 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
 
       <Card title="CEO Journal" wide>
         <div className="ceo-journal">{ceoJournal.map((entry, index) => <article key={`${entry.title}-${index}`}><time>{entry.time}</time><div><b>{entry.title}</b><p>{entry.detail}</p></div></article>)}</div>
+      </Card>
+    </div>}
+
+
+    {section === "board" && <div className="grid two ceo-view">
+      <Card title="AI Board of Directors" wide className="ceo-command-card">
+        <div className="ceo-command-head">
+          <div>
+            <p className="eyebrow">V12.1 AUTOMATIC GOVERNANCE</p>
+            <h3>{text(boardStatus.finalDecision, "WAITING FOR FIRST MEETING")}</h3>
+            <p className="muted">{text(boardStatus.finalReason, "The board will meet automatically after the backend starts.")}</p>
+          </div>
+          <div className={`ceo-grade ${boardStatus.finalDecision === "VETO" ? "poor" : boardStatus.finalDecision === "DELAY" ? "medium" : "good"}`}>
+            <strong>{Math.round(pct(boardStatus.confidence))}</strong><span>%</span><small>Board confidence</small>
+          </div>
+        </div>
+        <div className="intelligence-stat-grid ceo-stat-grid">
+          <StatTile label="Approvals" value={String(num(boardStatus.consensus?.approve))} sub={`${num(boardStatus.consensus?.total)} directors`} />
+          <StatTile label="Wait / Caution" value={String(num(boardStatus.consensus?.wait) + num(boardStatus.consensus?.caution))} sub="More evidence required" />
+          <StatTile label="Vetoes" value={String(num(boardStatus.consensus?.veto))} tone={num(boardStatus.consensus?.veto) > 0 ? "negative" : "positive"} />
+          <StatTile label="CEO Grade" value={`${text(boardStatus.ceoGradeLetter, "—")} ${num(boardStatus.ceoGrade).toFixed(1)}`} sub={`Risk: ${text(boardStatus.riskLevel, "—")}`} />
+        </div>
+        <div className="operator-actions">
+          <span className="pill ok">AUTOMATIC MEETINGS ACTIVE</span>
+          <span className="pill ok">ADVISORY ONLY</span>
+        </div>
+      </Card>
+
+      <Card title="Board Next Action" className="ceo-decision-card">
+        <span className={`pill ${boardStatus.finalDecision === "VETO" ? "bad" : boardStatus.finalDecision === "DELAY" ? "warn" : "ok"}`}>{text(boardStatus.finalDecision, "PENDING")}</span>
+        <h3>{text(boardStatus.nextAction, "Waiting for the first automatic board review.")}</h3>
+        <p className="muted">Meeting type: {text(boardStatus.meetingType, "—")} · {boardStatus.createdAt ? new Date(String(boardStatus.createdAt)).toLocaleString("en-GB") : "—"}</p>
+      </Card>
+
+      <Card title="Director Votes" wide>
+        <DataTable rows={firstArray(boardStatus.votes)} columns={[
+          { key: "director", label: "Director" },
+          { key: "vote", label: "Vote", render: (row) => <span className={`pill ${row.vote === "VETO" ? "bad" : row.vote === "APPROVE" ? "ok" : "warn"}`}>{text(row.vote, "WAIT")}</span> },
+          { key: "confidence", label: "Confidence", render: (row) => `${Math.round(pct(row.confidence))}%` },
+          { key: "reason", label: "Evidence-backed reason" },
+        ]} />
+      </Card>
+
+      <Card title="Board Meeting History" wide>
+        <DataTable rows={firstArray(boardHistoryData.items).slice(0, 15)} columns={[
+          { key: "created_at", label: "Date", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB") : "—" },
+          { key: "meeting_type", label: "Meeting" },
+          { key: "final_decision", label: "Decision" },
+          { key: "ceo_grade", label: "CEO Grade", render: (row) => num(row.ceo_grade).toFixed(1) },
+          { key: "risk_level", label: "Risk" },
+        ]} />
+      </Card>
+
+      <Card title="Board Constitution" wide>
+        <div className="operator-actions"><span className="pill ok">AUTOMATIC</span><span className="pill ok">NO MANUAL REVIEW</span></div>
+        <div className="ceo-priorities">{(Array.isArray(boardConstitution.rules) ? boardConstitution.rules : []).map((rule: string, index: number) => <div key={rule}><span>{index + 1}</span><p>{rule}</p></div>)}</div>
       </Card>
     </div>}
 
