@@ -117,6 +117,10 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     status: EMPTY_ENDPOINT,
     reports: EMPTY_ENDPOINT,
     reputation: EMPTY_ENDPOINT,
+    ceoStatus: EMPTY_ENDPOINT,
+    ceoJournal: EMPTY_ENDPOINT,
+    ceoReviews: EMPTY_ENDPOINT,
+    ceoConstitution: EMPTY_ENDPOINT,
   });
 
   const endpoints = useMemo(() => ({
@@ -138,6 +142,10 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     status: "/status",
     reports: "/reports",
     reputation: "/v10/symbol-reputation/summary",
+    ceoStatus: "/v12/ceo/status?journal_limit=40",
+    ceoJournal: "/v12/ceo/journal?limit=100",
+    ceoReviews: "/v12/ceo/reviews?limit=30",
+    ceoConstitution: "/v12/ceo/constitution",
   }), []);
 
   const load = useCallback(async () => {
@@ -180,6 +188,10 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const liveStatus = sources.status.data;
   const reportsData = sources.reports.data;
   const reputationData = sources.reputation.data;
+  const ceoBackend = sources.ceoStatus.data;
+  const ceoJournalData = sources.ceoJournal.data;
+  const ceoReviewsData = sources.ceoReviews.data;
+  const ceoConstitution = sources.ceoConstitution.data;
   const operatorCurrent = firstObject(operator.current);
   const operatorProposal = firstObject(operator.lastProposal);
   const operatorChanged = firstObject(operatorProposal.changed);
@@ -282,35 +294,47 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
 
   const account = firstObject(liveStatus.account, liveStatus.data?.account);
   const reportSummary = firstObject(reportsData.summary, reportsData);
-  const ceoEquity = num(account.equity);
-  const ceoDayPnl = num(account.pnlDay ?? account.dayPnl ?? reportSummary.todayPnl ?? reportSummary.dailyPnl);
-  const ceoTotalPnl = num(reportSummary.totalGainLoss ?? reportSummary.totalPnl ?? reportSummary.netPnl);
-  const ceoTradesToday = num(reportSummary.todayTrades ?? reportSummary.tradesToday ?? advisor.today?.trades);
-  const ceoHealthScore = Math.round(clamp((intelligenceHealth * 0.35) + (calibration * 0.25) + (shadowAccuracy * 0.15) + (learningProgress * 0.1) + (botHealth * 0.15)));
-  const ceoRiskLevel = ceoDayPnl < -Math.max(10, ceoEquity * 0.015) ? "HIGH" : ceoDayPnl < 0 ? "MODERATE" : "LOW";
-  const ceoStatus = ceoRiskLevel === "HIGH" ? "PROTECTING CAPITAL" : text(operator.mode, "OFF") === "AUTO" ? "AUTONOMOUS TRADING ACTIVE" : "SUPERVISED TRADING";
+  const backendAccount = firstObject(ceoBackend.account);
+  const backendPerformance = firstObject(ceoBackend.performance);
+  const backendHealth = firstObject(ceoBackend.health);
+  const backendLearning = firstObject(ceoBackend.learning);
+  const backendEvolution = firstObject(ceoBackend.evolution);
+  const backendSymbols = firstObject(ceoBackend.symbols);
+  const ceoEquity = num(backendAccount.equity ?? account.equity);
+  const ceoDayPnl = num(backendAccount.todayRealisedPnl ?? account.pnlDay ?? account.dayPnl ?? reportSummary.todayPnl ?? reportSummary.dailyPnl);
+  const ceoTotalPnl = num(backendAccount.totalRealisedPnl ?? reportSummary.totalGainLoss ?? reportSummary.totalPnl ?? reportSummary.netPnl);
+  const ceoTradesToday = num(backendPerformance.closedTrades ?? reportSummary.todayTrades ?? reportSummary.tradesToday ?? advisor.today?.trades);
+  const ceoHealthScore = num(ceoBackend.grade, Math.round(clamp((intelligenceHealth * 0.35) + (calibration * 0.25) + (shadowAccuracy * 0.15) + (learningProgress * 0.1) + (botHealth * 0.15))));
+  const ceoRiskLevel = text(ceoBackend.riskLevel, ceoDayPnl < -Math.max(10, ceoEquity * 0.015) ? "HIGH" : ceoDayPnl < 0 ? "MODERATE" : "LOW");
+  const ceoStatus = text(ceoBackend.operatingStatus, ceoRiskLevel === "HIGH" ? "PROTECTING CAPITAL" : text(operator.mode, "OFF") === "AUTO" ? "AUTONOMOUS TRADING ACTIVE" : "SUPERVISED TRADING");
   const bestResearch = [...researchRows].sort((a, b) => num(b.expectancyPct ?? b.expectancy) - num(a.expectancyPct ?? a.expectancy))[0] || {};
-  const bestSymbol = [...symbolRows].sort((a, b) => num(b.averageReturnPct ?? b.expectancyPct ?? b.expectancy) - num(a.averageReturnPct ?? a.expectancyPct ?? a.expectancy))[0] || {};
-  const worstSymbol = [...symbolRows].sort((a, b) => num(a.averageReturnPct ?? a.expectancyPct ?? a.expectancy) - num(b.averageReturnPct ?? b.expectancyPct ?? b.expectancy))[0] || {};
+  const bestSymbol = firstObject(backendSymbols.strongest, [...symbolRows].sort((a, b) => num(b.averageReturnPct ?? b.expectancyPct ?? b.expectancy) - num(a.averageReturnPct ?? a.expectancyPct ?? a.expectancy))[0]);
+  const worstSymbol = firstObject(backendSymbols.weakest, [...symbolRows].sort((a, b) => num(a.averageReturnPct ?? a.expectancyPct ?? a.expectancy) - num(b.averageReturnPct ?? b.expectancyPct ?? b.expectancy))[0]);
   const hurtingRules = ruleRows.filter((row) => String(row.rating ?? row.verdict ?? row.status ?? "").toUpperCase().includes("HURT"));
   const blockedSymbols = firstArray(reputationData.blockedSymbols, reputationData.blocked, reputationData.cooldowns);
-  const ceoRecommendation = ceoRiskLevel === "HIGH"
-    ? "Reduce exposure and preserve capital until the next closed-market review."
-    : operatorChangeCount && operatorEligible
-      ? `Continue current strategy while Generation ${currentGeneration + 1} completes stability validation.`
-      : recommendationMessage;
-  const ceoPriorities = [
-    hurtingRules.length ? `Repair ${text(hurtingRules[0]?.rule ?? hurtingRules[0]?.name, "the weakest rule")}` : "Maintain rule stability",
-    num(worstSymbol.averageReturnPct ?? worstSymbol.expectancyPct ?? worstSymbol.expectancy) < 0 ? `Avoid weak ${text(worstSymbol.symbol ?? worstSymbol.name, "symbol")} setups` : "Expand symbol evidence",
-    calibration < 80 ? "Improve confidence calibration" : "Protect calibrated confidence",
-    operatorStableRuns < operatorRequiredRuns ? `Validate next generation (${operatorStableRuns}/${operatorRequiredRuns})` : "Prepare next closed-market promotion",
+  const ceoRecommendation = text(ceoBackend.recommendation, recommendationMessage);
+  const ceoPriorities = Array.isArray(ceoBackend.priorities) && ceoBackend.priorities.length
+    ? ceoBackend.priorities.map(String).slice(0, 5)
+    : [
+      hurtingRules.length ? `Repair ${text(hurtingRules[0]?.rule ?? hurtingRules[0]?.name, "the weakest rule")}` : "Maintain rule stability",
+      num(worstSymbol.averageReturnPct ?? worstSymbol.expectancyPct ?? worstSymbol.expectancy) < 0 ? `Avoid weak ${text(worstSymbol.symbol ?? worstSymbol.name, "symbol")} setups` : "Expand symbol evidence",
+      calibration < 80 ? "Improve confidence calibration" : "Protect calibrated confidence",
+      operatorStableRuns < operatorRequiredRuns ? `Validate next generation (${operatorStableRuns}/${operatorRequiredRuns})` : "Prepare next closed-market promotion",
+    ];
+  const rawCeoJournal = firstArray(ceoJournalData.items, ceoBackend.journal);
+  const ceoJournal = rawCeoJournal.length ? rawCeoJournal.map((entry) => ({
+    time: entry.created_at ? new Date(String(entry.created_at)).toLocaleString("en-GB", { dateStyle: "short", timeStyle: "medium" }) : text(entry.day, "Recorded"),
+    title: text(entry.title, keyLabel(text(entry.category, "CEO event"))),
+    detail: text(entry.detail, "No detail recorded."),
+    severity: text(entry.severity, "INFO"),
+  })) : [
+    { time: operatorLastRun, title: "Autonomous review", detail: operatorStatus, severity: "INFO" },
+    { time: "Live", title: "Trading state", detail: `${ceoStatus}; daily P&L ${ceoDayPnl >= 0 ? "+" : ""}$${ceoDayPnl.toFixed(2)}`, severity: "INFO" },
   ];
-  const ceoJournal = [
-    { time: operatorLastRun, title: "Autonomous review", detail: operatorStatus },
-    { time: "Live", title: "Trading state", detail: `${ceoStatus}; daily P&L ${ceoDayPnl >= 0 ? "+" : ""}$${ceoDayPnl.toFixed(2)}` },
-    { time: "Research", title: "Best current brain", detail: `${text(bestResearch.name ?? bestResearch.brainName, "Still learning")} · ${num(bestResearch.expectancyPct ?? bestResearch.expectancy).toFixed(2)}% expectancy` },
-    { time: "Risk", title: "Biggest current weakness", detail: hurtingRules.length ? text(hurtingRules[0]?.rule ?? hurtingRules[0]?.name) : "No mature hurting rule detected" },
-  ];
+  const ceoReviewRows = firstArray(ceoReviewsData.items);
+  const ceoManualActionRequired = ceoBackend.manualActionRequired === true;
+  const ceoGradeLetter = text(ceoBackend.gradeLetter, "—");
+  const ceoCreatedAt = ceoBackend.createdAt ? new Date(String(ceoBackend.createdAt)).toLocaleString("en-GB") : "Not generated yet";
 
   const refreshAll = async () => {
     await Promise.all([load(), fetchData(true)]);
@@ -390,53 +414,73 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="AI Chief Executive" wide className="ceo-command-card">
         <div className="ceo-command-head">
           <div>
-            <p className="eyebrow">EXECUTIVE CONTROL ROOM</p>
+            <p className="eyebrow">V12 EXECUTIVE CONTROL ROOM</p>
             <h3>{ceoStatus}</h3>
-            <p className="muted">Evidence-backed summary generated from live trading, research, symbol, rule and evolution engines.</p>
+            <p className="muted">{ceoBackend.ok ? `Live V12 CEO review generated ${ceoCreatedAt}.` : "Waiting for the V12 CEO backend."}</p>
           </div>
           <div className={`ceo-grade ${ceoHealthScore >= 80 ? "good" : ceoHealthScore >= 60 ? "medium" : "poor"}`}>
-            <strong>{(ceoHealthScore / 10).toFixed(1)}</strong><span>/ 10</span><small>CEO Grade</small>
+            <strong>{(ceoHealthScore / 10).toFixed(1)}</strong><span>/ 10</span><small>{ceoGradeLetter} CEO Grade</small>
           </div>
         </div>
         <div className="intelligence-stat-grid ceo-stat-grid">
-          <StatTile label="Account Equity" value={`$${ceoEquity.toFixed(2)}`} sub={`Total P&L ${ceoTotalPnl >= 0 ? "+" : ""}$${ceoTotalPnl.toFixed(2)}`} tone={ceoTotalPnl >= 0 ? "positive" : "negative"} />
-          <StatTile label="Today" value={`${ceoDayPnl >= 0 ? "+" : ""}$${ceoDayPnl.toFixed(2)}`} sub={`${ceoTradesToday} trades recorded`} tone={ceoDayPnl >= 0 ? "positive" : "negative"} />
-          <StatTile label="Risk" value={ceoRiskLevel} sub={`Market: ${text(advisor.marketRegime ?? marketDna.currentRegime ?? marketRegime)}`} tone={ceoRiskLevel === "HIGH" ? "negative" : ceoRiskLevel === "LOW" ? "positive" : ""} />
-          <StatTile label="Next Generation" value={`${operatorStableRuns} / ${operatorRequiredRuns}`} sub={operatorStatus} />
+          <StatTile label="Account Equity" value={`$${ceoEquity.toFixed(2)}`} sub={`Total realised ${ceoTotalPnl >= 0 ? "+" : ""}$${ceoTotalPnl.toFixed(2)}`} tone={ceoTotalPnl >= 0 ? "positive" : "negative"} />
+          <StatTile label="Today Realised" value={`${ceoDayPnl >= 0 ? "+" : ""}$${ceoDayPnl.toFixed(2)}`} sub={`${ceoTradesToday} closed trades`} tone={ceoDayPnl >= 0 ? "positive" : "negative"} />
+          <StatTile label="Risk" value={ceoRiskLevel} sub={`Market: ${text(ceoBackend.market?.status ?? ceoBackend.market?.session ?? marketRegime)}`} tone={ceoRiskLevel === "HIGH" ? "negative" : ceoRiskLevel === "LOW" ? "positive" : ""} />
+          <StatTile label="Evolution" value={`${num(backendEvolution.stableRuns, operatorStableRuns)} / ${num(backendEvolution.requiredStableRuns, operatorRequiredRuns)}`} sub={text(backendEvolution.mode, operatorStatus)} />
         </div>
+        <div className="operator-actions">
+          <span className="pill ok">AUTOMATIC REVIEWS ACTIVE</span>
+          <span className={`pill ${ceoBackend.advisoryOnly === false ? "bad" : "ok"}`}>{ceoBackend.advisoryOnly === false ? "LIVE CONTROL" : "ADVISORY ONLY"}</span>
+        </div>
+        {promotionMessage && <p className="muted">{promotionMessage}</p>}
       </Card>
 
       <Card title="CEO Decision" className="ceo-decision-card">
-        <span className={`pill ${ceoRiskLevel === "HIGH" ? "bad" : "ok"}`}>{ceoRiskLevel === "HIGH" ? "ACTION REQUIRED" : "NO MANUAL ACTION REQUIRED"}</span>
+        <span className={`pill ${ceoManualActionRequired ? "bad" : "ok"}`}>{ceoManualActionRequired ? "ACTION REQUIRED" : "NO MANUAL ACTION REQUIRED"}</span>
         <h3>{ceoRecommendation}</h3>
         <div className="summary">
-          <div><span>Autonomy</span><b>{text(operator.mode, "OFF")}</b></div>
-          <div><span>Calibration</span><b>{Math.round(calibration)}%</b></div>
-          <div><span>Shadow accuracy</span><b>{Math.round(shadowAccuracy)}%</b></div>
-          <div><span>Evidence</span><b>{evidenceCount.toLocaleString("en-GB")}</b></div>
+          <div><span>Autonomy</span><b>{text(backendEvolution.mode, operator.mode)}</b></div>
+          <div><span>Calibration</span><b>{Math.round(pct(backendLearning.confidenceCalibration ?? calibration))}%</b></div>
+          <div><span>Completed outcomes</span><b>{num(backendLearning.completedOutcomes, evidenceCount).toLocaleString("en-GB")}</b></div>
+          <div><span>Ready outcomes</span><b>{num(backendLearning.readyOutcomes).toLocaleString("en-GB")}</b></div>
         </div>
       </Card>
 
       <Card title="Executive Priorities">
-        <div className="ceo-priorities">{ceoPriorities.map((priority, index) => <div key={priority}><span>{index + 1}</span><p>{priority}</p></div>)}</div>
+        <div className="ceo-priorities">{ceoPriorities.map((priority, index) => <div key={`${priority}-${index}`}><span>{index + 1}</span><p>{priority}</p></div>)}</div>
       </Card>
 
       <Card title="Company Health" wide>
         <div className="ceo-health-grid">
-          <Meter label="Trading systems" value={botHealth} />
-          <Meter label="Intelligence systems" value={intelligenceHealth} />
-          <Meter label="Confidence calibration" value={calibration} />
-          <Meter label="Research readiness" value={learningProgress} />
+          <Meter label="Trading" value={num(backendHealth.trading, botHealth)} />
+          <Meter label="Learning" value={num(backendHealth.learning, learningProgress)} />
+          <Meter label="Research" value={num(backendHealth.research, intelligenceHealth)} />
+          <Meter label="Stability" value={num(backendHealth.stability, 100)} />
+          <Meter label="Autonomy" value={num(backendHealth.autonomy, 0)} />
         </div>
       </Card>
 
-      <Card title="Research & Market View">
+      <Card title="Research & Symbol Supervision">
         <div className="ceo-facts">
           <div><span>Best research brain</span><b>{text(bestResearch.name ?? bestResearch.brainName, "Learning")}</b><small>{num(bestResearch.expectancyPct ?? bestResearch.expectancy).toFixed(2)}% expectancy</small></div>
-          <div><span>Strongest symbol</span><b>{text(bestSymbol.symbol ?? bestSymbol.name, "Learning")}</b><small>{num(bestSymbol.averageReturnPct ?? bestSymbol.expectancyPct ?? bestSymbol.expectancy).toFixed(2)}% expectancy</small></div>
-          <div><span>Weakest symbol</span><b>{text(worstSymbol.symbol ?? worstSymbol.name, "Learning")}</b><small>{num(worstSymbol.averageReturnPct ?? worstSymbol.expectancyPct ?? worstSymbol.expectancy).toFixed(2)}% expectancy</small></div>
-          <div><span>Blocked / cooling symbols</span><b>{blockedSymbols.length}</b><small>Reputation protection active</small></div>
+          <div><span>Strongest symbol</span><b>{text(bestSymbol.symbol ?? bestSymbol.name, "Learning")}</b><small>Reputation score {num(bestSymbol.score).toFixed(1)}</small></div>
+          <div><span>Weakest symbol</span><b>{text(worstSymbol.symbol ?? worstSymbol.name, "Learning")}</b><small>Reputation score {num(worstSymbol.score).toFixed(1)}</small></div>
+          <div><span>Mature symbols monitored</span><b>{num(backendSymbols.count)}</b><small>{blockedSymbols.length} currently blocked / cooling</small></div>
         </div>
+      </Card>
+
+      <Card title="CEO Review History">
+        <DataTable rows={ceoReviewRows.slice(0, 10)} columns={[
+          { key: "created_at", label: "Date", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB") : "—" },
+          { key: "review_type", label: "Type" },
+          { key: "grade_letter", label: "Grade", render: (row) => `${text(row.grade_letter, "—")} (${num(row.grade).toFixed(1)})` },
+          { key: "risk_level", label: "Risk" },
+        ]} />
+      </Card>
+
+      <Card title="CEO Constitution">
+        <span className={`pill ${ceoConstitution.advisoryOnly === false ? "bad" : "ok"}`}>{ceoConstitution.advisoryOnly === false ? "LIVE CONTROL" : "ADVISORY ONLY"}</span>
+        <div className="ceo-priorities">{(Array.isArray(ceoConstitution.principles) ? ceoConstitution.principles : []).map((principle: string, index: number) => <div key={principle}><span>{index + 1}</span><p>{principle}</p></div>)}</div>
       </Card>
 
       <Card title="CEO Journal" wide>
