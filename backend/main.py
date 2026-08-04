@@ -2836,6 +2836,17 @@ def pick_money_mode_stocks(
         if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
             record_v2_setup_decision(scan, "REJECTED", "pdt_gate", "maximum new buys for today reached")
             continue
+
+        # V10.5 Symbol Reputation Gate: prevent repeated live entries into symbols
+        # with sufficiently mature, persistently negative evidence. New/low-sample
+        # symbols remain eligible so the learner can continue gathering evidence.
+        reputation_ok, reputation_reason, reputation = symbol_reputation_allows_live_buy(symbol)
+        scan["symbolReputation"] = reputation
+        if not reputation_ok:
+            print(f"REPUTATION SKIP {symbol} | {reputation_reason}")
+            record_v2_setup_decision(scan, "REJECTED", "symbol_reputation_gate", reputation_reason)
+            continue
+
         sniper_ok, sniper_reason = sniper_passes(scan)
         if not sniper_ok:
             print(f"SNIPER SKIP {symbol} | {sniper_reason}")
@@ -12177,6 +12188,233 @@ def weakness_intelligence_summary() -> Dict[str, Any]:
 def api_symbol_intelligence_summary(request: Request, days: int = 180, horizon_hours: int = 24, minimum_samples: int = 5, limit: int = 100):
     verify_api_key(request)
     return symbol_intelligence(days, horizon_hours, minimum_samples, limit)
+
+
+
+# =========================
+# TRADEBOT V10.5 — AI SYMBOL REPUTATION ENGINE
+# Evidence-based live entry protection with reversible cooldowns.
+# =========================
+SYMBOL_REPUTATION_ENABLED = os.getenv("SYMBOL_REPUTATION_ENABLED", "true").lower() == "true"
+SYMBOL_REPUTATION_MIN_SAMPLES = max(3, int(os.getenv("SYMBOL_REPUTATION_MIN_SAMPLES", "5") or 5))
+SYMBOL_REPUTATION_BLOCK_SCORE = max(0.0, min(100.0, float(os.getenv("SYMBOL_REPUTATION_BLOCK_SCORE", "35") or 35)))
+SYMBOL_REPUTATION_COOLDOWN_DAYS = max(1, int(os.getenv("SYMBOL_REPUTATION_COOLDOWN_DAYS", "5") or 5))
+SYMBOL_REPUTATION_CACHE_SECONDS = max(30, int(os.getenv("SYMBOL_REPUTATION_CACHE_SECONDS", "300") or 300))
+_symbol_reputation_cache: Dict[str, Any] = {"at": 0.0, "items": {}}
+
+
+def _symbol_reputation_ensure_table() -> None:
+    if not SQLITE_ENABLED:
+        return
+    init_db()
+    conn = db_connect()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS symbol_reputation_cooldowns (
+            symbol TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            score REAL NOT NULL,
+            reason TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _symbol_reputation_score(item: Dict[str, Any]) -> float:
+    samples = int(item.get("samples") or 0)
+    win_rate = float(item.get("winRate") or 0.0)
+    expectancy = float(item.get("averageReturnPct") or item.get("expectancyPct") or 0.0)
+    profit_factor = float(item.get("profitFactor") or 0.0)
+    actual_pnl = float(item.get("actualPnlGbp") or 0.0)
+
+    # Balanced 0-100 score. Expectancy is capped so single outliers cannot dominate.
+    win_component = max(0.0, min(1.0, win_rate)) * 40.0
+    expectancy_component = max(0.0, min(1.0, (expectancy + 2.0) / 4.0)) * 30.0
+    pf_component = max(0.0, min(1.0, profit_factor / 2.0)) * 20.0
+    sample_component = max(0.0, min(1.0, samples / 25.0)) * 10.0
+    score = win_component + expectancy_component + pf_component + sample_component
+
+    # Real-money losses receive a modest penalty, capped to avoid overreaction.
+    if actual_pnl < 0:
+        score -= min(15.0, abs(actual_pnl) / 5.0)
+    return round(max(0.0, min(100.0, score)), 1)
+
+
+def _symbol_reputation_label(score: float, samples: int) -> str:
+    if samples < SYMBOL_REPUTATION_MIN_SAMPLES:
+        return "LEARNING"
+    if score < 20:
+        return "BLACKLISTED"
+    if score < SYMBOL_REPUTATION_BLOCK_SCORE:
+        return "AVOID"
+    if score < 50:
+        return "WEAK"
+    if score < 70:
+        return "NEUTRAL"
+    if score < 85:
+        return "STRONG"
+    return "ELITE"
+
+
+def symbol_reputation_snapshot(force: bool = False) -> Dict[str, Any]:
+    now_ts = time.time()
+    if (not force and _symbol_reputation_cache.get("items") and
+            now_ts - float(_symbol_reputation_cache.get("at") or 0) < SYMBOL_REPUTATION_CACHE_SECONDS):
+        return _symbol_reputation_cache["items"]
+
+    intelligence = symbol_intelligence(days=180, horizon_hours=24, minimum_samples=1, limit=1000)
+    rows = intelligence.get("symbols", []) if intelligence.get("ok") else []
+    items: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if not symbol:
+            continue
+        samples = int(row.get("samples") or 0)
+        score = _symbol_reputation_score(row)
+        items[symbol] = {
+            "symbol": symbol,
+            "score": score,
+            "label": _symbol_reputation_label(score, samples),
+            "samples": samples,
+            "winRate": round(float(row.get("winRate") or 0.0), 4),
+            "expectancyPct": round(float(row.get("averageReturnPct") or row.get("expectancyPct") or 0.0), 4),
+            "profitFactor": round(float(row.get("profitFactor") or 0.0), 4),
+            "actualTrades": int(row.get("actualTrades") or 0),
+            "actualPnlGbp": round(float(row.get("actualPnlGbp") or 0.0), 2),
+            "mature": samples >= SYMBOL_REPUTATION_MIN_SAMPLES,
+        }
+    _symbol_reputation_cache["at"] = now_ts
+    _symbol_reputation_cache["items"] = items
+    return items
+
+
+def _symbol_reputation_active_cooldown(symbol: str) -> Optional[Dict[str, Any]]:
+    if not SQLITE_ENABLED:
+        return None
+    try:
+        _symbol_reputation_ensure_table()
+        conn = db_connect()
+        row = conn.execute(
+            "SELECT * FROM symbol_reputation_cooldowns WHERE symbol=? AND active=1",
+            (symbol.upper(),),
+        ).fetchone()
+        if not row:
+            conn.close()
+            return None
+        item = dict(row)
+        expires = datetime.fromisoformat(str(item.get("expires_at")).replace("Z", "+00:00"))
+        if expires <= datetime.now(UTC):
+            conn.execute("UPDATE symbol_reputation_cooldowns SET active=0,updated_at=? WHERE symbol=?",
+                         (datetime.now(UTC).isoformat(), symbol.upper()))
+            conn.commit()
+            conn.close()
+            return None
+        conn.close()
+        return item
+    except Exception as exc:
+        print(f"SYMBOL REPUTATION COOLDOWN READ ERROR {symbol}: {exc}")
+        return None
+
+
+def _symbol_reputation_set_cooldown(symbol: str, score: float, reason: str) -> None:
+    if not SQLITE_ENABLED:
+        return
+    try:
+        _symbol_reputation_ensure_table()
+        now = datetime.now(UTC)
+        expires = now + timedelta(days=SYMBOL_REPUTATION_COOLDOWN_DAYS)
+        conn = db_connect()
+        conn.execute("""
+            INSERT INTO symbol_reputation_cooldowns
+            (symbol,started_at,expires_at,score,reason,active,updated_at)
+            VALUES (?,?,?,?,?,1,?)
+            ON CONFLICT(symbol) DO UPDATE SET
+              started_at=excluded.started_at,expires_at=excluded.expires_at,
+              score=excluded.score,reason=excluded.reason,active=1,updated_at=excluded.updated_at
+        """, (symbol.upper(), now.isoformat(), expires.isoformat(), float(score), reason, now.isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception as exc:
+        print(f"SYMBOL REPUTATION COOLDOWN SAVE ERROR {symbol}: {exc}")
+
+
+def symbol_reputation_allows_live_buy(symbol: str) -> Tuple[bool, str, Dict[str, Any]]:
+    symbol = str(symbol or "").upper().strip()
+    if not SYMBOL_REPUTATION_ENABLED or not symbol:
+        return True, "reputation gate disabled", {"symbol": symbol, "label": "DISABLED"}
+
+    cooldown = _symbol_reputation_active_cooldown(symbol)
+    if cooldown:
+        return False, f"symbol cooldown active until {cooldown.get('expires_at')}", {
+            "symbol": symbol, "label": "COOLDOWN", "score": cooldown.get("score"),
+            "expiresAt": cooldown.get("expires_at"), "reason": cooldown.get("reason")
+        }
+
+    item = symbol_reputation_snapshot().get(symbol)
+    if not item:
+        return True, "no reputation evidence yet", {"symbol": symbol, "label": "LEARNING", "samples": 0}
+    if not item.get("mature"):
+        return True, f"learning ({item.get('samples',0)}/{SYMBOL_REPUTATION_MIN_SAMPLES} samples)", item
+
+    score = float(item.get("score") or 0.0)
+    if score < SYMBOL_REPUTATION_BLOCK_SCORE:
+        reason = (f"reputation {score:.1f}/100 ({item.get('label')}); "
+                  f"samples={item.get('samples')} win_rate={float(item.get('winRate') or 0):.0%} "
+                  f"expectancy={float(item.get('expectancyPct') or 0):.2f}%")
+        _symbol_reputation_set_cooldown(symbol, score, reason)
+        return False, reason, item
+    return True, f"reputation passed {score:.1f}/100", item
+
+
+def symbol_reputation_summary(force: bool = False) -> Dict[str, Any]:
+    items = list(symbol_reputation_snapshot(force=force).values())
+    items.sort(key=lambda x: (float(x.get("score") or 0.0), -int(x.get("samples") or 0)))
+    cooldowns = []
+    if SQLITE_ENABLED:
+        try:
+            _symbol_reputation_ensure_table()
+            conn = db_connect()
+            cooldowns = [dict(r) for r in conn.execute(
+                "SELECT * FROM symbol_reputation_cooldowns WHERE active=1 ORDER BY score ASC"
+            ).fetchall()]
+            conn.close()
+        except Exception as exc:
+            print(f"SYMBOL REPUTATION SUMMARY ERROR: {exc}")
+    return {
+        "ok": True,
+        "version": "V10.5",
+        "enabled": SYMBOL_REPUTATION_ENABLED,
+        "minimumSamples": SYMBOL_REPUTATION_MIN_SAMPLES,
+        "blockBelowScore": SYMBOL_REPUTATION_BLOCK_SCORE,
+        "cooldownDays": SYMBOL_REPUTATION_COOLDOWN_DAYS,
+        "summary": {
+            "symbols": len(items),
+            "blocked": sum(1 for x in items if x.get("mature") and float(x.get("score") or 0) < SYMBOL_REPUTATION_BLOCK_SCORE),
+            "strong": sum(1 for x in items if float(x.get("score") or 0) >= 70),
+            "learning": sum(1 for x in items if not x.get("mature")),
+            "activeCooldowns": len(cooldowns),
+        },
+        "symbols": items,
+        "cooldowns": cooldowns,
+        "liveGateActive": True,
+    }
+
+
+@app.get('/v10/symbol-reputation/summary')
+def api_symbol_reputation_summary(request: Request, force: bool = False):
+    verify_api_key(request)
+    return symbol_reputation_summary(force=force)
+
+
+@app.get('/v10/symbol-reputation/{symbol}')
+def api_symbol_reputation_symbol(symbol: str, request: Request):
+    verify_api_key(request)
+    symbol = symbol.upper().strip()
+    allowed, reason, reputation = symbol_reputation_allows_live_buy(symbol)
+    return {"ok": True, "symbol": symbol, "allowed": allowed, "reason": reason, "reputation": reputation}
 
 
 @app.get('/rule-intelligence/summary')
