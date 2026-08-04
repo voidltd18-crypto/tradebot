@@ -17,7 +17,7 @@ import { API_URL, readJson } from "../lib/api";
 import { clamp } from "../lib/format";
 import type { AnyObj } from "../lib/types";
 
-type IntelligenceSection = "brain" | "market" | "research" | "symbols" | "rules" | "evolution";
+type IntelligenceSection = "ceo" | "brain" | "market" | "research" | "symbols" | "rules" | "evolution";
 
 type EndpointState = {
   data: AnyObj;
@@ -93,7 +93,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   aiConfidence: number;
   fetchData: (force?: boolean) => Promise<void>;
 }) {
-  const [section, setSection] = useState<IntelligenceSection>("brain");
+  const [section, setSection] = useState<IntelligenceSection>("ceo");
   const [lastUpdated, setLastUpdated] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [promotionBusy, setPromotionBusy] = useState(false);
@@ -114,6 +114,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     v8Status: EMPTY_ENDPOINT,
     promotion: EMPTY_ENDPOINT,
     operator: EMPTY_ENDPOINT,
+    status: EMPTY_ENDPOINT,
+    reports: EMPTY_ENDPOINT,
+    reputation: EMPTY_ENDPOINT,
   });
 
   const endpoints = useMemo(() => ({
@@ -132,6 +135,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     v8Status: "/v8/status",
     promotion: "/v10/promotion/status",
     operator: "/v10/operator/status",
+    status: "/status",
+    reports: "/reports",
+    reputation: "/v10/symbol-reputation/summary",
   }), []);
 
   const load = useCallback(async () => {
@@ -171,6 +177,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const v8Status = sources.v8Status.data;
   const promotion = sources.promotion.data;
   const operator = sources.operator.data;
+  const liveStatus = sources.status.data;
+  const reportsData = sources.reports.data;
+  const reputationData = sources.reputation.data;
   const operatorCurrent = firstObject(operator.current);
   const operatorProposal = firstObject(operator.lastProposal);
   const operatorChanged = firstObject(operatorProposal.changed);
@@ -270,6 +279,39 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const endpointTotal = Object.keys(sources).length;
   const intelligenceHealth = Math.round(((botHealth / 100) * 0.45 + (endpointHealth / endpointTotal) * 0.55) * 100);
 
+
+  const account = firstObject(liveStatus.account, liveStatus.data?.account);
+  const reportSummary = firstObject(reportsData.summary, reportsData);
+  const ceoEquity = num(account.equity);
+  const ceoDayPnl = num(account.pnlDay ?? account.dayPnl ?? reportSummary.todayPnl ?? reportSummary.dailyPnl);
+  const ceoTotalPnl = num(reportSummary.totalGainLoss ?? reportSummary.totalPnl ?? reportSummary.netPnl);
+  const ceoTradesToday = num(reportSummary.todayTrades ?? reportSummary.tradesToday ?? advisor.today?.trades);
+  const ceoHealthScore = Math.round(clamp((intelligenceHealth * 0.35) + (calibration * 0.25) + (shadowAccuracy * 0.15) + (learningProgress * 0.1) + (botHealth * 0.15)));
+  const ceoRiskLevel = ceoDayPnl < -Math.max(10, ceoEquity * 0.015) ? "HIGH" : ceoDayPnl < 0 ? "MODERATE" : "LOW";
+  const ceoStatus = ceoRiskLevel === "HIGH" ? "PROTECTING CAPITAL" : text(operator.mode, "OFF") === "AUTO" ? "AUTONOMOUS TRADING ACTIVE" : "SUPERVISED TRADING";
+  const bestResearch = [...researchRows].sort((a, b) => num(b.expectancyPct ?? b.expectancy) - num(a.expectancyPct ?? a.expectancy))[0] || {};
+  const bestSymbol = [...symbolRows].sort((a, b) => num(b.averageReturnPct ?? b.expectancyPct ?? b.expectancy) - num(a.averageReturnPct ?? a.expectancyPct ?? a.expectancy))[0] || {};
+  const worstSymbol = [...symbolRows].sort((a, b) => num(a.averageReturnPct ?? a.expectancyPct ?? a.expectancy) - num(b.averageReturnPct ?? b.expectancyPct ?? b.expectancy))[0] || {};
+  const hurtingRules = ruleRows.filter((row) => String(row.rating ?? row.verdict ?? row.status ?? "").toUpperCase().includes("HURT"));
+  const blockedSymbols = firstArray(reputationData.blockedSymbols, reputationData.blocked, reputationData.cooldowns);
+  const ceoRecommendation = ceoRiskLevel === "HIGH"
+    ? "Reduce exposure and preserve capital until the next closed-market review."
+    : operatorChangeCount && operatorEligible
+      ? `Continue current strategy while Generation ${currentGeneration + 1} completes stability validation.`
+      : recommendationMessage;
+  const ceoPriorities = [
+    hurtingRules.length ? `Repair ${text(hurtingRules[0]?.rule ?? hurtingRules[0]?.name, "the weakest rule")}` : "Maintain rule stability",
+    num(worstSymbol.averageReturnPct ?? worstSymbol.expectancyPct ?? worstSymbol.expectancy) < 0 ? `Avoid weak ${text(worstSymbol.symbol ?? worstSymbol.name, "symbol")} setups` : "Expand symbol evidence",
+    calibration < 80 ? "Improve confidence calibration" : "Protect calibrated confidence",
+    operatorStableRuns < operatorRequiredRuns ? `Validate next generation (${operatorStableRuns}/${operatorRequiredRuns})` : "Prepare next closed-market promotion",
+  ];
+  const ceoJournal = [
+    { time: operatorLastRun, title: "Autonomous review", detail: operatorStatus },
+    { time: "Live", title: "Trading state", detail: `${ceoStatus}; daily P&L ${ceoDayPnl >= 0 ? "+" : ""}$${ceoDayPnl.toFixed(2)}` },
+    { time: "Research", title: "Best current brain", detail: `${text(bestResearch.name ?? bestResearch.brainName, "Still learning")} · ${num(bestResearch.expectancyPct ?? bestResearch.expectancy).toFixed(2)}% expectancy` },
+    { time: "Risk", title: "Biggest current weakness", detail: hurtingRules.length ? text(hurtingRules[0]?.rule ?? hurtingRules[0]?.name) : "No mature hurting rule detected" },
+  ];
+
   const refreshAll = async () => {
     await Promise.all([load(), fetchData(true)]);
   };
@@ -340,8 +382,67 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     </Card>
 
     <nav className="intelligence-tabs">
-      {(["brain", "market", "research", "symbols", "rules", "evolution"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "brain" ? "AI BRAIN" : item.toUpperCase()}</button>)}
+      {(["ceo", "brain", "market", "research", "symbols", "rules", "evolution"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "ceo" ? "AI CEO" : item === "brain" ? "AI BRAIN" : item.toUpperCase()}</button>)}
     </nav>
+
+
+    {section === "ceo" && <div className="grid two ceo-view">
+      <Card title="AI Chief Executive" wide className="ceo-command-card">
+        <div className="ceo-command-head">
+          <div>
+            <p className="eyebrow">EXECUTIVE CONTROL ROOM</p>
+            <h3>{ceoStatus}</h3>
+            <p className="muted">Evidence-backed summary generated from live trading, research, symbol, rule and evolution engines.</p>
+          </div>
+          <div className={`ceo-grade ${ceoHealthScore >= 80 ? "good" : ceoHealthScore >= 60 ? "medium" : "poor"}`}>
+            <strong>{(ceoHealthScore / 10).toFixed(1)}</strong><span>/ 10</span><small>CEO Grade</small>
+          </div>
+        </div>
+        <div className="intelligence-stat-grid ceo-stat-grid">
+          <StatTile label="Account Equity" value={`$${ceoEquity.toFixed(2)}`} sub={`Total P&L ${ceoTotalPnl >= 0 ? "+" : ""}$${ceoTotalPnl.toFixed(2)}`} tone={ceoTotalPnl >= 0 ? "positive" : "negative"} />
+          <StatTile label="Today" value={`${ceoDayPnl >= 0 ? "+" : ""}$${ceoDayPnl.toFixed(2)}`} sub={`${ceoTradesToday} trades recorded`} tone={ceoDayPnl >= 0 ? "positive" : "negative"} />
+          <StatTile label="Risk" value={ceoRiskLevel} sub={`Market: ${text(advisor.marketRegime ?? marketDna.currentRegime ?? marketRegime)}`} tone={ceoRiskLevel === "HIGH" ? "negative" : ceoRiskLevel === "LOW" ? "positive" : ""} />
+          <StatTile label="Next Generation" value={`${operatorStableRuns} / ${operatorRequiredRuns}`} sub={operatorStatus} />
+        </div>
+      </Card>
+
+      <Card title="CEO Decision" className="ceo-decision-card">
+        <span className={`pill ${ceoRiskLevel === "HIGH" ? "bad" : "ok"}`}>{ceoRiskLevel === "HIGH" ? "ACTION REQUIRED" : "NO MANUAL ACTION REQUIRED"}</span>
+        <h3>{ceoRecommendation}</h3>
+        <div className="summary">
+          <div><span>Autonomy</span><b>{text(operator.mode, "OFF")}</b></div>
+          <div><span>Calibration</span><b>{Math.round(calibration)}%</b></div>
+          <div><span>Shadow accuracy</span><b>{Math.round(shadowAccuracy)}%</b></div>
+          <div><span>Evidence</span><b>{evidenceCount.toLocaleString("en-GB")}</b></div>
+        </div>
+      </Card>
+
+      <Card title="Executive Priorities">
+        <div className="ceo-priorities">{ceoPriorities.map((priority, index) => <div key={priority}><span>{index + 1}</span><p>{priority}</p></div>)}</div>
+      </Card>
+
+      <Card title="Company Health" wide>
+        <div className="ceo-health-grid">
+          <Meter label="Trading systems" value={botHealth} />
+          <Meter label="Intelligence systems" value={intelligenceHealth} />
+          <Meter label="Confidence calibration" value={calibration} />
+          <Meter label="Research readiness" value={learningProgress} />
+        </div>
+      </Card>
+
+      <Card title="Research & Market View">
+        <div className="ceo-facts">
+          <div><span>Best research brain</span><b>{text(bestResearch.name ?? bestResearch.brainName, "Learning")}</b><small>{num(bestResearch.expectancyPct ?? bestResearch.expectancy).toFixed(2)}% expectancy</small></div>
+          <div><span>Strongest symbol</span><b>{text(bestSymbol.symbol ?? bestSymbol.name, "Learning")}</b><small>{num(bestSymbol.averageReturnPct ?? bestSymbol.expectancyPct ?? bestSymbol.expectancy).toFixed(2)}% expectancy</small></div>
+          <div><span>Weakest symbol</span><b>{text(worstSymbol.symbol ?? worstSymbol.name, "Learning")}</b><small>{num(worstSymbol.averageReturnPct ?? worstSymbol.expectancyPct ?? worstSymbol.expectancy).toFixed(2)}% expectancy</small></div>
+          <div><span>Blocked / cooling symbols</span><b>{blockedSymbols.length}</b><small>Reputation protection active</small></div>
+        </div>
+      </Card>
+
+      <Card title="CEO Journal" wide>
+        <div className="ceo-journal">{ceoJournal.map((entry, index) => <article key={`${entry.title}-${index}`}><time>{entry.time}</time><div><b>{entry.title}</b><p>{entry.detail}</p></div></article>)}</div>
+      </Card>
+    </div>}
 
     {section === "brain" && <div className="grid two">
       <Card title="AI Readiness">
