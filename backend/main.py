@@ -13525,3 +13525,415 @@ def api_v10_operator_rollback(request: Request, payload: Dict[str, Any] = Body(d
 @app.get("/v10/operator/constitution")
 def api_v10_operator_constitution(request: Request):
     verify_api_key(request); return {"ok": True, "version": V10_OPERATOR_VERSION, "constitution": V10_CONSTITUTION}
+
+
+# ============================================================
+# TRADEBOT V12.0 — AI CEO BACKEND
+# Executive supervision, persistent journal and evidence-backed reviews.
+# Advisory-only by default: it never submits orders or changes live settings.
+# ============================================================
+V12_CEO_VERSION = "V12.0"
+V12_CEO_ENABLED = os.getenv("V12_CEO_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+V12_CEO_ADVISORY_ONLY = os.getenv("V12_CEO_ADVISORY_ONLY", "true").lower() in ("1", "true", "yes", "on")
+V12_CEO_INTERVAL_SECONDS = max(300, int(os.getenv("V12_CEO_INTERVAL_SECONDS", "1800") or 1800))
+V12_CEO_STARTUP_DELAY_SECONDS = max(10, int(os.getenv("V12_CEO_STARTUP_DELAY_SECONDS", "45") or 45))
+V12_CEO_JOURNAL_LIMIT = max(50, min(int(os.getenv("V12_CEO_JOURNAL_LIMIT", "1000") or 1000), 10000))
+v12_ceo_thread_started = False
+
+
+def _v12_ceo_ensure_tables() -> None:
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v12_ceo_reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        review_type TEXT NOT NULL,
+        market_open INTEGER NOT NULL DEFAULT 0,
+        grade REAL NOT NULL DEFAULT 0,
+        grade_letter TEXT,
+        risk_level TEXT,
+        operating_status TEXT,
+        recommendation TEXT,
+        payload_json TEXT NOT NULL
+    )""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_v12_ceo_reviews_time
+                    ON v12_ceo_reviews(created_at DESC)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v12_ceo_journal (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        day TEXT NOT NULL,
+        event_key TEXT,
+        category TEXT NOT NULL,
+        severity TEXT NOT NULL DEFAULT 'INFO',
+        title TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        evidence_json TEXT,
+        UNIQUE(day, event_key)
+    )""")
+    conn.execute("""CREATE INDEX IF NOT EXISTS idx_v12_ceo_journal_time
+                    ON v12_ceo_journal(created_at DESC)""")
+    conn.commit()
+    conn.close()
+
+
+def _v12_safe_call(name: str, *args, fallback=None, **kwargs):
+    fn = globals().get(name)
+    if not callable(fn):
+        return fallback
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        print(f"V12 CEO SOURCE ERROR {name}: {exc}")
+        return fallback
+
+
+def _v12_num(value: Any, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else default
+    except Exception:
+        return default
+
+
+def _v12_letter(score: float) -> str:
+    if score >= 90: return "A+"
+    if score >= 85: return "A"
+    if score >= 80: return "A-"
+    if score >= 75: return "B+"
+    if score >= 70: return "B"
+    if score >= 65: return "B-"
+    if score >= 60: return "C+"
+    if score >= 55: return "C"
+    if score >= 45: return "D"
+    return "F"
+
+
+def _v12_journal_write(category: str, title: str, detail: str,
+                       severity: str = "INFO", event_key: str = "",
+                       evidence: Optional[Dict[str, Any]] = None) -> bool:
+    if not SQLITE_ENABLED:
+        return False
+    _v12_ceo_ensure_tables()
+    now = datetime.now(UTC)
+    key = str(event_key or "").strip() or None
+    conn = db_connect()
+    try:
+        cur = conn.execute("""INSERT OR IGNORE INTO v12_ceo_journal
+            (created_at,day,event_key,category,severity,title,detail,evidence_json)
+            VALUES(?,?,?,?,?,?,?,?)""", (
+            now.isoformat(), now.strftime("%Y-%m-%d"), key,
+            str(category).upper(), str(severity).upper(),
+            str(title)[:240], str(detail)[:4000],
+            json.dumps(evidence or {}, default=str),
+        ))
+        conn.commit()
+        return bool(cur.rowcount)
+    finally:
+        conn.close()
+
+
+def _v12_recent_journal(limit: int = 100, day: str = "") -> List[Dict[str, Any]]:
+    if not SQLITE_ENABLED:
+        return []
+    _v12_ceo_ensure_tables()
+    limit = max(1, min(int(limit), V12_CEO_JOURNAL_LIMIT))
+    conn = db_connect()
+    try:
+        if day:
+            rows = conn.execute("""SELECT * FROM v12_ceo_journal
+                WHERE day=? ORDER BY id DESC LIMIT ?""", (day, limit)).fetchall()
+        else:
+            rows = conn.execute("""SELECT * FROM v12_ceo_journal
+                ORDER BY id DESC LIMIT ?""", (limit,)).fetchall()
+    finally:
+        conn.close()
+    items = []
+    for row in rows:
+        item = dict(row)
+        try: item["evidence"] = json.loads(item.pop("evidence_json") or "{}")
+        except Exception: item["evidence"] = {}; item.pop("evidence_json", None)
+        items.append(item)
+    return items
+
+
+def _v12_symbol_facts(reputation: Dict[str, Any], analytics: Dict[str, Any]) -> Dict[str, Any]:
+    symbols = reputation.get("symbols") or reputation.get("items") or []
+    if isinstance(symbols, dict):
+        symbols = list(symbols.values())
+    mature = [s for s in symbols if isinstance(s, dict) and int(s.get("samples") or s.get("trades") or 0) > 0]
+    strongest = max(mature, key=lambda s: _v12_num(s.get("score")), default=None)
+    weakest = min(mature, key=lambda s: _v12_num(s.get("score")), default=None)
+    if not strongest:
+        best = analytics.get("bestStocks") or []
+        strongest = best[0] if best else None
+    if not weakest:
+        worst = analytics.get("worstStocks") or []
+        weakest = worst[0] if worst else None
+    return {"strongest": strongest, "weakest": weakest, "count": len(mature)}
+
+
+def v12_ceo_build_review(review_type: str = "LIVE", persist: bool = True) -> Dict[str, Any]:
+    review_type = str(review_type or "LIVE").upper()
+    market = get_market_status_payload()
+    analytics = _v12_safe_call("analytics_payload", fallback={}) or {}
+    decision = _v12_safe_call("decision_intelligence_summary", 30, fallback={}) or {}
+    reputation = _v12_safe_call("symbol_reputation_summary", False, fallback={}) or {}
+    operator = _v12_safe_call("v10_operator_status", 25, fallback={}) or {}
+    advisor = _v12_safe_call("ai_advisor_summary", 10, fallback={}) or {}
+    weakness = _v12_safe_call("weakness_intelligence_summary", fallback={}) or {}
+    research = _v12_safe_call("v7_status_payload", fallback={}) or {}
+    outcomes = _v12_safe_call("v2_pending_breakdown", fallback={}) or {}
+    report_sync = dict(auto_report_last_result or {})
+
+    try:
+        account = get_account()
+        equity = _v12_num(getattr(account, "equity", 0.0))
+        cash = _v12_num(getattr(account, "cash", 0.0))
+        buying_power = _v12_num(getattr(account, "buying_power", 0.0))
+    except Exception:
+        equity = cash = buying_power = 0.0
+
+    today_pnl = _v12_num(analytics.get("todayRealisedPnl"))
+    total_pnl = _v12_num(analytics.get("totalPnl"))
+    win_rate = _v12_num(analytics.get("winRate"))
+    profit_factor = _v12_num(analytics.get("profitFactor"))
+    closed_trades = int(analytics.get("closedTrades") or 0)
+    calibration = _v12_num(decision.get("confidenceCalibration") or (decision.get("calibration") or {}).get("score"))
+    completed = int(outcomes.get("completed") or 0)
+    pending_ready = int(outcomes.get("readyForProcessing") or 0)
+    outcome_errors = int(outcomes.get("withErrors") or 0)
+    operator_mode = str(operator.get("mode") or "OFF").upper()
+    stable_runs = int(operator.get("stableRuns") or 0)
+    stable_required = max(1, int(operator.get("requiredStableRuns") or 1))
+    symbol_facts = _v12_symbol_facts(reputation, analytics)
+
+    trading_score = 50.0
+    if closed_trades >= 5:
+        trading_score += max(-20.0, min(20.0, (win_rate - 0.50) * 80.0))
+        trading_score += max(-15.0, min(15.0, (profit_factor - 1.0) * 15.0))
+    if total_pnl > 0: trading_score += 8.0
+    elif total_pnl < 0: trading_score -= 8.0
+
+    learning_score = min(100.0, 20.0 + min(completed / 150.0, 55.0) + calibration * 25.0)
+    research_score = 75.0 if research.get("enabled", V7_ENABLED) else 35.0
+    if research.get("automaticEvolution") or research.get("automatic_evolution"):
+        research_score += 10.0
+    stability_score = 100.0
+    if outcome_errors: stability_score -= min(35.0, outcome_errors * 2.0)
+    if pending_ready: stability_score -= min(20.0, pending_ready / 25.0)
+    if report_sync.get("ok") is False: stability_score -= 15.0
+    operator_score = 40.0 if operator_mode == "OFF" else 75.0 if operator_mode == "SHADOW" else 90.0
+    operator_score += min(10.0, (stable_runs / stable_required) * 10.0)
+
+    health = {
+        "trading": round(max(0.0, min(100.0, trading_score)), 1),
+        "learning": round(max(0.0, min(100.0, learning_score)), 1),
+        "research": round(max(0.0, min(100.0, research_score)), 1),
+        "stability": round(max(0.0, min(100.0, stability_score)), 1),
+        "autonomy": round(max(0.0, min(100.0, operator_score)), 1),
+    }
+    grade = round(sum(health.values()) / len(health), 1)
+
+    daily_loss_trigger = max(10.0, equity * 0.015) if equity > 0 else 10.0
+    if emergency_stop or risk_blocked()[0] or today_pnl <= -daily_loss_trigger:
+        risk_level = "HIGH"
+    elif today_pnl < 0 or outcome_errors > 0 or pending_ready > 250:
+        risk_level = "MODERATE"
+    else:
+        risk_level = "LOW"
+
+    if emergency_stop:
+        status = "EMERGENCY PROTECTION ACTIVE"
+        recommendation = "Keep new buying disabled and investigate the emergency-stop cause."
+    elif risk_level == "HIGH":
+        status = "PROTECTING CAPITAL"
+        recommendation = "Do not increase exposure. Review losses and system health before the next entry."
+    elif operator_mode == "AUTO":
+        status = "AUTONOMOUS SUPERVISION ACTIVE"
+        recommendation = "Continue autonomous operation within the existing safety constitution."
+    elif operator_mode == "SHADOW":
+        status = "SHADOW SUPERVISION"
+        recommendation = "Continue collecting stable evidence before promoting further changes."
+    else:
+        status = "SUPERVISED TRADING"
+        recommendation = "Trading may continue, but autonomous promotions are currently disabled."
+
+    priorities: List[str] = []
+    if risk_level == "HIGH": priorities.append("Protect account capital and prevent additional exposure")
+    if symbol_facts.get("weakest"):
+        ws = symbol_facts["weakest"]
+        priorities.append(f"Monitor weak symbol {ws.get('symbol', 'UNKNOWN')} (score {round(_v12_num(ws.get('score')),1)})")
+    if pending_ready: priorities.append(f"Drain {pending_ready} mature outcome checkpoints")
+    if calibration < 0.75: priorities.append("Improve confidence calibration with more completed evidence")
+    if operator_mode != "AUTO": priorities.append("Validate the autonomous operator before enabling AUTO mode")
+    if not priorities: priorities.append("Maintain current controls and continue evidence collection")
+    priorities = priorities[:5]
+
+    now = datetime.now(UTC)
+    payload = {
+        "ok": True,
+        "version": V12_CEO_VERSION,
+        "advisoryOnly": V12_CEO_ADVISORY_ONLY,
+        "reviewType": review_type,
+        "createdAt": now.isoformat(),
+        "market": market,
+        "operatingStatus": status,
+        "grade": grade,
+        "gradeOutOf10": round(grade / 10.0, 1),
+        "gradeLetter": _v12_letter(grade),
+        "riskLevel": risk_level,
+        "recommendation": recommendation,
+        "manualActionRequired": risk_level == "HIGH" or bool(emergency_stop),
+        "priorities": priorities,
+        "account": {"equity": equity, "cash": cash, "buyingPower": buying_power,
+                    "todayRealisedPnl": today_pnl, "totalRealisedPnl": total_pnl},
+        "performance": {"closedTrades": closed_trades, "winRate": win_rate,
+                        "profitFactor": profit_factor},
+        "health": health,
+        "learning": {"completedOutcomes": completed, "readyOutcomes": pending_ready,
+                     "outcomeErrors": outcome_errors, "confidenceCalibration": calibration},
+        "evolution": {"mode": operator_mode, "stableRuns": stable_runs,
+                      "requiredStableRuns": stable_required,
+                      "lastApplyAt": operator.get("lastApplyAt"),
+                      "lastRunAt": operator.get("lastRunAt")},
+        "symbols": symbol_facts,
+        "advisor": advisor,
+        "weakness": weakness,
+    }
+
+    if persist and SQLITE_ENABLED:
+        _v12_ceo_ensure_tables()
+        conn = db_connect()
+        conn.execute("""INSERT INTO v12_ceo_reviews
+            (created_at,review_type,market_open,grade,grade_letter,risk_level,operating_status,recommendation,payload_json)
+            VALUES(?,?,?,?,?,?,?,?,?)""", (
+            now.isoformat(), review_type, int(bool(market.get("isOpen"))), grade,
+            payload["gradeLetter"], risk_level, status, recommendation,
+            json.dumps(payload, default=str),
+        ))
+        conn.commit(); conn.close()
+
+        event_slot = f"{review_type}:{now.strftime('%Y-%m-%d')}"
+        if review_type == "LIVE":
+            event_slot = f"LIVE:{now.strftime('%Y-%m-%dT%H')}"
+        _v12_journal_write(
+            "EXECUTIVE", f"{review_type.title()} CEO review", recommendation,
+            "WARNING" if risk_level == "HIGH" else "INFO", event_slot,
+            {"grade": grade, "riskLevel": risk_level, "status": status},
+        )
+        if symbol_facts.get("weakest"):
+            ws = symbol_facts["weakest"]
+            _v12_journal_write(
+                "SYMBOL", "Weakest symbol under review",
+                f"{ws.get('symbol','UNKNOWN')} currently has the lowest mature reputation score.",
+                "WARNING", f"WEAKEST:{now.strftime('%Y-%m-%d')}:{ws.get('symbol','UNKNOWN')}", ws,
+            )
+        if operator.get("lastApplyAt"):
+            _v12_journal_write(
+                "EVOLUTION", "Autonomous configuration active",
+                f"Latest bounded operator configuration was applied at {operator.get('lastApplyAt')}.",
+                "INFO", f"OPERATOR_APPLY:{operator.get('lastApplyAt')}",
+                {"mode": operator_mode, "lastApplyAt": operator.get("lastApplyAt")},
+            )
+    return payload
+
+
+def v12_ceo_status(include_journal: bool = True, journal_limit: int = 30) -> Dict[str, Any]:
+    latest = None
+    if SQLITE_ENABLED:
+        _v12_ceo_ensure_tables()
+        conn = db_connect()
+        row = conn.execute("SELECT payload_json FROM v12_ceo_reviews ORDER BY id DESC LIMIT 1").fetchone()
+        conn.close()
+        if row and row[0]:
+            try: latest = json.loads(row[0])
+            except Exception: latest = None
+    if not latest:
+        latest = v12_ceo_build_review("LIVE", persist=True)
+    latest["enabled"] = V12_CEO_ENABLED
+    latest["journal"] = _v12_recent_journal(journal_limit) if include_journal else []
+    return latest
+
+
+def v12_ceo_review_history(limit: int = 50) -> List[Dict[str, Any]]:
+    if not SQLITE_ENABLED:
+        return []
+    _v12_ceo_ensure_tables(); limit = max(1, min(int(limit), 500))
+    conn = db_connect(); rows = conn.execute("""SELECT id,created_at,review_type,market_open,
+        grade,grade_letter,risk_level,operating_status,recommendation
+        FROM v12_ceo_reviews ORDER BY id DESC LIMIT ?""", (limit,)).fetchall(); conn.close()
+    return [dict(r) for r in rows]
+
+
+def _v12_ceo_worker() -> None:
+    time.sleep(V12_CEO_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            market = get_market_status_payload()
+            uk_now = datetime.now(ZoneInfo("Europe/London"))
+            review_type = "LIVE" if market.get("isOpen") else "CLOSED_MARKET"
+            if not market.get("isOpen") and uk_now.hour < 12:
+                review_type = "MORNING_BRIEF"
+            elif not market.get("isOpen") and uk_now.hour >= 21:
+                review_type = "DAILY_DEBRIEF"
+            result = v12_ceo_build_review(review_type, persist=True)
+            print(f"V12 CEO | {review_type} grade={result.get('gradeOutOf10')}/10 risk={result.get('riskLevel')} status={result.get('operatingStatus')}")
+        except Exception as exc:
+            print(f"V12 CEO WORKER ERROR: {exc}")
+        time.sleep(V12_CEO_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+def v12_ceo_startup_event():
+    global v12_ceo_thread_started
+    if not V12_CEO_ENABLED:
+        return
+    _v12_ceo_ensure_tables()
+    if not v12_ceo_thread_started:
+        v12_ceo_thread_started = True
+        threading.Thread(target=_v12_ceo_worker, daemon=True).start()
+        print(f"V12 CEO | enabled advisory_only={V12_CEO_ADVISORY_ONLY}")
+
+
+@app.get("/v12/ceo/status")
+def api_v12_ceo_status(request: Request, journal_limit: int = 30):
+    verify_api_key(request)
+    return v12_ceo_status(True, journal_limit)
+
+
+@app.get("/v12/ceo/journal")
+def api_v12_ceo_journal(request: Request, limit: int = 100, day: str = ""):
+    verify_api_key(request)
+    return {"ok": True, "version": V12_CEO_VERSION, "count": len(_v12_recent_journal(limit, day)),
+            "items": _v12_recent_journal(limit, day)}
+
+
+@app.get("/v12/ceo/reviews")
+def api_v12_ceo_reviews(request: Request, limit: int = 50):
+    verify_api_key(request)
+    items = v12_ceo_review_history(limit)
+    return {"ok": True, "version": V12_CEO_VERSION, "count": len(items), "items": items}
+
+
+@app.post("/v12/ceo/review")
+def api_v12_ceo_review(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    review_type = str(payload.get("reviewType") or payload.get("type") or "MANUAL").upper()
+    return v12_ceo_build_review(review_type, persist=True)
+
+
+@app.get("/v12/ceo/constitution")
+def api_v12_ceo_constitution(request: Request):
+    verify_api_key(request)
+    return {
+        "ok": True, "version": V12_CEO_VERSION,
+        "advisoryOnly": V12_CEO_ADVISORY_ONLY,
+        "principles": [
+            "Protect capital before pursuing growth.",
+            "Use persisted evidence rather than invented metrics.",
+            "Do not submit, cancel or alter orders from the CEO layer.",
+            "Do not change live settings without the existing bounded operator safeguards.",
+            "Record executive reviews and recommendations in an auditable journal.",
+        ],
+    }
