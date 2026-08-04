@@ -12452,3 +12452,506 @@ def api_v10_promotion_rollback(request: Request, payload: Dict[str, Any] = Body(
     if confirmation != "ROLLBACK":
         return {"ok": False, "message": "Type ROLLBACK to restore the previous adaptive strategy thresholds."}
     return v2_rollback_latest_strategy()
+
+
+# ============================================================
+# TRADEBOT V10.2 — AUTONOMOUS AI OPERATOR
+# Bounded self-optimisation with an immutable constitution.
+# It can manage approved runtime settings, but cannot disable core safety.
+# ============================================================
+V10_OPERATOR_VERSION = "V10.2"
+V10_OPERATOR_ENABLED = os.getenv("V10_OPERATOR_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+V10_OPERATOR_MODE = os.getenv("V10_OPERATOR_MODE", "SHADOW").strip().upper() or "SHADOW"  # OFF, SHADOW, AUTO
+V10_OPERATOR_INTERVAL_SECONDS = max(900, int(os.getenv("V10_OPERATOR_INTERVAL_SECONDS", "3600") or 3600))
+V10_OPERATOR_STARTUP_DELAY_SECONDS = max(30, int(os.getenv("V10_OPERATOR_STARTUP_DELAY_SECONDS", "180") or 180))
+V10_OPERATOR_REQUIRED_STABLE_RUNS = max(2, int(os.getenv("V10_OPERATOR_REQUIRED_STABLE_RUNS", "5") or 5))
+V10_OPERATOR_MIN_SAMPLES = max(100, int(os.getenv("V10_OPERATOR_MIN_SAMPLES", "500") or 500))
+V10_OPERATOR_COOLDOWN_HOURS = max(1, int(os.getenv("V10_OPERATOR_COOLDOWN_HOURS", "24") or 24))
+V10_OPERATOR_AUTO_ROLLBACK_DRAWDOWN_PCT = max(0.5, float(os.getenv("V10_OPERATOR_AUTO_ROLLBACK_DRAWDOWN_PCT", "4.0") or 4.0))
+V10_OPERATOR_AUTO_ROLLBACK_DAILY_LOSS_PCT = max(0.25, float(os.getenv("V10_OPERATOR_AUTO_ROLLBACK_DAILY_LOSS_PCT", "2.0") or 2.0))
+
+# Immutable constitution. These are hard ceilings/floors; the operator cannot override them.
+V10_CONSTITUTION = {
+    "maxPositions": {"min": 1, "max": max(1, int(os.getenv("V10_CONSTITUTION_MAX_POSITIONS", "3") or 3))},
+    "tradingCapUsd": {
+        "min": max(25.0, float(os.getenv("V10_CONSTITUTION_MIN_CAP_USD", "100") or 100)),
+        "max": max(25.0, float(os.getenv("V10_CONSTITUTION_MAX_CAP_USD", "1500") or 1500)),
+    },
+    "positionValuePct": {
+        "min": max(0.02, float(os.getenv("V10_CONSTITUTION_MIN_POSITION_PCT", "0.10") or 0.10)),
+        "max": min(1.0, float(os.getenv("V10_CONSTITUTION_MAX_POSITION_PCT", "1.00") or 1.00)),
+    },
+    "stopLossPct": {
+        "min": max(0.5, float(os.getenv("V10_CONSTITUTION_MIN_STOP_PCT", "1.0") or 1.0)),
+        "max": min(10.0, float(os.getenv("V10_CONSTITUTION_MAX_STOP_PCT", "5.0") or 5.0)),
+    },
+    "trailStartPct": {
+        "min": max(0.5, float(os.getenv("V10_CONSTITUTION_MIN_TRAIL_START_PCT", "2.0") or 2.0)),
+        "max": min(20.0, float(os.getenv("V10_CONSTITUTION_MAX_TRAIL_START_PCT", "10.0") or 10.0)),
+    },
+    "trailGivebackPct": {
+        "min": max(0.2, float(os.getenv("V10_CONSTITUTION_MIN_TRAIL_GIVEBACK_PCT", "0.5") or 0.5)),
+        "max": min(10.0, float(os.getenv("V10_CONSTITUTION_MAX_TRAIL_GIVEBACK_PCT", "4.0") or 4.0)),
+    },
+    "minimumEvidenceSamples": V10_OPERATOR_MIN_SAMPLES,
+    "requiredStableRuns": V10_OPERATOR_REQUIRED_STABLE_RUNS,
+    "dailyLossGuardCannotBeDisabled": True,
+    "emergencyStopCannotBeDisabled": True,
+    "pdtProtectionCannotBeDisabled": True,
+    "allChangesMustBeLogged": True,
+    "allChangesMustBeReversible": True,
+}
+
+v10_operator_thread_started = False
+_v10_operator_last_run_ts = 0.0
+
+
+def _v10_operator_ensure_tables() -> None:
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v10_operator_state (
+        id INTEGER PRIMARY KEY CHECK (id=1),
+        mode TEXT NOT NULL DEFAULT 'SHADOW',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        stable_key TEXT,
+        stable_runs INTEGER NOT NULL DEFAULT 0,
+        last_run_at TEXT,
+        last_apply_at TEXT,
+        last_snapshot_json TEXT,
+        last_proposal_json TEXT,
+        updated_at TEXT NOT NULL
+    )""")
+    conn.execute("""INSERT OR IGNORE INTO v10_operator_state(id,mode,enabled,updated_at)
+                    VALUES(1,?,?,?)""", (V10_OPERATOR_MODE, int(V10_OPERATOR_ENABLED), datetime.now(UTC).isoformat()))
+    conn.execute("""CREATE TABLE IF NOT EXISTS v10_operator_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        action_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reason TEXT,
+        evidence_samples INTEGER NOT NULL DEFAULT 0,
+        before_json TEXT,
+        after_json TEXT,
+        proposal_json TEXT,
+        account_equity REAL,
+        rollback_of INTEGER,
+        note TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_operator_actions_time ON v10_operator_actions(created_at)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS v10_symbol_exclusions (
+        symbol TEXT PRIMARY KEY,
+        excluded INTEGER NOT NULL DEFAULT 1,
+        reason TEXT,
+        samples INTEGER NOT NULL DEFAULT 0,
+        total_pnl REAL,
+        profit_factor REAL,
+        updated_at TEXT NOT NULL
+    )""")
+    conn.commit(); conn.close()
+
+
+def _v10_operator_state() -> Dict[str, Any]:
+    _v10_operator_ensure_tables()
+    conn = db_connect(); row = conn.execute("SELECT * FROM v10_operator_state WHERE id=1").fetchone(); conn.close()
+    return dict(row) if row else {"mode": V10_OPERATOR_MODE, "enabled": int(V10_OPERATOR_ENABLED), "stable_runs": 0}
+
+
+def _v10_operator_current_config() -> Dict[str, Any]:
+    cap = trading_cap_usd() if "trading_cap_usd" in globals() else float(MAX_TRADING_CAPITAL)
+    exclusions = []
+    try:
+        _v10_operator_ensure_tables(); conn = db_connect()
+        exclusions = [r[0] for r in conn.execute("SELECT symbol FROM v10_symbol_exclusions WHERE excluded=1 ORDER BY symbol").fetchall()]
+        conn.close()
+    except Exception:
+        pass
+    return {
+        "maxPositions": int(MAX_POSITIONS),
+        "tradingCapUsd": float(cap),
+        "targetPositionValuePct": float(TARGET_POSITION_VALUE_PCT),
+        "maxPositionValuePct": float(MAX_POSITION_VALUE_PCT),
+        "fullBuyWhenOnePosition": bool(FULL_BUY_WHEN_ONE_POSITION),
+        "stopLossPct": round((1.0 - float(STOP_LOSS)) * 100.0, 4),
+        "fastStopLossPct": abs(float(FAST_STOP_LOSS_PCT)),
+        "trailStartPct": round((float(TRAIL_START) - 1.0) * 100.0, 4),
+        "trailGivebackPct": round((1.0 - float(TRAIL_GIVEBACK)) * 100.0, 4),
+        "symbolExclusions": exclusions,
+        "orderExecution": str(globals().get("V10_ORDER_EXECUTION_MODE", "MARKET")),
+    }
+
+
+def _v10_operator_snapshot() -> Dict[str, Any]:
+    analytics = analytics_payload() if "analytics_payload" in globals() else {}
+    rules = rule_intelligence_summary(365, 24) if "rule_intelligence_summary" in globals() else {}
+    symbols = symbol_intelligence_summary(365, 24) if "symbol_intelligence_summary" in globals() else {}
+    shadow = shadow_trading_summary(365, 24) if "shadow_trading_summary" in globals() else {}
+    advisor = ai_advisor_summary() if "ai_advisor_summary" in globals() else {}
+    completed = int((shadow.get("summary") or {}).get("completed") or shadow.get("completed") or 0)
+    return {
+        "capturedAt": datetime.now(UTC).isoformat(),
+        "completedOutcomes": completed,
+        "analytics": analytics,
+        "rules": rules,
+        "symbols": symbols,
+        "shadow": shadow,
+        "advisor": advisor,
+        "current": _v10_operator_current_config(),
+    }
+
+
+def _v10_clamp(value: float, low: float, high: float) -> float:
+    return max(float(low), min(float(high), float(value)))
+
+
+def _v10_rule_row(snapshot: Dict[str, Any], names: List[str]) -> Dict[str, Any]:
+    payload = snapshot.get("rules") or {}
+    rows = payload.get("rules") or payload.get("items") or payload.get("rows") or []
+    for row in rows:
+        label = str(row.get("rule") or row.get("name") or row.get("key") or "").lower()
+        if any(n.lower() in label for n in names):
+            return row
+    return {}
+
+
+def _v10_symbol_rows(snapshot: Dict[str, Any]) -> List[Dict[str, Any]]:
+    payload = snapshot.get("symbols") or {}
+    return payload.get("symbols") or payload.get("items") or payload.get("rows") or []
+
+
+def _v10_operator_propose(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a bounded proposal from existing evidence. No live change happens here."""
+    current = snapshot["current"]
+    analytics = snapshot.get("analytics") or {}
+    completed = int(snapshot.get("completedOutcomes") or 0)
+    proposal = dict(current)
+    reasons: List[str] = []
+
+    # Maximum positions: increase only when the position-limit rule is persistently hurting
+    # and the overall closed-trade evidence is profitable. Decrease after weak PF/drawdown evidence.
+    max_rule = _v10_rule_row(snapshot, ["maximum positions", "max_positions", "position_limit"])
+    helped = float(max_rule.get("helpedRate") or max_rule.get("helped_rate") or 0.0)
+    rule_samples = int(max_rule.get("samples") or max_rule.get("triggered") or 0)
+    pf = float(analytics.get("profitFactor") or 0.0)
+    total_pnl = float(analytics.get("totalPnl") or 0.0)
+    if rule_samples >= V10_OPERATOR_MIN_SAMPLES and helped > 0 and helped < 0.48 and pf >= 1.10 and total_pnl > 0:
+        proposal["maxPositions"] = min(current["maxPositions"] + 1, V10_CONSTITUTION["maxPositions"]["max"])
+        reasons.append(f"Position-limit evidence is hurting ({helped:.1%}, {rule_samples} samples).")
+    elif pf > 0 and pf < 0.85 and current["maxPositions"] > V10_CONSTITUTION["maxPositions"]["min"]:
+        proposal["maxPositions"] = current["maxPositions"] - 1
+        reasons.append(f"Profit factor is weak ({pf:.2f}); reduce concurrent exposure.")
+
+    # Position sizing and trading cap: only scale up after positive realised evidence; scale down sooner.
+    win_rate = float(analytics.get("winRate") or 0.0)
+    closed_count = int(analytics.get("closedTrades") or 0)
+    cap_bounds = V10_CONSTITUTION["tradingCapUsd"]
+    size_bounds = V10_CONSTITUTION["positionValuePct"]
+    if closed_count >= 20 and pf >= 1.30 and win_rate >= 0.55 and total_pnl > 0:
+        proposal["tradingCapUsd"] = round(_v10_clamp(current["tradingCapUsd"] * 1.05, cap_bounds["min"], cap_bounds["max"]), 2)
+        proposal["targetPositionValuePct"] = round(_v10_clamp(current["targetPositionValuePct"] * 1.05, size_bounds["min"], size_bounds["max"]), 4)
+        reasons.append("Strong realised evidence permits a conservative 5% scale-up.")
+    elif closed_count >= 10 and (pf < 0.90 or total_pnl < 0):
+        proposal["tradingCapUsd"] = round(_v10_clamp(current["tradingCapUsd"] * 0.90, cap_bounds["min"], cap_bounds["max"]), 2)
+        proposal["targetPositionValuePct"] = round(_v10_clamp(current["targetPositionValuePct"] * 0.90, size_bounds["min"], size_bounds["max"]), 4)
+        reasons.append("Weak realised evidence triggers a defensive 10% exposure reduction.")
+
+    # Stop loss: use average losing trade percentage when available, but stay inside constitution.
+    closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
+    loss_pcts = sorted(abs(float(t.get("pnlPct") or 0.0)) for t in closed if float(t.get("pnl") or 0.0) < 0 and float(t.get("pnlPct") or 0.0) != 0)
+    win_pcts = sorted(float(t.get("pnlPct") or 0.0) for t in closed if float(t.get("pnl") or 0.0) > 0)
+    if len(loss_pcts) >= 10:
+        median_loss = loss_pcts[len(loss_pcts)//2]
+        desired_stop = _v10_clamp(median_loss * 0.90, V10_CONSTITUTION["stopLossPct"]["min"], V10_CONSTITUTION["stopLossPct"]["max"])
+        # Maximum step of 0.5 percentage points per promotion.
+        delta = _v10_clamp(desired_stop - current["stopLossPct"], -0.5, 0.5)
+        proposal["stopLossPct"] = round(current["stopLossPct"] + delta, 3)
+        proposal["fastStopLossPct"] = proposal["stopLossPct"]
+        if abs(delta) >= 0.05:
+            reasons.append(f"Stop calibrated from {len(loss_pcts)} realised losses (median {median_loss:.2f}%).")
+
+    # Trailing values: derive cautiously from the distribution of winning trades.
+    if len(win_pcts) >= 10:
+        median_win = win_pcts[len(win_pcts)//2]
+        desired_start = _v10_clamp(median_win * 0.70, V10_CONSTITUTION["trailStartPct"]["min"], V10_CONSTITUTION["trailStartPct"]["max"])
+        desired_giveback = _v10_clamp(max(0.5, median_win * 0.25), V10_CONSTITUTION["trailGivebackPct"]["min"], V10_CONSTITUTION["trailGivebackPct"]["max"])
+        proposal["trailStartPct"] = round(current["trailStartPct"] + _v10_clamp(desired_start-current["trailStartPct"], -0.5, 0.5), 3)
+        proposal["trailGivebackPct"] = round(current["trailGivebackPct"] + _v10_clamp(desired_giveback-current["trailGivebackPct"], -0.25, 0.25), 3)
+        reasons.append(f"Trailing policy calibrated from {len(win_pcts)} realised winners.")
+
+    # Symbol exclusions: reversible and evidence based.
+    exclusions = set(current.get("symbolExclusions") or [])
+    for row in _v10_symbol_rows(snapshot):
+        sym = str(row.get("symbol") or "").upper().strip()
+        samples = int(row.get("trades") or row.get("samples") or 0)
+        sym_pnl = float(row.get("totalPnl") or row.get("actualPnl") or 0.0)
+        sym_pf = float(row.get("profitFactor") or 0.0)
+        if not sym or samples < 5:
+            continue
+        if sym_pnl < 0 and sym_pf < 0.80:
+            exclusions.add(sym)
+        elif sym_pnl > 0 and sym_pf >= 1.20 and sym in exclusions:
+            exclusions.remove(sym)
+    proposal["symbolExclusions"] = sorted(exclusions)
+    if proposal["symbolExclusions"] != current.get("symbolExclusions", []):
+        reasons.append("Symbol exclusions refreshed from realised symbol expectancy.")
+
+    # Order execution uses approved templates only. HYBRID keeps market orders for tight spreads
+    # and marketable limits for wider spreads; it never generates arbitrary execution code.
+    spread_rule = _v10_rule_row(snapshot, ["spread filter", "spread_filter"])
+    spread_helped = float(spread_rule.get("helpedRate") or 0.0)
+    spread_samples = int(spread_rule.get("samples") or spread_rule.get("triggered") or 0)
+    if spread_samples >= V10_OPERATOR_MIN_SAMPLES and spread_helped >= 0.60:
+        proposal["orderExecution"] = "HYBRID_SAFE"
+        reasons.append("Spread evidence supports the approved hybrid execution template.")
+    else:
+        proposal["orderExecution"] = "MARKET"
+
+    # Full-buy is only permitted when max positions is one. Multi-position mode uses percentage sizing.
+    proposal["fullBuyWhenOnePosition"] = bool(proposal["maxPositions"] == 1)
+    proposal["maxPositionValuePct"] = max(proposal["targetPositionValuePct"], min(1.0, proposal["targetPositionValuePct"] * 1.25))
+
+    changed = {k: {"before": current.get(k), "after": proposal.get(k)} for k in proposal if proposal.get(k) != current.get(k)}
+    return {
+        "key": json.dumps(proposal, sort_keys=True, default=str),
+        "createdAt": datetime.now(UTC).isoformat(),
+        "evidenceSamples": completed,
+        "eligible": completed >= V10_OPERATOR_MIN_SAMPLES and bool(changed),
+        "changed": changed,
+        "proposal": proposal,
+        "reasons": reasons or ["No evidence-backed setting change is currently required."],
+    }
+
+
+def _v10_operator_apply_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
+    global MAX_POSITIONS, TARGET_POSITION_VALUE_PCT, MAX_POSITION_VALUE_PCT, FULL_BUY_WHEN_ONE_POSITION
+    global STOP_LOSS, FAST_STOP_LOSS_PCT, OPTIMIZED_STOP_LOSS, OPTIMIZED_FAST_STOP_LOSS_PCT
+    global TRAIL_START, TRAIL_GIVEBACK, OPTIMIZED_TRAIL_START, OPTIMIZED_TRAIL_GIVEBACK
+    global V10_ORDER_EXECUTION_MODE
+
+    MAX_POSITIONS = int(_v10_clamp(config["maxPositions"], V10_CONSTITUTION["maxPositions"]["min"], V10_CONSTITUTION["maxPositions"]["max"]))
+    TARGET_POSITION_VALUE_PCT = _v10_clamp(config["targetPositionValuePct"], V10_CONSTITUTION["positionValuePct"]["min"], V10_CONSTITUTION["positionValuePct"]["max"])
+    MAX_POSITION_VALUE_PCT = max(TARGET_POSITION_VALUE_PCT, min(1.0, float(config.get("maxPositionValuePct") or TARGET_POSITION_VALUE_PCT)))
+    FULL_BUY_WHEN_ONE_POSITION = bool(config.get("fullBuyWhenOnePosition") and MAX_POSITIONS == 1)
+
+    stop_pct = _v10_clamp(config["stopLossPct"], V10_CONSTITUTION["stopLossPct"]["min"], V10_CONSTITUTION["stopLossPct"]["max"])
+    STOP_LOSS = 1.0 - stop_pct / 100.0
+    FAST_STOP_LOSS_PCT = -abs(stop_pct)
+    OPTIMIZED_STOP_LOSS = STOP_LOSS
+    OPTIMIZED_FAST_STOP_LOSS_PCT = FAST_STOP_LOSS_PCT
+
+    start_pct = _v10_clamp(config["trailStartPct"], V10_CONSTITUTION["trailStartPct"]["min"], V10_CONSTITUTION["trailStartPct"]["max"])
+    giveback_pct = _v10_clamp(config["trailGivebackPct"], V10_CONSTITUTION["trailGivebackPct"]["min"], V10_CONSTITUTION["trailGivebackPct"]["max"])
+    TRAIL_START = 1.0 + start_pct / 100.0
+    TRAIL_GIVEBACK = 1.0 - giveback_pct / 100.0
+    OPTIMIZED_TRAIL_START = TRAIL_START
+    OPTIMIZED_TRAIL_GIVEBACK = TRAIL_GIVEBACK
+
+    save_trading_cap_setting(float(config["tradingCapUsd"]), "USD")
+    V10_ORDER_EXECUTION_MODE = str(config.get("orderExecution") or "MARKET").upper()
+
+    # Persist exclusions in dedicated reversible memory and mirror them into the existing blacklist.
+    _v10_operator_ensure_tables(); conn = db_connect(); now = datetime.now(UTC).isoformat()
+    wanted = {str(s).upper() for s in config.get("symbolExclusions") or []}
+    existing = {r[0] for r in conn.execute("SELECT symbol FROM v10_symbol_exclusions WHERE excluded=1").fetchall()}
+    for sym in wanted | existing:
+        excluded = int(sym in wanted)
+        conn.execute("""INSERT INTO v10_symbol_exclusions(symbol,excluded,reason,updated_at)
+                        VALUES(?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET excluded=excluded.excluded,reason=excluded.reason,updated_at=excluded.updated_at""",
+                     (sym, excluded, "V10 autonomous symbol evidence", now))
+        if excluded:
+            temp_blacklist[sym] = {"reason": "V10 autonomous symbol exclusion", "until": (datetime.now(UTC)+timedelta(days=7)).isoformat()}
+        elif sym in temp_blacklist and str(temp_blacklist[sym].get("reason", "")).startswith("V10 autonomous"):
+            del temp_blacklist[sym]
+    conn.commit(); conn.close(); save_temp_blacklist()
+    return _v10_operator_current_config()
+
+
+def _v10_operator_log(action_type: str, status: str, reason: str, proposal: Dict[str, Any], before: Dict[str, Any], after: Dict[str, Any], samples: int, rollback_of: Optional[int] = None) -> int:
+    _v10_operator_ensure_tables(); conn = db_connect()
+    try:
+        equity = float(get_account().equity)
+    except Exception:
+        equity = 0.0
+    cur = conn.execute("""INSERT INTO v10_operator_actions
+        (created_at,action_type,status,reason,evidence_samples,before_json,after_json,proposal_json,account_equity,rollback_of)
+        VALUES(?,?,?,?,?,?,?,?,?,?)""", (datetime.now(UTC).isoformat(), action_type, status, str(reason)[:2000], int(samples),
+        json.dumps(before, default=str), json.dumps(after, default=str), json.dumps(proposal, default=str), equity, rollback_of))
+    action_id = int(cur.lastrowid); conn.commit(); conn.close(); return action_id
+
+
+def _v10_operator_apply(proposal: Dict[str, Any], automatic: bool = True) -> Dict[str, Any]:
+    before = _v10_operator_current_config()
+    after = _v10_operator_apply_runtime(proposal["proposal"])
+    action_id = _v10_operator_log("AUTO_PROMOTION" if automatic else "MANUAL_PROMOTION", "APPLIED", "; ".join(proposal.get("reasons") or []), proposal, before, after, proposal.get("evidenceSamples") or 0)
+    now = datetime.now(UTC).isoformat(); conn = db_connect()
+    conn.execute("UPDATE v10_operator_state SET last_apply_at=?,updated_at=? WHERE id=1", (now, now)); conn.commit(); conn.close()
+    print(f"V10 AUTOPILOT APPLIED | action={action_id} changes={list((proposal.get('changed') or {}).keys())}")
+    return {"ok": True, "actionId": action_id, "before": before, "after": after, "proposal": proposal}
+
+
+def _v10_operator_rollback_latest(reason: str) -> Dict[str, Any]:
+    _v10_operator_ensure_tables(); conn = db_connect()
+    row = conn.execute("SELECT * FROM v10_operator_actions WHERE status='APPLIED' AND action_type IN ('AUTO_PROMOTION','MANUAL_PROMOTION') ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    if not row:
+        return {"ok": False, "message": "No autonomous setting change is available to roll back."}
+    row = dict(row); before = json.loads(row.get("before_json") or "{}")
+    current = _v10_operator_current_config(); restored = _v10_operator_apply_runtime(before)
+    rollback_id = _v10_operator_log("AUTO_ROLLBACK", "APPLIED", reason, {"rollbackOf": row["id"]}, current, restored, 0, rollback_of=int(row["id"]))
+    conn = db_connect(); conn.execute("UPDATE v10_operator_actions SET status='ROLLED_BACK',note=? WHERE id=?", (reason[:1000], int(row["id"]))); conn.commit(); conn.close()
+    print(f"V10 AUTOPILOT ROLLBACK | original={row['id']} rollback={rollback_id} reason={reason}")
+    return {"ok": True, "rollbackActionId": rollback_id, "rolledBackActionId": row["id"], "current": restored}
+
+
+def _v10_operator_should_rollback() -> Optional[str]:
+    _v10_operator_ensure_tables(); conn = db_connect()
+    row = conn.execute("SELECT id,account_equity,created_at FROM v10_operator_actions WHERE status='APPLIED' AND action_type='AUTO_PROMOTION' ORDER BY id DESC LIMIT 1").fetchone(); conn.close()
+    if not row or not float(row["account_equity"] or 0):
+        return None
+    try:
+        equity = float(get_account().equity); baseline = float(row["account_equity"])
+        drawdown = ((equity / baseline) - 1.0) * 100.0
+        if drawdown <= -V10_OPERATOR_AUTO_ROLLBACK_DRAWDOWN_PCT:
+            return f"Post-promotion drawdown {drawdown:.2f}% breached {-V10_OPERATOR_AUTO_ROLLBACK_DRAWDOWN_PCT:.2f}% limit."
+        daily = float(get_daily_pnl())
+        cap = max(1.0, trading_cap_usd())
+        if daily <= -(cap * V10_OPERATOR_AUTO_ROLLBACK_DAILY_LOSS_PCT / 100.0):
+            return f"Daily loss ${daily:.2f} breached {V10_OPERATOR_AUTO_ROLLBACK_DAILY_LOSS_PCT:.2f}% of trading cap."
+    except Exception:
+        return None
+    return None
+
+
+def v10_operator_run(force: bool = False) -> Dict[str, Any]:
+    global _v10_operator_last_run_ts
+    if not V10_OPERATOR_ENABLED:
+        return {"ok": False, "message": "V10 autonomous operator is disabled."}
+    state_row = _v10_operator_state(); mode = str(state_row.get("mode") or V10_OPERATOR_MODE).upper()
+    if mode == "OFF":
+        return {"ok": True, "mode": mode, "message": "Operator is switched off."}
+    if not force and time.time() - _v10_operator_last_run_ts < V10_OPERATOR_INTERVAL_SECONDS:
+        return {"ok": True, "mode": mode, "skipped": True, "message": "Operator interval is not due."}
+    _v10_operator_last_run_ts = time.time()
+
+    rollback_reason = _v10_operator_should_rollback()
+    if rollback_reason and mode == "AUTO":
+        return {"ok": True, "mode": mode, "rollback": _v10_operator_rollback_latest(rollback_reason)}
+
+    snapshot = _v10_operator_snapshot(); proposal = _v10_operator_propose(snapshot)
+    old_key = str(state_row.get("stable_key") or "")
+    stable_runs = int(state_row.get("stable_runs") or 0) + 1 if proposal["key"] == old_key else 1
+    now = datetime.now(UTC).isoformat(); conn = db_connect()
+    conn.execute("""UPDATE v10_operator_state SET stable_key=?,stable_runs=?,last_run_at=?,last_snapshot_json=?,last_proposal_json=?,updated_at=? WHERE id=1""",
+                 (proposal["key"], stable_runs, now, json.dumps(snapshot, default=str), json.dumps(proposal, default=str), now))
+    conn.commit(); conn.close()
+
+    result = {"ok": True, "version": V10_OPERATOR_VERSION, "mode": mode, "stableRuns": stable_runs,
+              "requiredStableRuns": V10_OPERATOR_REQUIRED_STABLE_RUNS, "snapshot": snapshot, "proposal": proposal,
+              "applied": False, "automaticLiveChanges": mode == "AUTO"}
+
+    # Automatic changes only happen while the market is closed, after identical evidence
+    # remains stable for the required number of runs and the cooldown has expired.
+    market_open = bool(get_market_status_payload().get("isOpen"))
+    last_apply = state_row.get("last_apply_at")
+    cooldown_ok = True
+    if last_apply:
+        try:
+            cooldown_ok = (datetime.now(UTC) - _v6_parse_utc(last_apply)).total_seconds() >= V10_OPERATOR_COOLDOWN_HOURS * 3600
+        except Exception:
+            pass
+    if mode == "AUTO" and proposal["eligible"] and stable_runs >= V10_OPERATOR_REQUIRED_STABLE_RUNS and not market_open and cooldown_ok:
+        result["application"] = _v10_operator_apply(proposal, automatic=True); result["applied"] = True
+    elif mode == "AUTO" and market_open:
+        result["holdReason"] = "Market open; settings promotions are deferred until the market is closed."
+    elif mode == "AUTO" and not cooldown_ok:
+        result["holdReason"] = "Promotion cooldown is still active."
+    elif mode == "AUTO" and stable_runs < V10_OPERATOR_REQUIRED_STABLE_RUNS:
+        result["holdReason"] = f"Waiting for stable evidence {stable_runs}/{V10_OPERATOR_REQUIRED_STABLE_RUNS}."
+    elif mode == "SHADOW":
+        result["holdReason"] = "Shadow mode records proposals but does not change live settings."
+    return result
+
+
+def v10_operator_status(limit: int = 50) -> Dict[str, Any]:
+    _v10_operator_ensure_tables(); state_row = _v10_operator_state(); conn = db_connect()
+    rows = [dict(r) for r in conn.execute("SELECT * FROM v10_operator_actions ORDER BY id DESC LIMIT ?", (max(1, min(int(limit), 200)),)).fetchall()]
+    conn.close()
+    for row in rows:
+        for key in ("before_json", "after_json", "proposal_json"):
+            try: row[key[:-5] if key.endswith("_json") else key] = json.loads(row.get(key) or "{}")
+            except Exception: row[key[:-5] if key.endswith("_json") else key] = {}
+    try: last_proposal = json.loads(state_row.get("last_proposal_json") or "{}")
+    except Exception: last_proposal = {}
+    return {"ok": True, "version": V10_OPERATOR_VERSION, "enabled": bool(state_row.get("enabled")),
+            "mode": str(state_row.get("mode") or V10_OPERATOR_MODE), "constitution": V10_CONSTITUTION,
+            "current": _v10_operator_current_config(), "stableRuns": int(state_row.get("stable_runs") or 0),
+            "requiredStableRuns": V10_OPERATOR_REQUIRED_STABLE_RUNS, "lastRunAt": state_row.get("last_run_at"),
+            "lastApplyAt": state_row.get("last_apply_at"), "lastProposal": last_proposal,
+            "history": rows, "recurringManualApprovalRequired": False,
+            "setupNote": "Set V10_OPERATOR_MODE=AUTO once to allow bounded closed-market promotions. No recurring approval is required."}
+
+
+def v10_operator_worker() -> None:
+    time.sleep(V10_OPERATOR_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            result = v10_operator_run(False)
+            if result.get("applied"):
+                print("V10 OPERATOR | automatic promotion completed")
+            elif not result.get("skipped"):
+                print(f"V10 OPERATOR | mode={result.get('mode')} stable={result.get('stableRuns',0)}/{result.get('requiredStableRuns',0)} applied={result.get('applied',False)}")
+        except Exception as exc:
+            print(f"V10 OPERATOR ERROR: {exc}")
+        time.sleep(V10_OPERATOR_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+def v10_operator_startup_event():
+    global v10_operator_thread_started
+    _v10_operator_ensure_tables()
+    # Restore the most recently applied runtime configuration after a redeploy.
+    try:
+        conn = db_connect(); row = conn.execute("SELECT after_json FROM v10_operator_actions WHERE status='APPLIED' AND action_type IN ('AUTO_PROMOTION','MANUAL_PROMOTION','AUTO_ROLLBACK') ORDER BY id DESC LIMIT 1").fetchone(); conn.close()
+        if row and row[0]:
+            _v10_operator_apply_runtime(json.loads(row[0]))
+            print("V10 OPERATOR | restored persisted runtime configuration")
+    except Exception as exc:
+        print(f"V10 OPERATOR RESTORE ERROR: {exc}")
+    if V10_OPERATOR_ENABLED and not v10_operator_thread_started:
+        v10_operator_thread_started = True
+        threading.Thread(target=v10_operator_worker, daemon=True).start()
+
+
+@app.get("/v10/operator/status")
+def api_v10_operator_status(request: Request, limit: int = 50):
+    verify_api_key(request); return v10_operator_status(limit)
+
+
+@app.post("/v10/operator/run")
+def api_v10_operator_run(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request); return v10_operator_run(bool(payload.get("force", True)))
+
+
+@app.post("/v10/operator/mode")
+def api_v10_operator_mode(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    mode = str(payload.get("mode") or "").strip().upper()
+    if mode not in ("OFF", "SHADOW", "AUTO"):
+        return {"ok": False, "message": "Mode must be OFF, SHADOW or AUTO."}
+    _v10_operator_ensure_tables(); now = datetime.now(UTC).isoformat(); conn = db_connect()
+    conn.execute("UPDATE v10_operator_state SET mode=?,updated_at=? WHERE id=1", (mode, now)); conn.commit(); conn.close()
+    return {"ok": True, "mode": mode, "message": "AUTO performs bounded closed-market promotions without recurring approval."}
+
+
+@app.post("/v10/operator/rollback")
+def api_v10_operator_rollback(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    confirmation = str(payload.get("confirmation") or "").strip().upper()
+    if confirmation != "ROLLBACK":
+        return {"ok": False, "message": "Type ROLLBACK to restore the previous autonomous configuration."}
+    return _v10_operator_rollback_latest("Manual emergency rollback requested from dashboard.")
+
+
+@app.get("/v10/operator/constitution")
+def api_v10_operator_constitution(request: Request):
+    verify_api_key(request); return {"ok": True, "version": V10_OPERATOR_VERSION, "constitution": V10_CONSTITUTION}
