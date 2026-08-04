@@ -2,6 +2,7 @@ import os
 import json
 import time
 import secrets
+import hashlib
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "200") or 200)
 
 import sqlite3
@@ -2521,7 +2522,49 @@ def decision_intelligence_summary(days: int = 30) -> Dict[str, Any]:
                ORDER BY d.id DESC,o.horizon_hours ASC LIMIT 500""",
             (cutoff,),
         ).fetchall()
+        calibration_rows = conn.execute(
+            """WITH ranked AS (
+                   SELECT d.confidence,o.net_return_pct,
+                          ROW_NUMBER() OVER (
+                              PARTITION BY COALESCE(o.sample_key,CAST(o.decision_id AS TEXT)),o.horizon_hours
+                              ORDER BY o.id ASC
+                          ) AS rn
+                   FROM v2_setup_decisions d
+                   JOIN v2_observation_outcomes o ON o.decision_id=d.id
+                   WHERE d.timestamp>=? AND o.status='COMPLETE'
+                     AND o.horizon_hours=24 AND o.net_return_pct IS NOT NULL
+                     AND d.confidence IS NOT NULL
+               )
+               SELECT CAST(MIN(9,MAX(0,CAST(confidence*10 AS INTEGER))) AS INTEGER) AS bucket,
+                      COUNT(*) AS samples,
+                      AVG(confidence) AS avg_confidence,
+                      AVG(CASE WHEN net_return_pct>0 THEN 1.0 ELSE 0.0 END) AS actual_win_rate,
+                      AVG(net_return_pct) AS expectancy_pct
+               FROM ranked WHERE rn=1
+               GROUP BY bucket ORDER BY bucket""",
+            (cutoff,),
+        ).fetchall()
         conn.close()
+        confidence_buckets = []
+        weighted_error = 0.0
+        weighted_samples = 0
+        for row in calibration_rows:
+            bucket = int(row['bucket'] or 0)
+            samples = int(row['samples'] or 0)
+            expected = float(row['avg_confidence'] or 0.0)
+            actual = float(row['actual_win_rate'] or 0.0)
+            weighted_error += abs(expected - actual) * samples
+            weighted_samples += samples
+            confidence_buckets.append({
+                'bucket': f"{bucket/10:.1f}-{(bucket+1)/10:.1f}",
+                'samples': samples,
+                'expected': round(expected, 4),
+                'actual': round(actual, 4),
+                'winRate': round(actual, 4),
+                'expectancyPct': round(float(row['expectancy_pct'] or 0.0), 4),
+                'calibrationErrorPct': round(abs(expected-actual)*100.0, 2),
+            })
+        calibration_score = max(0.0, 1.0 - (weighted_error / weighted_samples)) if weighted_samples else 0.0
         return {
             "ok": True,
             "version": "V9.1",
@@ -2531,6 +2574,10 @@ def decision_intelligence_summary(days: int = 30) -> Dict[str, Any]:
             "totals": [dict(r) for r in totals],
             "outcomesByDecision": [dict(r) for r in outcomes],
             "blockedOpportunities": [dict(r) for r in blocked],
+            "confidenceBuckets": confidence_buckets,
+            "confidenceCalibration": round(calibration_score, 4),
+            "calibration": {"score": round(calibration_score, 4), "buckets": confidence_buckets,
+                            "samples": weighted_samples},
             "note": "Decision evidence and historical outcomes only; live trading rules are unchanged.",
         }
     except Exception as e:
@@ -5528,8 +5575,26 @@ def api_v4_status():
     return v4_status_payload()
 
 @app.get("/v4/market-dna")
-def api_v4_market_dna(symbol: Optional[str] = None, limit: int = 100):
-    return {"ok": True, "rows": v4_market_dna_rows(symbol, limit)}
+def api_v4_market_dna(symbol: Optional[str] = None, limit: int = 100, horizon_hours: int = 24):
+    rows = v4_market_dna_rows(symbol, limit)
+    report = v4_pattern_report(horizon_hours, V4_PATTERN_MIN_SAMPLES)
+    regime_rows = ((report.get("patterns") or {}).get("marketRegime") or []) if report.get("ok") else []
+    latest = rows[0] if rows else None
+    current = {
+        "symbol": (latest or {}).get("symbol"),
+        "regime": (latest or {}).get("market_regime") or "UNKNOWN",
+        "session": (latest or {}).get("session_name") or "UNKNOWN",
+        "confidence": float((latest or {}).get("confidence") or 0.0),
+        "quality": float((latest or {}).get("quality") or 0.0),
+        "momentum": float((latest or {}).get("momentum") or 0.0),
+        "spread": float((latest or {}).get("spread") or 0.0),
+        "observedAt": (latest or {}).get("observed_at"),
+    } if latest else {}
+    return {"ok": True, "version": "V9.9", "rows": rows, "current": current,
+            "regimes": regime_rows, "marketRegimes": regime_rows,
+            "overall": report.get("overall", {}), "bestPatterns": report.get("bestPatterns", []),
+            "observations": int(report.get("observations") or 0),
+            "advisoryOnly": True, "automaticLiveChanges": False}
 
 @app.get("/v4/similarity/{symbol}")
 def api_v4_similarity(symbol: str, horizon_hours: int = 24, limit: int = 50):
@@ -6118,8 +6183,15 @@ def v4_weekly_intelligence(horizon_hours: int = 24) -> Dict[str, Any]:
     recommendation = "COLLECT_MORE_EVIDENCE"
     if metrics["samples"] >= V4_PATTERN_MIN_SAMPLES:
         recommendation = "CONTINUE_CURRENT_GUARDS" if metrics["expectancyPct"] >= 0 else "REVIEW_WEAK_PATTERNS"
+    direction = "positive" if metrics["expectancyPct"] > 0 else "negative" if metrics["expectancyPct"] < 0 else "flat"
+    message = (f"The latest 7-day Market DNA sample contains {metrics['samples']} completed 24-hour outcomes, "
+               f"with a {metrics['winRate']*100:.1f}% win rate and {metrics['expectancyPct']:.3f}% average expectancy. "
+               f"The evidence is currently {direction}; recommendation: {recommendation.replace('_',' ').lower()}.")
     return {"ok": True, "advisoryOnly": True, "periodDays": 7, "horizonHours": int(horizon_hours),
-            "weekly": metrics, "recommendation": recommendation, "topPatterns": best[:5],
+            "title": "Weekly Market DNA review", "message": message,
+            "weekly": metrics, "summary": {"title": "Weekly Market DNA review", **metrics},
+            "recommendation": {"verdict": recommendation, "nextStep": "Shadow-test before any live change."},
+            "topPatterns": best[:5], "highlights": best[:5],
             "marketDnaRows": len(v4_market_dna_rows(limit=2000)),
             "nextStep": "Use similarity and pattern evidence in shadow mode before any guarded optimiser proposal."}
 
@@ -9031,10 +9103,35 @@ def v7_research_insights(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS) -> Dict[
             'winnerMedian':round(_v7_quantile([float(r.get(f) or 0) for r in wins],.5),6),
             'loserMedian':round(_v7_quantile([float(r.get(f) or 0) for r in losses],.5),6)})
     overall=_v7_segment_metrics(rows)
-    return {'ok':True,'version':V7_VERSION,'advisoryOnly':True,'horizonHours':horizon,
-            'sourceObservations':len(source),'validObservations':len(rows),'invalidObservations':len(source)-len(rows),
-            'overall':overall,'winnerLoserContrasts':contrasts,'featureAnalysis':feature_report,
-            'regimeAnalysis':regimes,'note':'Descriptive research only; no live setting was changed.'}
+    lab=v7_brain_lab(horizon)
+    brains=[]
+    for brain in lab.get('brains',[]):
+        item=dict(brain)
+        item['key']=item.get('brain_key')
+        item['name']=item.get('brain_name')
+        item['winRate']=float(item.get('win_rate') or 0.0)
+        item['expectancyPct']=float(item.get('expectancy_pct') or 0.0)
+        item['researchScore']=float(item.get('research_score') or 0.0)
+        item['profitFactor']=float(item.get('profit_factor') or 0.0)
+        item['maxDrawdownPct']=float(item.get('max_drawdown_pct') or 0.0)
+        item['trades']=int(item.get('trades') or 0)
+        brains.append(item)
+    champion=lab.get('champion') or lab.get('researchChampion')
+    if champion:
+        champion=dict(champion)
+        champion['key']=champion.get('brain_key') or champion.get('key')
+        champion['name']=champion.get('brain_name') or champion.get('name')
+        champion['winRate']=float(champion.get('win_rate') or champion.get('winRate') or 0.0)
+        champion['expectancyPct']=float(champion.get('expectancy_pct') or champion.get('expectancyPct') or 0.0)
+        champion['researchScore']=float(champion.get('research_score') or champion.get('researchScore') or 0.0)
+    return {'ok':True,'version':V7_VERSION,'advisoryOnly':True,'automaticLiveChanges':False,
+            'horizonHours':horizon,'sourceObservations':len(source),'validObservations':len(rows),
+            'invalidObservations':len(source)-len(rows),'overall':overall,
+            'winnerLoserContrasts':contrasts,'featureAnalysis':feature_report,
+            'regimeAnalysis':regimes,'generation':max([int(x.get('generation') or 0) for x in brains] or [0]),
+            'activeBrains':int(lab.get('activeBrains') or 0),'champion':champion,
+            'researchChampion':champion,'brains':brains,'leaderboard':brains,
+            'note':'Descriptive research only; no live setting was changed.'}
 
 
 def _v7_candidate_grid(rows: List[Dict[str, Any]], max_candidates: int) -> List[Dict[str, Any]]:
@@ -11641,6 +11738,12 @@ def api_strategy_intelligence_recommendations(request: Request, limit: int = 20)
 
 
 # =========================
+# TRADEBOT V9.9 — INTELLIGENCE COMPLETION
+# Completes confidence calibration, Market DNA summaries and research promotion.
+# Advisory-only: no live order, sizing, stop or gate changes.
+# =========================
+
+# =========================
 # TRADEBOT V9.8 — WEAKNESS INTELLIGENCE ENGINE
 # Fast, read-only analytics for symbols, rejection rules and data quality.
 # It does not alter live gates, position limits, risk or order execution.
@@ -11762,6 +11865,8 @@ def symbol_intelligence(days: int = 180, horizon_hours: int = 24, minimum_sample
                 "losses": losses,
                 "winRate": round(win_rate, 4),
                 "averageReturnPct": round(expectancy, 4),
+                "expectancyPct": round(expectancy, 4),
+                "expectancy": round(expectancy, 4),
                 "profitFactor": round(pf, 4),
                 "actualTrades": len(item["actualPnlGbp"]) or len(actual_pct),
                 "actualPnlGbp": round(sum(item["actualPnlGbp"]), 2),
@@ -11880,6 +11985,8 @@ def rule_intelligence(days: int = 180, horizon_hours: int = 24, minimum_samples:
                 "avoidedLosers": avoided_losers, "missedWinners": missed_winners,
                 "helpedRate": round(helped_rate, 4),
                 "rejectedTradeAverageReturnPct": round(average_return, 4),
+                "expectancyPct": round(average_return, 4),
+                "expectancy": round(average_return, 4),
                 "shadowPnlIfTakenGbp": round(shadow_pnl, 2),
                 "estimatedRuleNetBenefitGbp": round(rule_net_benefit, 2),
                 "evidenceConfidencePct": round(confidence, 1),
@@ -12057,3 +12164,291 @@ def ai_periodic_summary_worker() -> None:
 def api_ai_periodic_summary(request: Request):
     verify_api_key(request)
     return ai_periodic_summary_payload()
+
+
+# =========================
+# TRADEBOT V10 — HUMAN-GATED STRATEGY PROMOTION
+# Converts the existing guarded adaptive optimiser into a transparent
+# evaluate -> stabilise -> approve -> apply -> rollback workflow.
+# No strategy change occurs without an authenticated explicit approval.
+# =========================
+V10_HUMAN_PROMOTION_ENABLED = os.getenv("V10_HUMAN_PROMOTION_ENABLED", "true").lower() == "true"
+V10_PROMOTION_MIN_SAMPLES = max(25, int(os.getenv("V10_PROMOTION_MIN_SAMPLES", "100") or 100))
+V10_PROMOTION_CONFIRMATION = os.getenv("V10_PROMOTION_CONFIRMATION", "PROMOTE").strip().upper() or "PROMOTE"
+
+
+def _v10_ensure_tables() -> None:
+    if not SQLITE_ENABLED:
+        return
+    init_db()
+    conn = db_connect()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS v10_promotion_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_key TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'EVALUATING',
+            horizon_hours INTEGER NOT NULL,
+            minimum_samples INTEGER NOT NULL,
+            matching_runs INTEGER NOT NULL DEFAULT 0,
+            required_runs INTEGER NOT NULL DEFAULT 0,
+            payload_json TEXT NOT NULL,
+            approved_at TEXT,
+            rejected_at TEXT,
+            applied_version TEXT,
+            note TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _v10_candidate_key(candidate: Dict[str, Any], horizon_hours: int) -> str:
+    identity = {
+        "horizonHours": int(horizon_hours),
+        "confidence": round(float(candidate.get("confidence") or 0.0), 4),
+        "quality": round(float(candidate.get("quality") or 0.0), 6),
+        "targetConfidence": round(float(candidate.get("targetConfidence") or candidate.get("confidence") or 0.0), 4),
+        "targetQuality": round(float(candidate.get("targetQuality") or candidate.get("quality") or 0.0), 6),
+    }
+    raw = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _v10_save_evaluation(result: Dict[str, Any]) -> Dict[str, Any]:
+    _v10_ensure_tables()
+    candidate = result.get("stagedRecommendation") or result.get("recommended") or {}
+    if not candidate:
+        return result
+    key = _v10_candidate_key(candidate, int(result.get("horizonHours") or 24))
+    stability = result.get("stability") or {}
+    recommendation = str(result.get("recommendation") or "KEEP_CURRENT")
+    status = "READY_FOR_APPROVAL" if recommendation == "READY_TO_APPLY" else "EVALUATING"
+    now = datetime.now(UTC).isoformat()
+    payload = {
+        "optimizer": result,
+        "candidate": candidate,
+        "candidateKey": key,
+        "humanApprovalRequired": True,
+        "automaticLiveChanges": False,
+    }
+    conn = db_connect()
+    conn.execute("""
+        INSERT INTO v10_promotion_candidates
+        (candidate_key,created_at,updated_at,status,horizon_hours,minimum_samples,matching_runs,required_runs,payload_json)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(candidate_key) DO UPDATE SET
+          updated_at=excluded.updated_at,
+          status=CASE
+            WHEN v10_promotion_candidates.status IN ('APPLIED','REJECTED') THEN v10_promotion_candidates.status
+            ELSE excluded.status
+          END,
+          matching_runs=excluded.matching_runs,
+          required_runs=excluded.required_runs,
+          payload_json=excluded.payload_json
+    """, (
+        key, now, now, status,
+        int(result.get("horizonHours") or 24),
+        int(result.get("minimumSamples") or V10_PROMOTION_MIN_SAMPLES),
+        int(stability.get("matchingRuns") or 0),
+        int(stability.get("requiredRuns") or V2_OPTIMIZER_REQUIRED_STABLE_RUNS),
+        json.dumps(payload),
+    ))
+    conn.commit()
+    conn.close()
+    result["promotion"] = {
+        "candidateKey": key,
+        "status": status,
+        "humanApprovalRequired": True,
+        "automaticLiveChanges": False,
+    }
+    return result
+
+
+def v10_evaluate_promotion(horizon_hours: int = 24, min_samples: int = V10_PROMOTION_MIN_SAMPLES) -> Dict[str, Any]:
+    if not V10_HUMAN_PROMOTION_ENABLED:
+        return {"ok": False, "message": "Human strategy promotion is disabled by configuration."}
+    result = v2_adaptive_threshold_recommendations(
+        max(1, int(horizon_hours)),
+        max(V10_PROMOTION_MIN_SAMPLES, int(min_samples)),
+    )
+    if result.get("ok"):
+        _v10_save_evaluation(result)
+    result["version"] = "V10"
+    result["name"] = "Human-Gated Strategy Promotion"
+    result["humanApprovalRequired"] = True
+    result["automaticLiveChanges"] = False
+    return result
+
+
+def v10_promotion_status(limit: int = 20) -> Dict[str, Any]:
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled", "candidates": []}
+    _v10_ensure_tables()
+    conn = db_connect()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM v10_promotion_candidates ORDER BY id DESC LIMIT ?",
+        (max(1, min(int(limit), 100)),),
+    ).fetchall()]
+    conn.close()
+    candidates = []
+    for row in rows:
+        try:
+            payload = json.loads(row.pop("payload_json") or "{}")
+        except Exception:
+            payload = {}
+        row["payload"] = payload
+        row["candidate"] = payload.get("candidate") or {}
+        row["optimizer"] = payload.get("optimizer") or {}
+        candidates.append(row)
+    latest = candidates[0] if candidates else None
+    return {
+        "ok": True,
+        "version": "V10",
+        "enabled": V10_HUMAN_PROMOTION_ENABLED,
+        "mode": "HUMAN_APPROVAL_ONLY",
+        "automaticLiveChanges": False,
+        "current": {
+            "confidence": float(A_PLUS_MIN_CONFIDENCE),
+            "quality": float(A_PLUS_MIN_QUALITY),
+        },
+        "latest": latest,
+        "candidates": candidates,
+        "requiredConfirmation": V10_PROMOTION_CONFIRMATION,
+        "rollbackAvailable": bool(v2_strategy_timeline(1).get("rows")),
+    }
+
+
+def v10_approve_promotion(candidate_key: str, confirmation: str) -> Dict[str, Any]:
+    if not V10_HUMAN_PROMOTION_ENABLED:
+        return {"ok": False, "message": "Human strategy promotion is disabled."}
+    if str(confirmation or "").strip().upper() != V10_PROMOTION_CONFIRMATION:
+        return {"ok": False, "message": f"Type {V10_PROMOTION_CONFIRMATION} to approve this strategy change."}
+    _v10_ensure_tables()
+    conn = db_connect()
+    stored = conn.execute(
+        "SELECT * FROM v10_promotion_candidates WHERE candidate_key=?",
+        (str(candidate_key or "").strip(),),
+    ).fetchone()
+    conn.close()
+    if not stored:
+        return {"ok": False, "message": "Promotion candidate not found."}
+    stored = dict(stored)
+    if stored.get("status") == "APPLIED":
+        return {"ok": False, "message": "This candidate has already been applied."}
+    if stored.get("status") == "REJECTED":
+        return {"ok": False, "message": "This candidate was rejected. Run a fresh evaluation."}
+
+    # Re-evaluate at approval time. This prevents approval of stale evidence.
+    fresh = v10_evaluate_promotion(
+        int(stored.get("horizon_hours") or 24),
+        int(stored.get("minimum_samples") or V10_PROMOTION_MIN_SAMPLES),
+    )
+    candidate = fresh.get("stagedRecommendation") or {}
+    fresh_key = (fresh.get("promotion") or {}).get("candidateKey")
+    if fresh.get("recommendation") != "READY_TO_APPLY":
+        return {
+            "ok": False,
+            "message": "The candidate is no longer ready. It must pass all safeguards for the required consecutive evaluations.",
+            "evaluation": fresh,
+        }
+    if fresh_key != str(candidate_key):
+        return {
+            "ok": False,
+            "message": "Evidence changed and produced a different candidate. Review the new candidate before approval.",
+            "evaluation": fresh,
+        }
+    if int(candidate.get("samples") or 0) < V10_PROMOTION_MIN_SAMPLES:
+        return {"ok": False, "message": "Candidate does not meet the V10 minimum sample requirement."}
+
+    previous_conf = float(A_PLUS_MIN_CONFIDENCE)
+    previous_quality = float(A_PLUS_MIN_QUALITY)
+    applied = apply_custom_a_plus_thresholds(
+        float(candidate["confidence"]),
+        float(candidate["quality"]),
+        f"V10 human-approved candidate {candidate_key}",
+        True,
+    )
+    now = datetime.now(UTC).isoformat()
+    timeline = v2_strategy_timeline(1)
+    version_label = ((timeline.get("rows") or [{}])[0]).get("version_label")
+    conn = db_connect()
+    conn.execute("""
+        UPDATE v10_promotion_candidates
+        SET status='APPLIED', approved_at=?, updated_at=?, applied_version=?, note=?
+        WHERE candidate_key=?
+    """, (
+        now, now, version_label,
+        f"Applied from confidence {previous_conf:.4f}/quality {previous_quality:.6f}",
+        candidate_key,
+    ))
+    conn.commit()
+    conn.close()
+    return {
+        "ok": True,
+        "message": "Human-approved staged strategy change applied.",
+        "candidateKey": candidate_key,
+        "previous": {"confidence": previous_conf, "quality": previous_quality},
+        "current": applied,
+        "appliedVersion": version_label,
+        "rollbackAvailable": True,
+        "automaticLiveChanges": False,
+    }
+
+
+def v10_reject_promotion(candidate_key: str, note: str = "") -> Dict[str, Any]:
+    _v10_ensure_tables()
+    now = datetime.now(UTC).isoformat()
+    conn = db_connect()
+    cur = conn.execute("""
+        UPDATE v10_promotion_candidates
+        SET status='REJECTED', rejected_at=?, updated_at=?, note=?
+        WHERE candidate_key=? AND status!='APPLIED'
+    """, (now, now, str(note or "Human rejected candidate")[:500], str(candidate_key or "").strip()))
+    conn.commit()
+    changed = cur.rowcount
+    conn.close()
+    return {"ok": bool(changed), "message": "Candidate rejected." if changed else "Candidate was not found or was already applied."}
+
+
+@app.get('/v10/promotion/status')
+def api_v10_promotion_status(request: Request, limit: int = 20):
+    verify_api_key(request)
+    return v10_promotion_status(limit)
+
+
+@app.post('/v10/promotion/evaluate')
+def api_v10_promotion_evaluate(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v10_evaluate_promotion(
+        int(payload.get("horizonHours") or 24),
+        int(payload.get("minimumSamples") or V10_PROMOTION_MIN_SAMPLES),
+    )
+
+
+@app.post('/v10/promotion/approve')
+def api_v10_promotion_approve(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v10_approve_promotion(
+        str(payload.get("candidateKey") or ""),
+        str(payload.get("confirmation") or ""),
+    )
+
+
+@app.post('/v10/promotion/reject')
+def api_v10_promotion_reject(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v10_reject_promotion(
+        str(payload.get("candidateKey") or ""),
+        str(payload.get("note") or ""),
+    )
+
+
+@app.post('/v10/promotion/rollback')
+def api_v10_promotion_rollback(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    confirmation = str(payload.get("confirmation") or "").strip().upper()
+    if confirmation != "ROLLBACK":
+        return {"ok": False, "message": "Type ROLLBACK to restore the previous adaptive strategy thresholds."}
+    return v2_rollback_latest_strategy()
