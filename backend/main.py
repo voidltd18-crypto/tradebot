@@ -1329,9 +1329,14 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
     return False
 
 
-def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
+def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", scan: Optional[Dict[str, Any]] = None):
     order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
     trading_client.submit_order(order)
+    if AI_RISK_ENGINE_ENABLED and scan:
+        try:
+            _ai_risk_save_profile(_ai_risk_build_profile(scan), float(scan.get("price") or 0.0))
+        except Exception as risk_error:
+            print(f"AI RISK PROFILE SAVE ERROR {symbol}: {risk_error}")
     event = {
         "day": today_str(),
         "time": now_time(),
@@ -1588,7 +1593,10 @@ def should_fast_stop(position: Dict[str, Any]):
         return False, "fast exit disabled"
 
     pnl_pct = float(position.get("pnlPct") or 0.0)
-    return pnl_pct <= FAST_STOP_LOSS_PCT, f"fast stop pnl={pnl_pct:.2f}%"
+    symbol = str(position.get("symbol") or "").upper()
+    profile = _ai_risk_effective_profile(symbol) if "_ai_risk_effective_profile" in globals() else {}
+    threshold = -abs(float(profile.get("fastStopLossPct") or abs(FAST_STOP_LOSS_PCT)))
+    return pnl_pct <= threshold, f"adaptive fast stop pnl={pnl_pct:.2f}% threshold={threshold:.2f}%"
 
 
 def should_stall_exit(position: Dict[str, Any]):
@@ -2892,10 +2900,10 @@ def maybe_rotate_weakest_into_best(scans):
         if not sell_result.get("ok"):
             return f"ROTATION SELL BLOCKED | {sell_result.get('message')}"
         time.sleep(2)
-        notional = confidence_notional(best)
+        notional = ai_risk_notional(best)
         if notional < MIN_ORDER_NOTIONAL:
             return "ROTATION BUY SKIP | no buying power"
-        market_buy_notional(best["symbol"], notional, reason=f"PROFIT MODE ROTATE INTO FROM {weakest['symbol']}")
+        market_buy_notional(best["symbol"], notional, reason=f"PROFIT MODE ROTATE INTO FROM {weakest['symbol']}", scan=best)
         last_rotation_ts = time.time()
         return f"ROTATION DONE | sold {weakest['symbol']} -> bought {best['symbol']} ${notional:.2f}"
     except Exception as e:
@@ -2933,7 +2941,19 @@ def manage_money_mode_positions():
                 print(f"SELL ERROR {symbol}: {e}")
             continue
 
-        stop_price = entry * STOP_LOSS
+        risk_profile = _ai_risk_effective_profile(symbol) if "_ai_risk_effective_profile" in globals() else {}
+        adaptive_stop_pct = abs(float(risk_profile.get("stopLossPct") or ((1.0 - STOP_LOSS) * 100.0)))
+        emergency_stop_pct = abs(float(risk_profile.get("emergencyStopPct") or AI_RISK_EMERGENCY_STOP_PCT if "AI_RISK_EMERGENCY_STOP_PCT" in globals() else 10.0))
+        stop_price = entry * (1.0 - adaptive_stop_pct / 100.0)
+        emergency_stop_price = entry * (1.0 - emergency_stop_pct / 100.0)
+        if price <= emergency_stop_price:
+            try:
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason="AI RISK EMERGENCY STOP")
+                state[symbol]["highest_since_entry"] = None
+                print(f"AI RISK EMERGENCY STOP {symbol} | pnl={p['pnlPct']:.2f}% limit=-{emergency_stop_pct:.2f}%")
+            except Exception as e:
+                print(f"EMERGENCY SELL ERROR {symbol}: {e}")
+            continue
         if price <= stop_price:
             try:
                 if pdt_aware_should_avoid_sell(symbol, "MONEY MODE STOP LOSS", p["pnlPct"], allow_hard_stop=True):
@@ -2980,9 +3000,14 @@ def manage_money_mode_positions():
                 print(f"STALL SELL ERROR {symbol}: {e}")
             continue
 
-        trail_start_price = entry * TRAIL_START
+        adaptive_trail_start_pct = abs(float(risk_profile.get("trailStartPct") or ((TRAIL_START - 1.0) * 100.0)))
+        adaptive_giveback_pct = abs(float(risk_profile.get("trailGivebackPct") or ((1.0 - TRAIL_GIVEBACK) * 100.0)))
+        trail_start_price = entry * (1.0 + adaptive_trail_start_pct / 100.0)
         if price >= trail_start_price and highest is not None:
-            giveback = POST_PARTIAL_TRAIL_GIVEBACK if has_taken_partial_profit(symbol) else TRAIL_GIVEBACK
+            if has_taken_partial_profit(symbol):
+                giveback = POST_PARTIAL_TRAIL_GIVEBACK
+            else:
+                giveback = 1.0 - adaptive_giveback_pct / 100.0
             trail_floor = highest * giveback
 
             if price <= trail_floor:
@@ -3061,14 +3086,14 @@ def money_mode_buy(scans, manual=False):
         if not can_buy:
             messages.append(f"SKIP {symbol} | {reason}")
             continue
-        notional = confidence_notional(c)
+        notional = ai_risk_notional(c)
         if notional < MIN_ORDER_NOTIONAL:
             messages.append(f"SKIP {symbol} | notional too small {notional:.2f}")
             continue
         confidence, label = calculate_confidence(c)
         reason = f"{'MANUAL' if manual else 'AUTO'} SNIPER {label} BUY"
         try:
-            market_buy_notional(symbol, notional, reason=reason)
+            market_buy_notional(symbol, notional, reason=reason, scan=c)
             # Preserve the final execution decision separately from the earlier
             # APPROVED gate record so research can compare approved vs bought.
             record_v2_setup_decision(
@@ -3103,8 +3128,8 @@ def buy_custom_symbol(symbol: str):
         return {"ok": False, "message": f"BUY BLOCKED | {symbol} spread too wide: {quote['spread']:.4f}"}
     add_symbol_to_universe(symbol, custom=True)
     fake_scan = {"symbol": symbol, "quality_score": 0.03, "spread": quote["spread"], "short_momentum": 0, "pullback": 0.01}
-    notional = confidence_notional(fake_scan)
-    market_buy_notional(symbol, notional, reason="CUSTOM SNIPER BUY")
+    notional = ai_risk_notional(fake_scan)
+    market_buy_notional(symbol, notional, reason="CUSTOM SNIPER BUY", scan=fake_scan)
     return {"ok": True, "message": f"CUSTOM BUY ${notional:.2f} of {symbol}. Added to managed universe."}
 
 
@@ -12537,6 +12562,229 @@ def api_v10_promotion_rollback(request: Request, payload: Dict[str, Any] = Body(
         return {"ok": False, "message": "Type ROLLBACK to restore the previous adaptive strategy thresholds."}
     return v2_rollback_latest_strategy()
 
+
+
+# =========================
+# V10.3 ADAPTIVE AI RISK ENGINE
+# =========================
+AI_RISK_ENGINE_VERSION = "V10.3"
+AI_RISK_ENGINE_ENABLED = os.getenv("AI_RISK_ENGINE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+AI_RISK_EMERGENCY_STOP_PCT = max(6.0, min(15.0, float(os.getenv("AI_RISK_EMERGENCY_STOP_PCT", "10.0") or 10.0)))
+AI_RISK_MIN_POSITION_MULTIPLIER = max(0.25, min(1.0, float(os.getenv("AI_RISK_MIN_POSITION_MULTIPLIER", "0.60") or 0.60)))
+AI_RISK_MAX_POSITION_MULTIPLIER = max(1.0, min(1.50, float(os.getenv("AI_RISK_MAX_POSITION_MULTIPLIER", "1.25") or 1.25)))
+_ai_risk_symbol_cache: Dict[str, Any] = {"ts": 0.0, "rows": {}}
+
+
+def _ai_risk_ensure_tables() -> None:
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""CREATE TABLE IF NOT EXISTS v10_position_risk_profiles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        entry_price REAL,
+        confidence REAL,
+        quality REAL,
+        symbol_status TEXT,
+        symbol_samples INTEGER,
+        symbol_expectancy_pct REAL,
+        position_multiplier REAL NOT NULL,
+        stop_loss_pct REAL NOT NULL,
+        fast_stop_loss_pct REAL NOT NULL,
+        trail_start_pct REAL NOT NULL,
+        trail_giveback_pct REAL NOT NULL,
+        emergency_stop_pct REAL NOT NULL,
+        rationale TEXT,
+        active INTEGER NOT NULL DEFAULT 1
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_risk_symbol_time ON v10_position_risk_profiles(symbol, created_at DESC)")
+    conn.commit(); conn.close()
+
+
+def _ai_risk_symbol_evidence(symbol: str) -> Dict[str, Any]:
+    symbol = str(symbol or "").upper().strip()
+    now = time.time()
+    if now - float(_ai_risk_symbol_cache.get("ts") or 0.0) > 600:
+        rows = {}
+        try:
+            payload = symbol_intelligence(days=365, horizon_hours=24, minimum_samples=3, limit=500)
+            for row in payload.get("symbols") or payload.get("items") or payload.get("rows") or []:
+                key = str(row.get("symbol") or "").upper().strip()
+                if key:
+                    rows[key] = row
+        except Exception as exc:
+            print(f"AI RISK SYMBOL EVIDENCE ERROR: {exc}")
+        _ai_risk_symbol_cache["ts"] = now
+        _ai_risk_symbol_cache["rows"] = rows
+    return dict((_ai_risk_symbol_cache.get("rows") or {}).get(symbol) or {})
+
+
+def _ai_risk_build_profile(scan: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(scan.get("symbol") or "").upper().strip()
+    confidence = float(scan.get("confidence") or calculate_confidence(scan)[0] or 0.0)
+    quality = float(scan.get("quality_score") or scan.get("quality") or 0.0)
+    spread = max(0.0, float(scan.get("spread") or 0.0))
+    momentum = float(scan.get("short_momentum") or scan.get("momentum") or 0.0)
+    evidence = _ai_risk_symbol_evidence(symbol)
+    status = str(evidence.get("status") or "INSUFFICIENT_DATA").upper()
+    samples = int(evidence.get("samples") or 0)
+    expectancy = float(evidence.get("averageReturnPct") or evidence.get("expectancyPct") or 0.0)
+
+    # Start from the currently promoted live configuration.
+    base_stop = max(0.5, (1.0 - float(STOP_LOSS)) * 100.0)
+    base_fast = max(0.5, abs(float(FAST_STOP_LOSS_PCT)))
+    base_trail_start = max(0.5, (float(TRAIL_START) - 1.0) * 100.0)
+    base_giveback = max(0.2, (1.0 - float(TRAIL_GIVEBACK)) * 100.0)
+
+    conviction = max(0.0, min(1.0, (confidence - 0.45) / 0.50))
+    quality_boost = max(-0.15, min(0.15, (quality - 0.025) * 4.0))
+    status_adjust = 0.12 if status == "STRONG" else -0.18 if status == "WEAK" else -0.08 if status == "UNDER_REVIEW" else 0.0
+    expectancy_adjust = max(-0.12, min(0.12, expectancy / 10.0)) if samples >= 5 else 0.0
+    spread_penalty = max(0.0, min(0.15, spread * 5.0))
+    position_multiplier = 0.72 + conviction * 0.38 + quality_boost + status_adjust + expectancy_adjust - spread_penalty
+    position_multiplier = _v10_clamp(position_multiplier, AI_RISK_MIN_POSITION_MULTIPLIER, AI_RISK_MAX_POSITION_MULTIPLIER)
+
+    # Higher-quality, historically strong trades receive slightly more breathing room.
+    room_adjust = (conviction - 0.5) * 1.2 + (0.45 if status == "STRONG" else -0.55 if status == "WEAK" else -0.25 if status == "UNDER_REVIEW" else 0.0)
+    if momentum < -0.002:
+        room_adjust -= 0.35
+    stop_pct = _v10_clamp(base_stop + room_adjust, V10_CONSTITUTION["stopLossPct"]["min"], V10_CONSTITUTION["stopLossPct"]["max"])
+    fast_stop_pct = _v10_clamp(min(base_fast, stop_pct), V10_CONSTITUTION["stopLossPct"]["min"], V10_CONSTITUTION["stopLossPct"]["max"])
+    trail_start_pct = _v10_clamp(base_trail_start + room_adjust * 0.70, V10_CONSTITUTION["trailStartPct"]["min"], V10_CONSTITUTION["trailStartPct"]["max"])
+    giveback_pct = _v10_clamp(base_giveback + room_adjust * 0.25, V10_CONSTITUTION["trailGivebackPct"]["min"], V10_CONSTITUTION["trailGivebackPct"]["max"])
+
+    rationale = (
+        f"confidence={confidence:.2f}; quality={quality:.4f}; symbol={status}; "
+        f"samples={samples}; expectancy={expectancy:.3f}%; spread={spread:.4f}"
+    )
+    return {
+        "version": AI_RISK_ENGINE_VERSION,
+        "symbol": symbol,
+        "confidence": round(confidence, 4),
+        "quality": round(quality, 6),
+        "symbolStatus": status,
+        "symbolSamples": samples,
+        "symbolExpectancyPct": round(expectancy, 4),
+        "positionMultiplier": round(position_multiplier, 4),
+        "stopLossPct": round(stop_pct, 4),
+        "fastStopLossPct": round(fast_stop_pct, 4),
+        "trailStartPct": round(trail_start_pct, 4),
+        "trailGivebackPct": round(giveback_pct, 4),
+        "emergencyStopPct": round(AI_RISK_EMERGENCY_STOP_PCT, 4),
+        "rationale": rationale,
+    }
+
+
+def _ai_risk_save_profile(profile: Dict[str, Any], entry_price: float = 0.0) -> None:
+    if not SQLITE_ENABLED or not AI_RISK_ENGINE_ENABLED:
+        return
+    _ai_risk_ensure_tables()
+    conn = db_connect(); now = datetime.now(UTC).isoformat(); symbol = profile["symbol"]
+    conn.execute("UPDATE v10_position_risk_profiles SET active=0 WHERE symbol=? AND active=1", (symbol,))
+    conn.execute("""INSERT INTO v10_position_risk_profiles
+        (symbol,created_at,entry_price,confidence,quality,symbol_status,symbol_samples,symbol_expectancy_pct,
+         position_multiplier,stop_loss_pct,fast_stop_loss_pct,trail_start_pct,trail_giveback_pct,
+         emergency_stop_pct,rationale,active)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+        (symbol, now, float(entry_price or 0.0), profile["confidence"], profile["quality"], profile["symbolStatus"],
+         profile["symbolSamples"], profile["symbolExpectancyPct"], profile["positionMultiplier"],
+         profile["stopLossPct"], profile["fastStopLossPct"], profile["trailStartPct"],
+         profile["trailGivebackPct"], profile["emergencyStopPct"], profile["rationale"]))
+    conn.commit(); conn.close()
+    print(
+        f"AI RISK PROFILE {symbol} | size=x{profile['positionMultiplier']:.2f} "
+        f"stop={profile['stopLossPct']:.2f}% trail={profile['trailStartPct']:.2f}%/"
+        f"{profile['trailGivebackPct']:.2f}% emergency={profile['emergencyStopPct']:.2f}%"
+    )
+
+
+def _ai_risk_latest_profile(symbol: str) -> Dict[str, Any]:
+    if not AI_RISK_ENGINE_ENABLED or not SQLITE_ENABLED:
+        return {}
+    try:
+        _ai_risk_ensure_tables(); conn = db_connect()
+        row = conn.execute("SELECT * FROM v10_position_risk_profiles WHERE symbol=? AND active=1 ORDER BY id DESC LIMIT 1", (str(symbol).upper(),)).fetchone()
+        conn.close()
+        if not row:
+            return {}
+        d = dict(row)
+        return {
+            "symbol": d.get("symbol"), "createdAt": d.get("created_at"), "confidence": d.get("confidence"),
+            "quality": d.get("quality"), "symbolStatus": d.get("symbol_status"), "symbolSamples": d.get("symbol_samples"),
+            "symbolExpectancyPct": d.get("symbol_expectancy_pct"), "positionMultiplier": d.get("position_multiplier"),
+            "stopLossPct": d.get("stop_loss_pct"), "fastStopLossPct": d.get("fast_stop_loss_pct"),
+            "trailStartPct": d.get("trail_start_pct"), "trailGivebackPct": d.get("trail_giveback_pct"),
+            "emergencyStopPct": d.get("emergency_stop_pct"), "rationale": d.get("rationale")
+        }
+    except Exception as exc:
+        print(f"AI RISK PROFILE READ ERROR {symbol}: {exc}")
+        return {}
+
+
+def ai_risk_notional(scan: Dict[str, Any]) -> float:
+    base = float(confidence_notional(scan))
+    if not AI_RISK_ENGINE_ENABLED:
+        return base
+    profile = _ai_risk_build_profile(scan)
+    try:
+        account = get_account(); equity = float(account.equity); buying_power = float(account.buying_power)
+        sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
+        constitutional_cap = sizing_equity * float(V10_CONSTITUTION["positionValuePct"]["max"])
+        usable_cash = max(0.0, buying_power - CASH_BUFFER)
+        return round(max(0.0, min(base * profile["positionMultiplier"], constitutional_cap, usable_cash)), 2)
+    except Exception:
+        return round(max(0.0, base * profile["positionMultiplier"]), 2)
+
+
+def _ai_risk_effective_profile(symbol: str) -> Dict[str, Any]:
+    profile = _ai_risk_latest_profile(symbol)
+    if profile:
+        return profile
+    return {
+        "symbol": symbol,
+        "stopLossPct": round((1.0 - float(STOP_LOSS)) * 100.0, 4),
+        "fastStopLossPct": abs(float(FAST_STOP_LOSS_PCT)),
+        "trailStartPct": round((float(TRAIL_START) - 1.0) * 100.0, 4),
+        "trailGivebackPct": round((1.0 - float(TRAIL_GIVEBACK)) * 100.0, 4),
+        "emergencyStopPct": AI_RISK_EMERGENCY_STOP_PCT,
+        "positionMultiplier": 1.0,
+        "rationale": "Fallback to current promoted live configuration."
+    }
+
+
+def ai_risk_engine_status() -> Dict[str, Any]:
+    profiles = []
+    if SQLITE_ENABLED:
+        try:
+            _ai_risk_ensure_tables(); conn = db_connect()
+            profiles = [dict(r) for r in conn.execute("SELECT * FROM v10_position_risk_profiles WHERE active=1 ORDER BY created_at DESC LIMIT 50").fetchall()]
+            conn.close()
+        except Exception as exc:
+            print(f"AI RISK STATUS ERROR: {exc}")
+    return {
+        "ok": True, "version": AI_RISK_ENGINE_VERSION, "enabled": AI_RISK_ENGINE_ENABLED,
+        "emergencyStopPct": AI_RISK_EMERGENCY_STOP_PCT,
+        "managedParameters": ["position size", "stop loss", "fast stop", "trailing start", "trailing giveback"],
+        "profiles": profiles,
+        "constitution": {
+            "positionValuePct": V10_CONSTITUTION.get("positionValuePct"),
+            "stopLossPct": V10_CONSTITUTION.get("stopLossPct"),
+            "trailStartPct": V10_CONSTITUTION.get("trailStartPct"),
+            "trailGivebackPct": V10_CONSTITUTION.get("trailGivebackPct"),
+            "emergencyStopCannotBeDisabled": True,
+        },
+    }
+
+
+@app.get("/v10/risk-engine/status")
+def api_v10_risk_engine_status(request: Request):
+    verify_api_key(request); return ai_risk_engine_status()
+
+
+@app.get("/v10/risk-engine/position/{symbol}")
+def api_v10_risk_engine_position(symbol: str, request: Request):
+    verify_api_key(request); return {"ok": True, "profile": _ai_risk_effective_profile(symbol.upper())}
 
 # ============================================================
 # TRADEBOT V10.2 — AUTONOMOUS AI OPERATOR
