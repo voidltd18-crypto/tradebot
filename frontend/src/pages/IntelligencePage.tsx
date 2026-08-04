@@ -166,8 +166,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const ruleRows = firstArray(rules.rules, rules.rows, rules.rankings, rules.summary, rules.data);
   const weaknessRows = firstArray(weakness.issues, weakness.weaknesses, weakness.rows, weakness.findings, weakness.data);
   const strategyRows = firstArray(strategy.strategies, strategy.rows, strategy.rankings, strategy.summary, strategy.data);
-  const patternRows = firstArray(patterns.patterns, patterns.rows, patterns.discoveries, patterns.data, research.patterns, research.discoveries);
-  const researchRows = firstArray(research.brains, research.rows, research.leaderboard, research.insights, v7Status.brains, v8Status.brains);
+  const patternRows = firstArray(patterns.bestPatterns, patterns.rows, patterns.discoveries, patterns.data, research.patterns, research.discoveries,
+    ...(Object.values(patterns.patterns || {}).filter(Array.isArray) as AnyObj[][]));
+  const researchRows = firstArray(research.leaderboard, research.brains, research.rows, research.insights, v7Status.brains, v8Status.brains);
 
   const chartSymbolRows = symbolRows.slice(0, 12).map((row) => ({
     name: text(row.symbol ?? row.name ?? row.key, "?"),
@@ -324,7 +325,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           { key: "symbol", label: "Symbol", render: (row) => <b className="symbol-badge">{text(row.symbol ?? row.name ?? row.key)}</b> },
           { key: "samples", label: "Samples", render: (row) => num(row.trades ?? row.samples ?? row.observations).toLocaleString("en-GB") },
           { key: "winRate", label: "Win Rate", render: (row) => `${Math.round(pct(row.winRate ?? row.accuracy))}%` },
-          { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
+          { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.averageReturnPct ?? row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
           { key: "bestRegime", label: "Best Regime", render: (row) => text(row.status, "Learning") },
           { key: "confidence", label: "Confidence", render: (row) => `${Math.round(num(row.samples) ? Math.min(99, Math.sqrt(num(row.samples) / 50) * 100) : 0)}%` },
         ]} />
@@ -337,7 +338,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           { key: "rule", label: "Rule", render: (row) => <b>{text(row.rule ?? row.name ?? row.key)}</b> },
           { key: "triggered", label: "Triggered", render: (row) => num(row.triggered ?? row.samples ?? row.count).toLocaleString("en-GB") },
           { key: "helped", label: "Helped", render: (row) => `${Math.round(pct(row.helpedRate ?? row.helpRate ?? row.successRate ?? row.winRate))}%` },
-          { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
+          { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.rejectedTradeAverageReturnPct ?? row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
           { key: "verdict", label: "Verdict", render: (row) => <span className="pill">{text(row.rating ?? row.verdict ?? row.status ?? row.recommendation, "Learning")}</span> },
         ]} />
       </Card>
