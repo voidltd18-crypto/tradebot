@@ -185,7 +185,9 @@ V2_LOOKBACK_DAYS = int(os.getenv("V2_LOOKBACK_DAYS", "365") or 365)
 V2_LOG_DECISIONS = os.getenv("V2_LOG_DECISIONS", "true").lower() == "true"
 V2_DECISION_DEDUPE_SECONDS = int(os.getenv("V2_DECISION_DEDUPE_SECONDS", "300") or 300)
 V2_OUTCOME_HORIZONS_HOURS = tuple(int(x.strip()) for x in os.getenv("V2_OUTCOME_HORIZONS_HOURS", "1,24,72,120").split(",") if x.strip())
-V2_OUTCOME_BATCH_SIZE = int(os.getenv("V2_OUTCOME_BATCH_SIZE", "100"))
+V2_OUTCOME_BATCH_SIZE = int(os.getenv("V2_OUTCOME_BATCH_SIZE", "250"))
+V2_OUTCOME_DRAIN_LIMIT = max(V2_OUTCOME_BATCH_SIZE, int(os.getenv("V2_OUTCOME_DRAIN_LIMIT", "1000") or 1000))
+V2_OUTCOME_DRAIN_PAUSE_SECONDS = max(0.0, float(os.getenv("V2_OUTCOME_DRAIN_PAUSE_SECONDS", "0.25") or 0.25))
 V2_INDEPENDENT_SAMPLE_MINUTES = int(os.getenv("V2_INDEPENDENT_SAMPLE_MINUTES", "30"))
 V2_ESTIMATED_COST_BPS = float(os.getenv("V2_ESTIMATED_COST_BPS", "10"))
 
@@ -218,7 +220,7 @@ V6_REPAIR_BATCH_SIZE = max(1, min(int(os.getenv("V6_REPAIR_BATCH_SIZE", "200") o
 
 # Closed-market AI research scheduler. Live trading stays focused while the market is open.
 AI_RESEARCH_CLOSED_MARKET_ONLY = os.getenv("AI_RESEARCH_CLOSED_MARKET_ONLY", "true").lower() == "true"
-AI_RESEARCH_INTERVAL_SECONDS = max(300, int(os.getenv("AI_RESEARCH_INTERVAL_SECONDS", "1800") or 1800))
+AI_RESEARCH_INTERVAL_SECONDS = max(300, int(os.getenv("AI_RESEARCH_INTERVAL_SECONDS", "300") or 300))
 AI_RESEARCH_STARTUP_DELAY_SECONDS = max(5, int(os.getenv("AI_RESEARCH_STARTUP_DELAY_SECONDS", "30") or 30))
 
 # TradeBot V7.1 Autonomous Research Lab. Shadow-only; never changes live trading.
@@ -2272,6 +2274,59 @@ def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
         try: conn.close()
         except Exception: pass
         return {"ok":False,"version":"V6.4","evaluated":evaluated,"errors":errors+1,"error":str(e)}
+
+
+def v2_pending_breakdown() -> Dict[str, Any]:
+    """Explain pending outcomes: immature, ready, and rows carrying an evaluation error."""
+    now = datetime.now(UTC).isoformat()
+    result = {"totalPending": 0, "notMatureYet": 0, "readyForProcessing": 0, "withErrors": 0, "completed": 0}
+    if not SQLITE_ENABLED:
+        return result
+    try:
+        init_db(); conn = db_connect()
+        row = conn.execute("""SELECT
+            SUM(CASE WHEN status='COMPLETE' AND net_return_pct IS NOT NULL THEN 1 ELSE 0 END) AS completed,
+            SUM(CASE WHEN status!='COMPLETE' OR net_return_pct IS NULL THEN 1 ELSE 0 END) AS pending,
+            SUM(CASE WHEN (status!='COMPLETE' OR net_return_pct IS NULL) AND due_at>? THEN 1 ELSE 0 END) AS immature,
+            SUM(CASE WHEN (status!='COMPLETE' OR net_return_pct IS NULL) AND due_at<=? THEN 1 ELSE 0 END) AS ready,
+            SUM(CASE WHEN (status!='COMPLETE' OR net_return_pct IS NULL) AND error IS NOT NULL AND TRIM(error)<>'' THEN 1 ELSE 0 END) AS errors
+            FROM v2_observation_outcomes""", (now, now)).fetchone()
+        conn.close()
+        result = {
+            "completed": int(row["completed"] or 0),
+            "totalPending": int(row["pending"] or 0),
+            "notMatureYet": int(row["immature"] or 0),
+            "readyForProcessing": int(row["ready"] or 0),
+            "withErrors": int(row["errors"] or 0),
+        }
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def v2_drain_due_outcomes(max_total: Optional[int] = None) -> Dict[str, Any]:
+    """Drain eligible outcomes in several bounded batches during closed-market research."""
+    ceiling = max(V2_OUTCOME_BATCH_SIZE, int(max_total or V2_OUTCOME_DRAIN_LIMIT))
+    total_evaluated = total_errors = batches = 0
+    while total_evaluated + total_errors < ceiling:
+        remaining = ceiling - (total_evaluated + total_errors)
+        result = v2_evaluate_due_outcomes(min(V2_OUTCOME_BATCH_SIZE, remaining))
+        batches += 1
+        evaluated = int(result.get("evaluated") or 0)
+        errors = int(result.get("errors") or 0)
+        due = int(result.get("due") or 0)
+        total_evaluated += evaluated
+        total_errors += errors
+        if due == 0 or (evaluated == 0 and errors == 0):
+            break
+        if due < min(V2_OUTCOME_BATCH_SIZE, remaining):
+            break
+        if V2_OUTCOME_DRAIN_PAUSE_SECONDS:
+            time.sleep(V2_OUTCOME_DRAIN_PAUSE_SECONDS)
+    backlog = v2_pending_breakdown()
+    if total_evaluated or total_errors:
+        print(f"V6.6 OUTCOME DRAIN | batches={batches} evaluated={total_evaluated} errors={total_errors} ready_remaining={backlog.get('readyForProcessing',0)} immature={backlog.get('notMatureYet',0)}")
+    return {"ok": True, "version": "V6.6", "batches": batches, "evaluated": total_evaluated, "errors": total_errors, "backlog": backlog}
 
 
 def v6_repair_outcome_times(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = V6_REPAIR_BATCH_SIZE) -> Dict[str, Any]:
@@ -6695,7 +6750,7 @@ def closed_market_ai_research_worker() -> None:
 
             started = datetime.now(UTC).isoformat()
             seeded = v2_seed_missing_outcomes()
-            outcomes = v2_evaluate_due_outcomes()
+            outcomes = v2_drain_due_outcomes()
             v6_result = v6_sync_brains(V6_DEFAULT_HORIZON_HOURS, V6_AUTO_SYNC_LIMIT) if V6_BRAINS_ENABLED else {"ok": True, "skipped": True}
             v11_result = v11_learning_cycle("closed_market", force=False) if V11_AUTO_LEARNING_ENABLED else {"ok": True, "skipped": True}
             last_cycle_at = time.monotonic()
@@ -11441,6 +11496,32 @@ def shadow_trading_run(evaluate_limit: int = 1000, horizon_hours: int = 24) -> D
             "advisoryOnly":True,"realOrdersPlaced":False,"automaticLiveChanges":False}
 
 
+@app.get('/outcomes/backlog')
+def api_outcomes_backlog(request: Request):
+    verify_api_key(request)
+    return {
+        "ok": True,
+        "backlog": v2_pending_breakdown(),
+        "horizonsHours": list(V2_OUTCOME_HORIZONS_HOURS),
+        "validatedPromotionHorizonHours": V11_DEFAULT_HORIZON_HOURS,
+        "researchIntervalSeconds": AI_RESEARCH_INTERVAL_SECONDS,
+        "batchSize": V2_OUTCOME_BATCH_SIZE,
+        "drainLimitPerCycle": V2_OUTCOME_DRAIN_LIMIT,
+    }
+
+
+@app.post('/outcomes/drain')
+def api_outcomes_drain(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    try:
+        clock = trading_client.get_clock()
+        if clock.is_open and AI_RESEARCH_CLOSED_MARKET_ONLY:
+            return {"ok": False, "blocked": True, "reason": "market_open_live_trader_has_priority"}
+    except Exception:
+        pass
+    return v2_drain_due_outcomes(int(payload.get("limit") or V2_OUTCOME_DRAIN_LIMIT))
+
+
 @app.get('/shadow-trading/summary')
 def api_shadow_trading_summary(request: Request, days: int = 30, horizon_hours: int = 24, notional_gbp: float = SHADOW_TRADE_NOTIONAL_GBP):
     verify_api_key(request)
@@ -11521,6 +11602,9 @@ def ai_advisor_summary(limit: int = 10) -> Dict[str, Any]:
             "learningRuns": int(learning.get("learningRuns") or 0),
             "validatedPositive": len(positive),
             "validatedNegative": len(negative),
+            "pendingBreakdown": v2_pending_breakdown(),
+            "outcomeHorizonsHours": list(V2_OUTCOME_HORIZONS_HOURS),
+            "researchIntervalSeconds": AI_RESEARCH_INTERVAL_SECONDS,
         },
         "recommendations": {
             "favourablePatterns": positive,
