@@ -1,0 +1,13 @@
+TradeBot V10.2 Autonomous Operator
+
+Backend endpoint requirements:
+GET  /v10/operator/status
+POST /v10/operator/run
+POST /v10/operator/mode
+POST /v10/operator/rollback
+GET  /v10/operator/constitution
+
+For unattended bounded operation, set the backend environment variable:
+V10_OPERATOR_MODE=AUTO
+
+AUTO changes settings only while the market is closed and only after stable evidence.

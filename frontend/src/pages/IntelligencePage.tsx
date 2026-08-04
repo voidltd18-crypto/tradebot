@@ -103,6 +103,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     v7Status: EMPTY_ENDPOINT,
     v8Status: EMPTY_ENDPOINT,
     promotion: EMPTY_ENDPOINT,
+    operator: EMPTY_ENDPOINT,
   });
 
   const endpoints = useMemo(() => ({
@@ -120,6 +121,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     v7Status: "/v7/status",
     v8Status: "/v8/status",
     promotion: "/v10/promotion/status",
+    operator: "/v10/operator/status",
   }), []);
 
   const load = useCallback(async () => {
@@ -158,6 +160,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const v7Status = sources.v7Status.data;
   const v8Status = sources.v8Status.data;
   const promotion = sources.promotion.data;
+  const operator = sources.operator.data;
+  const operatorCurrent = firstObject(operator.current);
+  const operatorProposal = firstObject(operator.lastProposal);
   const promotionLatest = firstObject(promotion.latest);
   const promotionCandidate = firstObject(promotionLatest.candidate, promotionLatest.payload?.candidate);
   const promotionOptimizer = firstObject(promotionLatest.optimizer, promotionLatest.payload?.optimizer);
@@ -244,6 +249,12 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     const confirmation = window.prompt("Type ROLLBACK to restore the previous promoted thresholds.", "");
     if (confirmation !== null) promotionPost("/v10/promotion/rollback", { confirmation });
   };
+  const runOperator = () => promotionPost("/v10/operator/run", { force: true });
+  const setOperatorMode = (mode: "OFF" | "SHADOW" | "AUTO") => promotionPost("/v10/operator/mode", { mode });
+  const rollbackOperator = () => {
+    const confirmation = window.prompt("Type ROLLBACK to restore the previous autonomous configuration.", "");
+    if (confirmation !== null) promotionPost("/v10/operator/rollback", { confirmation });
+  };
 
   return <div className="intelligence-page">
     <Card wide className="intelligence-hero">
@@ -286,6 +297,31 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <div><span>Current regime</span><b>{text(advisor.marketRegime ?? marketRegime)}</b></div>
         </div>
       </Card>
+      <Card title="Autonomous AI Operator" wide className="recommendation-card">
+        <div className="summary">
+          <div><span>Mode</span><b>{text(operator.mode, "SHADOW")}</b></div>
+          <div><span>Stable evidence</span><b>{num(operator.stableRuns)} / {num(operator.requiredStableRuns)}</b></div>
+          <div><span>Max positions</span><b>{num(operatorCurrent.maxPositions)}</b></div>
+          <div><span>Trading cap</span><b>${num(operatorCurrent.tradingCapUsd).toFixed(2)}</b></div>
+          <div><span>Position size</span><b>{pct(operatorCurrent.targetPositionValuePct).toFixed(0)}%</b></div>
+          <div><span>Stop loss</span><b>{num(operatorCurrent.stopLossPct).toFixed(2)}%</b></div>
+          <div><span>Trail start</span><b>{num(operatorCurrent.trailStartPct).toFixed(2)}%</b></div>
+          <div><span>Trail giveback</span><b>{num(operatorCurrent.trailGivebackPct).toFixed(2)}%</b></div>
+          <div><span>Excluded symbols</span><b>{firstArray(operatorCurrent.symbolExclusions).length || (Array.isArray(operatorCurrent.symbolExclusions) ? operatorCurrent.symbolExclusions.length : 0)}</b></div>
+          <div><span>Order execution</span><b>{text(operatorCurrent.orderExecution, "MARKET")}</b></div>
+        </div>
+        <div className="actions admin-section">
+          <button onClick={() => setOperatorMode("AUTO")} disabled={promotionBusy}>ENABLE AUTO</button>
+          <button className="ghost" onClick={() => setOperatorMode("SHADOW")} disabled={promotionBusy}>SHADOW ONLY</button>
+          <button className="ghost" onClick={() => setOperatorMode("OFF")} disabled={promotionBusy}>TURN OFF</button>
+          <button onClick={runOperator} disabled={promotionBusy}>{promotionBusy ? "WORKING..." : "RUN REVIEW NOW"}</button>
+          <button className="danger" onClick={rollbackOperator} disabled={promotionBusy || !operator.history?.length}>ROLL BACK</button>
+        </div>
+        <p className="muted">AUTO needs no recurring approval. It changes only constitution-bounded settings while the market is closed, after the same proposal remains stable for the required runs. It automatically rolls back after excessive post-change drawdown or daily loss.</p>
+        {Object.keys(operatorProposal).length > 0 && <pre>{JSON.stringify(operatorProposal.changed ?? operatorProposal, null, 2)}</pre>}
+        {promotionMessage && <p><b>{promotionMessage}</b></p>}
+      </Card>
+
       <Card title="Human-Gated Strategy Promotion" wide className="recommendation-card">
         <div className="summary">
           <div><span>Status</span><b>{text(promotionLatest.status ?? promotionOptimizer.recommendation, "No candidate evaluated")}</b></div>
