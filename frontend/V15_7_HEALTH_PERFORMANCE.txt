@@ -1,0 +1,6 @@
+TradeBot V15.7 frontend health tuning
+
+- Endpoint checks run four at a time.
+- Composite Reports, Operator, Advisor and Evolution endpoints receive a 60-second first-load allowance.
+- All other endpoints retain a 30-second timeout.
+- This prevents false failures immediately after Render restarts while keeping actual outages visible.

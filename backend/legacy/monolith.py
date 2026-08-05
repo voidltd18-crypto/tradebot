@@ -7222,7 +7222,17 @@ def rebuild_performance_state() -> Dict[str, Any]:
     return stats
 
 
-def performance_engine_payload() -> Dict[str, Any]:
+_performance_payload_cache: Dict[str, Any] = {"at": 0.0, "value": None}
+_performance_payload_lock = threading.RLock()
+PERFORMANCE_PAYLOAD_CACHE_SECONDS = max(10, int(os.getenv("PERFORMANCE_PAYLOAD_CACHE_SECONDS", "45")))
+
+
+def performance_engine_payload(force_refresh: bool = False) -> Dict[str, Any]:
+    now_mono = time.monotonic()
+    with _performance_payload_lock:
+        cached = _performance_payload_cache.get("value")
+        if not force_refresh and isinstance(cached, dict) and now_mono - float(_performance_payload_cache.get("at", 0.0)) < PERFORMANCE_PAYLOAD_CACHE_SECONDS:
+            return dict(cached)
     stats = rebuild_performance_state()
     baseline = load_equity_baseline()
     try:
@@ -7236,7 +7246,7 @@ def performance_engine_payload() -> Dict[str, Any]:
         if baseline > 0:
             save_equity_baseline(baseline)
     total_gain_loss = equity + total_withdrawn - baseline
-    return {
+    payload = {
         "ok": True,
         "persistent": os.path.abspath(SQLITE_DB_FILE).startswith("/var/data") or bool(os.getenv("PERSISTENT_DATA_DIR")),
         "databaseFile": SQLITE_DB_FILE,
@@ -7249,6 +7259,10 @@ def performance_engine_payload() -> Dict[str, Any]:
         "totalGainLossGbp": money_gbp(total_gain_loss),
         **stats,
     }
+    with _performance_payload_lock:
+        _performance_payload_cache["at"] = time.monotonic()
+        _performance_payload_cache["value"] = dict(payload)
+    return payload
 
 @app.post("/reset-baseline")
 def reset_baseline(request: Request):
@@ -7273,7 +7287,7 @@ def api_performance_engine():
 @app.post("/performance-engine/rebuild")
 def api_rebuild_performance_engine(request: Request):
     verify_api_key(request)
-    return {"ok": True, **performance_engine_payload(), "message": "Performance statistics rebuilt from closed trades."}
+    return {"ok": True, **performance_engine_payload(force_refresh=True), "message": "Performance statistics rebuilt from closed trades."}
 
 @app.get("/reports")
 def reports():
@@ -13656,9 +13670,25 @@ def v10_operator_run(force: bool = False) -> Dict[str, Any]:
     return result
 
 
-def v10_operator_status(limit: int = 50) -> Dict[str, Any]:
+_v10_operator_status_cache: Dict[str, Any] = {"at": 0.0, "value": None, "limit": 0}
+_v10_operator_status_lock = threading.RLock()
+V10_OPERATOR_STATUS_CACHE_SECONDS = max(5, int(os.getenv("V10_OPERATOR_STATUS_CACHE_SECONDS", "30")))
+
+
+def v10_operator_status(limit: int = 50, force_refresh: bool = False) -> Dict[str, Any]:
+    limit = max(1, min(int(limit), 200))
+    now_mono = time.monotonic()
+    with _v10_operator_status_lock:
+        cached = _v10_operator_status_cache.get("value")
+        if (not force_refresh and isinstance(cached, dict)
+                and int(_v10_operator_status_cache.get("limit", 0)) >= limit
+                and now_mono - float(_v10_operator_status_cache.get("at", 0.0)) < V10_OPERATOR_STATUS_CACHE_SECONDS):
+            result = dict(cached)
+            result["history"] = list(result.get("history") or [])[:limit]
+            result["cached"] = True
+            return result
     _v10_operator_ensure_tables(); state_row = _v10_operator_state(); conn = db_connect()
-    rows = [dict(r) for r in conn.execute("SELECT * FROM v10_operator_actions ORDER BY id DESC LIMIT ?", (max(1, min(int(limit), 200)),)).fetchall()]
+    rows = [dict(r) for r in conn.execute("SELECT * FROM v10_operator_actions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
     conn.close()
     for row in rows:
         for key in ("before_json", "after_json", "proposal_json"):
@@ -13666,13 +13696,16 @@ def v10_operator_status(limit: int = 50) -> Dict[str, Any]:
             except Exception: row[key[:-5] if key.endswith("_json") else key] = {}
     try: last_proposal = json.loads(state_row.get("last_proposal_json") or "{}")
     except Exception: last_proposal = {}
-    return {"ok": True, "version": V10_OPERATOR_VERSION, "enabled": bool(state_row.get("enabled")),
+    result = {"ok": True, "version": V10_OPERATOR_VERSION, "enabled": bool(state_row.get("enabled")),
             "mode": str(state_row.get("mode") or V10_OPERATOR_MODE), "constitution": V10_CONSTITUTION,
             "current": _v10_operator_current_config(), "stableRuns": int(state_row.get("stable_runs") or 0),
             "requiredStableRuns": V10_OPERATOR_REQUIRED_STABLE_RUNS, "lastRunAt": state_row.get("last_run_at"),
             "lastApplyAt": state_row.get("last_apply_at"), "lastProposal": last_proposal,
             "history": rows, "recurringManualApprovalRequired": False,
             "setupNote": "Set V10_OPERATOR_MODE=AUTO once to allow bounded closed-market promotions. No recurring approval is required."}
+    with _v10_operator_status_lock:
+        _v10_operator_status_cache.update({"at": time.monotonic(), "value": dict(result), "limit": limit})
+    return result
 
 
 def v10_operator_worker() -> None:
@@ -13724,6 +13757,8 @@ def api_v10_operator_mode(request: Request, payload: Dict[str, Any] = Body(defau
         return {"ok": False, "message": "Mode must be OFF, SHADOW or AUTO."}
     _v10_operator_ensure_tables(); now = datetime.now(UTC).isoformat(); conn = db_connect()
     conn.execute("UPDATE v10_operator_state SET mode=?,updated_at=? WHERE id=1", (mode, now)); conn.commit(); conn.close()
+    with _v10_operator_status_lock:
+        _v10_operator_status_cache.update({"at": 0.0, "value": None, "limit": 0})
     return {"ok": True, "mode": mode, "message": "AUTO performs bounded closed-market promotions without recurring approval."}
 
 
@@ -15174,12 +15209,34 @@ def api_v14_scientist_constitution(request: Request):
 # ============================================================
 # TRADEBOT V15 — AUTONOMOUS AI OPERATIONS CENTRE (AIOPS)
 # ============================================================
-V15_AIOPS_VERSION = "V15.1"
+V15_AIOPS_VERSION = "V15.7"
 V15_AIOPS_ENABLED = os.getenv("V15_AIOPS_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 V15_AIOPS_INTERVAL_SECONDS = max(300, int(os.getenv("V15_AIOPS_INTERVAL_SECONDS", "900")))
 V15_AIOPS_STARTUP_DELAY_SECONDS = max(15, int(os.getenv("V15_AIOPS_STARTUP_DELAY_SECONDS", "75")))
 V15_AIOPS_HISTORY_LIMIT = max(50, int(os.getenv("V15_AIOPS_HISTORY_LIMIT", "1000")))
 v15_aiops_thread_started = False
+
+# V15.7: health checks must observe the system, not become the system's heaviest workload.
+_v157_health_cache: Dict[str, Dict[str, Any]] = {}
+_v157_health_cache_lock = threading.RLock()
+V157_COMPONENT_CACHE_SECONDS = max(30, int(os.getenv("V157_COMPONENT_CACHE_SECONDS", "120")))
+V157_DEEP_DB_CACHE_SECONDS = max(300, int(os.getenv("V157_DEEP_DB_CACHE_SECONDS", "21600")))
+
+
+def _v157_cached_check(name: str, ttl_seconds: int, fn):
+    now = time.monotonic()
+    with _v157_health_cache_lock:
+        cached = _v157_health_cache.get(name)
+        if cached and now - float(cached.get("at", 0.0)) < ttl_seconds:
+            result = cached.get("result")
+            if isinstance(result, tuple) and len(result) >= 3 and isinstance(result[2], dict):
+                details = dict(result[2]); details["cached"] = True
+                return (result[0], result[1], details)
+            return result
+    result = fn()
+    with _v157_health_cache_lock:
+        _v157_health_cache[name] = {"at": now, "result": result}
+    return result
 
 
 def _v15_now() -> str:
@@ -15251,10 +15308,13 @@ def _v15_component(name: str, category: str, critical: bool, fn) -> Dict[str, An
     except Exception as exc:
         status = "FAIL"; message = f"{type(exc).__name__}: {exc}"
     duration = round((time.perf_counter() - started) * 1000.0, 2)
-    if status == "PASS" and duration > 5000:
-        status = "WARN"; message = f"Healthy but slow response ({duration:.0f} ms)."
+    performance_warning = None
+    if status == "PASS" and duration > 15000:
+        performance_warning = f"Slow response ({duration:.0f} ms), but check completed successfully."
+        details = dict(details or {}); details["performanceWarning"] = performance_warning
     return {"name": name, "category": category, "critical": critical, "status": status,
-            "message": message, "durationMs": duration, "details": details, "checkedAt": _v15_now()}
+            "message": message, "durationMs": duration, "performanceWarning": performance_warning,
+            "details": details, "checkedAt": _v15_now()}
 
 
 def _v15_database_check():
@@ -15330,40 +15390,49 @@ def _v15_core_check():
 
 
 def _v15_operator_check():
-    payload = v10_operator_status(20)
-    status = "PASS" if str(payload.get("mode") or "").upper() in ("AUTO", "SHADOW", "OFF") else "WARN"
-    return (status, "Autonomous operator status is readable.", payload)
+    def _probe():
+        payload = v10_operator_status(20)
+        status = "PASS" if str(payload.get("mode") or "").upper() in ("AUTO", "SHADOW", "OFF") else "WARN"
+        return (status, "Autonomous operator status is readable.", payload)
+    return _v157_cached_check("operator-health", V157_COMPONENT_CACHE_SECONDS, _probe)
 
 
 def _v15_research_check():
-    payload = v7_status_payload()
-    return ("PASS" if payload.get("ok", True) is not False else "WARN", "Research engine status is readable.", payload)
+    return _v157_cached_check("research-health", V157_COMPONENT_CACHE_SECONDS,
+        lambda: ("PASS" if (payload := v7_status_payload()).get("ok", True) is not False else "WARN",
+                 "Research engine status is readable.", payload))
 
 
 def _v15_evolution_check():
-    payload = v8_status_payload()
-    return ("PASS" if payload.get("ok", True) is not False else "WARN", "Evolution engine status is readable.", payload)
+    return _v157_cached_check("evolution-health", V157_COMPONENT_CACHE_SECONDS,
+        lambda: ("PASS" if (payload := v8_status_payload()).get("ok", True) is not False else "WARN",
+                 "Evolution engine status is readable.", payload))
 
 
 def _v15_ceo_check():
-    payload = v12_ceo_status(False, 0)
-    return ("PASS" if payload.get("enabled", True) else "WARN", "AI CEO review engine is available.", payload)
+    return _v157_cached_check("ceo-health", V157_COMPONENT_CACHE_SECONDS,
+        lambda: ("PASS" if (payload := v12_ceo_status(False, 0)).get("enabled", True) else "WARN",
+                 "AI CEO review engine is available.", payload))
 
 
 def _v15_board_check():
-    payload = v121_board_status()
-    vetoes = int(payload.get("vetoes") or payload.get("vetoCount") or 0)
-    return ("WARN" if vetoes else "PASS", "AI Board is available." if not vetoes else "AI Board currently reports a veto.", payload)
+    def _probe():
+        payload = v121_board_status()
+        vetoes = int(payload.get("vetoes") or payload.get("vetoCount") or 0)
+        return ("WARN" if vetoes else "PASS", "AI Board is available." if not vetoes else "AI Board currently reports a veto.", payload)
+    return _v157_cached_check("board-health", V157_COMPONENT_CACHE_SECONDS, _probe)
 
 
 def _v15_memory_check():
-    payload = v13_memory_status()
-    return ("PASS" if payload.get("enabled", True) else "WARN", "Long-term AI Memory is available.", payload)
+    return _v157_cached_check("memory-health", V157_COMPONENT_CACHE_SECONDS,
+        lambda: ("PASS" if (payload := v13_memory_status()).get("enabled", True) else "WARN",
+                 "Long-term AI Memory is available.", payload))
 
 
 def _v15_scientist_check():
-    payload = v14_scientist_status()
-    return ("PASS" if payload.get("enabled", True) else "WARN", "AI Scientist is available.", payload)
+    return _v157_cached_check("scientist-health", V157_COMPONENT_CACHE_SECONDS,
+        lambda: ("PASS" if (payload := v14_scientist_status()).get("enabled", True) else "WARN",
+                 "AI Scientist is available.", payload))
 
 
 
@@ -15373,23 +15442,39 @@ def _v151_table_exists(conn, table: str) -> bool:
 
 
 def _v151_database_doctor_check():
+    """Fast, read-only doctor used by the recurring audit.
+
+    Deep integrity scans and write probes are deliberately cached for six hours so
+    monitoring cannot hold SQLite locks or delay live endpoints.
+    """
     if not SQLITE_ENABLED:
         return ("WARN", "SQLite persistence is disabled.", {"sqliteEnabled": False})
-    started = time.perf_counter(); conn = db_connect()
-    integrity = conn.execute("PRAGMA integrity_check").fetchone()
-    integrity_value = list(dict(integrity).values())[0] if integrity else "unknown"
-    conn.execute("CREATE TABLE IF NOT EXISTS v151_health_probe(id INTEGER PRIMARY KEY, checked_at TEXT NOT NULL)")
-    now = _v15_now(); conn.execute("INSERT INTO v151_health_probe(checked_at) VALUES(?)", (now,))
-    conn.execute("DELETE FROM v151_health_probe WHERE id NOT IN (SELECT id FROM v151_health_probe ORDER BY id DESC LIMIT 5)")
-    conn.commit()
-    journal = str(conn.execute("PRAGMA journal_mode").fetchone()[0])
-    page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
-    freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
-    conn.close(); ms=round((time.perf_counter()-started)*1000,2)
-    status = "PASS" if str(integrity_value).lower() == "ok" else "FAIL"
-    return (status, "Database integrity, read and write probe passed." if status == "PASS" else "Database integrity check failed.",
-            {"integrity": integrity_value, "writeProbe": True, "journalMode": journal,
-             "pageCount": page_count, "freePages": freelist, "latencyMs": ms})
+
+    def _probe():
+        started = time.perf_counter()
+        conn = db_connect()
+        try:
+            row = conn.execute("SELECT 1 AS ok").fetchone()
+            journal_row = conn.execute("PRAGMA journal_mode").fetchone()
+            page_row = conn.execute("PRAGMA page_count").fetchone()
+            free_row = conn.execute("PRAGMA freelist_count").fetchone()
+            # quick_check(1) performs a bounded sanity check; full integrity_check is
+            # intentionally excluded from the recurring hot path.
+            quick_row = conn.execute("PRAGMA quick_check(1)").fetchone()
+        finally:
+            conn.close()
+        quick_value = quick_row[0] if quick_row else "unknown"
+        ms = round((time.perf_counter() - started) * 1000.0, 2)
+        status = "PASS" if str(quick_value).lower() == "ok" else "FAIL"
+        return (status,
+                "Database quick check passed." if status == "PASS" else "Database quick check failed.",
+                {"sqliteEnabled": True, "readProbe": int(dict(row).get("ok", 0)),
+                 "quickCheck": quick_value, "journalMode": str(journal_row[0]) if journal_row else "unknown",
+                 "pageCount": int(page_row[0]) if page_row else 0,
+                 "freePages": int(free_row[0]) if free_row else 0,
+                 "latencyMs": ms, "writeProbe": "DEFERRED", "deepCheckCachedSeconds": V157_DEEP_DB_CACHE_SECONDS})
+
+    return _v157_cached_check("database-doctor", V157_DEEP_DB_CACHE_SECONDS, _probe)
 
 
 def _v151_route_inventory_check():

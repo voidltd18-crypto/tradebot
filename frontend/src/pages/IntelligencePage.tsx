@@ -203,7 +203,11 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       let lastError = "Endpoint unavailable";
       for (let attempt = 1; attempt <= 2; attempt += 1) {
         const controller = new AbortController();
-        const timeout = window.setTimeout(() => controller.abort(), 30000);
+        // Reports and Operator are composite snapshots and can legitimately need a
+        // little longer on the first request after a Render restart. Other endpoints
+        // keep the tighter limit so real outages are still surfaced quickly.
+        const timeoutSeconds = ["reports", "operator", "advisor", "evolution"].includes(key) ? 60 : 30;
+        const timeout = window.setTimeout(() => controller.abort(), timeoutSeconds * 1000);
         try {
           const response = await fetch(`${API_URL}${endpoint}`, {
             cache: "no-store",
@@ -216,7 +220,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           return;
         } catch (error: any) {
           lastError = error?.name === "AbortError"
-            ? "Request timed out after 30 seconds"
+            ? `Request timed out after ${timeoutSeconds} seconds`
             : error?.message || "Endpoint unavailable";
           if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 500));
         } finally {
@@ -228,8 +232,8 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
 
     try {
       // Avoid hammering SQLite and Render with 43 simultaneous requests.
-      // Six-at-a-time prevents false "offline" results caused by database locks.
-      const batchSize = 6;
+      // Four-at-a-time keeps the dashboard responsive without creating a health-check storm.
+      const batchSize = 4;
       for (let index = 0; index < entries.length; index += batchSize) {
         const batch = entries.slice(index, index + batchSize);
         await Promise.all(batch.map(([key, endpoint]) => fetchEndpoint(key, endpoint)));
