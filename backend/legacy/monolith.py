@@ -10,7 +10,7 @@ import math
 import re
 import threading
 import random
-from datetime import datetime, UTC, timedelta
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Any, Tuple
 
