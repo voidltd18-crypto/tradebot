@@ -17,7 +17,7 @@ import { API_URL, readJson } from "../lib/api";
 import { clamp } from "../lib/format";
 import type { AnyObj } from "../lib/types";
 
-type IntelligenceSection = "ceo" | "board" | "brain" | "market" | "research" | "symbols" | "rules" | "evolution" | "memory" | "scientist";
+type IntelligenceSection = "ceo" | "board" | "brain" | "market" | "research" | "symbols" | "rules" | "evolution" | "memory" | "scientist" | "operations";
 
 type EndpointState = {
   data: AnyObj;
@@ -133,6 +133,15 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     scientistExperiments: EMPTY_ENDPOINT,
     scientistEvents: EMPTY_ENDPOINT,
     scientistConstitution: EMPTY_ENDPOINT,
+    operationsStatus: EMPTY_ENDPOINT,
+    operationsComponents: EMPTY_ENDPOINT,
+    operationsAlerts: EMPTY_ENDPOINT,
+    operationsHistory: EMPTY_ENDPOINT,
+    operationsConstitution: EMPTY_ENDPOINT,
+    operationsDependencies: EMPTY_ENDPOINT,
+    operationsWatchdogs: EMPTY_ENDPOINT,
+    operationsQueues: EMPTY_ENDPOINT,
+    operationsDoctor: EMPTY_ENDPOINT,
   });
 
   const endpoints = useMemo(() => ({
@@ -170,6 +179,15 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     scientistExperiments: "/v14/scientist/experiments?limit=200",
     scientistEvents: "/v14/scientist/events?limit=100",
     scientistConstitution: "/v14/scientist/constitution",
+    operationsStatus: "/v15/operations/status",
+    operationsComponents: "/v15/operations/components",
+    operationsAlerts: "/v15/operations/alerts?limit=100&status=ACTIVE",
+    operationsHistory: "/v15/operations/history?limit=100",
+    operationsConstitution: "/v15/operations/constitution",
+    operationsDependencies: "/v15/operations/dependencies",
+    operationsWatchdogs: "/v15/operations/watchdogs",
+    operationsQueues: "/v15/operations/queues",
+    operationsDoctor: "/v15/operations/doctor",
   }), []);
 
   const load = useCallback(async () => {
@@ -235,6 +253,20 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const scientistHypotheses = firstArray(scientistHypothesesData.items, scientistStatus.topHypotheses);
   const scientistExperiments = firstArray(scientistExperimentsData.items, scientistStatus.topExperiments);
   const scientistEvents = firstArray(scientistEventsData.items);
+  const operationsStatus = sources.operationsStatus.data;
+  const operationsComponentsData = sources.operationsComponents.data;
+  const operationsAlertsData = sources.operationsAlerts.data;
+  const operationsHistoryData = sources.operationsHistory.data;
+  const operationsConstitution = sources.operationsConstitution.data;
+  const operationsDependencies = Array.isArray(sources.operationsDependencies.data?.items) ? sources.operationsDependencies.data.items : [];
+  const operationsWatchdogs = Array.isArray(sources.operationsWatchdogs.data?.items) ? sources.operationsWatchdogs.data.items : [];
+  const operationsQueues = sources.operationsQueues.data?.queues || {};
+  const operationsDoctor = sources.operationsDoctor.data || {};
+  const holidayMode = operationsDoctor.holidayMode || {};
+  const operationsSummary = firstObject(operationsStatus.summary);
+  const operationsComponents = firstArray(operationsComponentsData.items, operationsStatus.components);
+  const operationsAlerts = firstArray(operationsAlertsData.items);
+  const operationsHistory = firstArray(operationsHistoryData.items);
   const operatorCurrent = firstObject(operator.current);
   const operatorProposal = firstObject(operator.lastProposal);
   const operatorChanged = firstObject(operatorProposal.changed);
@@ -449,7 +481,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     </Card>
 
     <nav className="intelligence-tabs">
-      {(["ceo", "board", "brain", "market", "research", "symbols", "rules", "evolution", "memory", "scientist"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "ceo" ? "AI CEO" : item === "board" ? "AI BOARD" : item === "brain" ? "AI BRAIN" : item === "memory" ? "AI MEMORY" : item === "scientist" ? "AI SCIENTIST" : item.toUpperCase()}</button>)}
+      {(["ceo", "board", "brain", "market", "research", "symbols", "rules", "evolution", "memory", "scientist", "operations"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "ceo" ? "AI CEO" : item === "board" ? "AI BOARD" : item === "brain" ? "AI BRAIN" : item === "memory" ? "AI MEMORY" : item === "scientist" ? "AI SCIENTIST" : item === "operations" ? "AI OPERATIONS" : item.toUpperCase()}</button>)}
     </nav>
 
 
@@ -846,6 +878,56 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         <Card title="Scientist activity">{scientistEvents.length ? <div className="journal-list">{scientistEvents.slice(0, 20).map((row, index) => <article key={String(row.id ?? index)}><time>{row.created_at ? new Date(row.created_at).toLocaleString("en-GB") : ""}</time><div><b>{text(row.title, "Scientist event")}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <EmptyState endpoint="V14 scientist events" error={sources.scientistEvents.error} />}</Card>
         <Card title="Scientist Constitution"><div className="constitution-list">{Array.isArray(scientistConstitution.rules) && scientistConstitution.rules.length ? scientistConstitution.rules.map((rule: unknown, index: number) => <div key={index}><span>{index + 1}</span><p>{text(rule)}</p></div>) : <EmptyState endpoint="V14 scientist constitution" error={sources.scientistConstitution.error} />}</div></Card>
       </div>
+    </div>}
+
+
+    {section === "operations" && <div className="memory-view operations-view">
+      <Card title="V15.1 AI Operations Centre Pro">
+        <div className="intelligence-hero-head"><div><span className="eyebrow">AUTOMATIC FULL-SYSTEM MONITORING</span><h2>{text(operationsSummary.overallStatus, "STARTING")}</h2><p>Continuously checks the full dependency tree, registered APIs, database integrity, queues, workers, intelligence, governance and host resources.</p></div><div className="score-ring"><strong>{num(operationsSummary.healthScore).toFixed(0)}%</strong><span>system health</span></div></div>
+        <div className="intelligence-stats four"><StatTile label="Passed" value={num(operationsSummary.passed).toLocaleString("en-GB")} tone="positive" /><StatTile label="Warnings" value={num(operationsSummary.warnings).toLocaleString("en-GB")} /><StatTile label="Failed" value={num(operationsSummary.failed).toLocaleString("en-GB")} tone={num(operationsSummary.failed) ? "negative" : ""} /><StatTile label="Active alerts" value={operationsAlerts.length.toLocaleString("en-GB")} tone={operationsAlerts.length ? "negative" : "positive"} /></div>
+        <div className="status-strip"><span>AUTOMATIC AUDITS ACTIVE</span><span>EVERY {Math.max(1, Math.round(num(operationsSummary.nextAuditInSeconds, 900) / 60))} MINUTES</span><span>ENDPOINT DISCOVERY</span><span>WORKER WATCHDOG</span><span>NO MANUAL REVIEW</span></div>
+        <p className="muted">Last audit: {operationsSummary.checkedAt ? new Date(String(operationsSummary.checkedAt)).toLocaleString("en-GB") : "Waiting for first automatic audit"}. {text(operationsStatus.nextAction, "No intervention required.")}</p>
+      </Card>
+      <Card title="Holiday Mode">
+        <div className="intelligence-hero-head"><div><span className="eyebrow">AUTOMATIC HOLIDAY SUPERVISION</span><h2>{text(holidayMode.headline, "WAITING FOR FIRST AUDIT")}</h2><p>{holidayMode.safeToLeaveRunning === false ? "A critical condition needs human attention." : "The system is monitoring itself and will keep warnings visible until they clear."}</p></div><div className="score-ring"><strong>{num(holidayMode.healthScore).toFixed(0)}%</strong><span>holiday health</span></div></div>
+        <div className="status-strip"><span>{holidayMode.safeToLeaveRunning === false ? "ATTENTION REQUIRED" : "SAFE TO LEAVE RUNNING"}</span><span>RECOVERY: {text(holidayMode.automaticRecovery, "MONITORING")}</span><span>CRITICAL: {num(holidayMode.criticalFailures)}</span><span>WARNINGS: {num(holidayMode.warnings)}</span></div>
+      </Card>
+      <Card title="Dependency Health">
+        <DataTable rows={operationsDependencies} columns={[
+          { key: "status", label: "Health", render: (row) => <span className={`pill ${row.status === "PASS" ? "ok" : "warn"}`}>{text(row.status)}</span> },
+          { key: "name", label: "Department", render: (row) => <b>{text(row.name)}</b> },
+          { key: "healthy", label: "Healthy", render: (row) => `${num(row.healthy)} / ${num(row.total)}` },
+          { key: "components", label: "Dependencies", render: (row) => Array.isArray(row.components) ? row.components.map((x: any) => `${text(x.name)}: ${text(x.status)}`).join(" · ") : "—" },
+        ]} />
+      </Card>
+      <div className="grid two">
+        <Card title="Worker Watchdogs"><DataTable rows={operationsWatchdogs} columns={[
+          { key: "status", label: "Health", render: (row) => <span className={`pill ${row.status === "PASS" ? "ok" : "warn"}`}>{text(row.status)}</span> },
+          { key: "name", label: "Watchdog" }, { key: "message", label: "Latest result" },
+          { key: "durationMs", label: "Check", render: (row) => `${num(row.durationMs).toFixed(0)} ms` },
+        ]} /></Card>
+        <Card title="Queue & Audit Stores"><div className="summary">{Object.entries(operationsQueues).length ? Object.entries(operationsQueues).map(([key,value]: any) => <div key={key}><span>{keyLabel(key)}</span><b>{typeof value === "object" ? text(value.total ?? value.status ?? value.table, "AVAILABLE") : num(value).toLocaleString("en-GB")}</b></div>) : <div><span>Status</span><b>Waiting for audit</b></div>}</div></Card>
+      </div>
+      <Card title="Subsystem Health">
+        <DataTable rows={operationsComponents} columns={[
+          { key: "status", label: "Health", render: (row) => <span className={`pill ${row.status === "PASS" ? "ok" : "warn"}`}>{text(row.status)}</span> },
+          { key: "category", label: "Area" },
+          { key: "name", label: "Subsystem", render: (row) => <b>{text(row.name)}</b> },
+          { key: "message", label: "Latest check" },
+          { key: "durationMs", label: "Response", render: (row) => `${num(row.durationMs).toFixed(0)} ms` },
+          { key: "critical", label: "Critical", render: (row) => row.critical ? "YES" : "NO" },
+        ]} />
+      </Card>
+      <div className="grid two">
+        <Card title="Active Operations Alerts">{operationsAlerts.length ? <div className="journal-list">{operationsAlerts.slice(0, 30).map((row, index) => <article key={String(row.id ?? index)}><time>{row.last_seen ? new Date(String(row.last_seen)).toLocaleString("en-GB") : ""}</time><div><b>{text(row.severity)} · {text(row.title)}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <div className="intelligence-empty"><strong>All clear</strong><span>No active system alerts.</span></div>}</Card>
+        <Card title="Health History"><DataTable rows={operationsHistory.slice(0, 30)} columns={[
+          { key: "created_at", label: "Audit", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB") : "—" },
+          { key: "overallStatus", label: "Status" },
+          { key: "healthScore", label: "Health", render: (row) => `${num(row.healthScore).toFixed(0)}%` },
+          { key: "passed", label: "Pass" }, { key: "warnings", label: "Warn" }, { key: "failed", label: "Fail" },
+        ]} /></Card>
+      </div>
+      <Card title="Operations Constitution"><div className="constitution-list">{Array.isArray(operationsConstitution.rules) && operationsConstitution.rules.length ? operationsConstitution.rules.map((rule: unknown, index: number) => <div key={index}><span>{index + 1}</span><p>{text(rule)}</p></div>) : <EmptyState endpoint="V15 operations constitution" error={sources.operationsConstitution.error} />}</div></Card>
     </div>}
 
     {section === "evolution" && <div className="grid two evolution-view">
