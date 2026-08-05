@@ -3285,6 +3285,17 @@ def _db_retry_delay(attempt: int) -> float:
     return min(2.0, _DB_RETRY_BASE_SECONDS * (2 ** attempt)) + random.uniform(0.0, 0.04)
 
 
+_DB_SERIAL_WRITE_LOCK = threading.RLock()
+
+
+def _db_sql_is_write(sql: Any) -> bool:
+    try:
+        token = str(sql).lstrip().split(None, 1)[0].upper()
+    except Exception:
+        return False
+    return token in {"INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "DROP", "ALTER", "VACUUM", "REINDEX"}
+
+
 class ReliableSQLiteCursor(sqlite3.Cursor):
     def execute(self, sql, parameters=()):
         last_error = None
@@ -3314,26 +3325,81 @@ class ReliableSQLiteCursor(sqlite3.Cursor):
 
 
 class ReliableSQLiteConnection(sqlite3.Connection):
+    """SQLite connection with bounded retries and one in-process writer at a time.
+
+    The lock is acquired on the first mutating statement and held until commit,
+    rollback or close. This prevents the autonomous workers from starting
+    competing write transactions against the same SQLite file.
+    """
+
+    def _acquire_writer_if_needed(self, sql) -> None:
+        if not _db_sql_is_write(sql) or getattr(self, "_tradebot_writer_lock_held", False):
+            return
+        _DB_SERIAL_WRITE_LOCK.acquire()
+        self._tradebot_writer_lock_held = True
+
+    def _release_writer(self) -> None:
+        if getattr(self, "_tradebot_writer_lock_held", False):
+            self._tradebot_writer_lock_held = False
+            try:
+                _DB_SERIAL_WRITE_LOCK.release()
+            except RuntimeError:
+                pass
+
     def cursor(self, factory=ReliableSQLiteCursor):
         return super().cursor(factory)
 
     def execute(self, sql, parameters=()):
-        return self.cursor().execute(sql, parameters)
+        self._acquire_writer_if_needed(sql)
+        try:
+            return self.cursor().execute(sql, parameters)
+        except Exception:
+            # If the first write failed before a transaction became useful, do
+            # not strand the process-wide writer lock.
+            if not self.in_transaction:
+                self._release_writer()
+            raise
 
     def executemany(self, sql, seq_of_parameters):
-        return self.cursor().executemany(sql, seq_of_parameters)
+        self._acquire_writer_if_needed(sql)
+        try:
+            return self.cursor().executemany(sql, seq_of_parameters)
+        except Exception:
+            if not self.in_transaction:
+                self._release_writer()
+            raise
 
     def commit(self):
         last_error = None
-        for attempt in range(_DB_LOCK_RETRIES):
-            try:
-                return super().commit()
-            except sqlite3.OperationalError as exc:
-                if not _db_is_lock_error(exc) or attempt >= _DB_LOCK_RETRIES - 1:
-                    raise
-                last_error = exc
-                time.sleep(_db_retry_delay(attempt))
-        raise last_error  # pragma: no cover
+        try:
+            for attempt in range(_DB_LOCK_RETRIES):
+                try:
+                    return super().commit()
+                except sqlite3.OperationalError as exc:
+                    if not _db_is_lock_error(exc) or attempt >= _DB_LOCK_RETRIES - 1:
+                        raise
+                    last_error = exc
+                    time.sleep(_db_retry_delay(attempt))
+            raise last_error  # pragma: no cover
+        finally:
+            self._release_writer()
+
+    def rollback(self):
+        try:
+            return super().rollback()
+        finally:
+            self._release_writer()
+
+    def close(self):
+        try:
+            if self.in_transaction:
+                try:
+                    super().rollback()
+                except Exception:
+                    pass
+            return super().close()
+        finally:
+            self._release_writer()
 
 
 def db_connect():
@@ -7451,8 +7517,12 @@ def api_rebuild_performance_engine(request: Request):
     verify_api_key(request)
     return {"ok": True, **performance_engine_payload(force_refresh=True), "message": "Performance statistics rebuilt from closed trades."}
 
-@app.get("/reports")
-def reports():
+_reports_payload_cache: Dict[str, Any] = {"at": 0.0, "value": None}
+_reports_payload_lock = threading.RLock()
+REPORTS_CACHE_SECONDS = max(15, int(os.getenv("REPORTS_CACHE_SECONDS", "45")))
+
+
+def _build_reports_payload() -> Dict[str, Any]:
     status = latest_status if isinstance(latest_status, dict) else {}
     account = status.get("account") or {}
     db = status.get("dbSummary") or {}
@@ -7462,8 +7532,6 @@ def reports():
     total_withdrawn = _safe_num(performance.get("totalWithdrawn"))
     total_deposited = _safe_num(performance.get("totalDeposited"))
     total_gain_loss = _safe_num(performance.get("totalGainLoss"))
-    deposit_source = "persistent-performance-engine"
-    # Always read closed trades fresh from SQLite so Reports does not show stale April rows.
     closed = closed_trades_from_db(500) if "closed_trades_from_db" in globals() else (status.get("closedTrades") or [])
     timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
     equity_history = []
@@ -7471,35 +7539,48 @@ def reports():
         if not isinstance(e, dict):
             continue
         equity_history.append({
-            "idx": i,
-            "time": e.get("time") or e.get("timestamp") or e.get("t") or "",
-            "symbol": e.get("symbol") or "",
-            "side": e.get("side") or "",
+            "idx": i, "time": e.get("time") or e.get("timestamp") or e.get("t") or "",
+            "symbol": e.get("symbol") or "", "side": e.get("side") or "",
             "equity": _safe_num(e.get("equity") or e.get("value")),
             "equityGbp": _safe_num(e.get("equityGbp") or e.get("valueGbp")),
-            "pnl": _safe_num(e.get("pnl")),
-            "pnlGbp": _safe_num(e.get("pnlGbp")),
-            "pnlPct": _safe_num(e.get("pnlPct")),
-            "reason": e.get("reason") or "",
+            "pnl": _safe_num(e.get("pnl")), "pnlGbp": _safe_num(e.get("pnlGbp")),
+            "pnlPct": _safe_num(e.get("pnlPct")), "reason": e.get("reason") or "",
         })
     return {
-        "ok": True,
-        "depositSource": deposit_source,
-        "totalDeposited": total_deposited,
-        "totalWithdrawn": total_withdrawn,
-        "currentEquity": equity,
-        "currentEquityGbp": equity_gbp,
-        "totalGainLoss": total_gain_loss,
-        "earnedSinceDeposit": max(total_gain_loss, 0.0),
-        "lostSinceDeposit": abs(min(total_gain_loss, 0.0)),
-        "dayPnl": _safe_num(account.get("pnlDay")),
+        "ok": True, "depositSource": "persistent-performance-engine",
+        "totalDeposited": total_deposited, "totalWithdrawn": total_withdrawn,
+        "currentEquity": equity, "currentEquityGbp": equity_gbp,
+        "totalGainLoss": total_gain_loss, "earnedSinceDeposit": max(total_gain_loss, 0.0),
+        "lostSinceDeposit": abs(min(total_gain_loss, 0.0)), "dayPnl": _safe_num(account.get("pnlDay")),
         "realisedNet": _safe_num(performance.get("lifetimeRealisedPnl", db.get("totalPnl"))),
-        "performanceEngine": performance,
-        "closedTrades": closed[:200] if isinstance(closed, list) else [],
-        "equityHistory": equity_history[-500:],
-        "winRate": _safe_num(db.get("winRate")) * 100.0,
+        "performanceEngine": performance, "closedTrades": closed[:200] if isinstance(closed, list) else [],
+        "equityHistory": equity_history[-500:], "winRate": _safe_num(db.get("winRate")) * 100.0,
         "totalTrades": int(_safe_num(db.get("totalTrades"))),
     }
+
+
+@app.get("/reports")
+def reports():
+    now_mono = time.monotonic()
+    with _reports_payload_lock:
+        cached = _reports_payload_cache.get("value")
+        if isinstance(cached, dict) and now_mono - float(_reports_payload_cache.get("at", 0.0)) < REPORTS_CACHE_SECONDS:
+            result = dict(cached); result["cached"] = True
+            return result
+    try:
+        result = _build_reports_payload()
+        with _reports_payload_lock:
+            _reports_payload_cache.update({"at": time.monotonic(), "value": dict(result)})
+        return result
+    except sqlite3.OperationalError as exc:
+        if _db_is_lock_error(exc):
+            with _reports_payload_lock:
+                cached = _reports_payload_cache.get("value")
+                if isinstance(cached, dict):
+                    result = dict(cached); result.update({"cached": True, "stale": True, "cacheReason": "database busy"})
+                    return result
+        raise
+
 
 # ---------- manual universe pins ----------
 MANUAL_UNIVERSE_FILE = os.path.join("backend", "state", "manual_universe_picks.json")
@@ -13464,55 +13545,63 @@ V10_CONSTITUTION = {
 
 v10_operator_thread_started = False
 _v10_operator_last_run_ts = 0.0
+_V10_OPERATOR_SCHEMA_LOCK = threading.RLock()
+_V10_OPERATOR_SCHEMA_COMPLETE = False
 
 
 def _v10_operator_ensure_tables() -> None:
-    if not SQLITE_ENABLED:
+    global _V10_OPERATOR_SCHEMA_COMPLETE
+    if not SQLITE_ENABLED or _V10_OPERATOR_SCHEMA_COMPLETE:
         return
-    conn = db_connect()
-    conn.execute("""CREATE TABLE IF NOT EXISTS v10_operator_state (
-        id INTEGER PRIMARY KEY CHECK (id=1),
-        mode TEXT NOT NULL DEFAULT 'SHADOW',
-        enabled INTEGER NOT NULL DEFAULT 1,
-        stable_key TEXT,
-        stable_runs INTEGER NOT NULL DEFAULT 0,
-        last_run_at TEXT,
-        last_apply_at TEXT,
-        last_snapshot_json TEXT,
-        last_proposal_json TEXT,
-        updated_at TEXT NOT NULL
-    )""")
-    conn.execute("""INSERT OR IGNORE INTO v10_operator_state(id,mode,enabled,updated_at)
-                    VALUES(1,?,?,?)""", (V10_OPERATOR_MODE, int(V10_OPERATOR_ENABLED), datetime.now(UTC).isoformat()))
-    conn.execute("""CREATE TABLE IF NOT EXISTS v10_operator_actions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at TEXT NOT NULL,
-        action_type TEXT NOT NULL,
-        status TEXT NOT NULL,
-        reason TEXT,
-        evidence_samples INTEGER NOT NULL DEFAULT 0,
-        before_json TEXT,
-        after_json TEXT,
-        proposal_json TEXT,
-        account_equity REAL,
-        rollback_of INTEGER,
-        note TEXT
-    )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_operator_actions_time ON v10_operator_actions(created_at)")
-    conn.execute("""CREATE TABLE IF NOT EXISTS v10_symbol_exclusions (
-        symbol TEXT PRIMARY KEY,
-        excluded INTEGER NOT NULL DEFAULT 1,
-        reason TEXT,
-        samples INTEGER NOT NULL DEFAULT 0,
-        total_pnl REAL,
-        profit_factor REAL,
-        updated_at TEXT NOT NULL
-    )""")
-    conn.commit(); conn.close()
+    with _V10_OPERATOR_SCHEMA_LOCK:
+        if _V10_OPERATOR_SCHEMA_COMPLETE:
+            return
+        conn = db_connect()
+        conn.execute("""CREATE TABLE IF NOT EXISTS v10_operator_state (
+            id INTEGER PRIMARY KEY CHECK (id=1),
+            mode TEXT NOT NULL DEFAULT 'SHADOW',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            stable_key TEXT,
+            stable_runs INTEGER NOT NULL DEFAULT 0,
+            last_run_at TEXT,
+            last_apply_at TEXT,
+            last_snapshot_json TEXT,
+            last_proposal_json TEXT,
+            updated_at TEXT NOT NULL
+        )""")
+        conn.execute("""INSERT OR IGNORE INTO v10_operator_state(id,mode,enabled,updated_at)
+                        VALUES(1,?,?,?)""", (V10_OPERATOR_MODE, int(V10_OPERATOR_ENABLED), datetime.now(UTC).isoformat()))
+        conn.execute("""CREATE TABLE IF NOT EXISTS v10_operator_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reason TEXT,
+            evidence_samples INTEGER NOT NULL DEFAULT 0,
+            before_json TEXT,
+            after_json TEXT,
+            proposal_json TEXT,
+            account_equity REAL,
+            rollback_of INTEGER,
+            note TEXT
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_operator_actions_time ON v10_operator_actions(created_at)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS v10_symbol_exclusions (
+            symbol TEXT PRIMARY KEY,
+            excluded INTEGER NOT NULL DEFAULT 1,
+            reason TEXT,
+            samples INTEGER NOT NULL DEFAULT 0,
+            total_pnl REAL,
+            profit_factor REAL,
+            updated_at TEXT NOT NULL
+        )""")
+        conn.commit(); conn.close()
+        _V10_OPERATOR_SCHEMA_COMPLETE = True
 
 
 def _v10_operator_state() -> Dict[str, Any]:
-    _v10_operator_ensure_tables()
+    if not _V10_OPERATOR_SCHEMA_COMPLETE:
+        _v10_operator_ensure_tables()
     conn = db_connect(); row = conn.execute("SELECT * FROM v10_operator_state WHERE id=1").fetchone(); conn.close()
     return dict(row) if row else {"mode": V10_OPERATOR_MODE, "enabled": int(V10_OPERATOR_ENABLED), "stable_runs": 0}
 
@@ -13840,29 +13929,45 @@ def v10_operator_status(limit: int = 50, force_refresh: bool = False) -> Dict[st
         if (not force_refresh and isinstance(cached, dict)
                 and int(_v10_operator_status_cache.get("limit", 0)) >= limit
                 and now_mono - float(_v10_operator_status_cache.get("at", 0.0)) < V10_OPERATOR_STATUS_CACHE_SECONDS):
-            result = dict(cached)
-            result["history"] = list(result.get("history") or [])[:limit]
-            result["cached"] = True
+            result = dict(cached); result["history"] = list(result.get("history") or [])[:limit]; result["cached"] = True
             return result
-    _v10_operator_ensure_tables(); state_row = _v10_operator_state(); conn = db_connect()
-    rows = [dict(r) for r in conn.execute("SELECT * FROM v10_operator_actions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
-    conn.close()
-    for row in rows:
-        for key in ("before_json", "after_json", "proposal_json"):
-            try: row[key[:-5] if key.endswith("_json") else key] = json.loads(row.get(key) or "{}")
-            except Exception: row[key[:-5] if key.endswith("_json") else key] = {}
-    try: last_proposal = json.loads(state_row.get("last_proposal_json") or "{}")
-    except Exception: last_proposal = {}
-    result = {"ok": True, "version": V10_OPERATOR_VERSION, "enabled": bool(state_row.get("enabled")),
-            "mode": str(state_row.get("mode") or V10_OPERATOR_MODE), "constitution": V10_CONSTITUTION,
-            "current": _v10_operator_current_config(), "stableRuns": int(state_row.get("stable_runs") or 0),
-            "requiredStableRuns": V10_OPERATOR_REQUIRED_STABLE_RUNS, "lastRunAt": state_row.get("last_run_at"),
-            "lastApplyAt": state_row.get("last_apply_at"), "lastProposal": last_proposal,
-            "history": rows, "recurringManualApprovalRequired": False,
-            "setupNote": "Set V10_OPERATOR_MODE=AUTO once to allow bounded closed-market promotions. No recurring approval is required."}
-    with _v10_operator_status_lock:
-        _v10_operator_status_cache.update({"at": time.monotonic(), "value": dict(result), "limit": limit})
-    return result
+    try:
+        # Deliberately read-only: schema setup belongs to application startup.
+        conn = db_connect()
+        state = conn.execute("SELECT * FROM v10_operator_state WHERE id=1").fetchone()
+        rows = [dict(r) for r in conn.execute("SELECT * FROM v10_operator_actions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
+        exclusions = [r[0] for r in conn.execute("SELECT symbol FROM v10_symbol_exclusions WHERE excluded=1 ORDER BY symbol").fetchall()]
+        conn.close()
+        state_row = dict(state) if state else {"mode": V10_OPERATOR_MODE, "enabled": int(V10_OPERATOR_ENABLED), "stable_runs": 0}
+        for row in rows:
+            for key in ("before_json", "after_json", "proposal_json"):
+                try: row[key[:-5]] = json.loads(row.get(key) or "{}")
+                except Exception: row[key[:-5]] = {}
+        try: last_proposal = json.loads(state_row.get("last_proposal_json") or "{}")
+        except Exception: last_proposal = {}
+        current = _v10_operator_current_config(); current["symbolExclusions"] = exclusions
+        result = {"ok": True, "version": V10_OPERATOR_VERSION, "enabled": bool(state_row.get("enabled")),
+                "mode": str(state_row.get("mode") or V10_OPERATOR_MODE), "constitution": V10_CONSTITUTION,
+                "current": current, "stableRuns": int(state_row.get("stable_runs") or 0),
+                "requiredStableRuns": V10_OPERATOR_REQUIRED_STABLE_RUNS, "lastRunAt": state_row.get("last_run_at"),
+                "lastApplyAt": state_row.get("last_apply_at"), "lastProposal": last_proposal, "history": rows,
+                "recurringManualApprovalRequired": False,
+                "setupNote": "AUTO performs bounded closed-market promotions without recurring approval."}
+        with _v10_operator_status_lock:
+            _v10_operator_status_cache.update({"at": time.monotonic(), "value": dict(result), "limit": limit})
+        return result
+    except sqlite3.OperationalError as exc:
+        if _db_is_lock_error(exc):
+            with _v10_operator_status_lock:
+                cached = _v10_operator_status_cache.get("value")
+                if isinstance(cached, dict):
+                    result = dict(cached); result["history"] = list(result.get("history") or [])[:limit]
+                    result.update({"cached": True, "stale": True, "cacheReason": "database busy"})
+                    return result
+            return {"ok": True, "version": V10_OPERATOR_VERSION, "enabled": V10_OPERATOR_ENABLED,
+                    "mode": V10_OPERATOR_MODE, "current": {}, "history": [], "cached": True, "stale": True,
+                    "cacheReason": "database busy during initial snapshot"}
+        raise
 
 
 def v10_operator_worker() -> None:
