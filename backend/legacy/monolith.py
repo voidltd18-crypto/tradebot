@@ -10336,79 +10336,88 @@ V10_ENABLED = os.getenv("V10_ENABLED", "true").lower() == "true"
 V10_DEFAULT_HORIZON_HOURS = max(1, int(os.getenv("V10_DEFAULT_HORIZON_HOURS", "1") or 1))
 V10_MIN_PATTERN_SAMPLES = max(3, int(os.getenv("V10_MIN_PATTERN_SAMPLES", "8") or 8))
 V10_MAX_PATTERNS = max(25, min(int(os.getenv("V10_MAX_PATTERNS", "250") or 250), 1000))
+_v10_tables_ready = False
+_v10_tables_lock = threading.RLock()
 
 
 def _v10_ensure_tables() -> None:
-    _v9_ensure_tables()
-    if not SQLITE_ENABLED:
+    global _v10_tables_ready
+    if _v10_tables_ready:
         return
-    conn = db_connect()
-    conn.execute("""CREATE TABLE IF NOT EXISTS v10_research_runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at TEXT NOT NULL,
-        completed_at TEXT,
-        horizon_hours INTEGER NOT NULL,
-        observations INTEGER NOT NULL DEFAULT 0,
-        rich_observations INTEGER NOT NULL DEFAULT 0,
-        patterns_found INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'RUNNING',
-        payload_json TEXT
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS v10_patterns (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        horizon_hours INTEGER NOT NULL,
-        pattern_key TEXT NOT NULL,
-        pattern_name TEXT NOT NULL,
-        dimensions_json TEXT NOT NULL,
-        samples INTEGER NOT NULL,
-        wins INTEGER NOT NULL,
-        losses INTEGER NOT NULL,
-        win_rate REAL NOT NULL,
-        average_return_pct REAL NOT NULL,
-        median_return_pct REAL NOT NULL,
-        expectancy_pct REAL NOT NULL,
-        gross_profit_pct REAL NOT NULL,
-        gross_loss_pct REAL NOT NULL,
-        profit_factor REAL NOT NULL,
-        score REAL NOT NULL,
-        confidence_grade TEXT NOT NULL,
-        explanation TEXT NOT NULL,
-        UNIQUE(run_id, pattern_key)
-    )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_patterns_run_score ON v10_patterns(run_id, score DESC)")
-    conn.execute("""CREATE TABLE IF NOT EXISTS v10_research_notebook (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        title TEXT NOT NULL,
-        summary TEXT NOT NULL,
-        payload_json TEXT
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS v10_evidence_lineage (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        schema_version TEXT NOT NULL DEFAULT '10.1',
-        decision_id INTEGER NOT NULL,
-        snapshot_id INTEGER NOT NULL,
-        outcome_id INTEGER NOT NULL,
-        symbol TEXT NOT NULL,
-        observed_at TEXT,
-        horizon_hours INTEGER NOT NULL,
-        outcome_status TEXT NOT NULL,
-        net_return_pct REAL,
-        linked_at TEXT NOT NULL,
-        UNIQUE(snapshot_id, outcome_id)
-    )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_lineage_horizon_status ON v10_evidence_lineage(horizon_hours,outcome_status)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_lineage_symbol_time ON v10_evidence_lineage(symbol,observed_at)")
-    # Backfill explicit evidence lineage from the already-stable decision_id relationship.
-    conn.execute("""INSERT OR IGNORE INTO v10_evidence_lineage(
-        schema_version,decision_id,snapshot_id,outcome_id,symbol,observed_at,horizon_hours,outcome_status,net_return_pct,linked_at)
-        SELECT ?,m.decision_id,m.decision_id,o.id,m.symbol,m.observed_at,o.horizon_hours,o.status,o.net_return_pct,?
-        FROM v9_market_memory m JOIN v2_observation_outcomes o ON o.decision_id=m.decision_id""",
-        (V10_SCHEMA_VERSION, datetime.now(UTC).isoformat()))
-    conn.commit(); conn.close()
+    with _v10_tables_lock:
+        if _v10_tables_ready:
+            return
+        _v9_ensure_tables()
+        if not SQLITE_ENABLED:
+            return
+        conn = db_connect()
+        conn.execute("""CREATE TABLE IF NOT EXISTS v10_research_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            horizon_hours INTEGER NOT NULL,
+            observations INTEGER NOT NULL DEFAULT 0,
+            rich_observations INTEGER NOT NULL DEFAULT 0,
+            patterns_found INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'RUNNING',
+            payload_json TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS v10_patterns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            horizon_hours INTEGER NOT NULL,
+            pattern_key TEXT NOT NULL,
+            pattern_name TEXT NOT NULL,
+            dimensions_json TEXT NOT NULL,
+            samples INTEGER NOT NULL,
+            wins INTEGER NOT NULL,
+            losses INTEGER NOT NULL,
+            win_rate REAL NOT NULL,
+            average_return_pct REAL NOT NULL,
+            median_return_pct REAL NOT NULL,
+            expectancy_pct REAL NOT NULL,
+            gross_profit_pct REAL NOT NULL,
+            gross_loss_pct REAL NOT NULL,
+            profit_factor REAL NOT NULL,
+            score REAL NOT NULL,
+            confidence_grade TEXT NOT NULL,
+            explanation TEXT NOT NULL,
+            UNIQUE(run_id, pattern_key)
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_patterns_run_score ON v10_patterns(run_id, score DESC)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS v10_research_notebook (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            title TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            payload_json TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS v10_evidence_lineage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            schema_version TEXT NOT NULL DEFAULT '10.1',
+            decision_id INTEGER NOT NULL,
+            snapshot_id INTEGER NOT NULL,
+            outcome_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            observed_at TEXT,
+            horizon_hours INTEGER NOT NULL,
+            outcome_status TEXT NOT NULL,
+            net_return_pct REAL,
+            linked_at TEXT NOT NULL,
+            UNIQUE(snapshot_id, outcome_id)
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_lineage_horizon_status ON v10_evidence_lineage(horizon_hours,outcome_status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_lineage_symbol_time ON v10_evidence_lineage(symbol,observed_at)")
+        # Backfill explicit evidence lineage from the already-stable decision_id relationship.
+        conn.execute("""INSERT OR IGNORE INTO v10_evidence_lineage(
+            schema_version,decision_id,snapshot_id,outcome_id,symbol,observed_at,horizon_hours,outcome_status,net_return_pct,linked_at)
+            SELECT ?,m.decision_id,m.decision_id,o.id,m.symbol,m.observed_at,o.horizon_hours,o.status,o.net_return_pct,?
+            FROM v9_market_memory m JOIN v2_observation_outcomes o ON o.decision_id=m.decision_id""",
+            (V10_SCHEMA_VERSION, datetime.now(UTC).isoformat()))
+        conn.commit(); conn.close()
+        _v10_tables_ready = True
 
 
 def _v10_float(value: Any, default: float = 0.0) -> float:
@@ -10739,93 +10748,102 @@ V11_AUTO_RUN_ON_STARTUP = os.getenv("V11_AUTO_RUN_ON_STARTUP", "false").lower() 
 V11_RICH_TARGET_OBSERVATIONS = max(20, int(os.getenv("V11_RICH_TARGET_OBSERVATIONS", "100") or 100))
 V11_AUTO_MAX_FACTORS = max(1, min(int(os.getenv("V11_AUTO_MAX_FACTORS", "3") or 3), 3))
 v11_last_learning_result: Dict[str, Any] = {}
+_v11_tables_ready = False
+_v11_tables_lock = threading.RLock()
 
 
 def _v11_ensure_tables() -> None:
-    _v10_ensure_tables()
-    if not SQLITE_ENABLED:
+    global _v11_tables_ready
+    if _v11_tables_ready:
         return
-    conn = db_connect()
-    conn.execute("""CREATE TABLE IF NOT EXISTS v11_discovery_runs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        schema_version TEXT NOT NULL DEFAULT '11.0',
-        created_at TEXT NOT NULL,
-        completed_at TEXT,
-        requested_horizon_hours INTEGER NOT NULL,
-        horizon_hours INTEGER NOT NULL,
-        minimum_samples INTEGER NOT NULL,
-        observations INTEGER NOT NULL DEFAULT 0,
-        rich_observations INTEGER NOT NULL DEFAULT 0,
-        candidates_tested INTEGER NOT NULL DEFAULT 0,
-        discoveries_found INTEGER NOT NULL DEFAULT 0,
-        validated_positive INTEGER NOT NULL DEFAULT 0,
-        validated_negative INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'RUNNING',
-        payload_json TEXT
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS v11_discoveries (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        horizon_hours INTEGER NOT NULL,
-        discovery_key TEXT NOT NULL,
-        discovery_name TEXT NOT NULL,
-        dimensions_json TEXT NOT NULL,
-        factor_count INTEGER NOT NULL,
-        samples INTEGER NOT NULL,
-        wins INTEGER NOT NULL,
-        losses INTEGER NOT NULL,
-        win_rate REAL NOT NULL,
-        expectancy_pct REAL NOT NULL,
-        profit_factor REAL NOT NULL,
-        median_return_pct REAL NOT NULL,
-        lower95_expectancy_pct REAL NOT NULL,
-        baseline_expectancy_pct REAL NOT NULL,
-        expectancy_lift_pct REAL NOT NULL,
-        train_samples INTEGER NOT NULL,
-        train_expectancy_pct REAL NOT NULL,
-        train_profit_factor REAL NOT NULL,
-        validation_samples INTEGER NOT NULL,
-        validation_expectancy_pct REAL NOT NULL,
-        validation_profit_factor REAL NOT NULL,
-        validation_win_rate REAL NOT NULL,
-        stability_score REAL NOT NULL,
-        evidence_score REAL NOT NULL,
-        classification TEXT NOT NULL,
-        explanation TEXT NOT NULL,
-        UNIQUE(run_id, discovery_key)
-    )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_discoveries_run_score ON v11_discoveries(run_id,evidence_score DESC)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_discoveries_run_class ON v11_discoveries(run_id,classification)")
-    conn.execute("""CREATE TABLE IF NOT EXISTS v11_learning_state (
-        id INTEGER PRIMARY KEY CHECK(id=1),
-        schema_version TEXT NOT NULL DEFAULT '11.1',
-        last_checked_at TEXT,
-        last_automatic_run_at TEXT,
-        last_run_id INTEGER,
-        last_observations INTEGER NOT NULL DEFAULT 0,
-        last_rich_observations INTEGER NOT NULL DEFAULT 0,
-        last_status TEXT NOT NULL DEFAULT 'NEVER_RUN',
-        last_reason TEXT,
-        last_error TEXT
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS v11_learning_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        created_at TEXT NOT NULL,
-        run_id INTEGER,
-        trigger_type TEXT NOT NULL,
-        observations INTEGER NOT NULL DEFAULT 0,
-        rich_observations INTEGER NOT NULL DEFAULT 0,
-        new_observations INTEGER NOT NULL DEFAULT 0,
-        new_rich_observations INTEGER NOT NULL DEFAULT 0,
-        validated_positive INTEGER NOT NULL DEFAULT 0,
-        validated_negative INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL,
-        reason TEXT,
-        payload_json TEXT
-    )""")
-    conn.execute("INSERT OR IGNORE INTO v11_learning_state(id,schema_version) VALUES(1,?)", (V11_SCHEMA_VERSION,))
-    conn.commit(); conn.close()
+    with _v11_tables_lock:
+        if _v11_tables_ready:
+            return
+        _v10_ensure_tables()
+        if not SQLITE_ENABLED:
+            return
+        conn = db_connect()
+        conn.execute("""CREATE TABLE IF NOT EXISTS v11_discovery_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            schema_version TEXT NOT NULL DEFAULT '11.0',
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            requested_horizon_hours INTEGER NOT NULL,
+            horizon_hours INTEGER NOT NULL,
+            minimum_samples INTEGER NOT NULL,
+            observations INTEGER NOT NULL DEFAULT 0,
+            rich_observations INTEGER NOT NULL DEFAULT 0,
+            candidates_tested INTEGER NOT NULL DEFAULT 0,
+            discoveries_found INTEGER NOT NULL DEFAULT 0,
+            validated_positive INTEGER NOT NULL DEFAULT 0,
+            validated_negative INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'RUNNING',
+            payload_json TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS v11_discoveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            horizon_hours INTEGER NOT NULL,
+            discovery_key TEXT NOT NULL,
+            discovery_name TEXT NOT NULL,
+            dimensions_json TEXT NOT NULL,
+            factor_count INTEGER NOT NULL,
+            samples INTEGER NOT NULL,
+            wins INTEGER NOT NULL,
+            losses INTEGER NOT NULL,
+            win_rate REAL NOT NULL,
+            expectancy_pct REAL NOT NULL,
+            profit_factor REAL NOT NULL,
+            median_return_pct REAL NOT NULL,
+            lower95_expectancy_pct REAL NOT NULL,
+            baseline_expectancy_pct REAL NOT NULL,
+            expectancy_lift_pct REAL NOT NULL,
+            train_samples INTEGER NOT NULL,
+            train_expectancy_pct REAL NOT NULL,
+            train_profit_factor REAL NOT NULL,
+            validation_samples INTEGER NOT NULL,
+            validation_expectancy_pct REAL NOT NULL,
+            validation_profit_factor REAL NOT NULL,
+            validation_win_rate REAL NOT NULL,
+            stability_score REAL NOT NULL,
+            evidence_score REAL NOT NULL,
+            classification TEXT NOT NULL,
+            explanation TEXT NOT NULL,
+            UNIQUE(run_id, discovery_key)
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_discoveries_run_score ON v11_discoveries(run_id,evidence_score DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_v11_discoveries_run_class ON v11_discoveries(run_id,classification)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS v11_learning_state (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            schema_version TEXT NOT NULL DEFAULT '11.1',
+            last_checked_at TEXT,
+            last_automatic_run_at TEXT,
+            last_run_id INTEGER,
+            last_observations INTEGER NOT NULL DEFAULT 0,
+            last_rich_observations INTEGER NOT NULL DEFAULT 0,
+            last_status TEXT NOT NULL DEFAULT 'NEVER_RUN',
+            last_reason TEXT,
+            last_error TEXT
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS v11_learning_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            run_id INTEGER,
+            trigger_type TEXT NOT NULL,
+            observations INTEGER NOT NULL DEFAULT 0,
+            rich_observations INTEGER NOT NULL DEFAULT 0,
+            new_observations INTEGER NOT NULL DEFAULT 0,
+            new_rich_observations INTEGER NOT NULL DEFAULT 0,
+            validated_positive INTEGER NOT NULL DEFAULT 0,
+            validated_negative INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            reason TEXT,
+            payload_json TEXT
+        )""")
+        conn.execute("INSERT OR IGNORE INTO v11_learning_state(id,schema_version) VALUES(1,?)", (V11_SCHEMA_VERSION,))
+        conn.commit(); conn.close()
+        _v11_tables_ready = True
 
 
 def _v11_bin(name: str, value: Any) -> Optional[str]:
@@ -12720,7 +12738,7 @@ V10_PROMOTION_MIN_SAMPLES = max(25, int(os.getenv("V10_PROMOTION_MIN_SAMPLES", "
 V10_PROMOTION_CONFIRMATION = os.getenv("V10_PROMOTION_CONFIRMATION", "PROMOTE").strip().upper() or "PROMOTE"
 
 
-def _v10_ensure_tables() -> None:
+def _v10_promotion_ensure_tables() -> None:
     if not SQLITE_ENABLED:
         return
     init_db()
@@ -12760,7 +12778,7 @@ def _v10_candidate_key(candidate: Dict[str, Any], horizon_hours: int) -> str:
 
 
 def _v10_save_evaluation(result: Dict[str, Any]) -> Dict[str, Any]:
-    _v10_ensure_tables()
+    _v10_promotion_ensure_tables()
     candidate = result.get("stagedRecommendation") or result.get("recommended") or {}
     if not candidate:
         return result
@@ -12828,7 +12846,7 @@ def v10_evaluate_promotion(horizon_hours: int = 24, min_samples: int = V10_PROMO
 def v10_promotion_status(limit: int = 20) -> Dict[str, Any]:
     if not SQLITE_ENABLED:
         return {"ok": False, "message": "SQLite disabled", "candidates": []}
-    _v10_ensure_tables()
+    _v10_promotion_ensure_tables()
     conn = db_connect()
     rows = [dict(r) for r in conn.execute(
         "SELECT * FROM v10_promotion_candidates ORDER BY id DESC LIMIT ?",
@@ -12868,7 +12886,7 @@ def v10_approve_promotion(candidate_key: str, confirmation: str) -> Dict[str, An
         return {"ok": False, "message": "Human strategy promotion is disabled."}
     if str(confirmation or "").strip().upper() != V10_PROMOTION_CONFIRMATION:
         return {"ok": False, "message": f"Type {V10_PROMOTION_CONFIRMATION} to approve this strategy change."}
-    _v10_ensure_tables()
+    _v10_promotion_ensure_tables()
     conn = db_connect()
     stored = conn.execute(
         "SELECT * FROM v10_promotion_candidates WHERE candidate_key=?",
@@ -12941,7 +12959,7 @@ def v10_approve_promotion(candidate_key: str, confirmation: str) -> Dict[str, An
 
 
 def v10_reject_promotion(candidate_key: str, note: str = "") -> Dict[str, Any]:
-    _v10_ensure_tables()
+    _v10_promotion_ensure_tables()
     now = datetime.now(UTC).isoformat()
     conn = db_connect()
     cur = conn.execute("""
