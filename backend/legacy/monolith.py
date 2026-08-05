@@ -1247,30 +1247,43 @@ def ai_position_capacity_payload() -> Dict[str, Any]:
 
     target_pct = max(0.001, float(globals().get("TARGET_POSITION_VALUE_PCT", 0.10) or 0.10))
     max_pct = max(target_pct, float(globals().get("MAX_POSITION_VALUE_PCT", target_pct) or target_pct))
-    # Target sizing is the main AI decision. Capacity follows from it: a 10%
-    # target naturally permits up to ten positions; 20% permits up to five.
-    sizing_capacity = max(1, int(1.0 // target_pct))
+    # Target sizing is the AI decision. Portfolio capacity is a consequence of
+    # that target, not of the legacy single-buy amount or currently free cash.
+    # The epsilon avoids 10% becoming 9 because of binary floating-point.
+    sizing_capacity = max(1, int(math.floor((1.0 / target_pct) + 1e-9)))
 
-    capital_capacity = hard_cap
     cap_usd = None
+    buying_power = None
+    target_notional = None
+    affordable_new_positions = 0
+    open_count = 0
     try:
         account = get_account()
         equity = float(account.equity)
         buying_power = max(0.0, float(account.buying_power))
         cap_usd = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
-        target_notional = max(float(globals().get("AI_POSITION_MIN_NOTIONAL_USD", 25.0)), cap_usd * target_pct)
-        # Existing positions are already consuming capital. Buying power limits
-        # how many additional slots are genuinely usable right now.
+        target_notional = max(
+            float(globals().get("AI_POSITION_MIN_NOTIONAL_USD", 25.0)),
+            cap_usd * target_pct,
+        )
         open_count = len(get_all_positions())
-        additional_by_cash = int(max(0.0, buying_power - float(globals().get("CASH_BUFFER", 0.0))) // max(target_notional, 1.0))
-        capital_capacity = max(open_count, open_count + additional_by_cash)
+        usable_cash = max(0.0, buying_power - float(globals().get("CASH_BUFFER", 0.0)))
+        affordable_new_positions = max(0, int(math.floor((usable_cash / max(target_notional, 1.0)) + 1e-9)))
     except Exception:
-        capital_capacity = sizing_capacity
+        # Capacity remains AI-sized if account telemetry is briefly unavailable.
+        # Existing order-side cash checks still prevent unaffordable purchases.
+        try:
+            open_count = len(get_all_positions())
+        except Exception:
+            open_count = 0
 
-    effective = max(1, min(hard_cap, sizing_capacity, max(1, capital_capacity)))
+    effective = max(1, min(hard_cap, sizing_capacity))
+    structural_slots = max(0, effective - open_count)
+    usable_slots_now = min(structural_slots, affordable_new_positions) if buying_power is not None else structural_slots
     reason = (
-        f"AI sizing permits up to {sizing_capacity}; current capital supports {capital_capacity}; "
-        f"hard safety ceiling is {hard_cap}. Slots are filled only by qualified candidates."
+        f"AI target allocation permits up to {sizing_capacity}; effective safety-bounded capacity is {effective}. "
+        f"Current buying power can fund {affordable_new_positions} additional target-sized position(s). "
+        "Every slot still requires an independently qualified candidate."
     )
     return {
         "enabled": True,
@@ -1280,6 +1293,12 @@ def ai_position_capacity_payload() -> Dict[str, Any]:
         "targetPositionValuePct": round(target_pct, 4),
         "maxPositionValuePct": round(max_pct, 4),
         "capitalUsd": round(float(cap_usd), 2) if cap_usd is not None else None,
+        "buyingPowerUsd": round(float(buying_power), 2) if buying_power is not None else None,
+        "targetPositionNotionalUsd": round(float(target_notional), 2) if target_notional is not None else None,
+        "openPositions": int(open_count),
+        "structuralAvailableSlots": int(structural_slots),
+        "affordableNewPositions": int(affordable_new_positions),
+        "availableSlots": int(usable_slots_now),
         "reason": reason,
     }
 
@@ -1292,6 +1311,12 @@ def effective_max_positions() -> int:
 
 
 def allowed_new_position_count():
+    try:
+        payload = ai_position_capacity_payload()
+        if payload.get("enabled"):
+            return max(0, int(payload.get("availableSlots", 0)))
+    except Exception:
+        pass
     return max(0, effective_max_positions() - len(get_all_positions()))
 
 
@@ -5768,8 +5793,6 @@ def api_get_position_settings():
 def api_ai_position_capacity(request: Request):
     verify_api_key(request)
     payload = ai_position_capacity_payload()
-    payload["openPositions"] = len(get_all_positions())
-    payload["availableSlots"] = max(0, int(payload["effectiveMaxPositions"]) - payload["openPositions"])
     return {"ok": True, **payload}
 
 
