@@ -1,0 +1,7 @@
+V15.5 Connection and startup status fix
+
+- SQLite schema initialises synchronously before any autonomous worker starts.
+- Prevents startup table-creation races.
+- /status now returns a live account/market/bot snapshot immediately.
+- /status no longer returns only botVersion and an empty universe during warm-up.
+- No trading strategy or order logic changed.

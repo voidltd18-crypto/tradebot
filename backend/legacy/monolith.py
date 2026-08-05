@@ -6721,8 +6721,54 @@ def api_v2_evaluate_outcomes(request: Request, limit: int = 100):
     verify_api_key(request)
     return v2_evaluate_due_outcomes(limit)
 
+def _quick_live_status_payload() -> Dict[str, Any]:
+    """Build a lightweight live status snapshot without running research/schema work."""
+    account = get_account()
+    positions = get_all_positions()
+    market_status = get_market_status_payload()
+    daily_pnl = get_daily_pnl()
+    return {
+        "id": "rebuilt-sniper-live",
+        "name": BOT_NAME,
+        "botVersion": "v1.1-strict-profit-mode",
+        "paperMode": PAPER,
+        "botEnabled": bot_enabled,
+        "manualOverride": manual_override,
+        "emergencyStop": emergency_stop,
+        "market": market_status,
+        "account": {
+            "equity": float(account.equity),
+            "equityGbp": money_gbp(float(account.equity)),
+            "buyingPower": float(account.buying_power),
+            "buyingPowerGbp": money_gbp(float(account.buying_power)),
+            "cash": float(account.cash),
+            "cashGbp": money_gbp(float(account.cash)),
+            "pnlDay": float(daily_pnl),
+            "pnlDayGbp": money_gbp(float(daily_pnl)),
+        },
+        "positions": positions,
+        "activePosition": positions[0] if positions else None,
+        "scans": list(latest_scans),
+        "maxPositions": MAX_POSITIONS,
+        "allowedNewPositions": allowed_new_position_count(),
+        "newPositionNotional": calculate_new_position_notional(),
+        "autoUniverse": auto_universe_payload(),
+        "universe": list(current_universe),
+        "banking": banking_payload(),
+        "quickStatus": True,
+        "quickStatusUpdatedAt": datetime.now(UTC).isoformat(),
+    }
+
+
 @app.get("/status")
 def get_status():
+    # Never return an empty shell while the background loop is still warming up.
+    if not isinstance(latest_status.get("account"), dict):
+        try:
+            latest_status.clear()
+            latest_status.update(_quick_live_status_payload())
+        except Exception as e:
+            print(f"QUICK STATUS BUILD ERROR: {e}")
     latest_status["botVersion"] = "v1.1-strict-profit-mode"
     try:
         if "merge_manual_picks_into_auto_universe" in globals():
@@ -7000,6 +7046,14 @@ def run_bot_loop():
 @app.on_event("startup")
 def startup_event():
     global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started
+    # Initialise the shared SQLite schema synchronously before any worker threads start.
+    # This removes the startup race where multiple workers all tried to create tables.
+    init_db()
+    try:
+        latest_status.clear()
+        latest_status.update(_quick_live_status_payload())
+    except Exception as exc:
+        print(f"STARTUP QUICK STATUS ERROR: {exc}")
     if not bot_thread_started:
         bot_thread_started = True
         threading.Thread(target=run_bot_loop, daemon=True).start()
