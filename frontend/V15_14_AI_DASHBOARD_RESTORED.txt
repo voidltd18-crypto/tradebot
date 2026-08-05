@@ -1,0 +1,21 @@
+V15.14 AI Dashboard Restored + Decoupled Reports
+
+This package restores and preserves the modular AI dashboard:
+- AI Intelligence
+- AI CEO
+- AI Board
+- AI Brain
+- AI Memory
+- AI Scientist
+- Evolution
+- AI Operations
+
+Fixes:
+- Reports no longer controls dashboard connection.
+- /status and /banking-status determine live connectivity.
+- Reports loads independently.
+- No overlapping status polls.
+- AbortError is treated as cancellation/timeout, not a platform crash.
+- Manual buy/sell controls remain available while Reports is slow.
+
+Deploy the complete frontend folder, not only a replacement legacy App.tsx.

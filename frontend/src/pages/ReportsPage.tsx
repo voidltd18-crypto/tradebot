@@ -5,7 +5,7 @@ import { Stat } from "../components/Stat";
 import { gbp, pct, tone, tradeDate, tradeTime, usd } from "../lib/format";
 import type { AnyObj, Currency } from "../lib/types";
 
-export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, setChartCurrency }: { reports: AnyObj; data: AnyObj; rate: number; closedTrades: AnyObj[]; chartCurrency: Currency; setChartCurrency: (currency: Currency) => void }) {
+export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, setChartCurrency, reportsLoading, reportsError, reportsUpdatedAt, loadReports }: { reports: AnyObj; data: AnyObj; rate: number; closedTrades: AnyObj[]; chartCurrency: Currency; setChartCurrency: (currency: Currency) => void; reportsLoading: boolean; reportsError: string; reportsUpdatedAt: string; loadReports: (force?: boolean) => Promise<void> }) {
   const totalDeposited = Number(reports?.totalDeposited || 0);
   const totalGainLoss = Number(reports?.totalGainLoss || 0);
   const earned = Number(reports?.earnedSinceDeposit || 0);
@@ -15,6 +15,12 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const dailyPnlChart = useMemo(() => { const grouped: Record<string, number> = {}; reportChart.forEach((point) => grouped[point.day] = (grouped[point.day] || 0) + Number(point.pnl || 0)); return Object.entries(grouped).map(([day, pnl]) => ({ day, pnl })); }, [reportChart]);
   const displayClosedTrades = [...closedTrades].sort((a, b) => Date.parse(String(b?.timestamp || b?.date || b?.day || "")) - Date.parse(String(a?.timestamp || a?.date || a?.day || ""))).slice(0, 80);
   return <main className="grid two reports-page">
+    <Card title="Reports Status" wide>
+      <div className="actions"><button onClick={() => loadReports(true)} disabled={reportsLoading}>{reportsLoading ? "Loading Reports..." : "Refresh Reports"}</button></div>
+      {reportsLoading && <p className="notice">Reports are loading separately. Live trading, positions and AI remain available.</p>}
+      {reportsError && <p className="notice loss">{reportsError}</p>}
+      {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { hour12: false })}</p>}
+    </Card>
     <Card title="Performance Summary" wide><section className="stats"><Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={usd(totalDeposited)}/><Stat label="Earned" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)}/><Stat label="Lost" value={gbp(lost * rate)} sub={usd(lost)} className="loss"/><Stat label="Current Equity" value={gbp(Number(reports?.currentEquity ?? data?.account?.equity ?? 0) * rate)} sub={usd(reports?.currentEquity ?? data?.account?.equity ?? 0)}/></section><p className={tone(totalGainLoss)}>Total gain/loss: {gbp(totalGainLoss * rate)}</p></Card>
     <Card title="Equity History" wide><div className="chart-controls"><button className={chartCurrency === "GBP" ? "active" : ""} onClick={() => setChartCurrency("GBP")}>GBP</button><button className={chartCurrency === "USD" ? "active" : ""} onClick={() => setChartCurrency("USD")}>USD</button></div><div className="chart">{reportChart.length ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={reportChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="label" stroke="#94a3b8" minTickGap={28}/><YAxis stroke="#94a3b8"/><Tooltip formatter={(value: any) => chartCurrency === "GBP" ? gbp(value) : usd(value)}/><Area type="monotone" dataKey="equity" stroke="#38bdf8" fill="#38bdf833"/></AreaChart></ResponsiveContainer> : <p className="muted">No equity history yet.</p>}</div></Card>
     <Card title="Daily PnL" wide><div className="chart small-chart">{dailyPnlChart.length ? <ResponsiveContainer width="100%" height="100%"><BarChart data={dailyPnlChart}><CartesianGrid strokeDasharray="3 3" stroke="#263450"/><XAxis dataKey="day" stroke="#94a3b8"/><YAxis stroke="#94a3b8"/><Tooltip formatter={(value: any) => chartCurrency === "GBP" ? gbp(value) : usd(value)}/><Bar dataKey="pnl" fill="#38bdf8"/></BarChart></ResponsiveContainer> : <p className="muted">Daily PnL will appear as trades are recorded.</p>}</div></Card>
