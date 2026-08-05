@@ -25,4 +25,5 @@ SERVICE_REGISTRY = (
     ServiceDescriptor("execution", "Order validation and broker execution", ("/buy", "/sell"), True),
     ServiceDescriptor("risk", "Capital, position, PDT and loss safeguards", ("/banking-status",)),
     ServiceDescriptor("memory", "V13 persistent evidence-backed long-term knowledge", ("/reports", "/v13/memory")),
+    ServiceDescriptor("scientist", "V14 autonomous hypothesis and experiment generation", ("/v14/scientist",)),
 )

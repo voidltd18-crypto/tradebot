@@ -14549,3 +14549,402 @@ def api_v13_memory_constitution(request: Request):
         "Knowledge that is not reconfirmed becomes STALE and is retired automatically.",
         "The memory layer cannot place, cancel or alter orders.",
         "CEO, Board, Research and Evolution may read memory but existing constitutions remain authoritative."]}
+# =========================
+# TRADEBOT V14 — AUTONOMOUS AI SCIENTIST
+# Generates evidence-backed hypotheses and research experiments from V13 memory.
+# Research-only: it cannot place orders, change live settings or promote strategies.
+# =========================
+V14_SCIENTIST_VERSION = "V14.0"
+V14_SCIENTIST_ENABLED = os.getenv("V14_SCIENTIST_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+V14_SCIENTIST_INTERVAL_SECONDS = max(300, int(os.getenv("V14_SCIENTIST_INTERVAL_SECONDS", "1800")))
+V14_SCIENTIST_STARTUP_DELAY_SECONDS = max(10, int(os.getenv("V14_SCIENTIST_STARTUP_DELAY_SECONDS", "55")))
+V14_MIN_MEMORY_CONFIDENCE = max(25.0, float(os.getenv("V14_MIN_MEMORY_CONFIDENCE", "55")))
+V14_MIN_RESEARCH_SAMPLES = max(20, int(os.getenv("V14_MIN_RESEARCH_SAMPLES", "100")))
+v14_scientist_thread_started = False
+
+
+def _v14_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _v14_fp(*parts: Any) -> str:
+    raw = "|".join(str(p).strip().upper() for p in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _v14_scientist_ensure_tables() -> None:
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS v14_hypotheses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fingerprint TEXT UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            hypothesis_type TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            statement TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'DISCOVERED',
+            confidence REAL NOT NULL DEFAULT 0,
+            evidence_count INTEGER NOT NULL DEFAULT 0,
+            expected_direction TEXT NOT NULL DEFAULT 'UNKNOWN',
+            source_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+            variables_json TEXT NOT NULL DEFAULT '{}',
+            safeguards_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS v14_experiments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_key TEXT UNIQUE NOT NULL,
+            hypothesis_fingerprint TEXT NOT NULL,
+            name TEXT NOT NULL,
+            experiment_type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'SHADOW_READY',
+            baseline_json TEXT NOT NULL DEFAULT '{}',
+            variant_json TEXT NOT NULL DEFAULT '{}',
+            evidence_json TEXT NOT NULL DEFAULT '{}',
+            sample_size INTEGER NOT NULL DEFAULT 0,
+            win_rate REAL,
+            expectancy_pct REAL,
+            profit_factor REAL,
+            evaluation_score REAL NOT NULL DEFAULT 0,
+            board_eligible INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS v14_scientist_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            reference_key TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v14_hypotheses_status ON v14_hypotheses(status,confidence)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v14_experiments_status ON v14_experiments(status,evaluation_score)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v14_events_created ON v14_scientist_events(created_at)")
+    conn.commit(); conn.close()
+
+
+def _v14_event(event_type: str, title: str, detail: str, reference_key: str = "", payload: Optional[Dict[str, Any]] = None) -> None:
+    if not SQLITE_ENABLED:
+        return
+    _v14_scientist_ensure_tables(); conn = db_connect()
+    conn.execute("INSERT INTO v14_scientist_events(created_at,event_type,title,detail,reference_key,payload_json) VALUES(?,?,?,?,?,?)",
+                 (_v14_now(), event_type, title, detail, reference_key, json.dumps(payload or {}, default=str)))
+    conn.commit(); conn.close()
+
+
+def _v14_design_from_memory(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    kind = str(item.get("knowledgeType") or "").upper()
+    subject = str(item.get("subject") or "UNKNOWN").upper()
+    metric = float(item.get("metricValue") or 0)
+    confidence = float(item.get("confidence") or 0)
+    evidence = int(item.get("evidenceCount") or 0)
+    memory_id = int(item.get("id") or 0)
+    claim = str(item.get("claim") or "")
+    if confidence < V14_MIN_MEMORY_CONFIDENCE:
+        return None
+
+    if kind == "RULE":
+        direction = "IMPROVE_EXPECTANCY"
+        if metric < 0:
+            title = f"Shadow-test a less restrictive {subject}"
+            statement = f"Reducing the influence of {subject} may improve net expectancy without materially increasing drawdown."
+            variant = {"rule": subject, "mode": "SOFTEN", "changePct": 15, "live": False}
+        else:
+            title = f"Shadow-test stronger use of {subject}"
+            statement = f"Prioritising setups supported by {subject} may preserve its positive historical expectancy."
+            variant = {"rule": subject, "mode": "WEIGHT_UP", "changePct": 10, "live": False}
+        htype = "RULE_VARIANT"
+        safeguards = ["Shadow-only", "No live rule removal", "Minimum 100 tagged outcomes", "Compare drawdown and expectancy"]
+    elif kind == "SYMBOL":
+        direction = "REDUCE_LOSS" if metric < 0 else "IMPROVE_SELECTION"
+        if metric < 0:
+            title = f"Test a reputation guard for {subject}"
+            statement = f"Applying a shadow-only reputation penalty to {subject} may reduce losses in similar market conditions."
+            variant = {"symbol": subject, "mode": "REPUTATION_PENALTY", "penaltyPct": min(50, max(10, abs(metric) * 3)), "live": False}
+        else:
+            title = f"Test selective preference for {subject}"
+            statement = f"Giving {subject} a small shadow ranking bonus may improve opportunity selection when its learned conditions recur."
+            variant = {"symbol": subject, "mode": "RANKING_BONUS", "bonusPct": min(20, max(5, metric * 2)), "live": False}
+        htype = "SYMBOL_POLICY"
+        safeguards = ["Shadow-only", "No permanent blacklist", "Regime-matched comparison", "Minimum 50 tagged outcomes"]
+    elif kind == "MARKET":
+        direction = "IMPROVE_REGIME_FIT"
+        title = "Test a market-context execution guard"
+        statement = "Conditioning trade selection on the strongest current Market DNA features may improve regime fit."
+        variant = {"mode": "MARKET_CONTEXT_GUARD", "source": subject, "live": False}
+        htype = "MARKET_CONTEXT"
+        safeguards = ["Shadow-only", "No live market shutdown", "Compare by session and regime", "Minimum 200 tagged outcomes"]
+    else:
+        return None
+
+    fp = _v14_fp(htype, subject, "POS" if metric >= 0 else "NEG")
+    return {
+        "fingerprint": fp,
+        "title": title,
+        "hypothesisType": htype,
+        "subject": subject,
+        "statement": statement,
+        "rationale": claim,
+        "status": "SHADOW_READY",
+        "confidence": min(95.0, confidence),
+        "evidenceCount": evidence,
+        "expectedDirection": direction,
+        "sourceMemoryIds": [memory_id] if memory_id else [],
+        "variables": variant,
+        "safeguards": safeguards,
+    }
+
+
+def _v14_upsert_hypothesis(item: Dict[str, Any]) -> bool:
+    if not SQLITE_ENABLED:
+        return False
+    _v14_scientist_ensure_tables(); now = _v14_now(); conn = db_connect()
+    row = conn.execute("SELECT id,confidence,evidence_count,status FROM v14_hypotheses WHERE fingerprint=?", (item["fingerprint"],)).fetchone()
+    created = row is None
+    if row:
+        old = dict(row)
+        confidence = max(float(old.get("confidence") or 0), float(item.get("confidence") or 0))
+        evidence = max(int(old.get("evidence_count") or 0), int(item.get("evidenceCount") or 0))
+        conn.execute("""UPDATE v14_hypotheses SET title=?,statement=?,rationale=?,status=?,confidence=?,evidence_count=?,
+            expected_direction=?,source_memory_ids_json=?,variables_json=?,safeguards_json=?,updated_at=? WHERE fingerprint=?""",
+            (item["title"], item["statement"], item["rationale"], item["status"], confidence, evidence,
+             item["expectedDirection"], json.dumps(item["sourceMemoryIds"]), json.dumps(item["variables"]),
+             json.dumps(item["safeguards"]), now, item["fingerprint"]))
+    else:
+        conn.execute("""INSERT INTO v14_hypotheses(fingerprint,title,hypothesis_type,subject,statement,rationale,status,
+            confidence,evidence_count,expected_direction,source_memory_ids_json,variables_json,safeguards_json,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (item["fingerprint"], item["title"], item["hypothesisType"], item["subject"], item["statement"],
+             item["rationale"], item["status"], item["confidence"], item["evidenceCount"], item["expectedDirection"],
+             json.dumps(item["sourceMemoryIds"]), json.dumps(item["variables"]), json.dumps(item["safeguards"]), now, now))
+    conn.commit(); conn.close()
+    if created:
+        _v14_event("HYPOTHESIS_CREATED", item["title"], item["statement"], item["fingerprint"],
+                   {"type": item["hypothesisType"], "confidence": item["confidence"], "evidence": item["evidenceCount"]})
+    return created
+
+
+def _v14_upsert_experiment(hypothesis: Dict[str, Any]) -> bool:
+    if not SQLITE_ENABLED:
+        return False
+    fp = str(hypothesis.get("fingerprint") or "")
+    key = _v14_fp("EXPERIMENT", fp, "A_B_SHADOW")
+    name = f"EXP-{key[:8].upper()} — {hypothesis.get('title')}"
+    baseline = {"mode": "CURRENT_LIVE_LOGIC", "mutated": False}
+    variant = hypothesis.get("variables") or {}
+    evidence = {"source": "V13_MEMORY", "memoryIds": hypothesis.get("sourceMemoryIds") or [],
+                "priorEvidenceCount": int(hypothesis.get("evidenceCount") or 0),
+                "priorConfidence": float(hypothesis.get("confidence") or 0),
+                "note": "Retrospective evidence designed the experiment; tagged shadow outcomes are still required."}
+    prior_score = min(99.0, float(hypothesis.get("confidence") or 0) * 0.7 + min(30.0, int(hypothesis.get("evidenceCount") or 0) / 100.0))
+    now = _v14_now(); conn = db_connect()
+    row = conn.execute("SELECT id FROM v14_experiments WHERE experiment_key=?", (key,)).fetchone(); created = row is None
+    if row:
+        conn.execute("""UPDATE v14_experiments SET name=?,status='SHADOW_READY',baseline_json=?,variant_json=?,evidence_json=?,
+            evaluation_score=?,updated_at=? WHERE experiment_key=?""",
+            (name, json.dumps(baseline), json.dumps(variant), json.dumps(evidence), prior_score, now, key))
+    else:
+        conn.execute("""INSERT INTO v14_experiments(experiment_key,hypothesis_fingerprint,name,experiment_type,status,
+            baseline_json,variant_json,evidence_json,sample_size,evaluation_score,board_eligible,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (key, fp, name, "A_B_SHADOW", "SHADOW_READY", json.dumps(baseline), json.dumps(variant),
+             json.dumps(evidence), 0, prior_score, 0, now, now))
+    conn.commit(); conn.close()
+    if created:
+        _v14_event("EXPERIMENT_DESIGNED", name,
+                   "A controlled shadow experiment was designed. It cannot affect live trading and is not Board-eligible until tagged outcomes exist.",
+                   key, {"hypothesisFingerprint": fp, "status": "SHADOW_READY"})
+    return created
+
+
+def _v14_import_research_validations() -> int:
+    """Record existing V7 research brains as observational validations, without pretending they are V14 A/B tests."""
+    if not SQLITE_ENABLED:
+        return 0
+    created = 0
+    try:
+        payload = v7_research_insights(24)
+        rows = payload.get("leaderboard") or payload.get("brains") or payload.get("items") or []
+        for row in rows[:30]:
+            if not isinstance(row, dict):
+                continue
+            samples = int(row.get("samples") or row.get("trades") or 0)
+            expectancy = float(row.get("expectancyPct") if row.get("expectancyPct") is not None else row.get("expectancy") or 0)
+            win_rate = float(row.get("winRate") or 0)
+            score = float(row.get("researchScore") if row.get("researchScore") is not None else row.get("score") or 0)
+            name = str(row.get("name") or row.get("brainName") or row.get("key") or "UNKNOWN")
+            if samples < V14_MIN_RESEARCH_SAMPLES:
+                continue
+            key = _v14_fp("OBSERVATIONAL", name)
+            status = "VALIDATED_RESEARCH" if expectancy > 0 and samples >= V14_MIN_RESEARCH_SAMPLES else "OBSERVED"
+            board_eligible = 1 if status == "VALIDATED_RESEARCH" and samples >= 200 and expectancy > 0.25 else 0
+            now = _v14_now(); conn = db_connect(); existing = conn.execute("SELECT id FROM v14_experiments WHERE experiment_key=?", (key,)).fetchone()
+            evidence = {"source": "V7_RESEARCH_LAB", "brain": name, "researchScore": score,
+                        "note": "Existing research-lab evidence; not a V14 causal A/B experiment."}
+            if existing:
+                conn.execute("""UPDATE v14_experiments SET status=?,evidence_json=?,sample_size=?,win_rate=?,expectancy_pct=?,
+                    evaluation_score=?,board_eligible=?,updated_at=? WHERE experiment_key=?""",
+                    (status, json.dumps(evidence), samples, win_rate, expectancy, score, board_eligible, now, key))
+            else:
+                conn.execute("""INSERT INTO v14_experiments(experiment_key,hypothesis_fingerprint,name,experiment_type,status,
+                    baseline_json,variant_json,evidence_json,sample_size,win_rate,expectancy_pct,evaluation_score,board_eligible,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (key, "", f"Research validation — {name}", "OBSERVATIONAL_RESEARCH", status, "{}", json.dumps({"brain": name}),
+                     json.dumps(evidence), samples, win_rate, expectancy, score, board_eligible, now, now))
+                created += 1
+                _v14_event("RESEARCH_VALIDATION_IMPORTED", f"Research evidence imported: {name}",
+                           f"{samples:,} samples, {win_rate:.1f}% win rate and {expectancy:.2f}% expectancy.", key,
+                           {"status": status, "boardEligible": bool(board_eligible)})
+            conn.commit(); conn.close()
+    except Exception as exc:
+        print(f"V14 SCIENTIST RESEARCH IMPORT ERROR: {exc}")
+    return created
+
+
+def v14_scientist_refresh() -> Dict[str, Any]:
+    _v14_scientist_ensure_tables()
+    created_hypotheses = 0; created_experiments = 0
+    try:
+        memory_items = _v13_rows(300, "", "ACTIVE")
+    except Exception:
+        memory_items = []
+    for memory in memory_items:
+        item = _v14_design_from_memory(memory)
+        if not item:
+            continue
+        if _v14_upsert_hypothesis(item):
+            created_hypotheses += 1
+        if _v14_upsert_experiment(item):
+            created_experiments += 1
+    imported = _v14_import_research_validations()
+    if created_hypotheses or created_experiments or imported:
+        _v14_event("SCIENTIST_CYCLE", "Automatic scientist cycle completed",
+                   f"Created {created_hypotheses} hypotheses, designed {created_experiments} shadow experiments and imported {imported} research validations.",
+                   "V14_CYCLE", {"hypotheses": created_hypotheses, "experiments": created_experiments, "researchValidations": imported})
+    return v14_scientist_status()
+
+
+def _v14_hypothesis_rows(limit: int = 200, status: str = "") -> List[Dict[str, Any]]:
+    if not SQLITE_ENABLED:
+        return []
+    _v14_scientist_ensure_tables(); limit=max(1,min(int(limit),1000)); params=[]; where=""
+    if status:
+        where=" WHERE status=?"; params.append(status.upper())
+    conn=db_connect(); rows=conn.execute(f"SELECT * FROM v14_hypotheses{where} ORDER BY confidence DESC,evidence_count DESC LIMIT ?", (*params,limit)).fetchall(); conn.close()
+    result=[]
+    for row in rows:
+        d=dict(row); d["hypothesisType"]=d.pop("hypothesis_type"); d["evidenceCount"]=d.pop("evidence_count")
+        d["expectedDirection"]=d.pop("expected_direction"); d["sourceMemoryIds"]=json.loads(d.pop("source_memory_ids_json") or "[]")
+        d["variables"]=json.loads(d.pop("variables_json") or "{}"); d["safeguards"]=json.loads(d.pop("safeguards_json") or "[]")
+        result.append(d)
+    return result
+
+
+def _v14_experiment_rows(limit: int = 200, status: str = "") -> List[Dict[str, Any]]:
+    if not SQLITE_ENABLED:
+        return []
+    _v14_scientist_ensure_tables(); limit=max(1,min(int(limit),1000)); params=[]; where=""
+    if status:
+        where=" WHERE status=?"; params.append(status.upper())
+    conn=db_connect(); rows=conn.execute(f"SELECT * FROM v14_experiments{where} ORDER BY board_eligible DESC,evaluation_score DESC,updated_at DESC LIMIT ?", (*params,limit)).fetchall(); conn.close()
+    result=[]
+    for row in rows:
+        d=dict(row); d["experimentKey"]=d.pop("experiment_key"); d["hypothesisFingerprint"]=d.pop("hypothesis_fingerprint")
+        d["experimentType"]=d.pop("experiment_type"); d["sampleSize"]=d.pop("sample_size")
+        d["winRate"]=d.pop("win_rate"); d["expectancyPct"]=d.pop("expectancy_pct"); d["profitFactor"]=d.pop("profit_factor")
+        d["evaluationScore"]=d.pop("evaluation_score"); d["boardEligible"]=bool(d.pop("board_eligible"))
+        d["baseline"]=json.loads(d.pop("baseline_json") or "{}"); d["variant"]=json.loads(d.pop("variant_json") or "{}")
+        d["evidence"]=json.loads(d.pop("evidence_json") or "{}")
+        result.append(d)
+    return result
+
+
+def v14_scientist_status() -> Dict[str, Any]:
+    hypotheses=_v14_hypothesis_rows(500); experiments=_v14_experiment_rows(500)
+    by_status: Dict[str,int]={}
+    for row in experiments: by_status[row["status"]]=by_status.get(row["status"],0)+1
+    eligible=[x for x in experiments if x.get("boardEligible")]
+    shadow=[x for x in experiments if x.get("status")=="SHADOW_READY"]
+    return {"ok": True, "version": V14_SCIENTIST_VERSION, "enabled": V14_SCIENTIST_ENABLED,
+        "researchOnly": True, "automatic": True, "advisoryOnly": True,
+        "summary": {"hypotheses": len(hypotheses), "experiments": len(experiments), "shadowReady": len(shadow),
+                    "validatedResearch": by_status.get("VALIDATED_RESEARCH",0), "boardEligible": len(eligible), "statuses": by_status},
+        "topHypotheses": hypotheses[:8], "topExperiments": experiments[:10],
+        "nextAction": "Continue automatic hypothesis generation and collect tagged shadow outcomes before any causal promotion proposal."}
+
+
+def _v14_scientist_worker() -> None:
+    time.sleep(V14_SCIENTIST_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            result=v14_scientist_refresh(); s=result["summary"]
+            print(f"V14 SCIENTIST | hypotheses={s['hypotheses']} experiments={s['experiments']} shadow_ready={s['shadowReady']} board_eligible={s['boardEligible']}")
+        except Exception as exc:
+            print(f"V14 SCIENTIST WORKER ERROR: {exc}")
+        time.sleep(V14_SCIENTIST_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+def v14_scientist_startup_event():
+    global v14_scientist_thread_started
+    if not V14_SCIENTIST_ENABLED:
+        return
+    _v14_scientist_ensure_tables()
+    if not v14_scientist_thread_started:
+        v14_scientist_thread_started=True
+        threading.Thread(target=_v14_scientist_worker, daemon=True).start()
+        print("V14 SCIENTIST | enabled automatic=True research_only=True advisory_only=True")
+
+
+@app.get("/v14/scientist/status")
+def api_v14_scientist_status(request: Request):
+    verify_api_key(request); return v14_scientist_status()
+
+
+@app.get("/v14/scientist/hypotheses")
+def api_v14_scientist_hypotheses(request: Request, limit: int = 200, status: str = ""):
+    verify_api_key(request); items=_v14_hypothesis_rows(limit,status)
+    return {"ok": True, "version": V14_SCIENTIST_VERSION, "count": len(items), "items": items}
+
+
+@app.get("/v14/scientist/experiments")
+def api_v14_scientist_experiments(request: Request, limit: int = 200, status: str = ""):
+    verify_api_key(request); items=_v14_experiment_rows(limit,status)
+    return {"ok": True, "version": V14_SCIENTIST_VERSION, "count": len(items), "items": items}
+
+
+@app.get("/v14/scientist/events")
+def api_v14_scientist_events(request: Request, limit: int = 100):
+    verify_api_key(request); _v14_scientist_ensure_tables(); limit=max(1,min(int(limit),500)); conn=db_connect()
+    rows=conn.execute("SELECT * FROM v14_scientist_events ORDER BY id DESC LIMIT ?",(limit,)).fetchall(); conn.close()
+    items=[]
+    for row in rows:
+        d=dict(row); d["payload"]=json.loads(d.pop("payload_json") or "{}"); items.append(d)
+    return {"ok": True, "version": V14_SCIENTIST_VERSION, "count": len(items), "items": items}
+
+
+@app.get("/v14/scientist/constitution")
+def api_v14_scientist_constitution(request: Request):
+    verify_api_key(request)
+    return {"ok": True, "version": V14_SCIENTIST_VERSION, "automatic": True, "researchOnly": True, "advisoryOnly": True,
+        "rules": [
+            "The Scientist may generate hypotheses only from persisted evidence and V13 memory.",
+            "New V14 experiments are shadow-only and cannot alter live trade selection, orders or settings.",
+            "Retrospective evidence may design an experiment but cannot prove that the proposed change caused an outcome.",
+            "A hypothesis requires tagged shadow outcomes before it may become causally validated.",
+            "Risk and Compliance safeguards remain authoritative and cannot be bypassed.",
+            "Research candidates may be presented to the CEO and Board, but promotion remains governed by existing constitutions.",
+            "Every hypothesis, experiment and scientist cycle is persisted for audit.",
+            "Reviews run automatically; no manual scientist review is required."
+        ]}
