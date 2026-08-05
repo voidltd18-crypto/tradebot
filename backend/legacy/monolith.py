@@ -91,6 +91,14 @@ CHECK_INTERVAL = 60
 UNIVERSE_REFRESH_SECONDS = 60 * 30
 
 MAX_POSITIONS = 1
+
+# V15.9 — AI-controlled portfolio capacity.
+# The legacy slider is no longer the live position limit while this is enabled.
+# The effective capacity is derived from the AI-promoted position sizing and
+# available trading capital, then bounded by an immutable safety ceiling.
+AI_POSITION_CAPACITY_ENABLED = os.getenv("AI_POSITION_CAPACITY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+AI_POSITION_HARD_CAP = max(1, min(10, int(os.getenv("AI_POSITION_HARD_CAP", "10") or 10)))
+AI_POSITION_MIN_NOTIONAL_USD = max(10.0, float(os.getenv("AI_POSITION_MIN_NOTIONAL_USD", "25") or 25))
 MAX_NEW_BUYS_PER_LOOP = 1
 MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
@@ -239,7 +247,9 @@ V7_WEEKEND_HOUR_UK = max(0, min(int(os.getenv("V7_WEEKEND_HOUR_UK", "6") or 6), 
 if TRADEBOT_V2_ENABLED:
     ROTATION_MODE_ENABLED = False
     MAX_NEW_BUYS_PER_LOOP = 1
-    MAX_POSITIONS = 1
+    # Position count is controlled by AI portfolio capacity, not forced to one.
+    if not AI_POSITION_CAPACITY_ENABLED:
+        MAX_POSITIONS = 1
 
 # Profit Optimiser / Analytics / Auto-Improve
 PROFIT_OPTIMIZER_ENABLED = True
@@ -1219,8 +1229,70 @@ def risk_blocked():
     return False, ""
 
 
+def ai_position_capacity_payload() -> Dict[str, Any]:
+    """Return the live AI-controlled portfolio capacity.
+
+    Capacity is not a target that must be filled. It is only the maximum number
+    of simultaneous positions the bot may hold if enough independent candidates
+    pass every existing entry, quality, risk, PDT and cash check.
+    """
+    configured = int(globals().get("MAX_POSITIONS", 1) or 1)
+    hard_cap = int(globals().get("AI_POSITION_HARD_CAP", 10) or 10)
+    if not bool(globals().get("AI_POSITION_CAPACITY_ENABLED", True)):
+        return {
+            "enabled": False, "configuredMaxPositions": configured,
+            "effectiveMaxPositions": configured, "hardSafetyCap": hard_cap,
+            "reason": "Legacy fixed-position mode is active.",
+        }
+
+    target_pct = max(0.001, float(globals().get("TARGET_POSITION_VALUE_PCT", 0.10) or 0.10))
+    max_pct = max(target_pct, float(globals().get("MAX_POSITION_VALUE_PCT", target_pct) or target_pct))
+    # Target sizing is the main AI decision. Capacity follows from it: a 10%
+    # target naturally permits up to ten positions; 20% permits up to five.
+    sizing_capacity = max(1, int(1.0 // target_pct))
+
+    capital_capacity = hard_cap
+    cap_usd = None
+    try:
+        account = get_account()
+        equity = float(account.equity)
+        buying_power = max(0.0, float(account.buying_power))
+        cap_usd = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
+        target_notional = max(float(globals().get("AI_POSITION_MIN_NOTIONAL_USD", 25.0)), cap_usd * target_pct)
+        # Existing positions are already consuming capital. Buying power limits
+        # how many additional slots are genuinely usable right now.
+        open_count = len(get_all_positions())
+        additional_by_cash = int(max(0.0, buying_power - float(globals().get("CASH_BUFFER", 0.0))) // max(target_notional, 1.0))
+        capital_capacity = max(open_count, open_count + additional_by_cash)
+    except Exception:
+        capital_capacity = sizing_capacity
+
+    effective = max(1, min(hard_cap, sizing_capacity, max(1, capital_capacity)))
+    reason = (
+        f"AI sizing permits up to {sizing_capacity}; current capital supports {capital_capacity}; "
+        f"hard safety ceiling is {hard_cap}. Slots are filled only by qualified candidates."
+    )
+    return {
+        "enabled": True,
+        "configuredMaxPositions": configured,
+        "effectiveMaxPositions": effective,
+        "hardSafetyCap": hard_cap,
+        "targetPositionValuePct": round(target_pct, 4),
+        "maxPositionValuePct": round(max_pct, 4),
+        "capitalUsd": round(float(cap_usd), 2) if cap_usd is not None else None,
+        "reason": reason,
+    }
+
+
+def effective_max_positions() -> int:
+    try:
+        return int(ai_position_capacity_payload()["effectiveMaxPositions"])
+    except Exception:
+        return max(1, int(globals().get("MAX_POSITIONS", 1) or 1))
+
+
 def allowed_new_position_count():
-    return max(0, MAX_POSITIONS - len(get_all_positions()))
+    return max(0, effective_max_positions() - len(get_all_positions()))
 
 
 def calculate_new_position_notional():
@@ -1235,7 +1307,7 @@ def calculate_new_position_notional():
 
     # Full-buy mode for one-position trading.
     # Uses nearly all available capped trading capital/buying power, leaving a small buffer.
-    if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
+    if FULL_BUY_WHEN_ONE_POSITION and effective_max_positions() <= 1:
         usable_cash = max(0.0, buying_power - FULL_BUY_CASH_BUFFER)
         return round(max(0.0, min(sizing_equity, usable_cash)), 2)
 
@@ -1250,7 +1322,7 @@ def confidence_notional(scan):
 
     # In one-position full-buy mode, do not downsize by confidence.
     # The entry gates still control trade quality; this only changes allocation size.
-    if FULL_BUY_WHEN_ONE_POSITION and int(MAX_POSITIONS) <= 1:
+    if FULL_BUY_WHEN_ONE_POSITION and effective_max_positions() <= 1:
         return base
 
     if not CONFIDENCE_SIZING_ENABLED:
@@ -3061,7 +3133,7 @@ def money_mode_buy(scans, manual=False):
                 scans,
                 approval_decision="BLOCKED",
                 approval_stage="position_limit",
-                approval_reason=f"max positions reached ({MAX_POSITIONS})",
+                approval_reason=f"AI portfolio capacity reached ({effective_max_positions()})",
             )
             if blocked_picks:
                 best = blocked_picks[0]
@@ -3069,11 +3141,11 @@ def money_mode_buy(scans, manual=False):
                     "DECISION INTELLIGENCE | "
                     f"blocked={len(blocked_picks)} best={best.get('symbol')} "
                     f"confidence={float(best.get('confidence') or 0.0):.2f} "
-                    f"reason=max positions reached ({MAX_POSITIONS})"
+                    f"reason=AI portfolio capacity reached ({effective_max_positions()})"
                 )
         except Exception as decision_error:
             print(f"DECISION INTELLIGENCE BLOCKED LOG ERROR: {decision_error}")
-        return f"BUY BLOCKED | max positions reached ({MAX_POSITIONS})"
+        return f"BUY BLOCKED | AI portfolio capacity reached ({effective_max_positions()})"
     if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
         return f"BUY BLOCKED | PDT-aware max new buys today reached ({MAX_NEW_BUYS_PER_DAY_PDT_AWARE})"
 
@@ -5289,14 +5361,16 @@ def build_status_payload(bot_name, scans):
         "maxNewBuysPerDayPdtAware": MAX_NEW_BUYS_PER_DAY_PDT_AWARE,
         "lockedSymbolsToday": locked_symbols,
         "customSymbols": sorted(list(custom_symbols.keys())),
-        "maxPositions": MAX_POSITIONS,
+        "maxPositions": effective_max_positions(),
+        "positionCapacity": ai_position_capacity_payload(),
         "positionSettings": current_position_settings_payload() if "current_position_settings_payload" in globals() else {},
         "newPositionNotional": calculate_new_position_notional(),
         "allowedNewPositions": allowed_new_position_count(),
         "universe": list(current_universe),
         "config": {
             "checkInterval": CHECK_INTERVAL,
-            "maxPositions": MAX_POSITIONS,
+            "maxPositions": effective_max_positions(),
+        "positionCapacity": ai_position_capacity_payload(),
             "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
             "fullBuyCashBuffer": FULL_BUY_CASH_BUFFER,
             "targetPositionValuePct": TARGET_POSITION_VALUE_PCT,
@@ -5360,14 +5434,14 @@ def build_status_payload(bot_name, scans):
         "banking": banking_payload(),
         "performanceEngine": performance_engine_payload(),
         "logs": [
-            f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={MAX_POSITIONS} | allowed_new={allowed_new_position_count()}",
+            f"MODE | SNIPER_CONFIDENCE_MEMORY_TIMELINE | max_positions={effective_max_positions()} | allowed_new={allowed_new_position_count()}",
             f"SNIPER | enabled={SNIPER_MODE_ENABLED} | confidence_sizing={CONFIDENCE_SIZING_ENABLED} | memory={STOCK_MEMORY_ENABLED} | timeline={len(trade_history)}",
             f"FX | USDGBP={get_usd_to_gbp_rate():.4f} | source={fx_cache.get('source', 'fallback')}",
             f"DB | sqlite={SQLITE_ENABLED} | raw_trades={db_summary_payload().get('totalTrades', 0)} | closed={closed_trade_summary_payload().get('closedTrades', 0)} | pnl_gbp={closed_trade_summary_payload().get('totalPnlGbp', 0):.2f}",
             f"BACKFILL | chunk={BACKFILL_CHUNK_SIZE} | max_pages={BACKFILL_MAX_PAGES}",
             f"OPTIMIZER | enabled={PROFIT_OPTIMIZER_ENABLED} | today_realised={today_realised_pnl():.2f} | block={profit_guardrail_status()[1] or 'none'}",
             f"ANALYTICS | profit_factor={analytics_payload().get('profitFactor', 0):.2f} | avg_win={analytics_payload().get('averageWin', 0):.2f} | avg_loss={analytics_payload().get('averageLoss', 0):.2f}",
-            f"HOLD AI | enabled={HOLD_AI_ENABLED} | min_trades={HOLD_AI_MIN_TRADES} | min_hold={HOLD_AI_MIN_HOLD_MINUTES}m | good_hold={HOLD_AI_GOOD_SYMBOL_HOLD_MINUTES}m | max_positions={MAX_POSITIONS}",
+            f"HOLD AI | enabled={HOLD_AI_ENABLED} | min_trades={HOLD_AI_MIN_TRADES} | min_hold={HOLD_AI_MIN_HOLD_MINUTES}m | good_hold={HOLD_AI_GOOD_SYMBOL_HOLD_MINUTES}m | max_positions={effective_max_positions()}",
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
@@ -5675,8 +5749,10 @@ def current_position_settings_payload() -> Dict[str, Any]:
     saved = _load_position_settings()
     return {
         "ok": True,
-        "maxPositions": int(MAX_POSITIONS),
+        "maxPositions": int(effective_max_positions()),
         "savedMaxPositions": int(saved.get("maxPositions", MAX_POSITIONS)),
+        "autonomousPositionCapacity": ai_position_capacity_payload(),
+        "manualSliderActive": not AI_POSITION_CAPACITY_ENABLED,
         "min": 1,
         "max": 10,
         "updatedAt": saved.get("updatedAt", ""),
@@ -5688,9 +5764,24 @@ def api_get_position_settings():
     return current_position_settings_payload()
 
 
+@app.get("/ai-position-capacity")
+def api_ai_position_capacity(request: Request):
+    verify_api_key(request)
+    payload = ai_position_capacity_payload()
+    payload["openPositions"] = len(get_all_positions())
+    payload["availableSlots"] = max(0, int(payload["effectiveMaxPositions"]) - payload["openPositions"])
+    return {"ok": True, **payload}
+
+
 @app.post("/position-settings")
 def api_set_position_settings(request: Request, payload: dict = Body(...)):
     verify_api_key(request)
+    if AI_POSITION_CAPACITY_ENABLED:
+        current = current_position_settings_payload()
+        return {
+            **current,
+            "message": "Manual position slider is disabled. AI portfolio capacity is active.",
+        }
     result = apply_position_settings(max_positions=payload.get("maxPositions"), save=True)
     return {**result, "message": f"Max positions set to {result['maxPositions']}"}
 
@@ -5754,7 +5845,8 @@ def v2_status():
         "rules": {
             "minSamples": V2_MIN_SYMBOL_SAMPLES, "minWinRate": V2_MIN_WIN_RATE,
             "minProfitFactor": V2_MIN_PROFIT_FACTOR, "minExpectancyPct": V2_MIN_EXPECTANCY_PCT,
-            "lookbackDays": V2_LOOKBACK_DAYS, "maxPositions": MAX_POSITIONS,
+            "lookbackDays": V2_LOOKBACK_DAYS, "maxPositions": effective_max_positions(),
+            "positionCapacity": ai_position_capacity_payload(),
             "logDecisions": V2_LOG_DECISIONS, "decisionDedupeSeconds": V2_DECISION_DEDUPE_SECONDS,
         },
     }
@@ -6749,7 +6841,8 @@ def _quick_live_status_payload() -> Dict[str, Any]:
         "positions": positions,
         "activePosition": positions[0] if positions else None,
         "scans": list(latest_scans),
-        "maxPositions": MAX_POSITIONS,
+        "maxPositions": effective_max_positions(),
+        "positionCapacity": ai_position_capacity_payload(),
         "allowedNewPositions": allowed_new_position_count(),
         "newPositionNotional": calculate_new_position_notional(),
         "autoUniverse": auto_universe_payload(),
@@ -8642,7 +8735,7 @@ def _compat_buy_preview():
     equity, buying_power = _compat_account_equity()
 
     try:
-        max_positions = int(globals().get("MAX_POSITIONS", 1))
+        max_positions = effective_max_positions()
     except Exception:
         max_positions = 1
 
@@ -13270,7 +13363,7 @@ V10_OPERATOR_AUTO_ROLLBACK_DAILY_LOSS_PCT = max(0.25, float(os.getenv("V10_OPERA
 
 # Immutable constitution. These are hard ceilings/floors; the operator cannot override them.
 V10_CONSTITUTION = {
-    "maxPositions": {"min": 1, "max": max(1, int(os.getenv("V10_CONSTITUTION_MAX_POSITIONS", "3") or 3))},
+    "maxPositions": {"min": 1, "max": max(1, int(os.getenv("V10_CONSTITUTION_MAX_POSITIONS", str(AI_POSITION_HARD_CAP)) or AI_POSITION_HARD_CAP))},
     "tradingCapUsd": {
         "min": max(25.0, float(os.getenv("V10_CONSTITUTION_MIN_CAP_USD", "100") or 100)),
         "max": max(25.0, float(os.getenv("V10_CONSTITUTION_MAX_CAP_USD", "1500") or 1500)),
@@ -13365,7 +13458,8 @@ def _v10_operator_current_config() -> Dict[str, Any]:
     except Exception:
         pass
     return {
-        "maxPositions": int(MAX_POSITIONS),
+        "maxPositions": int(effective_max_positions()),
+        "positionCapacity": ai_position_capacity_payload(),
         "tradingCapUsd": float(cap),
         "targetPositionValuePct": float(TARGET_POSITION_VALUE_PCT),
         "maxPositionValuePct": float(MAX_POSITION_VALUE_PCT),
@@ -13425,19 +13519,13 @@ def _v10_operator_propose(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     proposal = dict(current)
     reasons: List[str] = []
 
-    # Maximum positions: increase only when the position-limit rule is persistently hurting
-    # and the overall closed-trade evidence is profitable. Decrease after weak PF/drawdown evidence.
-    max_rule = _v10_rule_row(snapshot, ["maximum positions", "max_positions", "position_limit"])
-    helped = float(max_rule.get("helpedRate") or max_rule.get("helped_rate") or 0.0)
-    rule_samples = int(max_rule.get("samples") or max_rule.get("triggered") or 0)
-    pf = float(analytics.get("profitFactor") or 0.0)
-    total_pnl = float(analytics.get("totalPnl") or 0.0)
-    if rule_samples >= V10_OPERATOR_MIN_SAMPLES and helped > 0 and helped < 0.48 and pf >= 1.10 and total_pnl > 0:
-        proposal["maxPositions"] = min(current["maxPositions"] + 1, V10_CONSTITUTION["maxPositions"]["max"])
-        reasons.append(f"Position-limit evidence is hurting ({helped:.1%}, {rule_samples} samples).")
-    elif pf > 0 and pf < 0.85 and current["maxPositions"] > V10_CONSTITUTION["maxPositions"]["min"]:
-        proposal["maxPositions"] = current["maxPositions"] - 1
-        reasons.append(f"Profit factor is weak ({pf:.2f}); reduce concurrent exposure.")
+    # Portfolio capacity is now autonomous. It is derived from AI-promoted
+    # target position sizing and current capital rather than a manual slider.
+    # The operator still records the effective ceiling for audit/rollback, but
+    # it never forces the bot to fill every available slot.
+    capacity = ai_position_capacity_payload()
+    proposal["maxPositions"] = int(capacity.get("effectiveMaxPositions") or 1)
+    reasons.append(str(capacity.get("reason") or "AI portfolio capacity recalculated."))
 
     # Position sizing and trading cap: only scale up after positive realised evidence; scale down sooner.
     win_rate = float(analytics.get("winRate") or 0.0)
@@ -13526,7 +13614,7 @@ def _v10_operator_apply_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     global TRAIL_START, TRAIL_GIVEBACK, OPTIMIZED_TRAIL_START, OPTIMIZED_TRAIL_GIVEBACK
     global V10_ORDER_EXECUTION_MODE
 
-    MAX_POSITIONS = int(_v10_clamp(config["maxPositions"], V10_CONSTITUTION["maxPositions"]["min"], V10_CONSTITUTION["maxPositions"]["max"]))
+    MAX_POSITIONS = int(_v10_clamp(config.get("maxPositions", AI_POSITION_HARD_CAP), V10_CONSTITUTION["maxPositions"]["min"], V10_CONSTITUTION["maxPositions"]["max"]))
     TARGET_POSITION_VALUE_PCT = _v10_clamp(config["targetPositionValuePct"], V10_CONSTITUTION["positionValuePct"]["min"], V10_CONSTITUTION["positionValuePct"]["max"])
     MAX_POSITION_VALUE_PCT = max(TARGET_POSITION_VALUE_PCT, min(1.0, float(config.get("maxPositionValuePct") or TARGET_POSITION_VALUE_PCT)))
     FULL_BUY_WHEN_ONE_POSITION = bool(config.get("fullBuyWhenOnePosition") and MAX_POSITIONS == 1)
