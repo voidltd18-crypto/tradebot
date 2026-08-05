@@ -1,0 +1,8 @@
+V15.4 hot-path database fix
+
+- Core schema initialises once per process under a lock.
+- V7 schema initialises once, not during every status request.
+- V8 schema initialises once, not during every /v8/status request.
+- Whole-schema initialisation retries lock contention.
+- Board watchdog accepts the live thread, V12 legacy flag, or V12.1 flag.
+- No strategy or order-execution logic changed.

@@ -3154,6 +3154,12 @@ _DB_LOCK_RETRIES = max(1, int(os.getenv("SQLITE_LOCK_RETRIES", "7") or 7))
 _DB_RETRY_BASE_SECONDS = max(0.02, float(os.getenv("SQLITE_RETRY_BASE_SECONDS", "0.08") or 0.08))
 _DB_PRAGMA_LOCK = threading.RLock()
 _DB_WAL_INITIALISED = False
+_DB_INIT_LOCK = threading.RLock()
+_DB_INIT_COMPLETE = False
+_V7_SCHEMA_LOCK = threading.RLock()
+_V7_SCHEMA_COMPLETE = False
+_V8_SCHEMA_LOCK = threading.RLock()
+_V8_SCHEMA_COMPLETE = False
 
 
 def _db_is_lock_error(exc: BaseException) -> bool:
@@ -3245,7 +3251,7 @@ def db_connect():
     return conn
 
 
-def init_db():
+def _init_db_impl():
     if not SQLITE_ENABLED:
         return
 
@@ -3600,6 +3606,29 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+def init_db():
+    """Initialise the shared schema once per process, never on every API read."""
+    global _DB_INIT_COMPLETE
+    if not SQLITE_ENABLED or _DB_INIT_COMPLETE:
+        return
+    with _DB_INIT_LOCK:
+        if _DB_INIT_COMPLETE:
+            return
+        last_error = None
+        for attempt in range(5):
+            try:
+                _init_db_impl()
+                _DB_INIT_COMPLETE = True
+                return
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                if not _db_is_lock_error(exc) or attempt == 4:
+                    raise
+                time.sleep(min(3.0, 0.5 * (attempt + 1)) + random.uniform(0.0, 0.1))
+        if last_error:
+            raise last_error
 
 
 def save_trade_to_db(event: Dict[str, Any], source: str = "bot"):
@@ -9173,7 +9202,7 @@ def api_v6_recommendation_run(request: Request, payload: Dict[str, Any] = Body(d
 V7_VERSION = "V7.1"
 
 
-def _v7_ensure_tables() -> None:
+def _v7_ensure_tables_impl() -> None:
     if not SQLITE_ENABLED:
         return
     init_db(); conn = db_connect()
@@ -9210,6 +9239,18 @@ def _v7_ensure_tables() -> None:
             VALUES(?,?,0,NULL,'ACTIVE',?,?,'v6_seed')""",
             (brain['key'], brain['name'], now, json.dumps(brain, sort_keys=True)))
     conn.commit(); conn.close()
+
+
+def _v7_ensure_tables() -> None:
+    global _V7_SCHEMA_COMPLETE
+    if not SQLITE_ENABLED or _V7_SCHEMA_COMPLETE:
+        return
+    init_db()
+    with _V7_SCHEMA_LOCK:
+        if _V7_SCHEMA_COMPLETE:
+            return
+        _v7_ensure_tables_impl()
+        _V7_SCHEMA_COMPLETE = True
 
 
 def _v7_active_brains() -> List[Dict[str, Any]]:
@@ -9556,8 +9597,7 @@ V8_POPULATION_LIMIT = int(os.getenv("V8_POPULATION_LIMIT", "30"))
 V8_MIN_CONTEXT_SAMPLES = int(os.getenv("V8_MIN_CONTEXT_SAMPLES", "12"))
 
 
-def _v8_ensure_tables() -> None:
-    _v7_ensure_tables()
+def _v8_ensure_tables_impl() -> None:
     if not SQLITE_ENABLED:
         return
     conn = db_connect()
@@ -9589,6 +9629,18 @@ def _v8_ensure_tables() -> None:
         PRIMARY KEY(context_key, horizon_hours)
     )""")
     conn.commit(); conn.close()
+
+
+def _v8_ensure_tables() -> None:
+    global _V8_SCHEMA_COMPLETE
+    if not SQLITE_ENABLED or _V8_SCHEMA_COMPLETE:
+        return
+    _v7_ensure_tables()
+    with _V8_SCHEMA_LOCK:
+        if _V8_SCHEMA_COMPLETE:
+            return
+        _v8_ensure_tables_impl()
+        _V8_SCHEMA_COMPLETE = True
 
 
 def _v8_context_value(row: Dict[str, Any], key: str) -> Any:
@@ -15164,7 +15216,7 @@ def _v15_threads_check():
     threads = [t.name for t in threading.enumerate() if t.is_alive()]
     required_flags = {
         "CEO": bool(globals().get("v12_ceo_thread_started", False)),
-        "Board": bool(globals().get("v121_board_thread_started", False)),
+        "Board": bool(globals().get("v121_board_thread_started", False) or globals().get("v12_board_thread_started", False) or any(t.name == "v121-board-worker" and t.is_alive() for t in threading.enumerate())),
         "Memory": bool(globals().get("v13_memory_thread_started", False)),
         "Scientist": bool(globals().get("v14_scientist_thread_started", False)),
     }
@@ -15292,7 +15344,7 @@ def _v151_worker_watchdog_check():
     alive={t.name:t for t in threading.enumerate() if t.is_alive()}
     expected={
         "v12-ceo-worker": bool(globals().get("v12_ceo_thread_started",False)),
-        "v121-board-worker": bool(globals().get("v121_board_thread_started",False)),
+        "v121-board-worker": bool(globals().get("v121_board_thread_started",False) or globals().get("v12_board_thread_started",False) or any(t.name == "v121-board-worker" and t.is_alive() for t in threading.enumerate())),
         "v13-memory-worker": bool(globals().get("v13_memory_thread_started",False)),
         "v14-scientist-worker": bool(globals().get("v14_scientist_thread_started",False)),
         "v15-aiops-worker": bool(globals().get("v15_aiops_thread_started",False)),
