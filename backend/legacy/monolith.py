@@ -3148,10 +3148,100 @@ def buy_custom_symbol(symbol: str):
 # =========================
 # SQLITE PERSISTENT STORAGE
 # =========================
+# V15.3 database reliability: WAL, busy timeout and bounded lock retries.
+_DB_BUSY_TIMEOUT_MS = max(5000, int(os.getenv("SQLITE_BUSY_TIMEOUT_MS", "30000") or 30000))
+_DB_LOCK_RETRIES = max(1, int(os.getenv("SQLITE_LOCK_RETRIES", "7") or 7))
+_DB_RETRY_BASE_SECONDS = max(0.02, float(os.getenv("SQLITE_RETRY_BASE_SECONDS", "0.08") or 0.08))
+_DB_PRAGMA_LOCK = threading.RLock()
+_DB_WAL_INITIALISED = False
+
+
+def _db_is_lock_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "database is locked" in message or "database table is locked" in message or "database is busy" in message
+
+
+def _db_retry_delay(attempt: int) -> float:
+    # Bounded exponential backoff with small jitter to stop workers retrying together.
+    return min(2.0, _DB_RETRY_BASE_SECONDS * (2 ** attempt)) + random.uniform(0.0, 0.04)
+
+
+class ReliableSQLiteCursor(sqlite3.Cursor):
+    def execute(self, sql, parameters=()):
+        last_error = None
+        for attempt in range(_DB_LOCK_RETRIES):
+            try:
+                return super().execute(sql, parameters)
+            except sqlite3.OperationalError as exc:
+                if not _db_is_lock_error(exc) or attempt >= _DB_LOCK_RETRIES - 1:
+                    raise
+                last_error = exc
+                time.sleep(_db_retry_delay(attempt))
+        raise last_error  # pragma: no cover
+
+    def executemany(self, sql, seq_of_parameters):
+        # Materialise once because a retry cannot safely reuse an exhausted generator.
+        params = list(seq_of_parameters)
+        last_error = None
+        for attempt in range(_DB_LOCK_RETRIES):
+            try:
+                return super().executemany(sql, params)
+            except sqlite3.OperationalError as exc:
+                if not _db_is_lock_error(exc) or attempt >= _DB_LOCK_RETRIES - 1:
+                    raise
+                last_error = exc
+                time.sleep(_db_retry_delay(attempt))
+        raise last_error  # pragma: no cover
+
+
+class ReliableSQLiteConnection(sqlite3.Connection):
+    def cursor(self, factory=ReliableSQLiteCursor):
+        return super().cursor(factory)
+
+    def execute(self, sql, parameters=()):
+        return self.cursor().execute(sql, parameters)
+
+    def executemany(self, sql, seq_of_parameters):
+        return self.cursor().executemany(sql, seq_of_parameters)
+
+    def commit(self):
+        last_error = None
+        for attempt in range(_DB_LOCK_RETRIES):
+            try:
+                return super().commit()
+            except sqlite3.OperationalError as exc:
+                if not _db_is_lock_error(exc) or attempt >= _DB_LOCK_RETRIES - 1:
+                    raise
+                last_error = exc
+                time.sleep(_db_retry_delay(attempt))
+        raise last_error  # pragma: no cover
+
+
 def db_connect():
+    global _DB_WAL_INITIALISED
     os.makedirs(os.path.dirname(SQLITE_DB_FILE) or ".", exist_ok=True)
-    conn = sqlite3.connect(SQLITE_DB_FILE)
+    conn = sqlite3.connect(
+        SQLITE_DB_FILE,
+        timeout=_DB_BUSY_TIMEOUT_MS / 1000.0,
+        check_same_thread=False,
+        factory=ReliableSQLiteConnection,
+    )
     conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={_DB_BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA foreign_keys=ON")
+
+    # WAL is persistent for the database file, so initialise it once per process.
+    # If another process temporarily owns the schema lock, retries above handle it.
+    if not _DB_WAL_INITIALISED:
+        with _DB_PRAGMA_LOCK:
+            if not _DB_WAL_INITIALISED:
+                conn.execute("PRAGMA journal_mode=WAL").fetchone()
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA wal_autocheckpoint=1000")
+                _DB_WAL_INITIALISED = True
+    else:
+        conn.execute("PRAGMA synchronous=NORMAL")
+
     return conn
 
 
@@ -13948,6 +14038,7 @@ V12_BOARD_VERSION = "V12.1"
 V12_BOARD_ENABLED = os.getenv("V12_BOARD_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 V12_BOARD_INTERVAL_SECONDS = max(300, int(os.getenv("V12_BOARD_INTERVAL_SECONDS", "1800") or 1800))
 V12_BOARD_STARTUP_DELAY_SECONDS = max(20, int(os.getenv("V12_BOARD_STARTUP_DELAY_SECONDS", "75") or 75))
+v121_board_thread_started = False
 v12_board_thread_started = False
 
 
@@ -14219,13 +14310,18 @@ def _v121_board_worker() -> None:
 
 @app.on_event("startup")
 def v121_board_startup_event():
-    global v12_board_thread_started
+    global v12_board_thread_started, v121_board_thread_started
     if not V12_BOARD_ENABLED:
         return
     _v121_board_ensure_tables()
-    if not v12_board_thread_started:
-        v12_board_thread_started = True
-        threading.Thread(target=_v121_board_worker, daemon=True).start()
+    if not v121_board_thread_started:
+        v12_board_thread_started = True  # backward-compatible legacy flag
+        v121_board_thread_started = True
+        threading.Thread(
+            target=_v121_board_worker,
+            daemon=True,
+            name="v121-board-worker",
+        ).start()
         print("V12.1 BOARD | enabled advisory_only=True automatic_reviews=True")
 
 
