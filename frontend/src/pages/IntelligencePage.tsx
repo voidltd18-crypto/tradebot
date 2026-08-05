@@ -197,19 +197,55 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     setRefreshing(true);
     const headers = { "X-Auth-Token": authToken, "x-api-key": authToken };
     const entries = Object.entries(endpoints);
-    const results = await Promise.all(entries.map(async ([key, endpoint]) => {
-      try {
-        const response = await fetch(`${API_URL}${endpoint}`, { cache: "no-store", headers });
-        const json = await readJson(response);
-        if (!response.ok || json?.ok === false) throw new Error(json?.detail || json?.message || `${response.status}`);
-        return [key, { data: json || {}, error: "", loading: false }] as const;
-      } catch (error: any) {
-        return [key, { data: {}, error: error?.message || "Endpoint unavailable", loading: false }] as const;
+    const collected: Record<string, EndpointState> = {};
+
+    const fetchEndpoint = async (key: string, endpoint: string): Promise<void> => {
+      let lastError = "Endpoint unavailable";
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 30000);
+        try {
+          const response = await fetch(`${API_URL}${endpoint}`, {
+            cache: "no-store",
+            headers,
+            signal: controller.signal,
+          });
+          const json = await readJson(response);
+          if (!response.ok) throw new Error(json?.detail || json?.message || `HTTP ${response.status}`);
+          collected[key] = { data: json || {}, error: "", loading: false };
+          return;
+        } catch (error: any) {
+          lastError = error?.name === "AbortError"
+            ? "Request timed out after 30 seconds"
+            : error?.message || "Endpoint unavailable";
+          if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 500));
+        } finally {
+          window.clearTimeout(timeout);
+        }
       }
-    }));
-    setSources(Object.fromEntries(results));
-    setLastUpdated(new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
-    setRefreshing(false);
+      collected[key] = { data: {}, error: lastError, loading: false };
+    };
+
+    try {
+      // Avoid hammering SQLite and Render with 43 simultaneous requests.
+      // Six-at-a-time prevents false "offline" results caused by database locks.
+      const batchSize = 6;
+      for (let index = 0; index < entries.length; index += batchSize) {
+        const batch = entries.slice(index, index + batchSize);
+        await Promise.all(batch.map(([key, endpoint]) => fetchEndpoint(key, endpoint)));
+        if (index + batchSize < entries.length) {
+          await new Promise((resolve) => window.setTimeout(resolve, 150));
+        }
+      }
+      setSources(collected);
+      setLastUpdated(new Date().toLocaleTimeString("en-GB", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      }));
+    } finally {
+      setRefreshing(false);
+    }
   }, [authToken, endpoints]);
 
   useEffect(() => { load(); }, [load]);
@@ -264,9 +300,50 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const operationsWatchdogs = Array.isArray(sources.operationsWatchdogs.data?.items) ? sources.operationsWatchdogs.data.items : [];
   const operationsQueues = sources.operationsQueues.data?.queues || {};
   const operationsDoctor = sources.operationsDoctor.data || {};
-  const holidayMode = operationsDoctor.holidayMode || {};
-  const operationsSummary = firstObject(operationsStatus.summary);
-  const operationsComponents = firstArray(operationsComponentsData.items, operationsStatus.components);
+  const operationsEngineHealth = sources.operationsEngineHealth.data || {};
+  const operationsComponents = firstArray(
+    operationsComponentsData.items,
+    operationsComponentsData.components,
+    operationsStatus.components,
+    operationsStatus.items,
+    operationsEngineHealth.components,
+  );
+  const derivedPassed = operationsComponents.filter((row) => text(row.status, "").toUpperCase() === "PASS").length;
+  const derivedWarnings = operationsComponents.filter((row) => text(row.status, "").toUpperCase() === "WARN").length;
+  const derivedFailed = operationsComponents.filter((row) => ["FAIL", "CRITICAL"].includes(text(row.status, "").toUpperCase())).length;
+  const derivedHealthScore = operationsComponents.length
+    ? Math.round(((derivedPassed + (derivedWarnings * 0.5)) / operationsComponents.length) * 100)
+    : 0;
+  const operationsSummary = firstObject(
+    operationsStatus.summary,
+    operationsStatus.operationsSummary,
+    operationsStatus.latestAudit?.summary,
+    operationsStatus.latestAudit,
+    operationsEngineHealth.operationsSummary,
+    operationsDoctor.operationsSummary,
+    {
+      overallStatus: derivedFailed ? "CRITICAL" : derivedWarnings ? "WARNING" : operationsComponents.length ? "HEALTHY" : "STARTING",
+      healthScore: derivedHealthScore,
+      passed: derivedPassed,
+      warnings: derivedWarnings,
+      failed: derivedFailed,
+      componentCount: operationsComponents.length,
+      nextAuditInSeconds: 900,
+    },
+  );
+  const holidayMode = firstObject(
+    operationsDoctor.holidayMode,
+    operationsStatus.holidayMode,
+    operationsEngineHealth.holidayMode,
+    {
+      headline: derivedFailed ? "ATTENTION REQUIRED" : derivedWarnings ? "MONITORING WARNINGS" : operationsComponents.length ? "SYSTEM HEALTHY" : "WAITING FOR FIRST AUDIT",
+      healthScore: num(operationsSummary.healthScore, derivedHealthScore),
+      safeToLeaveRunning: derivedFailed === 0,
+      criticalFailures: derivedFailed,
+      warnings: derivedWarnings,
+      automaticRecovery: "MONITORING",
+    },
+  );
   const operationsAlerts = firstArray(operationsAlertsData.items);
   const operationsHistory = firstArray(operationsHistoryData.items);
   const operatorCurrent = firstObject(operator.current);
@@ -377,12 +454,26 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       source: "FRONTEND",
     }));
   const intelligenceHealth = Math.round(((botHealth / 100) * 0.45 + (endpointHealth / Math.max(1, endpointTotal)) * 0.55) * 100);
-  const operationsEngineHealth = sources.operationsEngineHealth.data;
-  const backendOfflineEngines = firstArray(operationsEngineHealth.offline).map((row) => ({
-    ...row,
-    source: "BACKEND",
-    reason: text(row.reason ?? row.message, "No diagnostic reason returned."),
-  }));
+  const backendEngineRows = firstArray(
+    operationsEngineHealth.offline,
+    operationsEngineHealth.failed,
+    operationsEngineHealth.engines,
+    operationsEngineHealth.items,
+  );
+  const backendOfflineEngines = backendEngineRows
+    .filter((row) => {
+      const status = text(row.status, row.online === false ? "FAIL" : "PASS").toUpperCase();
+      return row.online === false || !["PASS", "ONLINE", "HEALTHY", "OK"].includes(status);
+    })
+    .map((row) => ({
+      ...row,
+      name: text(row.name ?? row.endpoint ?? row.key, "Unnamed backend engine"),
+      category: text(row.category ?? row.area, "Backend component"),
+      status: text(row.status, row.online === false ? "FAIL" : "WARN").toUpperCase(),
+      critical: row.critical === true,
+      source: "BACKEND",
+      reason: text(row.reason ?? row.message ?? row.error, "No diagnostic reason returned."),
+    }));
   const exactOfflineEngines = [...frontendOfflineEngines, ...backendOfflineEngines].filter((row, index, rows) =>
     rows.findIndex((candidate) => `${candidate.source}:${candidate.name}` === `${row.source}:${row.name}`) === index
   );

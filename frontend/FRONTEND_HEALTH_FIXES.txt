@@ -1,0 +1,13 @@
+TradeBot frontend full health review fixes
+
+1. Limits intelligence polling to six concurrent endpoints.
+2. Retries transient failures once.
+3. Adds a 30-second timeout with a clear diagnostic.
+4. Stops treating a JSON payload with ok=false as an HTTP outage.
+5. Reads Operations summary from all V15/V15.2 response shapes.
+6. Derives Operations health from subsystem rows when a summary is absent.
+7. Reads exact failed engines from offline, failed, engines or items payloads.
+8. Fixes the stuck STARTING / 0% Operations header.
+9. Improves Operations status-strip spacing and mobile table readability.
+
+No trading controls or trading logic were changed.

@@ -11,3 +11,26 @@
 
 /* AI CEO */
 .ceo-view{align-items:start}.ceo-command-card{background:radial-gradient(circle at 85% 10%,rgba(56,189,248,.16),transparent 34%),linear-gradient(145deg,rgba(15,23,42,.98),rgba(2,6,23,.98))}.ceo-command-head{display:flex;justify-content:space-between;gap:24px;align-items:center}.ceo-command-head h3{font-size:clamp(24px,3vw,38px);margin:4px 0 8px}.ceo-grade{min-width:132px;min-height:132px;border-radius:50%;display:grid;place-content:center;text-align:center;border:2px solid rgba(56,189,248,.55);box-shadow:0 0 32px rgba(56,189,248,.18);background:rgba(2,6,23,.75)}.ceo-grade strong{font-size:42px;line-height:1}.ceo-grade span{font-weight:800;color:#94a3b8}.ceo-grade small{display:block;margin-top:5px;color:#94a3b8}.ceo-grade.good{border-color:rgba(34,197,94,.8);box-shadow:0 0 32px rgba(34,197,94,.18)}.ceo-grade.medium{border-color:rgba(250,204,21,.8)}.ceo-grade.poor{border-color:rgba(248,113,113,.85)}.ceo-stat-grid{margin-top:22px}.ceo-decision-card h3{font-size:21px;line-height:1.45;margin:16px 0}.ceo-priorities{display:grid;gap:11px}.ceo-priorities>div{display:flex;align-items:center;gap:12px;padding:13px;border:1px solid rgba(148,163,184,.16);border-radius:12px;background:rgba(15,23,42,.55)}.ceo-priorities span{width:30px;height:30px;border-radius:50%;display:grid;place-items:center;background:rgba(56,189,248,.13);color:#7dd3fc;font-weight:900}.ceo-priorities p{margin:0}.ceo-health-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.ceo-facts{display:grid;gap:10px}.ceo-facts>div{display:grid;grid-template-columns:1.2fr 1fr;gap:7px;padding:12px;border-bottom:1px solid rgba(148,163,184,.14)}.ceo-facts span{color:#94a3b8}.ceo-facts b{text-align:right}.ceo-facts small{grid-column:1/-1;text-align:right;color:#64748b}.ceo-journal{display:grid;gap:0}.ceo-journal article{display:grid;grid-template-columns:160px 1fr;gap:18px;padding:16px 4px;border-bottom:1px solid rgba(148,163,184,.14)}.ceo-journal time{color:#38bdf8;font-size:12px;font-weight:800}.ceo-journal b{font-size:15px}.ceo-journal p{margin:4px 0 0;color:#94a3b8}.intelligence-stat.positive strong{color:#4ade80}.intelligence-stat.negative strong{color:#fb7185}@media(max-width:760px){.ceo-command-head{align-items:flex-start;flex-direction:column}.ceo-grade{min-width:105px;min-height:105px}.ceo-health-grid{grid-template-columns:1fr}.ceo-journal article{grid-template-columns:1fr;gap:5px}.ceo-facts>div{grid-template-columns:1fr}.ceo-facts b,.ceo-facts small{text-align:left}}
+
+
+/* V15.2 reliability/readability corrections */
+.status-strip {
+  display: flex !important;
+  flex-wrap: wrap !important;
+  gap: 8px 14px !important;
+  align-items: center;
+}
+.status-strip > span {
+  white-space: nowrap;
+}
+.intelligence-hero-head {
+  gap: 18px;
+}
+@media (max-width: 900px) {
+  .compact-table {
+    min-width: 820px;
+  }
+  .score-ring {
+    min-width: 120px;
+  }
+}
