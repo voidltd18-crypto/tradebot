@@ -3149,16 +3149,27 @@ def money_mode_buy(scans, manual=False):
     if blocked:
         return f"BUY BLOCKED | {reason}"
     if allowed_new_position_count() <= 0:
-        # Decision Intelligence: run the unchanged entry gates even though an
-        # account-level position rule prevents buying. Qualifying candidates
-        # are saved as BLOCKED and receive the same future outcome checkpoints
-        # as executed/approved decisions. No order can be submitted here.
+        capacity = ai_position_capacity_payload()
+        structural_slots = int(capacity.get("structuralAvailableSlots") or 0)
+        affordable_slots = int(capacity.get("affordableNewPositions") or 0)
+        if structural_slots <= 0:
+            block_reason = f"AI portfolio capacity reached ({capacity.get('effectiveMaxPositions', effective_max_positions())})"
+            approval_stage = "position_limit"
+        elif affordable_slots <= 0:
+            buying_power = float(capacity.get("buyingPowerUsd") or 0.0)
+            target_notional = float(capacity.get("targetPositionNotionalUsd") or 0.0)
+            block_reason = f"insufficient buying power (${buying_power:.2f}) for AI target position (${target_notional:.2f})"
+            approval_stage = "buying_power"
+        else:
+            block_reason = str(capacity.get("reason") or "no AI-approved portfolio slot available")
+            approval_stage = "portfolio_capacity"
+        # Preserve decision evidence even when account-level capacity blocks an order.
         try:
             blocked_picks = pick_money_mode_stocks(
                 scans,
                 approval_decision="BLOCKED",
-                approval_stage="position_limit",
-                approval_reason=f"AI portfolio capacity reached ({effective_max_positions()})",
+                approval_stage=approval_stage,
+                approval_reason=block_reason,
             )
             if blocked_picks:
                 best = blocked_picks[0]
@@ -3166,11 +3177,11 @@ def money_mode_buy(scans, manual=False):
                     "DECISION INTELLIGENCE | "
                     f"blocked={len(blocked_picks)} best={best.get('symbol')} "
                     f"confidence={float(best.get('confidence') or 0.0):.2f} "
-                    f"reason=AI portfolio capacity reached ({effective_max_positions()})"
+                    f"reason={block_reason}"
                 )
         except Exception as decision_error:
             print(f"DECISION INTELLIGENCE BLOCKED LOG ERROR: {decision_error}")
-        return f"BUY BLOCKED | AI portfolio capacity reached ({effective_max_positions()})"
+        return f"BUY BLOCKED | {block_reason}"
     if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
         return f"BUY BLOCKED | PDT-aware max new buys today reached ({MAX_NEW_BUYS_PER_DAY_PDT_AWARE})"
 
@@ -5396,7 +5407,7 @@ def build_status_payload(bot_name, scans):
             "checkInterval": CHECK_INTERVAL,
             "maxPositions": effective_max_positions(),
         "positionCapacity": ai_position_capacity_payload(),
-            "fullBuyWhenOnePosition": FULL_BUY_WHEN_ONE_POSITION,
+            "fullBuyWhenOnePosition": False if AI_POSITION_CAPACITY_ENABLED else FULL_BUY_WHEN_ONE_POSITION,
             "fullBuyCashBuffer": FULL_BUY_CASH_BUFFER,
             "targetPositionValuePct": TARGET_POSITION_VALUE_PCT,
             "maxPositionValuePct": MAX_POSITION_VALUE_PCT,
@@ -6888,10 +6899,21 @@ def get_status():
     latest_status["botVersion"] = "v1.1-strict-profit-mode"
     try:
         if "merge_manual_picks_into_auto_universe" in globals():
-            return merge_manual_picks_into_auto_universe(latest_status)
+            merge_manual_picks_into_auto_universe(latest_status)
     except Exception as e:
         print(f"STATUS MANUAL PICK MERGE ERROR: {e}")
-    return latest_status
+
+    # The dashboard fetches reports separately. Do not send thousands of historic
+    # trades and the full symbol-memory database on every 10-second status poll.
+    # A compact copy keeps connection/account/positions/scans responsive and avoids
+    # the browser remaining on "Connecting..." while decoding a multi-megabyte JSON.
+    payload = dict(latest_status)
+    payload.pop("tradeTimeline", None)
+    payload.pop("closedTrades", None)
+    payload.pop("stockMemory", None)
+    payload["statusPayloadMode"] = "compact-live"
+    payload["fullHistoryAvailableFrom"] = "/reports"
+    return payload
 
 
 @app.post("/pause")
@@ -13616,7 +13638,7 @@ def _v10_operator_propose(snapshot: Dict[str, Any]) -> Dict[str, Any]:
         proposal["orderExecution"] = "MARKET"
 
     # Full-buy is only permitted when max positions is one. Multi-position mode uses percentage sizing.
-    proposal["fullBuyWhenOnePosition"] = bool(proposal["maxPositions"] == 1)
+    proposal["fullBuyWhenOnePosition"] = False  # autonomous capacity always uses bounded percentage sizing
     proposal["maxPositionValuePct"] = max(proposal["targetPositionValuePct"], min(1.0, proposal["targetPositionValuePct"] * 1.25))
 
     changed = {k: {"before": current.get(k), "after": proposal.get(k)} for k in proposal if proposal.get(k) != current.get(k)}
@@ -13640,7 +13662,7 @@ def _v10_operator_apply_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     MAX_POSITIONS = int(_v10_clamp(config.get("maxPositions", AI_POSITION_HARD_CAP), V10_CONSTITUTION["maxPositions"]["min"], V10_CONSTITUTION["maxPositions"]["max"]))
     TARGET_POSITION_VALUE_PCT = _v10_clamp(config["targetPositionValuePct"], V10_CONSTITUTION["positionValuePct"]["min"], V10_CONSTITUTION["positionValuePct"]["max"])
     MAX_POSITION_VALUE_PCT = max(TARGET_POSITION_VALUE_PCT, min(1.0, float(config.get("maxPositionValuePct") or TARGET_POSITION_VALUE_PCT)))
-    FULL_BUY_WHEN_ONE_POSITION = bool(config.get("fullBuyWhenOnePosition") and MAX_POSITIONS == 1)
+    FULL_BUY_WHEN_ONE_POSITION = False if AI_POSITION_CAPACITY_ENABLED else bool(config.get("fullBuyWhenOnePosition") and MAX_POSITIONS == 1)
 
     stop_pct = _v10_clamp(config["stopLossPct"], V10_CONSTITUTION["stopLossPct"]["min"], V10_CONSTITUTION["stopLossPct"]["max"])
     STOP_LOSS = 1.0 - stop_pct / 100.0

@@ -77,20 +77,41 @@ export function useTradeBot() {
     lastFetchAt.current = now;
     const seq = ++fetchSeq.current;
     try {
+      const fetchJson = async (path: string) => {
+        const response = await fetch(`${API_URL}${path}`, { cache: "no-store", headers: secureHeaders });
+        const json = await readJson(response);
+        if (!response.ok) throw new Error(json?.detail || json?.message || `${path} failed (${response.status})`);
+        return json || {};
+      };
       const [statusResult, reportResult, bankingResult] = await Promise.allSettled([
-        fetch(`${API_URL}/status`, { cache: "no-store", headers: secureHeaders }).then(readJson),
-        fetch(`${API_URL}/reports`, { cache: "no-store", headers: secureHeaders }).then(readJson),
-        fetch(`${API_URL}/banking-status`, { cache: "no-store", headers: secureHeaders }).then(readJson),
+        fetchJson("/status"),
+        fetchJson("/reports"),
+        fetchJson("/banking-status"),
       ]);
       if (seq !== fetchSeq.current) return;
-      if (statusResult.status === "fulfilled") {
+
+      let liveConnected = false;
+      if (statusResult.status === "fulfilled" && statusResult.value?.account) {
         setData((previous) => ({ ...previous, ...statusResult.value }));
         const mode = statusResult.value?.positionSettings?.buySizeMode;
         if (mode) setBuySizeMode(mode === "partial" ? "partial" : "full");
+        liveConnected = true;
       }
-      if (reportResult.status === "fulfilled") setReports((previous) => ({ ...previous, ...reportResult.value }));
-      if (bankingResult.status === "fulfilled") setBanking(bankingResult.value || {});
-      setStatus("Connected");
+      if (reportResult.status === "fulfilled") {
+        setReports((previous) => ({ ...previous, ...reportResult.value }));
+      }
+      if (bankingResult.status === "fulfilled" && bankingResult.value?.ok !== false) {
+        setBanking(bankingResult.value || {});
+        // Banking is broker-backed and proves the live API is reachable even if
+        // a non-critical report request is slow or temporarily unavailable.
+        liveConnected = true;
+      }
+
+      setStatus(liveConnected ? "Connected" : "Connection failed");
+      if (!liveConnected) {
+        const reason = statusResult.status === "rejected" ? statusResult.reason : bankingResult.status === "rejected" ? bankingResult.reason : "Live status unavailable";
+        console.error(reason);
+      }
     } catch (error) {
       console.error(error);
       setStatus("Connection failed");
