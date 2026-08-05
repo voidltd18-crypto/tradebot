@@ -24,5 +24,5 @@ SERVICE_REGISTRY = (
     ServiceDescriptor("reputation", "Symbol reputation and live-buy protection", ("/v10/symbol-reputation",)),
     ServiceDescriptor("execution", "Order validation and broker execution", ("/buy", "/sell"), True),
     ServiceDescriptor("risk", "Capital, position, PDT and loss safeguards", ("/banking-status",)),
-    ServiceDescriptor("memory", "Persistent evidence, outcomes and learned state", ("/reports",)),
+    ServiceDescriptor("memory", "V13 persistent evidence-backed long-term knowledge", ("/reports", "/v13/memory")),
 )

@@ -14267,3 +14267,285 @@ def api_v121_board_constitution(request: Request):
             "Reviews run automatically; no manual review is required.",
         ],
     }
+
+# =========================
+# TRADEBOT V13 — AUTONOMOUS LONG-TERM AI MEMORY
+# Structured, evidence-backed knowledge shared by CEO, Board, Research and Evolution.
+# Advisory-only: never places orders and never bypasses existing safeguards.
+# =========================
+V13_MEMORY_VERSION = "V13.0"
+V13_MEMORY_ENABLED = os.getenv("V13_MEMORY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+V13_MEMORY_INTERVAL_SECONDS = max(300, int(os.getenv("V13_MEMORY_INTERVAL_SECONDS", "1800")))
+V13_MEMORY_STARTUP_DELAY_SECONDS = max(5, int(os.getenv("V13_MEMORY_STARTUP_DELAY_SECONDS", "35")))
+v13_memory_thread_started = False
+
+
+def _v13_memory_ensure_tables() -> None:
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS v13_knowledge (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fingerprint TEXT UNIQUE NOT NULL,
+            knowledge_type TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            claim TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
+            confidence REAL NOT NULL DEFAULT 0,
+            evidence_count INTEGER NOT NULL DEFAULT 0,
+            metric_value REAL,
+            metric_name TEXT,
+            first_observed TEXT NOT NULL,
+            last_confirmed TEXT NOT NULL,
+            expires_at TEXT,
+            source_json TEXT NOT NULL DEFAULT '{}',
+            relationships_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS v13_memory_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            fingerprint TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v13_knowledge_type ON v13_knowledge(knowledge_type,status,confidence)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v13_memory_events_created ON v13_memory_events(created_at)")
+    conn.commit(); conn.close()
+
+
+def _v13_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _v13_fp(*parts: Any) -> str:
+    raw = "|".join(str(p).strip().upper() for p in parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _v13_write_event(event_type: str, title: str, detail: str, fingerprint: str = "", payload: Optional[Dict[str, Any]] = None) -> None:
+    if not SQLITE_ENABLED:
+        return
+    _v13_memory_ensure_tables(); conn = db_connect()
+    conn.execute("INSERT INTO v13_memory_events(created_at,event_type,title,detail,fingerprint,payload_json) VALUES(?,?,?,?,?,?)",
+                 (_v13_now(), event_type, title, detail, fingerprint, json.dumps(payload or {}, default=str)))
+    conn.commit(); conn.close()
+
+
+def _v13_upsert_knowledge(item: Dict[str, Any]) -> Dict[str, Any]:
+    if not SQLITE_ENABLED:
+        return item
+    _v13_memory_ensure_tables(); now = _v13_now(); fp = str(item["fingerprint"])
+    conn = db_connect(); row = conn.execute("SELECT * FROM v13_knowledge WHERE fingerprint=?", (fp,)).fetchone()
+    prior = dict(row) if row else None
+    incoming_conf = max(0.0, min(100.0, float(item.get("confidence") or 0)))
+    incoming_evidence = max(0, int(item.get("evidenceCount") or 0))
+    status = str(item.get("status") or "ACTIVE")
+    if prior:
+        old_conf = float(prior.get("confidence") or 0)
+        old_ev = int(prior.get("evidence_count") or 0)
+        # Grow confidence gradually on repeated confirmation; allow evidence deterioration to reduce it.
+        if incoming_evidence >= old_ev:
+            confidence = min(99.5, max(incoming_conf, old_conf + min(3.0, 0.25 + (incoming_evidence-old_ev)/500.0)))
+        else:
+            confidence = max(0.0, min(incoming_conf, old_conf - 2.0))
+        conn.execute("""UPDATE v13_knowledge SET claim=?,status=?,confidence=?,evidence_count=?,metric_value=?,metric_name=?,
+            last_confirmed=?,expires_at=?,source_json=?,relationships_json=?,updated_at=? WHERE fingerprint=?""",
+            (item["claim"], status, confidence, incoming_evidence, item.get("metricValue"), item.get("metricName"), now,
+             item.get("expiresAt"), json.dumps(item.get("source") or {}, default=str),
+             json.dumps(item.get("relationships") or [], default=str), now, fp))
+        event = "CONFIRMED" if incoming_evidence >= old_ev else "WEAKENED"
+    else:
+        confidence = incoming_conf
+        conn.execute("""INSERT INTO v13_knowledge(fingerprint,knowledge_type,subject,claim,status,confidence,evidence_count,
+            metric_value,metric_name,first_observed,last_confirmed,expires_at,source_json,relationships_json,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (fp, item["knowledgeType"], item["subject"], item["claim"], status, confidence, incoming_evidence,
+             item.get("metricValue"), item.get("metricName"), now, now, item.get("expiresAt"),
+             json.dumps(item.get("source") or {}, default=str), json.dumps(item.get("relationships") or [], default=str), now, now))
+        event = "DISCOVERED"
+    conn.commit(); conn.close()
+    if not prior or abs(confidence - float(prior.get("confidence") or 0)) >= 1.0:
+        _v13_write_event(event, f"{event.title()} knowledge: {item['subject']}", item["claim"], fp,
+                         {"confidence": confidence, "evidenceCount": incoming_evidence, "type": item["knowledgeType"]})
+    item["confidence"] = round(confidence, 2)
+    return item
+
+
+def _v13_extract_candidates() -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    # Symbol knowledge
+    try:
+        rep = symbol_reputation_summary(force=False)
+        for s in rep.get("symbols", []):
+            samples = int(s.get("samples") or 0); score = float(s.get("score") or 0); exp = float(s.get("expectancyPct") or 0)
+            if samples < max(5, int(rep.get("minimumSamples") or 20) // 2):
+                continue
+            symbol = str(s.get("symbol") or "UNKNOWN").upper()
+            direction = "outperforming" if exp > 0.25 else "underperforming" if exp < -0.25 else "neutral"
+            claim = f"{symbol} is {direction} in the current evidence window with {exp:.2f}% expectancy and a reputation score of {score:.1f}."
+            conf = min(98.0, 20.0 + samples * 1.2 + abs(exp) * 2.0)
+            candidates.append({"fingerprint": _v13_fp("SYMBOL", symbol, direction), "knowledgeType": "SYMBOL",
+                "subject": symbol, "claim": claim, "confidence": conf, "evidenceCount": samples,
+                "metricValue": exp, "metricName": "expectancy_pct", "status": "ACTIVE",
+                "source": {"engine": "symbol_reputation", "score": score, "label": s.get("label")},
+                "relationships": [{"type": "HAS_REGIME", "target": s.get("bestRegime") or "UNKNOWN"}]})
+    except Exception as exc:
+        print(f"V13 MEMORY SYMBOL EXTRACT ERROR: {exc}")
+    # Rule knowledge
+    try:
+        rules_payload = rule_intelligence(180, 24, 20, 100)
+        rows = rules_payload.get("rules") or rules_payload.get("items") or []
+        for r in rows:
+            samples = int(r.get("triggered") or r.get("samples") or 0)
+            if samples < 20: continue
+            rule = str(r.get("rule") or r.get("name") or "UNKNOWN").upper()
+            exp = float(r.get("expectancyPct") if r.get("expectancyPct") is not None else r.get("expectancy") or 0)
+            helped = float(r.get("helpedPct") if r.get("helpedPct") is not None else r.get("helped") or 0)
+            direction = "helping" if exp > 0 else "hurting"
+            claim = f"{rule} is historically {direction}: expectancy {exp:.2f}% across {samples:,} triggers; helped rate {helped:.0f}%."
+            candidates.append({"fingerprint": _v13_fp("RULE", rule, direction), "knowledgeType": "RULE", "subject": rule,
+                "claim": claim, "confidence": min(99.0, 35 + samples/40), "evidenceCount": samples,
+                "metricValue": exp, "metricName": "expectancy_pct", "status": "ACTIVE",
+                "source": {"engine": "rule_intelligence", "helpedPct": helped},
+                "relationships": [{"type": "AFFECTS", "target": "TRADE_SELECTION"}]})
+    except Exception as exc:
+        print(f"V13 MEMORY RULE EXTRACT ERROR: {exc}")
+    # Market knowledge
+    try:
+        weekly = v4_weekly_intelligence(24)
+        samples = int(weekly.get("samples") or weekly.get("completed") or weekly.get("completedOutcomes") or 0)
+        exp = float(weekly.get("expectancyPct") if weekly.get("expectancyPct") is not None else weekly.get("averageExpectancy") or 0)
+        wr = float(weekly.get("winRate") or 0)
+        verdict = str(weekly.get("verdict") or firstObject(weekly.get("recommendation")).get("verdict") or "CONTINUE_CURRENT_GUARDS")
+        if samples > 0:
+            claim = f"The latest market evidence contains {samples:,} completed outcomes, {wr:.1f}% win rate and {exp:.3f}% expectancy; current verdict is {verdict}."
+            candidates.append({"fingerprint": _v13_fp("MARKET", verdict), "knowledgeType": "MARKET", "subject": "CURRENT_MARKET",
+                "claim": claim, "confidence": min(98.0, 45 + samples/100), "evidenceCount": samples,
+                "metricValue": exp, "metricName": "expectancy_pct", "status": "ACTIVE",
+                "source": {"engine": "market_dna", "winRate": wr, "verdict": verdict},
+                "relationships": [{"type": "GUIDES", "target": "RISK_GUARDS"}]})
+    except Exception as exc:
+        print(f"V13 MEMORY MARKET EXTRACT ERROR: {exc}")
+    # Governance/evolution memory
+    try:
+        ceo = v12_ceo_status(False, 0); board = v121_board_status()
+        grade = float(ceo.get("grade") or ceo.get("gradeOutOf100") or 0)
+        decision = str(board.get("finalDecision") or "DELAY")
+        claim = f"AI governance currently rates company health at {grade:.1f}/100 and the Board decision is {decision}."
+        candidates.append({"fingerprint": _v13_fp("GOVERNANCE", decision), "knowledgeType": "GOVERNANCE", "subject": "AI_BOARD",
+            "claim": claim, "confidence": float(board.get("confidence") or 80), "evidenceCount": int(ceo.get("completedOutcomes") or 0),
+            "metricValue": grade, "metricName": "ceo_grade", "status": "ACTIVE",
+            "source": {"engine": "ceo_board", "risk": ceo.get("riskLevel")},
+            "relationships": [{"type": "SUPERVISES", "target": "AUTONOMOUS_OPERATOR"}]})
+    except Exception as exc:
+        print(f"V13 MEMORY GOVERNANCE EXTRACT ERROR: {exc}")
+    return candidates
+
+
+def v13_memory_refresh() -> Dict[str, Any]:
+    _v13_memory_ensure_tables(); candidates = _v13_extract_candidates(); stored = 0
+    for item in candidates:
+        try: _v13_upsert_knowledge(item); stored += 1
+        except Exception as exc: print(f"V13 MEMORY UPSERT ERROR: {exc}")
+    # Retire stale knowledge after 45 days without confirmation.
+    if SQLITE_ENABLED:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat(); conn = db_connect()
+        conn.execute("UPDATE v13_knowledge SET status='STALE', updated_at=? WHERE status='ACTIVE' AND last_confirmed < ?", (_v13_now(), cutoff))
+        conn.commit(); conn.close()
+    return v13_memory_status()
+
+
+def _v13_rows(limit: int = 200, knowledge_type: str = "", status: str = "ACTIVE") -> List[Dict[str, Any]]:
+    if not SQLITE_ENABLED: return []
+    _v13_memory_ensure_tables(); limit = max(1, min(int(limit), 1000)); clauses=[]; params=[]
+    if knowledge_type: clauses.append("knowledge_type=?"); params.append(knowledge_type.upper())
+    if status: clauses.append("status=?"); params.append(status.upper())
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    conn=db_connect(); rows=conn.execute(f"SELECT * FROM v13_knowledge{where} ORDER BY confidence DESC,evidence_count DESC LIMIT ?", (*params,limit)).fetchall(); conn.close()
+    result=[]
+    for row in rows:
+        d=dict(row)
+        d["knowledgeType"]=d.pop("knowledge_type"); d["evidenceCount"]=d.pop("evidence_count")
+        d["metricValue"]=d.pop("metric_value"); d["metricName"]=d.pop("metric_name")
+        d["firstObserved"]=d.pop("first_observed"); d["lastConfirmed"]=d.pop("last_confirmed")
+        d["source"] = json.loads(d.pop("source_json") or "{}")
+        d["relationships"] = json.loads(d.pop("relationships_json") or "[]")
+        result.append(d)
+    return result
+
+
+def v13_memory_status() -> Dict[str, Any]:
+    items = _v13_rows(500, "", "ACTIVE")
+    by_type: Dict[str,int] = {}
+    for item in items: by_type[item["knowledgeType"]] = by_type.get(item["knowledgeType"],0)+1
+    high = [x for x in items if float(x.get("confidence") or 0) >= 75]
+    positive = [x for x in items if float(x.get("metricValue") or 0) > 0]
+    negative = [x for x in items if float(x.get("metricValue") or 0) < 0]
+    return {"ok": True, "version": V13_MEMORY_VERSION, "enabled": V13_MEMORY_ENABLED, "advisoryOnly": True,
+        "automaticLearning": True, "summary": {"activeKnowledge": len(items), "highConfidence": len(high),
+        "positiveClaims": len(positive), "negativeClaims": len(negative), "types": by_type},
+        "strongestKnowledge": high[:8], "latestKnowledge": sorted(items, key=lambda x: x.get("lastConfirmed") or "", reverse=True)[:12],
+        "nextAction": "Continue automatic evidence consolidation; stale knowledge will decay and retire automatically."}
+
+
+def _v13_memory_worker() -> None:
+    time.sleep(V13_MEMORY_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            result = v13_memory_refresh()
+            print(f"V13 MEMORY | active={result['summary']['activeKnowledge']} high_conf={result['summary']['highConfidence']} types={result['summary']['types']}")
+        except Exception as exc:
+            print(f"V13 MEMORY WORKER ERROR: {exc}")
+        time.sleep(V13_MEMORY_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+def v13_memory_startup_event():
+    global v13_memory_thread_started
+    if not V13_MEMORY_ENABLED: return
+    _v13_memory_ensure_tables()
+    if not v13_memory_thread_started:
+        v13_memory_thread_started=True
+        threading.Thread(target=_v13_memory_worker, daemon=True).start()
+        print("V13 MEMORY | enabled advisory_only=True automatic_learning=True")
+
+
+@app.get("/v13/memory/status")
+def api_v13_memory_status(request: Request):
+    verify_api_key(request); return v13_memory_status()
+
+
+@app.get("/v13/memory/knowledge")
+def api_v13_memory_knowledge(request: Request, limit: int = 200, knowledge_type: str = "", status: str = "ACTIVE"):
+    verify_api_key(request); items=_v13_rows(limit, knowledge_type, status)
+    return {"ok": True, "version": V13_MEMORY_VERSION, "count": len(items), "items": items}
+
+
+@app.get("/v13/memory/events")
+def api_v13_memory_events(request: Request, limit: int = 100):
+    verify_api_key(request); _v13_memory_ensure_tables(); limit=max(1,min(int(limit),500)); conn=db_connect()
+    rows=conn.execute("SELECT * FROM v13_memory_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall(); conn.close()
+    items=[]
+    for row in rows:
+        d=dict(row); d["payload"]=json.loads(d.pop("payload_json") or "{}"); items.append(d)
+    return {"ok": True, "version": V13_MEMORY_VERSION, "count": len(items), "items": items}
+
+
+@app.get("/v13/memory/constitution")
+def api_v13_memory_constitution(request: Request):
+    verify_api_key(request)
+    return {"ok": True, "version": V13_MEMORY_VERSION, "advisoryOnly": True, "automaticLearning": True,
+        "rules": ["Only persisted evidence may create or strengthen knowledge.",
+        "Insufficient evidence remains LEARNING and cannot become a high-confidence claim.",
+        "Contradictory evidence lowers confidence instead of being hidden.",
+        "Knowledge that is not reconfirmed becomes STALE and is retired automatically.",
+        "The memory layer cannot place, cancel or alter orders.",
+        "CEO, Board, Research and Evolution may read memory but existing constitutions remain authoritative."]}
