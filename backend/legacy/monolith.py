@@ -53,7 +53,12 @@ API_SECRET = os.getenv("APCA_API_SECRET_KEY")
 DASHBOARD_API_KEY = os.getenv("DASHBOARD_API_KEY") or os.getenv("ADMIN_PASSWORD") or os.getenv("API_ACCESS_KEY") or ""
 
 # Guarded adaptive optimiser. Disabled by default; advisory/stability tracking still runs.
-V2_AUTO_APPLY_THRESHOLDS = os.getenv("V2_AUTO_APPLY_THRESHOLDS", "false").lower() == "true"
+V2_AUTO_APPLY_THRESHOLDS = os.getenv("V2_AUTO_APPLY_THRESHOLDS", "true").lower() == "true"
+AI_THRESHOLD_LEARNING_ENABLED = os.getenv("AI_THRESHOLD_LEARNING_ENABLED", "true").lower() == "true"
+AI_THRESHOLD_CLOSED_MARKET_ONLY = os.getenv("AI_THRESHOLD_CLOSED_MARKET_ONLY", "true").lower() == "true"
+AI_THRESHOLD_INTERVAL_SECONDS = max(900, int(os.getenv("AI_THRESHOLD_INTERVAL_SECONDS", "1800") or 1800))
+AI_THRESHOLD_MIN_SAMPLES = max(100, int(os.getenv("AI_THRESHOLD_MIN_SAMPLES", "100") or 100))
+AI_THRESHOLD_STARTUP_DELAY_SECONDS = max(30, int(os.getenv("AI_THRESHOLD_STARTUP_DELAY_SECONDS", "90") or 90))
 V2_OPTIMIZER_REQUIRED_STABLE_RUNS = int(os.getenv("V2_OPTIMIZER_REQUIRED_STABLE_RUNS", "5") or 5)
 V2_OPTIMIZER_MIN_IMPROVEMENT = float(os.getenv("V2_OPTIMIZER_MIN_IMPROVEMENT", "0.08") or 0.08)
 V2_OPTIMIZER_MAX_DRAWDOWN_INCREASE = float(os.getenv("V2_OPTIMIZER_MAX_DRAWDOWN_INCREASE", "0.10") or 0.10)
@@ -5623,17 +5628,26 @@ def apply_strategy_settings(level: int = None, preset: str = None, save: bool = 
 
 
 def apply_custom_a_plus_thresholds(confidence: float, quality: float, reason: str = "adaptive optimiser", save: bool = True) -> Dict[str, Any]:
-    global A_PLUS_MIN_CONFIDENCE, A_PLUS_MIN_QUALITY
+    global A_PLUS_MIN_CONFIDENCE, A_PLUS_MIN_QUALITY, SNIPER_MIN_CONFIDENCE, SNIPER_MIN_QUALITY
     confidence = max(0.50, min(0.90, float(confidence)))
     quality = max(0.010, min(0.100, float(quality)))
     previous_conf = float(A_PLUS_MIN_CONFIDENCE)
     previous_quality = float(A_PLUS_MIN_QUALITY)
+    previous_sniper_conf = float(SNIPER_MIN_CONFIDENCE)
+    previous_sniper_quality = float(SNIPER_MIN_QUALITY)
     A_PLUS_MIN_CONFIDENCE = confidence
     A_PLUS_MIN_QUALITY = quality
+    # Sniper remains the broader entry gate, learned alongside A+ while
+    # preserving a conservative separation between the two tiers.
+    SNIPER_MIN_CONFIDENCE = max(0.48, min(0.70, round(confidence - 0.12, 2)))
+    SNIPER_MIN_QUALITY = max(0.012, min(0.030, round(quality - 0.006, 3)))
     payload = current_strategy_settings_payload()
     payload.update({
         "preset": "custom", "label": "Adaptive Custom",
         "aPlusMinConfidence": confidence, "aPlusMinQuality": quality,
+        "sniperMinConfidence": SNIPER_MIN_CONFIDENCE, "sniperMinQuality": SNIPER_MIN_QUALITY,
+        "previousSniperMinConfidence": previous_sniper_conf,
+        "previousSniperMinQuality": previous_sniper_quality,
         "updatedAt": datetime.now(UTC).isoformat(), "changeReason": reason,
     })
     if save:
@@ -6682,9 +6696,19 @@ def v2_adaptive_threshold_recommendations(horizon_hours: int = 24, min_samples: 
         recent=conn.execute("SELECT stable_key,eligible FROM v2_optimizer_evaluations ORDER BY id DESC LIMIT ?",(V2_OPTIMIZER_REQUIRED_STABLE_RUNS,)).fetchall()
         stable_runs=len(recent)==V2_OPTIMIZER_REQUIRED_STABLE_RUNS and all(int(r["eligible"])==1 and r["stable_key"]==stable_key for r in recent)
         if eligible and stable_runs: recommendation="READY_TO_APPLY"
-        if eligible and stable_runs and V2_AUTO_APPLY_THRESHOLDS and staged:
-            apply_custom_a_plus_thresholds(staged["confidence"],staged["quality"],"guarded adaptive optimiser",True)
+        market_closed = True
+        if AI_THRESHOLD_CLOSED_MARKET_ONLY:
+            try:
+                market_closed = not bool(trading_client.get_clock().is_open)
+            except Exception:
+                market_closed = False
+        result["marketClosed"] = market_closed
+        result["closedMarketOnly"] = AI_THRESHOLD_CLOSED_MARKET_ONLY
+        if eligible and stable_runs and V2_AUTO_APPLY_THRESHOLDS and staged and market_closed:
+            apply_custom_a_plus_thresholds(staged["confidence"],staged["quality"],"autonomous evidence-calibrated threshold learner",True)
             result["applied"]=True; recommendation="APPLIED_STAGED_CHANGE"
+        elif eligible and stable_runs and V2_AUTO_APPLY_THRESHOLDS and staged and not market_closed:
+            recommendation="READY_FOR_CLOSED_MARKET_APPLY"
         conn.commit(); conn.close()
         result.update({"observations":len(observations),"excludedBlacklistSymbols":sorted(blocked),"excludedObservationCount":len(all_obs)-len(observations),
             "recommendation":recommendation,"reason":reason,"recommended":best,"stagedRecommendation":staged,"currentEvidence":current,
@@ -16014,3 +16038,116 @@ def api_v15_operations_constitution(request: Request):
             "Holiday Mode summarises whether the platform is safe to leave running, but never conceals active warnings or critical failures.",
             "Self-healing is bounded to monitoring, alert resolution and safe worker diagnostics; it never changes trading strategy or orders."
         ]}
+
+
+# ============================================================
+# V15.12 — AUTONOMOUS EVIDENCE-CALIBRATED ENTRY GATES
+# Learns Sniper/A+ confidence and quality thresholds from completed outcomes.
+# Changes are bounded, stability-tested, closed-market-only and auditable.
+# ============================================================
+_ai_threshold_last_result: Dict[str, Any] = {}
+_ai_threshold_worker_started = False
+
+
+def ai_threshold_learning_status() -> Dict[str, Any]:
+    current = current_strategy_settings_payload()
+    return {
+        "ok": True,
+        "version": "V15.12",
+        "enabled": AI_THRESHOLD_LEARNING_ENABLED,
+        "automaticApply": V2_AUTO_APPLY_THRESHOLDS,
+        "closedMarketOnly": AI_THRESHOLD_CLOSED_MARKET_ONLY,
+        "intervalSeconds": AI_THRESHOLD_INTERVAL_SECONDS,
+        "minimumSamples": AI_THRESHOLD_MIN_SAMPLES,
+        "requiredStableReviews": V2_OPTIMIZER_REQUIRED_STABLE_RUNS,
+        "maximumConfidenceStep": V2_OPTIMIZER_MAX_CONF_STEP,
+        "maximumQualityStep": V2_OPTIMIZER_MAX_QUALITY_STEP,
+        "currentSettings": current,
+        "lastResult": _ai_threshold_last_result or None,
+        "safety": {
+            "canPlaceOrders": False,
+            "canChangePositionCapacity": False,
+            "canChangeStops": False,
+            "changesOnlyEntryGates": True,
+            "rollbackHistoryEnabled": True,
+        },
+    }
+
+
+def ai_threshold_learning_cycle(trigger: str = "automatic", force: bool = False) -> Dict[str, Any]:
+    global _ai_threshold_last_result
+    if not AI_THRESHOLD_LEARNING_ENABLED:
+        return {"ok": False, "version": "V15.12", "message": "Autonomous threshold learning is disabled."}
+    try:
+        market_open = bool(trading_client.get_clock().is_open)
+    except Exception as exc:
+        result = {"ok": False, "version": "V15.12", "trigger": trigger, "error": f"Market clock unavailable: {exc}"}
+        _ai_threshold_last_result = result
+        return result
+    if market_open and AI_THRESHOLD_CLOSED_MARKET_ONLY and not force:
+        result = {
+            "ok": True, "version": "V15.12", "trigger": trigger,
+            "ran": False, "marketOpen": True,
+            "message": "Live market has priority; threshold learning waits for market close.",
+            "currentSettings": current_strategy_settings_payload(),
+        }
+        _ai_threshold_last_result = result
+        return result
+    result = v2_adaptive_threshold_recommendations(24, AI_THRESHOLD_MIN_SAMPLES)
+    result.update({
+        "version": "V15.12",
+        "name": "Autonomous Evidence-Calibrated Entry Gates",
+        "trigger": trigger,
+        "ran": True,
+        "marketOpen": market_open,
+        "learns": ["sniper confidence", "sniper quality", "A+ confidence", "A+ quality"],
+    })
+    _ai_threshold_last_result = result
+    try:
+        print(
+            "V15.12 THRESHOLD LEARNER | "
+            f"recommendation={result.get('recommendation')} observations={result.get('observations',0)} "
+            f"stable={((result.get('stability') or {}).get('matchingRuns',0))}/"
+            f"{((result.get('stability') or {}).get('requiredRuns',V2_OPTIMIZER_REQUIRED_STABLE_RUNS))} "
+            f"applied={result.get('applied',False)}"
+        )
+    except Exception:
+        pass
+    return result
+
+
+def ai_threshold_learning_worker() -> None:
+    time.sleep(AI_THRESHOLD_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            ai_threshold_learning_cycle("automatic", force=False)
+        except Exception as exc:
+            print(f"V15.12 THRESHOLD LEARNER ERROR: {exc}")
+        time.sleep(AI_THRESHOLD_INTERVAL_SECONDS)
+
+
+@app.get("/adaptive-thresholds/status")
+def api_adaptive_thresholds_status(request: Request):
+    verify_api_key(request)
+    return ai_threshold_learning_status()
+
+
+@app.post("/adaptive-thresholds/review")
+def api_adaptive_thresholds_review(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    # Force means run the evidence review now; market-open protection still
+    # prevents applying live changes inside v2_adaptive_threshold_recommendations.
+    return ai_threshold_learning_cycle("authenticated-manual-review", force=bool(payload.get("force", True)))
+
+
+# Start once, after all functions/routes are registered.
+if AI_THRESHOLD_LEARNING_ENABLED and not _ai_threshold_worker_started:
+    try:
+        threading.Thread(
+            target=ai_threshold_learning_worker,
+            daemon=True,
+            name="v1512-threshold-learning-worker",
+        ).start()
+        _ai_threshold_worker_started = True
+    except Exception as exc:
+        print(f"V15.12 THRESHOLD WORKER START ERROR: {exc}")
