@@ -17,7 +17,7 @@ import { API_URL, readJson } from "../lib/api";
 import { clamp } from "../lib/format";
 import type { AnyObj } from "../lib/types";
 
-type IntelligenceSection = "ceo" | "board" | "brain" | "market" | "research" | "symbols" | "rules" | "evolution";
+type IntelligenceSection = "ceo" | "board" | "brain" | "market" | "research" | "symbols" | "rules" | "evolution" | "memory";
 
 type EndpointState = {
   data: AnyObj;
@@ -124,6 +124,10 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     boardStatus: EMPTY_ENDPOINT,
     boardHistory: EMPTY_ENDPOINT,
     boardConstitution: EMPTY_ENDPOINT,
+    memoryStatus: EMPTY_ENDPOINT,
+    memoryKnowledge: EMPTY_ENDPOINT,
+    memoryEvents: EMPTY_ENDPOINT,
+    memoryConstitution: EMPTY_ENDPOINT,
   });
 
   const endpoints = useMemo(() => ({
@@ -152,6 +156,10 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     boardStatus: "/v12/board/status",
     boardHistory: "/v12/board/history?limit=30",
     boardConstitution: "/v12/board/constitution",
+    memoryStatus: "/v13/memory/status",
+    memoryKnowledge: "/v13/memory/knowledge?limit=200",
+    memoryEvents: "/v13/memory/events?limit=100",
+    memoryConstitution: "/v13/memory/constitution",
   }), []);
 
   const load = useCallback(async () => {
@@ -201,6 +209,13 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const boardStatus = sources.boardStatus.data;
   const boardHistoryData = sources.boardHistory.data;
   const boardConstitution = sources.boardConstitution.data;
+  const memoryStatus = sources.memoryStatus.data;
+  const memoryKnowledgeData = sources.memoryKnowledge.data;
+  const memoryEventsData = sources.memoryEvents.data;
+  const memoryConstitution = sources.memoryConstitution.data;
+  const memorySummary = firstObject(memoryStatus.summary);
+  const memoryKnowledge = firstArray(memoryKnowledgeData.items, memoryStatus.latestKnowledge);
+  const memoryEvents = firstArray(memoryEventsData.items);
   const operatorCurrent = firstObject(operator.current);
   const operatorProposal = firstObject(operator.lastProposal);
   const operatorChanged = firstObject(operatorProposal.changed);
@@ -415,7 +430,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     </Card>
 
     <nav className="intelligence-tabs">
-      {(["ceo", "board", "brain", "market", "research", "symbols", "rules", "evolution"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "ceo" ? "AI CEO" : item === "board" ? "AI BOARD" : item === "brain" ? "AI BRAIN" : item.toUpperCase()}</button>)}
+      {(["ceo", "board", "brain", "market", "research", "symbols", "rules", "evolution", "memory"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "ceo" ? "AI CEO" : item === "board" ? "AI BOARD" : item === "brain" ? "AI BRAIN" : item === "memory" ? "AI MEMORY" : item.toUpperCase()}</button>)}
     </nav>
 
 
@@ -752,6 +767,29 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           { key: "confidence", label: "Confidence", render: (row) => `${Math.round(num(row.samples) ? Math.min(99, Math.sqrt(num(row.samples) / 50) * 100) : 0)}%` },
         ]} />
       </Card>
+    </div>}
+
+
+    {section === "memory" && <div className="memory-view">
+      <Card title="V13 Long-Term AI Memory">
+        <div className="intelligence-hero-head"><div><span className="eyebrow">AUTONOMOUS KNOWLEDGE LAYER</span><h2>{memoryStatus.enabled === false ? "MEMORY DISABLED" : "MEMORY LEARNING ACTIVE"}</h2><p>Evidence-backed knowledge shared with the CEO, Board, Research and Evolution engines.</p></div><div className="score-ring"><strong>{num(memorySummary.highConfidence)}</strong><span>high-confidence claims</span></div></div>
+        <div className="intelligence-stats four"><StatTile label="Active knowledge" value={num(memorySummary.activeKnowledge).toLocaleString("en-GB")} /><StatTile label="High confidence" value={num(memorySummary.highConfidence).toLocaleString("en-GB")} /><StatTile label="Positive claims" value={num(memorySummary.positiveClaims).toLocaleString("en-GB")} tone="positive" /><StatTile label="Negative claims" value={num(memorySummary.negativeClaims).toLocaleString("en-GB")} tone="negative" /></div>
+        <div className="status-strip"><span>AUTOMATIC LEARNING ACTIVE</span><span>ADVISORY ONLY</span><span>STALE KNOWLEDGE AUTO-RETIRES</span></div>
+      </Card>
+      <Card title="What the AI currently knows">
+        <DataTable rows={memoryKnowledge} columns={[
+          { key: "knowledgeType", label: "Type", render: (row) => <span className="pill">{text(row.knowledgeType, "UNKNOWN")}</span> },
+          { key: "subject", label: "Subject" },
+          { key: "claim", label: "Evidence-backed knowledge" },
+          { key: "confidence", label: "Confidence", render: (row) => `${num(row.confidence).toFixed(0)}%` },
+          { key: "evidenceCount", label: "Evidence", render: (row) => num(row.evidenceCount).toLocaleString("en-GB") },
+          { key: "status", label: "Status" },
+        ]} />
+      </Card>
+      <div className="grid two">
+        <Card title="Memory activity">{memoryEvents.length ? <div className="journal-list">{memoryEvents.slice(0, 20).map((row, index) => <article key={String(row.id ?? index)}><time>{row.created_at ? new Date(row.created_at).toLocaleString("en-GB") : ""}</time><div><b>{text(row.title, "Memory event")}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <EmptyState endpoint="V13 memory events" error={sources.memoryEvents.error} />}</Card>
+        <Card title="Memory Constitution"><div className="constitution-list">{Array.isArray(memoryConstitution.rules) && memoryConstitution.rules.length ? memoryConstitution.rules.map((rule: unknown, index: number) => <div key={index}><span>{index + 1}</span><p>{text(rule)}</p></div>) : <EmptyState endpoint="V13 memory constitution" error={sources.memoryConstitution.error} />}</div></Card>
+      </div>
     </div>}
 
     {section === "evolution" && <div className="grid two evolution-view">

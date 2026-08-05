@@ -1,0 +1,9 @@
+TradeBot V13 AI Memory frontend
+
+Adds an automatic AI MEMORY tab wired to:
+/v13/memory/status
+/v13/memory/knowledge
+/v13/memory/events
+/v13/memory/constitution
+
+There is no manual review or learning button. The backend updates memory automatically.
