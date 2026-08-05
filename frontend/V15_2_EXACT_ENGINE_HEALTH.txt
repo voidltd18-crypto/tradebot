@@ -1,0 +1,4 @@
+TradeBot V15.2 Exact Engine Health frontend
+
+The AI Operations tab now displays every unavailable dashboard endpoint and backend component with its exact error reason.
+The headline engine count remains based on the original monitored dashboard endpoints; the diagnostic endpoint is not counted against itself.

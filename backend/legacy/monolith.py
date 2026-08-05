@@ -14424,7 +14424,8 @@ def _v13_extract_candidates() -> List[Dict[str, Any]]:
         samples = int(weekly.get("samples") or weekly.get("completed") or weekly.get("completedOutcomes") or 0)
         exp = float(weekly.get("expectancyPct") if weekly.get("expectancyPct") is not None else weekly.get("averageExpectancy") or 0)
         wr = float(weekly.get("winRate") or 0)
-        verdict = str(weekly.get("verdict") or firstObject(weekly.get("recommendation")).get("verdict") or "CONTINUE_CURRENT_GUARDS")
+        recommendation = weekly.get("recommendation") if isinstance(weekly.get("recommendation"), dict) else {}
+        verdict = str(weekly.get("verdict") or recommendation.get("verdict") or "CONTINUE_CURRENT_GUARDS")
         if samples > 0:
             claim = f"The latest market evidence contains {samples:,} completed outcomes, {wr:.1f}% win rate and {exp:.3f}% expectancy; current verdict is {verdict}."
             candidates.append({"fingerprint": _v13_fp("MARKET", verdict), "knowledgeType": "MARKET", "subject": "CURRENT_MARKET",
@@ -15473,6 +15474,89 @@ def api_v151_operations_doctor(request: Request):
     return {"ok":latest.get("ok",False),"version":V15_AIOPS_VERSION,"holidayMode":_v151_holiday_mode(latest),
             "dependencies":_v151_dependency_snapshot().get("items",[]),"summary":latest.get("summary",{}),
             "activeAlerts":_v15_alert_rows(100,"ACTIVE")}
+
+
+
+def _v152_engine_health_snapshot() -> Dict[str, Any]:
+    """Return a fault-isolated view of every Operations component and critical route.
+
+    A failed component is reported without aborting the remaining checks. Route
+    registration is also shown so deployment omissions are immediately visible.
+    """
+    latest = _v15_latest_audit()
+    components = list(latest.get("components") or [])
+
+    expected_routes = [
+        "/status", "/banking-status", "/reports",
+        "/ai-advisor/summary", "/shadow-trading/summary",
+        "/decision-intelligence/summary", "/strategy-intelligence/summary",
+        "/symbol-intelligence/summary", "/rule-intelligence/summary",
+        "/weakness-intelligence/summary", "/v4/market-dna", "/v4/patterns",
+        "/v4/weekly-intelligence", "/v7/status", "/v7/research/insights",
+        "/v8/status", "/v10/operator/status", "/v10/promotion/status",
+        "/v10/symbol-reputation/summary", "/v12/ceo/status",
+        "/v12/ceo/journal", "/v12/ceo/reviews", "/v12/ceo/constitution",
+        "/v12/board/status", "/v12/board/history", "/v12/board/constitution",
+        "/v13/memory/status", "/v13/memory/knowledge", "/v13/memory/events",
+        "/v13/memory/constitution", "/v14/scientist/status",
+        "/v14/scientist/hypotheses", "/v14/scientist/experiments",
+        "/v14/scientist/events", "/v14/scientist/constitution",
+        "/v15/operations/status", "/v15/operations/components",
+        "/v15/operations/alerts", "/v15/operations/history",
+        "/v15/operations/constitution", "/v15/operations/dependencies",
+        "/v15/operations/watchdogs", "/v15/operations/queues",
+        "/v15/operations/doctor", "/v15/operations/engine-health",
+    ]
+    registered = {getattr(route, "path", "") for route in getattr(app, "routes", [])}
+    route_items = []
+    for path in expected_routes:
+        present = path in registered
+        route_items.append({
+            "name": path,
+            "category": "API Route",
+            "status": "PASS" if present else "FAIL",
+            "online": present,
+            "critical": path in ("/status", "/banking-status", "/reports", "/v15/operations/status"),
+            "reason": "Route registered." if present else "Route missing from the deployed FastAPI application.",
+        })
+
+    component_items = []
+    for item in components:
+        status = str(item.get("status") or "UNKNOWN").upper()
+        component_items.append({
+            "name": item.get("name") or "Unnamed component",
+            "category": item.get("category") or "Subsystem",
+            "status": status,
+            "online": status == "PASS",
+            "critical": bool(item.get("critical")),
+            "reason": item.get("message") or "No diagnostic message.",
+            "durationMs": item.get("durationMs"),
+            "checkedAt": item.get("checkedAt"),
+            "details": item.get("details") or {},
+        })
+
+    all_items = component_items + route_items
+    online = sum(1 for item in all_items if item.get("online"))
+    warning = sum(1 for item in all_items if item.get("status") == "WARN")
+    offline = [item for item in all_items if not item.get("online")]
+    return {
+        "ok": not any(item.get("status") == "FAIL" and item.get("critical") for item in all_items),
+        "version": "V15.2",
+        "generatedAt": _v15_now(),
+        "online": online,
+        "total": len(all_items),
+        "warnings": warning,
+        "offlineCount": len(offline),
+        "offline": offline,
+        "items": all_items,
+        "operationsSummary": latest.get("summary") or {},
+    }
+
+
+@app.get("/v15/operations/engine-health")
+def api_v152_operations_engine_health(request: Request):
+    verify_api_key(request)
+    return _v152_engine_health_snapshot()
 
 
 @app.get("/v15/operations/constitution")

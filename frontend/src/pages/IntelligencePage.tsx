@@ -142,6 +142,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     operationsWatchdogs: EMPTY_ENDPOINT,
     operationsQueues: EMPTY_ENDPOINT,
     operationsDoctor: EMPTY_ENDPOINT,
+    operationsEngineHealth: EMPTY_ENDPOINT,
   });
 
   const endpoints = useMemo(() => ({
@@ -188,6 +189,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     operationsWatchdogs: "/v15/operations/watchdogs",
     operationsQueues: "/v15/operations/queues",
     operationsDoctor: "/v15/operations/doctor",
+    operationsEngineHealth: "/v15/operations/engine-health",
   }), []);
 
   const load = useCallback(async () => {
@@ -362,9 +364,28 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     samples: num(row.samples ?? row.trades ?? row.count),
   }));
 
-  const endpointHealth = Object.values(sources).filter((source) => !source.error && !source.loading).length;
-  const endpointTotal = Object.keys(sources).length;
-  const intelligenceHealth = Math.round(((botHealth / 100) * 0.45 + (endpointHealth / endpointTotal) * 0.55) * 100);
+  const monitoredSourceEntries = Object.entries(sources).filter(([key]) => key !== "operationsEngineHealth");
+  const endpointHealth = monitoredSourceEntries.filter(([, source]) => !source.error && !source.loading).length;
+  const endpointTotal = monitoredSourceEntries.length;
+  const frontendOfflineEngines = monitoredSourceEntries
+    .filter(([, source]) => Boolean(source.error) || source.loading)
+    .map(([key, source]) => ({
+      name: keyLabel(key),
+      category: "Dashboard endpoint",
+      status: source.loading ? "STARTING" : "FAIL",
+      reason: source.loading ? "Waiting for endpoint response." : source.error,
+      source: "FRONTEND",
+    }));
+  const intelligenceHealth = Math.round(((botHealth / 100) * 0.45 + (endpointHealth / Math.max(1, endpointTotal)) * 0.55) * 100);
+  const operationsEngineHealth = sources.operationsEngineHealth.data;
+  const backendOfflineEngines = firstArray(operationsEngineHealth.offline).map((row) => ({
+    ...row,
+    source: "BACKEND",
+    reason: text(row.reason ?? row.message, "No diagnostic reason returned."),
+  }));
+  const exactOfflineEngines = [...frontendOfflineEngines, ...backendOfflineEngines].filter((row, index, rows) =>
+    rows.findIndex((candidate) => `${candidate.source}:${candidate.name}` === `${row.source}:${row.name}`) === index
+  );
 
 
   const account = firstObject(liveStatus.account, liveStatus.data?.account);
@@ -891,6 +912,17 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="Holiday Mode">
         <div className="intelligence-hero-head"><div><span className="eyebrow">AUTOMATIC HOLIDAY SUPERVISION</span><h2>{text(holidayMode.headline, "WAITING FOR FIRST AUDIT")}</h2><p>{holidayMode.safeToLeaveRunning === false ? "A critical condition needs human attention." : "The system is monitoring itself and will keep warnings visible until they clear."}</p></div><div className="score-ring"><strong>{num(holidayMode.healthScore).toFixed(0)}%</strong><span>holiday health</span></div></div>
         <div className="status-strip"><span>{holidayMode.safeToLeaveRunning === false ? "ATTENTION REQUIRED" : "SAFE TO LEAVE RUNNING"}</span><span>RECOVERY: {text(holidayMode.automaticRecovery, "MONITORING")}</span><span>CRITICAL: {num(holidayMode.criticalFailures)}</span><span>WARNINGS: {num(holidayMode.warnings)}</span></div>
+      </Card>
+      <Card title="Exact Engine Health">
+        <div className="intelligence-hero-head"><div><span className="eyebrow">FAULT-ISOLATED DIAGNOSTICS</span><h2>{exactOfflineEngines.length ? `${exactOfflineEngines.length} ITEMS NEED ATTENTION` : "ALL MONITORED ENGINES HEALTHY"}</h2><p>The dashboard now identifies each unavailable endpoint or failed internal component instead of showing only a total.</p></div><div className="score-ring"><strong>{endpointHealth}/{endpointTotal}</strong><span>dashboard endpoints online</span></div></div>
+        {exactOfflineEngines.length ? <DataTable rows={exactOfflineEngines} columns={[
+          { key: "status", label: "Health", render: (row) => <span className={`pill ${row.status === "WARN" || row.status === "STARTING" ? "warn" : "bad"}`}>{text(row.status)}</span> },
+          { key: "source", label: "Detected by", render: (row) => <span className="pill">{text(row.source)}</span> },
+          { key: "category", label: "Area" },
+          { key: "name", label: "Engine / endpoint", render: (row) => <b>{text(row.name)}</b> },
+          { key: "reason", label: "Exact reason" },
+          { key: "critical", label: "Critical", render: (row) => row.critical ? "YES" : "NO" },
+        ]} /> : <div className="intelligence-empty"><strong>All clear</strong><span>Every monitored dashboard endpoint and backend Operations component is currently healthy.</span></div>}
       </Card>
       <Card title="Dependency Health">
         <DataTable rows={operationsDependencies} columns={[
