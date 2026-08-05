@@ -26,4 +26,5 @@ SERVICE_REGISTRY = (
     ServiceDescriptor("risk", "Capital, position, PDT and loss safeguards", ("/banking-status",)),
     ServiceDescriptor("memory", "V13 persistent evidence-backed long-term knowledge", ("/reports", "/v13/memory")),
     ServiceDescriptor("scientist", "V14 autonomous hypothesis and experiment generation", ("/v14/scientist",)),
+    ServiceDescriptor("operations", "V15 automatic full-system health monitoring and alerting", ("/v15/operations",)),
 )

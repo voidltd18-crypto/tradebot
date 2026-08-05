@@ -14948,3 +14948,547 @@ def api_v14_scientist_constitution(request: Request):
             "Every hypothesis, experiment and scientist cycle is persisted for audit.",
             "Reviews run automatically; no manual scientist review is required."
         ]}
+
+
+# ============================================================
+# TRADEBOT V15 — AUTONOMOUS AI OPERATIONS CENTRE (AIOPS)
+# ============================================================
+V15_AIOPS_VERSION = "V15.1"
+V15_AIOPS_ENABLED = os.getenv("V15_AIOPS_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+V15_AIOPS_INTERVAL_SECONDS = max(300, int(os.getenv("V15_AIOPS_INTERVAL_SECONDS", "900")))
+V15_AIOPS_STARTUP_DELAY_SECONDS = max(15, int(os.getenv("V15_AIOPS_STARTUP_DELAY_SECONDS", "75")))
+V15_AIOPS_HISTORY_LIMIT = max(50, int(os.getenv("V15_AIOPS_HISTORY_LIMIT", "1000")))
+v15_aiops_thread_started = False
+
+
+def _v15_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _v15_aiops_ensure_tables() -> None:
+    if not SQLITE_ENABLED:
+        return
+    conn = db_connect()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS v15_health_audits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            overall_status TEXT NOT NULL,
+            health_score REAL NOT NULL,
+            passed INTEGER NOT NULL,
+            warnings INTEGER NOT NULL,
+            failed INTEGER NOT NULL,
+            duration_ms REAL NOT NULL,
+            summary_json TEXT NOT NULL DEFAULT '{}',
+            components_json TEXT NOT NULL DEFAULT '[]',
+            resources_json TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS v15_health_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_key TEXT UNIQUE NOT NULL,
+            component TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
+            title TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            resolved_at TEXT,
+            occurrences INTEGER NOT NULL DEFAULT 1,
+            payload_json TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v15_audits_created ON v15_health_audits(created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_v15_alerts_status ON v15_health_alerts(status,severity,last_seen)")
+    conn.commit(); conn.close()
+
+
+def _v15_safe_json(value: Any) -> Any:
+    try:
+        return json.loads(json.dumps(value, default=str))
+    except Exception:
+        return str(value)
+
+
+def _v15_component(name: str, category: str, critical: bool, fn) -> Dict[str, Any]:
+    started = time.perf_counter()
+    status = "PASS"; message = "Operating normally."; details: Dict[str, Any] = {}
+    try:
+        result = fn()
+        if isinstance(result, tuple):
+            status = str(result[0] or "PASS").upper()
+            message = str(result[1] or message)
+            details = _v15_safe_json(result[2] if len(result) > 2 else {})
+        elif isinstance(result, dict):
+            details = _v15_safe_json(result)
+            if result.get("ok") is False or result.get("enabled") is False:
+                status = "WARN"; message = "Subsystem responded but reports a disabled or unhealthy state."
+        elif result is False:
+            status = "WARN"; message = "Subsystem check returned false."
+    except Exception as exc:
+        status = "FAIL"; message = f"{type(exc).__name__}: {exc}"
+    duration = round((time.perf_counter() - started) * 1000.0, 2)
+    if status == "PASS" and duration > 5000:
+        status = "WARN"; message = f"Healthy but slow response ({duration:.0f} ms)."
+    return {"name": name, "category": category, "critical": critical, "status": status,
+            "message": message, "durationMs": duration, "details": details, "checkedAt": _v15_now()}
+
+
+def _v15_database_check():
+    if not SQLITE_ENABLED:
+        return ("WARN", "SQLite persistence is disabled.", {"sqliteEnabled": False})
+    conn = db_connect(); row = conn.execute("SELECT 1 AS ok").fetchone()
+    tables = conn.execute("SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table'").fetchone()
+    conn.close()
+    return ("PASS", "Persistent database is readable and writable infrastructure is available.",
+            {"sqliteEnabled": True, "query": int(dict(row).get("ok", 0)), "tables": int(dict(tables).get("c", 0))})
+
+
+def _v15_broker_check():
+    broker = globals().get("api") or globals().get("trading_client")
+    if broker is None:
+        return ("WARN", "Broker client object is not currently available.", {})
+    account = broker.get_account()
+    blocked = bool(getattr(account, "trading_blocked", False) or getattr(account, "account_blocked", False))
+    status = "FAIL" if blocked else "PASS"
+    return (status, "Broker account is connected." if not blocked else "Broker reports trading blocked.",
+            {"tradingBlocked": blocked, "equity": getattr(account, "equity", None),
+             "buyingPower": getattr(account, "buying_power", None), "status": getattr(account, "status", None)})
+
+
+def _v15_market_check():
+    payload = get_market_status_payload()
+    return ("PASS", "Market clock and session state are available.", payload)
+
+
+def _v15_threads_check():
+    threads = [t.name for t in threading.enumerate() if t.is_alive()]
+    required_flags = {
+        "CEO": bool(globals().get("v12_ceo_thread_started", False)),
+        "Board": bool(globals().get("v121_board_thread_started", False)),
+        "Memory": bool(globals().get("v13_memory_thread_started", False)),
+        "Scientist": bool(globals().get("v14_scientist_thread_started", False)),
+    }
+    missing = [name for name, active in required_flags.items() if not active]
+    if missing:
+        return ("WARN", "One or more autonomous worker start flags are inactive: " + ", ".join(missing),
+                {"aliveThreadCount": len(threads), "workers": required_flags, "threadNames": threads[:50]})
+    return ("PASS", "Autonomous worker start flags are active.",
+            {"aliveThreadCount": len(threads), "workers": required_flags, "threadNames": threads[:50]})
+
+
+def _v15_resources_check():
+    import shutil as _shutil
+    disk = _shutil.disk_usage("/")
+    free_pct = (disk.free / disk.total * 100.0) if disk.total else 0.0
+    try:
+        load = list(os.getloadavg())
+    except Exception:
+        load = []
+    try:
+        import resource as _resource
+        rss_kb = float(_resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:
+        rss_kb = 0.0
+    status = "PASS"; message = "Host resources are within basic safety thresholds."
+    if free_pct < 5:
+        status = "FAIL"; message = "Critical disk-space shortage."
+    elif free_pct < 15:
+        status = "WARN"; message = "Disk space is becoming low."
+    return (status, message, {"diskTotalBytes": disk.total, "diskFreeBytes": disk.free,
+            "diskFreePct": round(free_pct, 2), "loadAverage": load, "maxRssKb": rss_kb,
+            "cpuCount": os.cpu_count()})
+
+
+def _v15_core_check():
+    return ("PASS", "FastAPI application and trading runtime are loaded.",
+            {"routes": len(getattr(app, "routes", [])), "botEnabled": bool(globals().get("BOT_ENABLED", True)),
+             "sqliteEnabled": bool(SQLITE_ENABLED)})
+
+
+def _v15_operator_check():
+    payload = v10_operator_status(20)
+    status = "PASS" if str(payload.get("mode") or "").upper() in ("AUTO", "SHADOW", "OFF") else "WARN"
+    return (status, "Autonomous operator status is readable.", payload)
+
+
+def _v15_research_check():
+    payload = v7_status_payload()
+    return ("PASS" if payload.get("ok", True) is not False else "WARN", "Research engine status is readable.", payload)
+
+
+def _v15_evolution_check():
+    payload = v8_status_payload()
+    return ("PASS" if payload.get("ok", True) is not False else "WARN", "Evolution engine status is readable.", payload)
+
+
+def _v15_ceo_check():
+    payload = v12_ceo_status(False, 0)
+    return ("PASS" if payload.get("enabled", True) else "WARN", "AI CEO review engine is available.", payload)
+
+
+def _v15_board_check():
+    payload = v121_board_status()
+    vetoes = int(payload.get("vetoes") or payload.get("vetoCount") or 0)
+    return ("WARN" if vetoes else "PASS", "AI Board is available." if not vetoes else "AI Board currently reports a veto.", payload)
+
+
+def _v15_memory_check():
+    payload = v13_memory_status()
+    return ("PASS" if payload.get("enabled", True) else "WARN", "Long-term AI Memory is available.", payload)
+
+
+def _v15_scientist_check():
+    payload = v14_scientist_status()
+    return ("PASS" if payload.get("enabled", True) else "WARN", "AI Scientist is available.", payload)
+
+
+
+def _v151_table_exists(conn, table: str) -> bool:
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    return bool(row)
+
+
+def _v151_database_doctor_check():
+    if not SQLITE_ENABLED:
+        return ("WARN", "SQLite persistence is disabled.", {"sqliteEnabled": False})
+    started = time.perf_counter(); conn = db_connect()
+    integrity = conn.execute("PRAGMA integrity_check").fetchone()
+    integrity_value = list(dict(integrity).values())[0] if integrity else "unknown"
+    conn.execute("CREATE TABLE IF NOT EXISTS v151_health_probe(id INTEGER PRIMARY KEY, checked_at TEXT NOT NULL)")
+    now = _v15_now(); conn.execute("INSERT INTO v151_health_probe(checked_at) VALUES(?)", (now,))
+    conn.execute("DELETE FROM v151_health_probe WHERE id NOT IN (SELECT id FROM v151_health_probe ORDER BY id DESC LIMIT 5)")
+    conn.commit()
+    journal = str(conn.execute("PRAGMA journal_mode").fetchone()[0])
+    page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+    freelist = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+    conn.close(); ms=round((time.perf_counter()-started)*1000,2)
+    status = "PASS" if str(integrity_value).lower() == "ok" else "FAIL"
+    return (status, "Database integrity, read and write probe passed." if status == "PASS" else "Database integrity check failed.",
+            {"integrity": integrity_value, "writeProbe": True, "journalMode": journal,
+             "pageCount": page_count, "freePages": freelist, "latencyMs": ms})
+
+
+def _v151_route_inventory_check():
+    routes=[]; parameter_free=[]; protected=[]
+    for route in getattr(app, "routes", []):
+        path=str(getattr(route,"path","") or "")
+        methods=sorted(list(getattr(route,"methods",[]) or []))
+        if not path: continue
+        item={"path":path,"methods":methods,"name":str(getattr(route,"name","") or "")}
+        routes.append(item)
+        if "GET" in methods and "{" not in path: parameter_free.append(path)
+        if path.startswith(("/v12/","/v13/","/v14/","/v15/")): protected.append(path)
+    expected=["/status","/reports","/banking-status","/v12/ceo/status","/v12/board/status",
+              "/v13/memory/status","/v14/scientist/status","/v15/operations/status"]
+    missing=[p for p in expected if p not in {x["path"] for x in routes}]
+    return (("FAIL" if missing else "PASS"),
+            "All critical API routes are registered." if not missing else "Critical API routes are missing: "+", ".join(missing),
+            {"routeCount":len(routes),"parameterFreeGetCount":len(set(parameter_free)),
+             "governanceRouteCount":len(set(protected)),"missingCriticalRoutes":missing,
+             "sampleRoutes":sorted(set(parameter_free))[:120]})
+
+
+def _v151_worker_watchdog_check():
+    alive={t.name:t for t in threading.enumerate() if t.is_alive()}
+    expected={
+        "v12-ceo-worker": bool(globals().get("v12_ceo_thread_started",False)),
+        "v121-board-worker": bool(globals().get("v121_board_thread_started",False)),
+        "v13-memory-worker": bool(globals().get("v13_memory_thread_started",False)),
+        "v14-scientist-worker": bool(globals().get("v14_scientist_thread_started",False)),
+        "v15-aiops-worker": bool(globals().get("v15_aiops_thread_started",False)),
+    }
+    rows=[]; missing=[]
+    for name,flag in expected.items():
+        running=name in alive or flag
+        rows.append({"worker":name,"running":running,"startFlag":flag,"threadVisible":name in alive})
+        if not running: missing.append(name)
+    return (("FAIL" if missing else "PASS"),
+            "All autonomous worker watchdogs are active." if not missing else "Missing autonomous workers: "+", ".join(missing),
+            {"workers":rows,"aliveThreadCount":len(alive),"missing":missing})
+
+
+def _v151_queue_check():
+    details={}; warnings=[]; failures=[]
+    try:
+        conn=db_connect()
+        table_names={dict(r).get('name') for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        # Decision outcome queue: tolerate schema differences and report only what is measurable.
+        outcome_candidates=["decision_outcomes","ai_decision_outcomes","v6_decision_outcomes","decision_memory"]
+        found=None
+        for t in outcome_candidates:
+            if t in table_names: found=t; break
+        if found:
+            total=int(dict(conn.execute(f"SELECT COUNT(*) AS c FROM {found}").fetchone()).get('c',0))
+            details["outcomes"]={"table":found,"total":total}
+        else:
+            details["outcomes"]={"table":None,"status":"NOT_DISCOVERED"}
+        for key,table in [("ceoReviews","v12_ceo_reviews"),("boardMeetings","v121_board_meetings"),
+                          ("memoryKnowledge","v13_knowledge"),("memoryEvents","v13_memory_events"),
+                          ("scientistHypotheses","v14_hypotheses"),("scientistExperiments","v14_experiments")]:
+            if table in table_names:
+                details[key]=int(dict(conn.execute(f"SELECT COUNT(*) AS c FROM {table}").fetchone()).get('c',0))
+        conn.close()
+    except Exception as exc:
+        failures.append(str(exc))
+    status="FAIL" if failures else "WARN" if warnings else "PASS"
+    msg="Persistent work queues and audit stores are readable." if status=="PASS" else ("; ".join(failures or warnings))
+    return (status,msg,details)
+
+
+def _v151_dependency_snapshot() -> Dict[str, Any]:
+    latest=_v15_latest_audit(); comps=latest.get("components") or []
+    byname={str(c.get("name")):c for c in comps}
+    groups={
+      "Trading Engine":["FastAPI & Trading Runtime","Persistent Database","Database Doctor","Broker Connection","Market Clock","Autonomous Operator"],
+      "Research & Learning":["Research Lab","Evolution Engine","AI Memory","AI Scientist","Queue & Audit Stores"],
+      "Governance":["AI CEO","AI Board","Autonomous Workers","Worker Watchdog"],
+      "Infrastructure":["Host Resources","API Route Inventory"]
+    }
+    out=[]
+    rank={"PASS":0,"WARN":1,"FAIL":2}
+    for group,names in groups.items():
+        items=[byname[n] for n in names if n in byname]
+        worst=max((rank.get(str(x.get("status")),1) for x in items),default=1)
+        status={0:"PASS",1:"WARN",2:"FAIL"}[worst]
+        out.append({"name":group,"status":status,"healthy":sum(1 for x in items if x.get("status")=="PASS"),
+                    "total":len(items),"components":[{"name":x.get("name"),"status":x.get("status"),"message":x.get("message")} for x in items]})
+    return {"ok":all(x["status"]!="FAIL" for x in out),"version":V15_AIOPS_VERSION,"items":out,"count":len(out)}
+
+
+def _v151_holiday_mode(latest: Dict[str, Any]) -> Dict[str, Any]:
+    summary=latest.get("summary") or {}; status=str(summary.get("overallStatus") or "STARTING")
+    critical=int(summary.get("criticalFailures") or 0); warnings=int(summary.get("warnings") or 0)
+    if critical:
+        headline="HUMAN ATTENTION REQUIRED"; safe=False
+    elif status in ("HEALTHY",) and warnings==0:
+        headline="EVERYTHING HEALTHY — NO ACTION REQUIRED"; safe=True
+    else:
+        headline="SYSTEM RUNNING WITH CAUTION"; safe=True
+    return {"enabled":True,"headline":headline,"safeToLeaveRunning":safe,"overallStatus":status,
+            "healthScore":summary.get("healthScore"),"criticalFailures":critical,"warnings":warnings,
+            "automaticRecovery":"MONITORING_AND_ALERTING","checkedAt":summary.get("checkedAt")}
+
+def _v15_collect_components() -> List[Dict[str, Any]]:
+    checks = [
+        ("FastAPI & Trading Runtime", "CORE", True, _v15_core_check),
+        ("Persistent Database", "CORE", True, _v15_database_check),
+        ("Database Doctor", "CORE", True, _v151_database_doctor_check),
+        ("Broker Connection", "TRADING", True, _v15_broker_check),
+        ("Market Clock", "MARKET", True, _v15_market_check),
+        ("Autonomous Workers", "OPERATIONS", True, _v15_threads_check),
+        ("Worker Watchdog", "OPERATIONS", True, _v151_worker_watchdog_check),
+        ("Host Resources", "OPERATIONS", True, _v15_resources_check),
+        ("API Route Inventory", "OPERATIONS", True, _v151_route_inventory_check),
+        ("Queue & Audit Stores", "OPERATIONS", False, _v151_queue_check),
+        ("Autonomous Operator", "TRADING", True, _v15_operator_check),
+        ("Research Lab", "INTELLIGENCE", False, _v15_research_check),
+        ("Evolution Engine", "INTELLIGENCE", False, _v15_evolution_check),
+        ("AI CEO", "GOVERNANCE", False, _v15_ceo_check),
+        ("AI Board", "GOVERNANCE", False, _v15_board_check),
+        ("AI Memory", "INTELLIGENCE", False, _v15_memory_check),
+        ("AI Scientist", "INTELLIGENCE", False, _v15_scientist_check),
+    ]
+    return [_v15_component(*item) for item in checks]
+
+
+def _v15_alert_key(component: Dict[str, Any]) -> str:
+    raw = f"{component.get('name')}|{component.get('status')}|{component.get('message')}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _v15_sync_alerts(components: List[Dict[str, Any]]) -> None:
+    if not SQLITE_ENABLED:
+        return
+    _v15_aiops_ensure_tables(); now = _v15_now(); active_keys = []
+    conn = db_connect()
+    for component in components:
+        if component.get("status") == "PASS":
+            continue
+        key = _v15_alert_key(component); active_keys.append(key)
+        severity = "CRITICAL" if component.get("status") == "FAIL" and component.get("critical") else \
+                   "ERROR" if component.get("status") == "FAIL" else "WARNING"
+        existing = conn.execute("SELECT id FROM v15_health_alerts WHERE alert_key=?", (key,)).fetchone()
+        if existing:
+            conn.execute("""UPDATE v15_health_alerts SET status='ACTIVE',severity=?,last_seen=?,resolved_at=NULL,
+                occurrences=occurrences+1,detail=?,payload_json=? WHERE alert_key=?""",
+                (severity, now, component.get("message"), json.dumps(component, default=str), key))
+        else:
+            conn.execute("""INSERT INTO v15_health_alerts(alert_key,component,severity,status,title,detail,first_seen,last_seen,payload_json)
+                VALUES(?,?,?,'ACTIVE',?,?,?,?,?)""",
+                (key, component.get("name"), severity, f"{component.get('name')} requires attention",
+                 component.get("message"), now, now, json.dumps(component, default=str)))
+    if active_keys:
+        placeholders = ",".join("?" for _ in active_keys)
+        conn.execute(f"UPDATE v15_health_alerts SET status='RESOLVED',resolved_at=? WHERE status='ACTIVE' AND alert_key NOT IN ({placeholders})",
+                     (now, *active_keys))
+    else:
+        conn.execute("UPDATE v15_health_alerts SET status='RESOLVED',resolved_at=? WHERE status='ACTIVE'", (now,))
+    conn.commit(); conn.close()
+
+
+def v15_aiops_run_audit() -> Dict[str, Any]:
+    started = time.perf_counter(); components = _v15_collect_components()
+    passed = sum(1 for x in components if x["status"] == "PASS")
+    warnings = sum(1 for x in components if x["status"] == "WARN")
+    failed = sum(1 for x in components if x["status"] == "FAIL")
+    critical_failures = sum(1 for x in components if x["status"] == "FAIL" and x.get("critical"))
+    weights = {"PASS": 1.0, "WARN": 0.55, "FAIL": 0.0}
+    total_weight = sum(2.0 if x.get("critical") else 1.0 for x in components) or 1.0
+    earned = sum((2.0 if x.get("critical") else 1.0) * weights[x["status"]] for x in components)
+    score = round(earned / total_weight * 100.0, 1)
+    overall = "CRITICAL" if critical_failures else "DEGRADED" if failed else "WARNING" if warnings else "HEALTHY"
+    duration = round((time.perf_counter() - started) * 1000.0, 2)
+    resources = next((x.get("details") for x in components if x.get("name") == "Host Resources"), {}) or {}
+    summary = {"overallStatus": overall, "healthScore": score, "passed": passed, "warnings": warnings,
+               "failed": failed, "criticalFailures": critical_failures, "componentCount": len(components),
+               "checkedAt": _v15_now(), "nextAuditInSeconds": V15_AIOPS_INTERVAL_SECONDS,
+               "automatic": True, "selfHealing": "BOUNDED_MONITORING", "tradingChangesAllowed": False,
+               "endpointDiscovery": True, "workerWatchdog": True, "databaseDoctor": True, "holidayMode": True}
+    if SQLITE_ENABLED:
+        _v15_aiops_ensure_tables(); conn = db_connect()
+        conn.execute("""INSERT INTO v15_health_audits(created_at,overall_status,health_score,passed,warnings,failed,duration_ms,
+            summary_json,components_json,resources_json) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            (summary["checkedAt"], overall, score, passed, warnings, failed, duration,
+             json.dumps(summary, default=str), json.dumps(components, default=str), json.dumps(resources, default=str)))
+        conn.execute("DELETE FROM v15_health_audits WHERE id NOT IN (SELECT id FROM v15_health_audits ORDER BY id DESC LIMIT ?)",
+                     (V15_AIOPS_HISTORY_LIMIT,))
+        conn.commit(); conn.close()
+        _v15_sync_alerts(components)
+    return {"ok": critical_failures == 0, "version": V15_AIOPS_VERSION, "enabled": V15_AIOPS_ENABLED,
+            "summary": summary, "components": components, "resources": resources, "durationMs": duration,
+            "nextAction": "No intervention required." if overall == "HEALTHY" else
+                          "Review active alerts; autonomous setting changes should remain bounded by existing safeguards."}
+
+
+def _v15_latest_audit() -> Dict[str, Any]:
+    if not SQLITE_ENABLED:
+        return v15_aiops_run_audit()
+    _v15_aiops_ensure_tables(); conn = db_connect()
+    row = conn.execute("SELECT * FROM v15_health_audits ORDER BY id DESC LIMIT 1").fetchone(); conn.close()
+    if not row:
+        return v15_aiops_run_audit()
+    d = dict(row)
+    return {"ok": d["overall_status"] != "CRITICAL", "version": V15_AIOPS_VERSION, "enabled": V15_AIOPS_ENABLED,
+            "summary": json.loads(d["summary_json"] or "{}"), "components": json.loads(d["components_json"] or "[]"),
+            "resources": json.loads(d["resources_json"] or "{}"), "durationMs": d["duration_ms"],
+            "nextAction": "No intervention required." if d["overall_status"] == "HEALTHY" else "Review active alerts."}
+
+
+def _v15_alert_rows(limit: int = 100, status: str = "") -> List[Dict[str, Any]]:
+    if not SQLITE_ENABLED:
+        return []
+    _v15_aiops_ensure_tables(); limit=max(1,min(int(limit),500)); params=[]; where=""
+    if status:
+        where=" WHERE status=?"; params.append(status.upper())
+    conn=db_connect(); rows=conn.execute(f"SELECT * FROM v15_health_alerts{where} ORDER BY CASE severity WHEN 'CRITICAL' THEN 1 WHEN 'ERROR' THEN 2 ELSE 3 END,last_seen DESC LIMIT ?", (*params,limit)).fetchall(); conn.close()
+    result=[]
+    for row in rows:
+        d=dict(row); d["payload"]=json.loads(d.pop("payload_json") or "{}"); result.append(d)
+    return result
+
+
+def _v15_history_rows(limit: int = 100) -> List[Dict[str, Any]]:
+    if not SQLITE_ENABLED:
+        return []
+    _v15_aiops_ensure_tables(); limit=max(1,min(int(limit),500)); conn=db_connect()
+    rows=conn.execute("SELECT id,created_at,overall_status,health_score,passed,warnings,failed,duration_ms,summary_json,resources_json FROM v15_health_audits ORDER BY id DESC LIMIT ?", (limit,)).fetchall(); conn.close()
+    result=[]
+    for row in rows:
+        d=dict(row); d["overallStatus"]=d.pop("overall_status"); d["healthScore"]=d.pop("health_score")
+        d["durationMs"]=d.pop("duration_ms"); d["summary"]=json.loads(d.pop("summary_json") or "{}")
+        d["resources"]=json.loads(d.pop("resources_json") or "{}"); result.append(d)
+    return result
+
+
+def _v15_aiops_worker() -> None:
+    time.sleep(V15_AIOPS_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            result = v15_aiops_run_audit(); s=result["summary"]
+            print(f"V15 AIOPS | status={s['overallStatus']} health={s['healthScore']} pass={s['passed']} warn={s['warnings']} fail={s['failed']}")
+        except Exception as exc:
+            print(f"V15 AIOPS WORKER ERROR: {exc}")
+        time.sleep(V15_AIOPS_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+def v15_aiops_startup_event():
+    global v15_aiops_thread_started
+    if not V15_AIOPS_ENABLED:
+        return
+    _v15_aiops_ensure_tables()
+    if not v15_aiops_thread_started:
+        v15_aiops_thread_started=True
+        threading.Thread(target=_v15_aiops_worker, daemon=True, name="v15-aiops-worker").start()
+        print(f"V15 AIOPS | enabled automatic=True interval={V15_AIOPS_INTERVAL_SECONDS}s monitoring_only=True")
+
+
+@app.get("/v15/operations/status")
+def api_v15_operations_status(request: Request):
+    verify_api_key(request); return _v15_latest_audit()
+
+
+@app.get("/v15/operations/components")
+def api_v15_operations_components(request: Request):
+    verify_api_key(request); latest=_v15_latest_audit()
+    return {"ok": True, "version": V15_AIOPS_VERSION, "count": len(latest.get("components") or []), "items": latest.get("components") or []}
+
+
+@app.get("/v15/operations/alerts")
+def api_v15_operations_alerts(request: Request, limit: int = 100, status: str = "ACTIVE"):
+    verify_api_key(request); items=_v15_alert_rows(limit,status)
+    return {"ok": True, "version": V15_AIOPS_VERSION, "count": len(items), "items": items}
+
+
+@app.get("/v15/operations/history")
+def api_v15_operations_history(request: Request, limit: int = 100):
+    verify_api_key(request); items=_v15_history_rows(limit)
+    return {"ok": True, "version": V15_AIOPS_VERSION, "count": len(items), "items": items}
+
+
+@app.get("/v15/operations/dependencies")
+def api_v151_operations_dependencies(request: Request):
+    verify_api_key(request); return _v151_dependency_snapshot()
+
+
+@app.get("/v15/operations/watchdogs")
+def api_v151_operations_watchdogs(request: Request):
+    verify_api_key(request); latest=_v15_latest_audit()
+    items=[x for x in (latest.get("components") or []) if x.get("name") in ("Autonomous Workers","Worker Watchdog")]
+    return {"ok":all(x.get("status")!="FAIL" for x in items),"version":V15_AIOPS_VERSION,"count":len(items),"items":items}
+
+
+@app.get("/v15/operations/queues")
+def api_v151_operations_queues(request: Request):
+    verify_api_key(request); status,message,details=_v151_queue_check()
+    return {"ok":status!="FAIL","version":V15_AIOPS_VERSION,"status":status,"message":message,"queues":details}
+
+
+@app.get("/v15/operations/doctor")
+def api_v151_operations_doctor(request: Request):
+    verify_api_key(request); latest=_v15_latest_audit()
+    return {"ok":latest.get("ok",False),"version":V15_AIOPS_VERSION,"holidayMode":_v151_holiday_mode(latest),
+            "dependencies":_v151_dependency_snapshot().get("items",[]),"summary":latest.get("summary",{}),
+            "activeAlerts":_v15_alert_rows(100,"ACTIVE")}
+
+
+@app.get("/v15/operations/constitution")
+def api_v15_operations_constitution(request: Request):
+    verify_api_key(request)
+    return {"ok": True, "version": V15_AIOPS_VERSION, "automatic": True, "monitoringOnly": True,
+        "manualReviewRequired": False, "operationsMode": "PRO", "rules": [
+            "The Operations Centre continuously monitors every critical subsystem without recurring human input.",
+            "AIOps may observe, score, persist and alert, but it cannot place, cancel or alter orders.",
+            "AIOps cannot change live strategy settings or bypass the CEO, Board, operator or risk constitutions.",
+            "Critical trading, database, broker or worker failures must reduce the overall health state.",
+            "Warnings remain visible until the underlying condition clears; resolved alerts remain auditable.",
+            "Every full-system audit and alert transition is persisted.",
+            "Health data may inform CEO and Board caution, but cannot grant additional trading authority.",
+            "Audits run automatically; no manual health-review button is required.",
+            "V15.1 discovers registered API routes, checks database integrity, watches autonomous workers and audits persistent queues.",
+            "Holiday Mode summarises whether the platform is safe to leave running, but never conceals active warnings or critical failures.",
+            "Self-healing is bounded to monitoring, alert resolution and safe worker diagnostics; it never changes trading strategy or orders."
+        ]}
