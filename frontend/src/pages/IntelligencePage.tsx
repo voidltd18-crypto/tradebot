@@ -17,7 +17,7 @@ import { API_URL, readJson } from "../lib/api";
 import { clamp } from "../lib/format";
 import type { AnyObj } from "../lib/types";
 
-type IntelligenceSection = "ceo" | "board" | "brain" | "market" | "research" | "symbols" | "rules" | "evolution" | "memory";
+type IntelligenceSection = "ceo" | "board" | "brain" | "market" | "research" | "symbols" | "rules" | "evolution" | "memory" | "scientist";
 
 type EndpointState = {
   data: AnyObj;
@@ -128,6 +128,11 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     memoryKnowledge: EMPTY_ENDPOINT,
     memoryEvents: EMPTY_ENDPOINT,
     memoryConstitution: EMPTY_ENDPOINT,
+    scientistStatus: EMPTY_ENDPOINT,
+    scientistHypotheses: EMPTY_ENDPOINT,
+    scientistExperiments: EMPTY_ENDPOINT,
+    scientistEvents: EMPTY_ENDPOINT,
+    scientistConstitution: EMPTY_ENDPOINT,
   });
 
   const endpoints = useMemo(() => ({
@@ -160,6 +165,11 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     memoryKnowledge: "/v13/memory/knowledge?limit=200",
     memoryEvents: "/v13/memory/events?limit=100",
     memoryConstitution: "/v13/memory/constitution",
+    scientistStatus: "/v14/scientist/status",
+    scientistHypotheses: "/v14/scientist/hypotheses?limit=200",
+    scientistExperiments: "/v14/scientist/experiments?limit=200",
+    scientistEvents: "/v14/scientist/events?limit=100",
+    scientistConstitution: "/v14/scientist/constitution",
   }), []);
 
   const load = useCallback(async () => {
@@ -216,6 +226,15 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const memorySummary = firstObject(memoryStatus.summary);
   const memoryKnowledge = firstArray(memoryKnowledgeData.items, memoryStatus.latestKnowledge);
   const memoryEvents = firstArray(memoryEventsData.items);
+  const scientistStatus = sources.scientistStatus.data;
+  const scientistHypothesesData = sources.scientistHypotheses.data;
+  const scientistExperimentsData = sources.scientistExperiments.data;
+  const scientistEventsData = sources.scientistEvents.data;
+  const scientistConstitution = sources.scientistConstitution.data;
+  const scientistSummary = firstObject(scientistStatus.summary);
+  const scientistHypotheses = firstArray(scientistHypothesesData.items, scientistStatus.topHypotheses);
+  const scientistExperiments = firstArray(scientistExperimentsData.items, scientistStatus.topExperiments);
+  const scientistEvents = firstArray(scientistEventsData.items);
   const operatorCurrent = firstObject(operator.current);
   const operatorProposal = firstObject(operator.lastProposal);
   const operatorChanged = firstObject(operatorProposal.changed);
@@ -430,7 +449,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     </Card>
 
     <nav className="intelligence-tabs">
-      {(["ceo", "board", "brain", "market", "research", "symbols", "rules", "evolution", "memory"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "ceo" ? "AI CEO" : item === "board" ? "AI BOARD" : item === "brain" ? "AI BRAIN" : item === "memory" ? "AI MEMORY" : item.toUpperCase()}</button>)}
+      {(["ceo", "board", "brain", "market", "research", "symbols", "rules", "evolution", "memory", "scientist"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "ceo" ? "AI CEO" : item === "board" ? "AI BOARD" : item === "brain" ? "AI BRAIN" : item === "memory" ? "AI MEMORY" : item === "scientist" ? "AI SCIENTIST" : item.toUpperCase()}</button>)}
     </nav>
 
 
@@ -789,6 +808,43 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <div className="grid two">
         <Card title="Memory activity">{memoryEvents.length ? <div className="journal-list">{memoryEvents.slice(0, 20).map((row, index) => <article key={String(row.id ?? index)}><time>{row.created_at ? new Date(row.created_at).toLocaleString("en-GB") : ""}</time><div><b>{text(row.title, "Memory event")}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <EmptyState endpoint="V13 memory events" error={sources.memoryEvents.error} />}</Card>
         <Card title="Memory Constitution"><div className="constitution-list">{Array.isArray(memoryConstitution.rules) && memoryConstitution.rules.length ? memoryConstitution.rules.map((rule: unknown, index: number) => <div key={index}><span>{index + 1}</span><p>{text(rule)}</p></div>) : <EmptyState endpoint="V13 memory constitution" error={sources.memoryConstitution.error} />}</div></Card>
+      </div>
+    </div>}
+
+
+    {section === "scientist" && <div className="memory-view scientist-view">
+      <Card title="V14 Autonomous AI Scientist">
+        <div className="intelligence-hero-head"><div><span className="eyebrow">AUTOMATIC RESEARCH ORGANISATION</span><h2>{scientistStatus.enabled === false ? "SCIENTIST DISABLED" : "SCIENTIST ACTIVE"}</h2><p>Generates evidence-backed hypotheses from AI Memory and designs controlled shadow experiments. It cannot alter live trading.</p></div><div className="score-ring"><strong>{num(scientistSummary.hypotheses)}</strong><span>active hypotheses</span></div></div>
+        <div className="intelligence-stats four"><StatTile label="Hypotheses" value={num(scientistSummary.hypotheses).toLocaleString("en-GB")} /><StatTile label="Experiments" value={num(scientistSummary.experiments).toLocaleString("en-GB")} /><StatTile label="Shadow ready" value={num(scientistSummary.shadowReady).toLocaleString("en-GB")} /><StatTile label="Board eligible" value={num(scientistSummary.boardEligible).toLocaleString("en-GB")} tone={num(scientistSummary.boardEligible) ? "positive" : ""} /></div>
+        <div className="status-strip"><span>AUTOMATIC HYPOTHESIS GENERATION</span><span>RESEARCH ONLY</span><span>NO MANUAL REVIEW REQUIRED</span></div>
+        <p className="muted">{text(scientistStatus.nextAction, "Collecting evidence for the next research cycle.")}</p>
+      </Card>
+      <Card title="Current Scientific Hypotheses">
+        <DataTable rows={scientistHypotheses} columns={[
+          { key: "title", label: "Hypothesis", render: (row) => <b>{text(row.title)}</b> },
+          { key: "hypothesisType", label: "Type", render: (row) => <span className="pill">{text(row.hypothesisType)}</span> },
+          { key: "subject", label: "Subject" },
+          { key: "statement", label: "Testable statement" },
+          { key: "confidence", label: "Prior confidence", render: (row) => `${num(row.confidence).toFixed(0)}%` },
+          { key: "evidenceCount", label: "Source evidence", render: (row) => num(row.evidenceCount).toLocaleString("en-GB") },
+          { key: "status", label: "Status" },
+        ]} />
+      </Card>
+      <Card title="Experiment Pipeline">
+        <DataTable rows={scientistExperiments} columns={[
+          { key: "name", label: "Experiment", render: (row) => <b>{text(row.name)}</b> },
+          { key: "experimentType", label: "Design", render: (row) => <span className="pill">{text(row.experimentType)}</span> },
+          { key: "status", label: "Status" },
+          { key: "sampleSize", label: "Tagged samples", render: (row) => num(row.sampleSize).toLocaleString("en-GB") },
+          { key: "winRate", label: "Win rate", render: (row) => row.winRate === null || row.winRate === undefined ? "—" : `${num(row.winRate).toFixed(0)}%` },
+          { key: "expectancyPct", label: "Expectancy", render: (row) => row.expectancyPct === null || row.expectancyPct === undefined ? "—" : `${num(row.expectancyPct).toFixed(2)}%` },
+          { key: "evaluationScore", label: "Research score", render: (row) => num(row.evaluationScore).toFixed(2) },
+          { key: "boardEligible", label: "Board", render: (row) => <span className={`pill ${row.boardEligible ? "ok" : "warn"}`}>{row.boardEligible ? "ELIGIBLE" : "NOT YET"}</span> },
+        ]} />
+      </Card>
+      <div className="grid two">
+        <Card title="Scientist activity">{scientistEvents.length ? <div className="journal-list">{scientistEvents.slice(0, 20).map((row, index) => <article key={String(row.id ?? index)}><time>{row.created_at ? new Date(row.created_at).toLocaleString("en-GB") : ""}</time><div><b>{text(row.title, "Scientist event")}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <EmptyState endpoint="V14 scientist events" error={sources.scientistEvents.error} />}</Card>
+        <Card title="Scientist Constitution"><div className="constitution-list">{Array.isArray(scientistConstitution.rules) && scientistConstitution.rules.length ? scientistConstitution.rules.map((rule: unknown, index: number) => <div key={index}><span>{index + 1}</span><p>{text(rule)}</p></div>) : <EmptyState endpoint="V14 scientist constitution" error={sources.scientistConstitution.error} />}</div></Card>
       </div>
     </div>}
 

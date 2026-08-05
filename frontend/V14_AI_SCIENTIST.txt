@@ -1,0 +1,10 @@
+V14 AI SCIENTIST FRONTEND
+
+Adds the AI SCIENTIST tab connected to:
+/v14/scientist/status
+/v14/scientist/hypotheses
+/v14/scientist/experiments
+/v14/scientist/events
+/v14/scientist/constitution
+
+The interface is read-only. Scientist cycles are automatic.
