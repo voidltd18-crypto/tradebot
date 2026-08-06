@@ -3924,8 +3924,20 @@ def money_mode_buy(scans, manual=False):
     if blocked:
         return f"BUY BLOCKED | {reason}"
 
-    if allowed_new_position_count() <= 0:
-        capacity = ai_position_capacity_payload()
+    # V16 portfolio execution sizes orders from the live portfolio plan.
+    # Do not require enough cash for the legacy fixed target notional here: the
+    # planner may intentionally create a smaller, affordable allocation. Only
+    # structural capacity is checked before planning; actual affordability is
+    # re-checked against each allocation immediately before submission.
+    capacity = ai_position_capacity_payload()
+    if AI_PORTFOLIO_MANAGER_ENABLED and V16_PORTFOLIO_EXECUTION_ENABLED:
+        structural_slots = int(capacity.get("structuralAvailableSlots") or 0)
+        if structural_slots <= 0:
+            return (
+                "BUY BLOCKED | AI portfolio capacity reached "
+                f"({capacity.get('effectiveMaxPositions', effective_max_positions())})"
+            )
+    elif allowed_new_position_count() <= 0:
         structural_slots = int(capacity.get("structuralAvailableSlots") or 0)
         affordable_slots = int(capacity.get("affordableNewPositions") or 0)
         if structural_slots <= 0:
@@ -4006,9 +4018,30 @@ def money_mode_buy(scans, manual=False):
             messages.append(f"SKIP {symbol} | portfolio allocation too small {notional:.2f}")
             continue
 
+        # Use the plan's actual allocation for affordability, not the legacy
+        # target-position size. Re-read buying power immediately before each
+        # order so multiple allocations cannot overspend stale cash telemetry.
+        try:
+            live_account = get_account()
+            live_buying_power = max(0.0, float(live_account.buying_power))
+            affordable_now = max(0.0, live_buying_power - float(CASH_BUFFER))
+        except Exception as exc:
+            messages.append(f"SKIP {symbol} | buying power unavailable: {exc}")
+            continue
+        if notional > affordable_now + 0.005:
+            messages.append(
+                f"SKIP {symbol} | allocation ${notional:.2f} exceeds available buying power "
+                f"${affordable_now:.2f}"
+            )
+            print(
+                f"V16 LIVE ORDER BLOCK | symbol={symbol} reason=ALLOCATION_EXCEEDS_BUYING_POWER "
+                f"allocation=${notional:.2f} available=${affordable_now:.2f}"
+            )
+            continue
+
         confidence, label = calculate_confidence(c)
         score = float(allocation.get("portfolioScore") or 0.0)
-        reason = f"{'MANUAL' if manual else 'AUTO'} V16.5.3 PORTFOLIO #{allocation.get('rank', bought + 1)} SCORE BUY"
+        reason = f"{'MANUAL' if manual else 'AUTO'} V16.5.5 PORTFOLIO #{allocation.get('rank', bought + 1)} SCORE BUY"
         try:
             market_buy_notional(symbol, notional, reason=reason, scan=c)
             record_v2_setup_decision(
