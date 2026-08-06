@@ -1,4 +1,0 @@
-V15 AI Operations Centre
-
-New AI OPERATIONS tab connected to automatic V15 health endpoints.
-No manual review button. Monitoring-only.

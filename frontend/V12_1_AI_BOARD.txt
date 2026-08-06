@@ -1,8 +1,0 @@
-TRADEBOT V12.1 AI BOARD OF DIRECTORS
-
-Automatic endpoints:
-GET /v12/board/status
-GET /v12/board/history
-GET /v12/board/constitution
-
-No manual review button. The board is advisory-only and cannot place orders or bypass the autonomous operator.
