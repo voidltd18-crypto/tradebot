@@ -1,13 +1,1 @@
-TradeBot v1.0-production-stable — all known issues fixed
-
-Includes:
-- same-day buy/sell allowed
-- sold ticker locked until next trading day
-- partial/fractional buy sizing unchanged
-- pinned manual universe picks survive refresh and are tradable
-- search preview endpoints restored
-- reports endpoint restored
-- reset PnL baseline restored
-- GBP-first UI
-- 15-minute refresh and no temporary £0 overwrite
-- /version endpoint
+v15.16-ai-trade-explanations

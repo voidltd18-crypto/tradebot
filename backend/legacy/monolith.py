@@ -354,6 +354,26 @@ BACKFILL_MAX_PAGES = 50
 
 TRADE_HISTORY_FILE = "trade_history.json"
 STOCK_MEMORY_FILE = "stock_memory.json"
+TRADE_EXPLANATIONS_FILE = persistent_file("trade_explanations.json")
+trade_explanations: Dict[str, Dict[str, Any]] = {}
+
+
+def _load_trade_explanations() -> None:
+    global trade_explanations
+    raw = safe_load_json(TRADE_EXPLANATIONS_FILE, {})
+    trade_explanations = raw if isinstance(raw, dict) else {}
+
+
+def _save_trade_explanations() -> None:
+    try:
+        os.makedirs(os.path.dirname(TRADE_EXPLANATIONS_FILE), exist_ok=True)
+        temp_path = TRADE_EXPLANATIONS_FILE + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(trade_explanations, handle, indent=2, default=str)
+        os.replace(temp_path, TRADE_EXPLANATIONS_FILE)
+    except Exception as exc:
+        print(f"TRADE EXPLANATION SAVE ERROR: {exc}")
+
 
 
 
@@ -549,6 +569,7 @@ def safe_save_json(path: str, data):
 
 def load_persistent_state():
     global trade_history, stock_memory, temp_blacklist
+    _load_trade_explanations()
     trade_history = safe_load_json(TRADE_HISTORY_FILE, [])
     stock_memory = safe_load_json(STOCK_MEMORY_FILE, {})
     temp_blacklist = safe_load_json(TEMP_BLACKLIST_FILE, {})
@@ -942,6 +963,7 @@ def get_all_positions():
                 "fastStopLossPct": FAST_STOP_LOSS_PCT,
                 "stallExitAfterMinutes": STALL_EXIT_AFTER_MINUTES,
             })
+            positions[-1]["tradeExplanation"] = trade_explanation_for_position(positions[-1])
         except Exception:
             continue
 
@@ -1431,9 +1453,134 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
     return False
 
 
+def _trade_allocation_explanation(symbol: str, final_notional: float, reason: str, scan: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    scan = scan or {}
+    confidence, confidence_label = calculate_confidence(scan)
+    quality = float(scan.get("quality_score") or scan.get("qualityScore") or 0.0)
+    spread = float(scan.get("spread") or 0.0)
+    target_pct = float(globals().get("TARGET_POSITION_VALUE_PCT", 0.10) or 0.10)
+    max_pct = float(globals().get("MAX_POSITION_VALUE_PCT", target_pct) or target_pct)
+    confidence_multiplier = (
+        float(HIGH_CONFIDENCE_SIZE_MULTIPLIER) if confidence_label == "HIGH"
+        else float(MEDIUM_CONFIDENCE_SIZE_MULTIPLIER) if confidence_label == "MEDIUM"
+        else float(LOW_CONFIDENCE_SIZE_MULTIPLIER)
+    ) if CONFIDENCE_SIZING_ENABLED else 1.0
+    risk_profile = _ai_risk_build_profile(scan) if AI_RISK_ENGINE_ENABLED else {"positionMultiplier": 1.0, "rationale": "AI risk sizing disabled."}
+    risk_multiplier = float(risk_profile.get("positionMultiplier") or 1.0)
+
+    equity = buying_power = sizing_equity = 0.0
+    try:
+        account = get_account()
+        equity = float(account.equity)
+        buying_power = float(account.buying_power)
+        sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
+    except Exception:
+        pass
+
+    target_usd = sizing_equity * target_pct
+    normal_max_usd = sizing_equity * max_pct
+    confidence_cap_usd = sizing_equity * float(MAX_CONFIDENCE_POSITION_VALUE_PCT)
+    constitutional_pct = float(V10_CONSTITUTION.get("positionValuePct", {}).get("max", max_pct)) if "V10_CONSTITUTION" in globals() else max_pct
+    constitutional_cap_usd = sizing_equity * constitutional_pct
+    usable_cash_usd = max(0.0, buying_power - float(CASH_BUFFER))
+    allocation_pct = (float(final_notional) / sizing_equity * 100.0) if sizing_equity > 0 else 0.0
+
+    limiting_factors = []
+    candidates = {
+        "AI target allocation": target_usd,
+        "normal position cap": normal_max_usd,
+        "confidence cap": confidence_cap_usd,
+        "constitutional safety cap": constitutional_cap_usd,
+        "available buying power": usable_cash_usd,
+    }
+    if candidates:
+        closest = min(candidates.items(), key=lambda item: abs(float(item[1]) - float(final_notional)))
+        limiting_factors.append(f"Closest active limit: {closest[0]} (${closest[1]:.2f}).")
+    if confidence_multiplier != 1.0:
+        limiting_factors.append(f"{confidence_label.title()} confidence applied a {confidence_multiplier:.2f}x sizing multiplier.")
+    if risk_multiplier != 1.0:
+        limiting_factors.append(f"AI Risk Engine applied a {risk_multiplier:.2f}x portfolio-risk multiplier.")
+    if usable_cash_usd > final_notional + 1.0:
+        limiting_factors.append(f"${usable_cash_usd-final_notional:.2f} remained available for other qualified opportunities.")
+
+    approvals = []
+    if bool(scan.get("sniper_pass") or scan.get("sniperPass")): approvals.append("Sniper Gate")
+    if bool(scan.get("a_plus_pass") or scan.get("aPlusPass")): approvals.append("A+ Quality Gate")
+    if AI_RISK_ENGINE_ENABLED: approvals.append("AI Risk Engine")
+    approvals.extend(["Portfolio Capacity", "Cash & Order Safety"])
+
+    return {
+        "symbol": str(symbol).upper(),
+        "createdAt": datetime.now(UTC).isoformat(),
+        "orderReason": reason,
+        "finalNotionalUsd": round(float(final_notional), 2),
+        "finalNotionalGbp": round(money_gbp(float(final_notional)), 2),
+        "allocationPctOfManagedCapital": round(allocation_pct, 2),
+        "managedCapitalUsd": round(sizing_equity, 2),
+        "accountEquityUsd": round(equity, 2),
+        "buyingPowerBeforeUsd": round(buying_power, 2),
+        "cashReservedAfterUsd": round(max(0.0, usable_cash_usd-final_notional), 2),
+        "targetAllocationPct": round(target_pct*100.0, 2),
+        "targetAllocationUsd": round(target_usd, 2),
+        "maxPositionPct": round(max_pct*100.0, 2),
+        "confidence": round(float(confidence), 4),
+        "confidenceLabel": confidence_label,
+        "confidenceMultiplier": round(confidence_multiplier, 3),
+        "qualityScore": round(quality, 6),
+        "spread": round(spread, 6),
+        "riskMultiplier": round(risk_multiplier, 3),
+        "riskRationale": risk_profile.get("rationale") or "Current promoted risk policy.",
+        "constitutionalCapUsd": round(constitutional_cap_usd, 2),
+        "approvals": approvals,
+        "sizingReasons": limiting_factors,
+        "summary": f"Allocated ${float(final_notional):.2f} ({allocation_pct:.1f}% of managed capital) to {str(symbol).upper()} while preserving ${max(0.0, usable_cash_usd-final_notional):.2f} for other qualified trades.",
+    }
+
+
+def _remember_trade_explanation(explanation: Dict[str, Any]) -> None:
+    symbol = str(explanation.get("symbol") or "").upper()
+    if not symbol:
+        return
+    trade_explanations[symbol] = explanation
+    # Keep the persisted JSON deliberately small and independent from SQLite.
+    if len(trade_explanations) > 100:
+        ordered = sorted(trade_explanations.items(), key=lambda item: str(item[1].get("createdAt") or ""), reverse=True)[:100]
+        trade_explanations.clear(); trade_explanations.update(dict(ordered))
+    _save_trade_explanations()
+
+
+def trade_explanation_for_position(position: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(position.get("symbol") or "").upper()
+    saved = trade_explanations.get(symbol)
+    if saved:
+        return saved
+    # Existing positions opened before this release receive an honest reconstructed explanation.
+    market_value = float(position.get("marketValue") or 0.0)
+    try:
+        account = get_account(); equity = float(account.equity)
+        sizing_equity = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
+    except Exception:
+        sizing_equity = 0.0
+    allocation_pct = market_value / sizing_equity * 100.0 if sizing_equity > 0 else 0.0
+    return {
+        "symbol": symbol,
+        "reconstructed": True,
+        "finalNotionalUsd": round(market_value, 2),
+        "finalNotionalGbp": round(money_gbp(market_value), 2),
+        "allocationPctOfManagedCapital": round(allocation_pct, 2),
+        "summary": f"This position predates detailed explanation tracking. Its current value is ${market_value:.2f}, about {allocation_pct:.1f}% of managed capital.",
+        "sizingReasons": ["Exact confidence and risk multipliers were not persisted when this order was submitted."],
+        "approvals": [],
+    }
+
+
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", scan: Optional[Dict[str, Any]] = None):
+    explanation = _trade_allocation_explanation(symbol, notional_amount, reason, scan)
     order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
-    trading_client.submit_order(order)
+    submitted_order = trading_client.submit_order(order)
+    explanation["orderId"] = str(getattr(submitted_order, "id", "") or "")
+    _remember_trade_explanation(explanation)
+    print(f"AI TRADE EXPLANATION {symbol} | {explanation['summary']}")
     if AI_RISK_ENGINE_ENABLED and scan:
         try:
             _ai_risk_save_profile(_ai_risk_build_profile(scan), float(scan.get("price") or 0.0))
@@ -5885,6 +6032,15 @@ def api_ai_position_capacity(request: Request):
     verify_api_key(request)
     payload = ai_position_capacity_payload()
     return {"ok": True, **payload}
+
+@app.get("/trade-explanations")
+def api_trade_explanations(request: Request, symbol: str = ""):
+    verify_api_key(request)
+    if symbol:
+        key = str(symbol).upper().strip()
+        return {"ok": True, "symbol": key, "explanation": trade_explanations.get(key)}
+    return {"ok": True, "count": len(trade_explanations), "explanations": sorted(trade_explanations.values(), key=lambda row: str(row.get("createdAt") or ""), reverse=True)}
+
 
 
 @app.post("/position-settings")
