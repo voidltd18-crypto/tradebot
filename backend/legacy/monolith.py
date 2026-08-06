@@ -3157,22 +3157,88 @@ def manage_money_mode_positions():
                 continue
 
 
-def _v16_portfolio_score(scan: Dict[str, Any]) -> float:
+def _v16_clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, float(value)))
+
+
+def _v16_factor_breakdown(scan: Dict[str, Any]) -> Dict[str, Any]:
+    """Transparent six-factor score using scanner data with conservative fallbacks."""
     confidence, _ = calculate_confidence(scan)
-    quality = max(0.0, float(scan.get("quality_score") or scan.get("qualityScore") or 0.0))
-    quality_norm = min(1.0, quality / max(0.0001, float(A_PLUS_MIN_QUALITY or 0.026)))
+    confidence = _v16_clamp(confidence)
+
+    momentum_raw = float(scan.get("short_momentum") or scan.get("shortMomentum") or 0.0)
+    momentum = _v16_clamp(0.5 + momentum_raw * 12.0)
+
+    quality_raw = max(0.0, float(scan.get("quality_score") or scan.get("qualityScore") or 0.0))
+    quality = _v16_clamp(quality_raw / max(0.0001, float(A_PLUS_MIN_QUALITY or 0.026)))
+
     spread = max(0.0, float(scan.get("spread") or 0.0))
-    spread_score = max(0.0, 1.0 - min(1.0, spread / max(0.0001, float(MAX_SPREAD))))
-    momentum = float(scan.get("short_momentum") or scan.get("shortMomentum") or 0.0)
-    momentum_score = max(0.0, min(1.0, 0.5 + momentum * 12.0))
+    spread_quality = _v16_clamp(1.0 - spread / max(0.0001, float(MAX_SPREAD)))
+    relative_volume = float(scan.get("relative_volume") or scan.get("relativeVolume") or scan.get("rvol") or 0.0)
+    volume_quality = _v16_clamp(relative_volume / 2.0) if relative_volume > 0 else confidence
+    liquidity = _v16_clamp((spread_quality * 0.72) + (volume_quality * 0.28))
+
+    atr_pct = abs(float(scan.get("atr_pct") or scan.get("atrPct") or 0.0))
+    if atr_pct > 0:
+        volatility_quality = _v16_clamp(1.0 - abs(atr_pct - 2.2) / 5.0)
+    else:
+        volatility_quality = _v16_clamp((spread_quality * 0.65) + (quality * 0.35))
+
+    relative_strength_raw = float(scan.get("sector_strength") or scan.get("sectorStrength") or scan.get("relative_strength") or scan.get("relativeStrength") or 0.0)
+    if relative_strength_raw:
+        relative_strength = _v16_clamp(0.5 + relative_strength_raw / 10.0)
+    else:
+        relative_strength = _v16_clamp((confidence * 0.55) + (momentum * 0.45))
+
     history = scan.get("optimiserDecision") or {}
     history_mult = max(0.65, min(1.25, float(history.get("multiplier") or 1.0)))
-    risk_profile = _ai_risk_build_profile(scan) if AI_RISK_ENGINE_ENABLED else {"positionMultiplier": 1.0, "rationale": "AI risk engine disabled"}
-    risk_mult = max(0.50, min(1.30, float(risk_profile.get("positionMultiplier") or 1.0)))
-    raw = (confidence * 0.52) + (quality_norm * 0.23) + (spread_score * 0.10) + (momentum_score * 0.08) + ((history_mult / 1.25) * 0.07)
-    score = max(0.0, min(1.0, raw * (0.82 + 0.18 * risk_mult)))
-    return round(score, 6)
+    historical_edge = _v16_clamp((history_mult - 0.65) / 0.60)
 
+    regime_text = str(scan.get("market_regime") or scan.get("marketRegime") or "").upper()
+    gap_pct = float(scan.get("gap_pct") or scan.get("gapPct") or 0.0)
+    regime_fit = 0.55
+    if "BULL" in regime_text or "RISK_ON" in regime_text:
+        regime_fit = 0.72 if momentum_raw >= 0 else 0.42
+    elif "BEAR" in regime_text or "RISK_OFF" in regime_text:
+        regime_fit = 0.62 if momentum_raw <= 0 else 0.38
+    elif "RANGE" in regime_text or "CHOP" in regime_text:
+        regime_fit = 0.62 if abs(gap_pct) < 2.0 else 0.42
+    regime_fit = _v16_clamp(regime_fit)
+
+    weights = {
+        "momentum": 0.25,
+        "relativeStrength": 0.18,
+        "liquidity": 0.15,
+        "volatilityQuality": 0.12,
+        "historicalEdge": 0.18,
+        "regimeFit": 0.12,
+    }
+    values = {
+        "momentum": momentum,
+        "relativeStrength": relative_strength,
+        "liquidity": liquidity,
+        "volatilityQuality": volatility_quality,
+        "historicalEdge": historical_edge,
+        "regimeFit": regime_fit,
+    }
+    weighted = {key: round(values[key] * weights[key], 6) for key in weights}
+    base = sum(weighted.values())
+    # Confidence and setup quality remain bounded validation signals rather than dominating the score.
+    validation = (confidence * 0.60) + (quality * 0.40)
+    final = _v16_clamp((base * 0.78) + (validation * 0.22))
+    return {
+        "version": "V16.4",
+        "values": {key: round(value, 6) for key, value in values.items()},
+        "weights": weights,
+        "weighted": weighted,
+        "validation": round(validation, 6),
+        "final": round(final, 6),
+        "regime": regime_text or "UNKNOWN",
+    }
+
+
+def _v16_portfolio_score(scan: Dict[str, Any]) -> float:
+    return float(_v16_factor_breakdown(scan).get("final") or 0.0)
 
 def _v16_calibrated_score_profiles(picks: List[Dict[str, Any]]) -> List[Dict[str, float]]:
     """Blend absolute setup strength with bounded current-batch separation."""
@@ -3318,6 +3384,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 
         quality = round(float(scan.get("quality_score") or 0.0), 6)
         spread = round(float(scan.get("spread") or 0.0), 6)
+        factors = _v16_factor_breakdown(scan)
 
         try:
             allowed, block = can_buy_symbol(symbol)
@@ -3338,9 +3405,12 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 "scoreZ": round(float(profile.get("zScore") or 0.0), 4),
                 "minimumScore": effective_minimum_score,
                 "confidence": round(confidence, 4),
+            "factors": factors,
                 "confidenceLabel": label,
                 "quality": quality,
                 "spread": spread,
+            "factors": factors,
+                "factors": factors,
                 "deployableNow": False,
             })
             print(
@@ -3367,6 +3437,8 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 "confidenceLabel": label,
                 "quality": quality,
                 "spread": spread,
+            "factors": factors,
+                "factors": factors,
                 "deployableNow": False,
             })
             print(
@@ -3386,6 +3458,8 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             "confidenceLabel": label,
             "quality": quality,
             "spread": spread,
+            "factors": factors,
+                "factors": factors,
             "riskProfile": _ai_risk_build_profile(scan) if AI_RISK_ENGINE_ENABLED else {},
         }
         ranked.append(item)
@@ -3401,6 +3475,8 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             "confidenceLabel": label,
             "quality": quality,
             "spread": spread,
+            "factors": factors,
+                "factors": factors,
             "deployableNow": False,
         })
         print(

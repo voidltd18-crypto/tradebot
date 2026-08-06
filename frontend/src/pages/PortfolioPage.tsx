@@ -16,6 +16,23 @@ function decisionClass(value: string) {
   return "loss";
 }
 
+function factorSummary(row: AnyObj) {
+  const values = row?.factors?.values || {};
+  const parts = [
+    ["MOM", values.momentum],
+    ["RS", values.relativeStrength],
+    ["LIQ", values.liquidity],
+    ["VOL", values.volatilityQuality],
+    ["HIST", values.historicalEdge],
+    ["REG", values.regimeFit],
+  ];
+  return <div style={{ minWidth: 250, lineHeight: 1.55 }}>
+    {parts.map(([label, value]) => <span key={String(label)} style={{ display: "inline-block", marginRight: 10, whiteSpace: "nowrap" }}>
+      <b>{label}</b> {Number(value || 0).toFixed(2)}
+    </span>)}
+  </div>;
+}
+
 export function PortfolioPage({ authToken }: { authToken: string }) {
   const [plan, setPlan] = useState<AnyObj>({});
   const [loading, setLoading] = useState(true);
@@ -89,8 +106,8 @@ export function PortfolioPage({ authToken }: { authToken: string }) {
           <button key={value} onClick={() => setFilter(value)} disabled={filter === value}>{value}</button>
         )}
       </div>
-      <p className="muted">Every live scanner candidate is shown here with the exact reason it qualified, was held back, or was rejected.</p>
-      <div className="table-wrap"><table><thead><tr><th>Rank</th><th>Symbol</th><th>Decision</th><th>Calibrated</th><th>Raw</th><th>Minimum</th><th>Confidence</th><th>Quality</th><th>Spread</th><th>Exact reason</th></tr></thead>
+      <p className="muted">Every candidate now shows its six-factor V16.4 score: momentum, relative strength, liquidity, volatility quality, historical edge and market-regime fit.</p>
+      <div className="table-wrap"><table><thead><tr><th>Rank</th><th>Symbol</th><th>Decision</th><th>Calibrated</th><th>Raw</th><th>Minimum</th><th>Confidence</th><th>Quality</th><th>Spread</th><th>Factor breakdown</th><th>Exact reason</th></tr></thead>
       <tbody>{filteredDecisions.map((row: AnyObj, index: number) => <tr key={`${row.symbol}-${row.scanIndex}-${index}`}>
         <td>{row.rank ? `#${row.rank}` : "—"}</td>
         <td><b>{row.symbol || "UNKNOWN"}</b></td>
@@ -101,8 +118,9 @@ export function PortfolioPage({ authToken }: { authToken: string }) {
         <td>{pct(Number(row.confidence || 0) * 100)}</td>
         <td>{Number(row.quality || 0).toFixed(4)}</td>
         <td>{Number(row.spread || 0).toFixed(5)}</td>
+        <td>{factorSummary(row)}</td>
         <td>{row.reason || row.reasonCode || "No reason supplied"}</td>
-      </tr>)}{!filteredDecisions.length && <tr><td colSpan={10}>{loading ? "Loading scanner decisions..." : "No scanner decisions are available yet."}</td></tr>}</tbody></table></div>
+      </tr>)}{!filteredDecisions.length && <tr><td colSpan={11}>{loading ? "Loading scanner decisions..." : "No scanner decisions are available yet."}</td></tr>}</tbody></table></div>
     </Card>
   </main>;
 }

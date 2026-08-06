@@ -1,13 +1,12 @@
-TradeBot V16.3 — Adaptive Scoring Calibration
+TradeBot V16.4 Multi-Factor Portfolio Intelligence
 
-This update keeps the absolute score dominant, adds bounded batch calibration, and permits a small adaptive threshold only when the market produces too few candidates. The threshold cannot fall below 0.520 by default. Existing PDT, buy lockouts, position limits, cash reserves, holdings checks and order limits remain active.
+Deploy both parts:
+1. Render: replace backend/legacy/monolith.py
+2. Vercel: replace frontend/src/pages/PortfolioPage.tsx
 
-Deploy:
-- Render: backend/legacy/monolith.py
-- Vercel: frontend/src/pages/PortfolioPage.tsx
-
-Optional Render environment variables:
-AI_PORTFOLIO_ADAPTIVE_SCORE_ENABLED=true
-AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR=0.52
-AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT=2
-AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT=0.22
+Changes:
+- Six-factor transparent scoring
+- Momentum, relative strength, liquidity, volatility quality, historical edge, regime fit
+- Existing calibrated batch ranking retained
+- Decision Inspector displays every factor
+- No PDT, lockout, cash, position or order safeguards bypassed
