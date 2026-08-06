@@ -1,23 +1,8 @@
-TradeBot V16.7 Adaptive AI Exit + Portfolio Rotation
+TradeBot V16.7.1 Autonomous Reliability Fix
 
-Replace:
-  backend/legacy/monolith.py
+Fixes:
+1. V10 autonomous operator crash: defines profit factor and total realised P&L before proposal logic.
+2. V14 Scientist SQLite lock: closes the experiment write transaction before writing its event.
 
-New behaviour:
-- Keep score >= 0.65: HOLD
-- 0.55-0.65: rotation WATCH only when a quality-approved replacement is >= 0.15 stronger (3 confirmations)
-- 0.45-0.55: EXIT after 2 weak scans
-- 0.35-0.45: EXIT after 1 weak scan
-- below 0.35: immediate AI thesis exit, subject to same-day/minimum-hold/PDT protections
-- replacement must score >= 0.60 and pass the V16 quality guard
-- maximum one AI exit per cycle
-- normal buy engine runs after an exit and can deploy into the best qualified replacement
-- exit evidence is persisted and reviewed at 24h, 72h and 120h
-
-Endpoints:
-  GET /v16/exits/status
-  GET /v16/exits/reviews
-
-Rollback:
-  AI_PORTFOLIO_EXIT_ENABLED=false
-  AI_PORTFOLIO_ROTATION_ENABLED=false
+Includes all V16.7 adaptive exit and rotation features.
+Replace backend/legacy/monolith.py and redeploy Render.

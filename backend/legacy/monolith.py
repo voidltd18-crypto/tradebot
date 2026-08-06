@@ -14764,6 +14764,11 @@ def _v10_operator_propose(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     # Position sizing and trading cap: only scale up after positive realised evidence; scale down sooner.
     win_rate = float(analytics.get("winRate") or 0.0)
     closed_count = int(analytics.get("closedTrades") or 0)
+    # V16.7.1 reliability: these metrics were referenced below without being
+    # initialised, causing the autonomous operator cycle to fail with
+    # `name pf is not defined`. Accept both legacy and current payload keys.
+    pf = float(analytics.get("profitFactor") or analytics.get("profit_factor") or 0.0)
+    total_pnl = float(analytics.get("totalPnl") or analytics.get("total_pnl") or analytics.get("realisedPnl") or 0.0)
     cap_bounds = V10_CONSTITUTION["tradingCapUsd"]
     size_bounds = V10_CONSTITUTION["positionValuePct"]
     if closed_count >= 20 and pf >= 1.30 and win_rate >= 0.55 and total_pnl > 0:
@@ -16363,7 +16368,13 @@ def _v14_upsert_experiment(hypothesis: Dict[str, Any]) -> bool:
 
 
 def _v14_import_research_validations() -> int:
-    """Record existing V7 research brains as observational validations, without pretending they are V14 A/B tests."""
+    """Record V7 research brains as observational validations.
+
+    V16.7.1 reliability: commit and close the experiment transaction before
+    writing the associated event. The previous code called _v14_event while
+    its first write connection was still open, which could deadlock against
+    SQLite's single-writer rule and produce `database is locked`.
+    """
     if not SQLITE_ENABLED:
         return 0
     created = 0
@@ -16383,24 +16394,36 @@ def _v14_import_research_validations() -> int:
             key = _v14_fp("OBSERVATIONAL", name)
             status = "VALIDATED_RESEARCH" if expectancy > 0 and samples >= V14_MIN_RESEARCH_SAMPLES else "OBSERVED"
             board_eligible = 1 if status == "VALIDATED_RESEARCH" and samples >= 200 and expectancy > 0.25 else 0
-            now = _v14_now(); conn = db_connect(); existing = conn.execute("SELECT id FROM v14_experiments WHERE experiment_key=?", (key,)).fetchone()
-            evidence = {"source": "V7_RESEARCH_LAB", "brain": name, "researchScore": score,
-                        "note": "Existing research-lab evidence; not a V14 causal A/B experiment."}
-            if existing:
-                conn.execute("""UPDATE v14_experiments SET status=?,evidence_json=?,sample_size=?,win_rate=?,expectancy_pct=?,
-                    evaluation_score=?,board_eligible=?,updated_at=? WHERE experiment_key=?""",
-                    (status, json.dumps(evidence), samples, win_rate, expectancy, score, board_eligible, now, key))
-            else:
-                conn.execute("""INSERT INTO v14_experiments(experiment_key,hypothesis_fingerprint,name,experiment_type,status,
-                    baseline_json,variant_json,evidence_json,sample_size,win_rate,expectancy_pct,evaluation_score,board_eligible,created_at,updated_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (key, "", f"Research validation — {name}", "OBSERVATIONAL_RESEARCH", status, "{}", json.dumps({"brain": name}),
-                     json.dumps(evidence), samples, win_rate, expectancy, score, board_eligible, now, now))
+            now = _v14_now()
+            was_created = False
+            conn = None
+            try:
+                conn = db_connect()
+                existing = conn.execute("SELECT id FROM v14_experiments WHERE experiment_key=?", (key,)).fetchone()
+                evidence = {"source": "V7_RESEARCH_LAB", "brain": name, "researchScore": score,
+                            "note": "Existing research-lab evidence; not a V14 causal A/B experiment."}
+                if existing:
+                    conn.execute("""UPDATE v14_experiments SET status=?,evidence_json=?,sample_size=?,win_rate=?,expectancy_pct=?,
+                        evaluation_score=?,board_eligible=?,updated_at=? WHERE experiment_key=?""",
+                        (status, json.dumps(evidence), samples, win_rate, expectancy, score, board_eligible, now, key))
+                else:
+                    conn.execute("""INSERT INTO v14_experiments(experiment_key,hypothesis_fingerprint,name,experiment_type,status,
+                        baseline_json,variant_json,evidence_json,sample_size,win_rate,expectancy_pct,evaluation_score,board_eligible,created_at,updated_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (key, "", f"Research validation — {name}", "OBSERVATIONAL_RESEARCH", status, "{}", json.dumps({"brain": name}),
+                         json.dumps(evidence), samples, win_rate, expectancy, score, board_eligible, now, now))
+                    was_created = True
+                conn.commit()
+            finally:
+                if conn is not None:
+                    conn.close()
+            if was_created:
                 created += 1
+                # Event write happens only after the experiment transaction has
+                # released the process-wide writer lock.
                 _v14_event("RESEARCH_VALIDATION_IMPORTED", f"Research evidence imported: {name}",
                            f"{samples:,} samples, {win_rate:.1f}% win rate and {expectancy:.2f}% expectancy.", key,
                            {"status": status, "boardEligible": bool(board_eligible)})
-            conn.commit(); conn.close()
     except Exception as exc:
         print(f"V14 SCIENTIST RESEARCH IMPORT ERROR: {exc}")
     return created
