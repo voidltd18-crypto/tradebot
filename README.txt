@@ -1,19 +1,14 @@
-TradeBot V16.5.1 — Real Market Factor Source Fix
+TradeBot V16.5.2 — Portfolio Live Execution
 
-Replace on Render:
+Replace:
   backend/legacy/monolith.py
 
-Fixes:
-- Qualified rows now return rawPortfolioScore correctly.
-- Momentum uses cached Alpaca 1-minute bars while the live curve warms up after restart.
-- Relative-strength value 0.00 is no longer incorrectly replaced by neutral 0.50.
-- Saved plans from older scoring engines are automatically rebuilt.
-- Factor payload reports marketDataSource and historicalSource for verification.
-- Duplicate factor fields removed from decision payloads.
+What changed:
+- V16 portfolio score is now the live entry gate when AI Portfolio Manager is enabled.
+- The old Sniper/A+ confidence and quality gates remain visible as supporting evidence but no longer veto V16-qualified candidates.
+- Full safeguards remain: market open, emergency stop, bot enabled, PDT daily buy limit, position capacity, buying power, existing holdings, open orders, daily symbol locks, minimum order size, and hard spread limit.
+- Set V16_PORTFOLIO_EXECUTION_ENABLED=false to return to legacy Sniper/A+ execution.
+- Set V16_PORTFOLIO_REQUIRE_READY_TRIGGER=true to additionally require the old dip trigger.
 
-Verification after deploy:
-- /v16/portfolio/status should contain:
-  scoringEngineVersion: V16.5.1-REAL-MARKET-FACTORS
-- decisions[*].rawPortfolioScore should differ from portfolioScore when calibration applies.
-- decisions[*].factors.marketDataSource should normally be ALPACA_1MIN_BARS immediately after restart, then LIVE_CURVE after enough scan cycles.
-- Relative strength should span the batch rather than remaining near 0.50 for every symbol.
+Expected Render log after an order:
+  AUTO V16.5 PORTFOLIO #1 SCORE BUY $... SYMBOL score=...

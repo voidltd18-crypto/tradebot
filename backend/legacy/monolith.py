@@ -105,7 +105,12 @@ AI_POSITION_CAPACITY_ENABLED = os.getenv("AI_POSITION_CAPACITY_ENABLED", "true")
 AI_POSITION_HARD_CAP = max(1, min(10, int(os.getenv("AI_POSITION_HARD_CAP", "10") or 10)))
 AI_POSITION_MIN_NOTIONAL_USD = max(10.0, float(os.getenv("AI_POSITION_MIN_NOTIONAL_USD", "25") or 25))
 AI_PORTFOLIO_MANAGER_ENABLED = os.getenv("AI_PORTFOLIO_MANAGER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-AI_PORTFOLIO_MANAGER_VERSION = "V16.0"
+# V16.5.2 — the live order engine can execute candidates approved by the
+# portfolio score. Legacy Sniper/A+ scores remain visible as supporting
+# evidence, but no longer silently veto a V16-qualified portfolio candidate.
+V16_PORTFOLIO_EXECUTION_ENABLED = os.getenv("V16_PORTFOLIO_EXECUTION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+V16_PORTFOLIO_REQUIRE_READY_TRIGGER = os.getenv("V16_PORTFOLIO_REQUIRE_READY_TRIGGER", "false").lower() in ("1", "true", "yes", "on")
+AI_PORTFOLIO_MANAGER_VERSION = "V16.5.2-LIVE-EXECUTION"
 AI_PORTFOLIO_MAX_SINGLE_WEIGHT = max(0.10, min(0.60, float(os.getenv("AI_PORTFOLIO_MAX_SINGLE_WEIGHT", "0.45") or 0.45)))
 AI_PORTFOLIO_MIN_CASH_RESERVE_PCT = max(0.02, min(0.50, float(os.getenv("AI_PORTFOLIO_MIN_CASH_RESERVE_PCT", "0.08") or 0.08)))
 AI_PORTFOLIO_MAX_CASH_RESERVE_PCT = max(AI_PORTFOLIO_MIN_CASH_RESERVE_PCT, min(0.80, float(os.getenv("AI_PORTFOLIO_MAX_CASH_RESERVE_PCT", "0.45") or 0.45)))
@@ -134,6 +139,9 @@ FULL_BUY_CASH_BUFFER = float(os.getenv("FULL_BUY_CASH_BUFFER", "2.00") or 2.00)
 
 MAX_SPREAD = 0.015
 PREFER_SPREAD_UNDER = 0.006
+# Hard execution safety. Portfolio scoring may reward liquidity, but a live
+# order is never sent through an excessively wide quote.
+V16_PORTFOLIO_HARD_MAX_SPREAD = max(0.0001, min(MAX_SPREAD, float(os.getenv("V16_PORTFOLIO_HARD_MAX_SPREAD", str(MAX_SPREAD)) or MAX_SPREAD)))
 
 BUY_DIP = 0.9985
 MIN_PULLBACK = 0.0010
@@ -3552,6 +3560,45 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             )
             continue
 
+        price = float(scan.get("price") or 0.0)
+        if price <= 0:
+            decisions.append({
+                "scanIndex": scan_index + 1, "symbol": symbol, "decision": "REJECTED",
+                "reasonCode": "INVALID_PRICE", "reason": "Live price is unavailable or invalid.",
+                "portfolioScore": score, "rawPortfolioScore": raw_score,
+                "minimumScore": effective_minimum_score, "confidence": round(confidence, 4),
+                "confidenceLabel": label, "quality": quality, "spread": spread,
+                "factors": factors, "deployableNow": False,
+            })
+            print(f"V16 DECISION | symbol={symbol} decision=REJECTED reason=INVALID_PRICE price={price}")
+            continue
+
+        if spread > V16_PORTFOLIO_HARD_MAX_SPREAD:
+            decisions.append({
+                "scanIndex": scan_index + 1, "symbol": symbol, "decision": "REJECTED",
+                "reasonCode": "HARD_SPREAD_LIMIT",
+                "reason": f"Spread {spread:.5f} exceeds the live-order safety maximum {V16_PORTFOLIO_HARD_MAX_SPREAD:.5f}.",
+                "portfolioScore": score, "rawPortfolioScore": raw_score,
+                "minimumScore": effective_minimum_score, "confidence": round(confidence, 4),
+                "confidenceLabel": label, "quality": quality, "spread": spread,
+                "factors": factors, "deployableNow": False,
+            })
+            print(f"V16 DECISION | symbol={symbol} decision=REJECTED reason=HARD_SPREAD_LIMIT spread={spread:.5f}")
+            continue
+
+        if V16_PORTFOLIO_REQUIRE_READY_TRIGGER and not bool(scan.get("ready_to_buy")) and not manual:
+            decisions.append({
+                "scanIndex": scan_index + 1, "symbol": symbol, "decision": "QUALIFIED_WAITING",
+                "reasonCode": "WAITING_FOR_ENTRY_TRIGGER",
+                "reason": "Portfolio score qualified, but the optional legacy entry trigger is not ready.",
+                "portfolioScore": score, "rawPortfolioScore": raw_score,
+                "minimumScore": effective_minimum_score, "confidence": round(confidence, 4),
+                "confidenceLabel": label, "quality": quality, "spread": spread,
+                "factors": factors, "deployableNow": False,
+            })
+            print(f"V16 DECISION | symbol={symbol} decision=WAITING reason=WAITING_FOR_ENTRY_TRIGGER score={score:.3f}")
+            continue
+
         if score < effective_minimum_score and not manual:
             reason = f"Calibrated portfolio score {score:.3f} (raw {raw_score:.3f}) is below the minimum {effective_minimum_score:.3f}."
             decisions.append({
@@ -3716,6 +3763,10 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         "adaptiveScoreFloor": AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR,
         "thresholdMode": threshold_mode,
         "scoringMode": "ABSOLUTE_PLUS_BATCH_CALIBRATION",
+        "executionMode": "V16_PORTFOLIO_SCORE" if V16_PORTFOLIO_EXECUTION_ENABLED else "LEGACY_SNIPER_A_PLUS",
+        "portfolioExecutionEnabled": V16_PORTFOLIO_EXECUTION_ENABLED,
+        "requireReadyTrigger": V16_PORTFOLIO_REQUIRE_READY_TRIGGER,
+        "hardMaxSpread": V16_PORTFOLIO_HARD_MAX_SPREAD,
         "decisionReasonCounts": reason_counts,
         "decisions": decisions[:100],
         "qualifiedCandidates": [
@@ -3803,103 +3854,138 @@ def api_v16_portfolio_status(request: Request):
     return payload
 
 def money_mode_buy(scans, manual=False):
+    """Submit live buys from the V16 portfolio plan.
+
+    When V16 execution is enabled, portfolio qualification is the live entry
+    gate. Legacy Sniper/A+ metrics remain in the scan and inspector as evidence,
+    but they do not veto a candidate that passes the portfolio score and all
+    account/risk safeguards.
+    """
     if TRADEBOT_V2_ENABLED and not PAPER and not TRADEBOT_V2_LIVE_ENABLED:
-        # Validation mode must still run the complete decision pipeline so V2 can
-        # record approved/rejected observations without submitting a live order.
         try:
-            validation_picks = pick_money_mode_stocks(scans)
-            print(f"V2 VALIDATION | observations processed={len(scans)} approved={len(validation_picks)} live_order=False")
+            if AI_PORTFOLIO_MANAGER_ENABLED and V16_PORTFOLIO_EXECUTION_ENABLED:
+                validation = build_v16_portfolio_plan(list(scans), manual=manual).get("plan") or {}
+                print(
+                    f"V16 VALIDATION | observations={len(scans)} qualified={validation.get('qualifiedCount', 0)} "
+                    f"actionable={validation.get('actionableCount', 0)} live_order=False"
+                )
+            else:
+                validation_picks = pick_money_mode_stocks(scans)
+                print(f"V2 VALIDATION | observations processed={len(scans)} approved={len(validation_picks)} live_order=False")
         except Exception as e:
-            print(f"V2 VALIDATION LOG ERROR: {e}")
+            print(f"V16 VALIDATION LOG ERROR: {e}")
         return "BUY BLOCKED | TradeBot V2 validation mode. Decisions recorded; live ordering remains disabled."
+
     if emergency_stop:
         return "BUY BLOCKED | emergency stop active"
+
+    try:
+        if not bool(trading_client.get_clock().is_open):
+            return "BUY BLOCKED | market closed"
+    except Exception as exc:
+        return f"BUY BLOCKED | market status unavailable: {exc}"
+
     blocked, reason = risk_blocked()
     if blocked:
         return f"BUY BLOCKED | {reason}"
+
     if allowed_new_position_count() <= 0:
         capacity = ai_position_capacity_payload()
         structural_slots = int(capacity.get("structuralAvailableSlots") or 0)
         affordable_slots = int(capacity.get("affordableNewPositions") or 0)
         if structural_slots <= 0:
             block_reason = f"AI portfolio capacity reached ({capacity.get('effectiveMaxPositions', effective_max_positions())})"
-            approval_stage = "position_limit"
         elif affordable_slots <= 0:
             buying_power = float(capacity.get("buyingPowerUsd") or 0.0)
             target_notional = float(capacity.get("targetPositionNotionalUsd") or 0.0)
             block_reason = f"insufficient buying power (${buying_power:.2f}) for AI target position (${target_notional:.2f})"
-            approval_stage = "buying_power"
         else:
             block_reason = str(capacity.get("reason") or "no AI-approved portfolio slot available")
-            approval_stage = "portfolio_capacity"
-        # Preserve decision evidence even when account-level capacity blocks an order.
-        try:
-            blocked_picks = pick_money_mode_stocks(
-                scans,
-                approval_decision="BLOCKED",
-                approval_stage=approval_stage,
-                approval_reason=block_reason,
-            )
-            if blocked_picks:
-                best = blocked_picks[0]
-                print(
-                    "DECISION INTELLIGENCE | "
-                    f"blocked={len(blocked_picks)} best={best.get('symbol')} "
-                    f"confidence={float(best.get('confidence') or 0.0):.2f} "
-                    f"reason={block_reason}"
-                )
-        except Exception as decision_error:
-            print(f"DECISION INTELLIGENCE BLOCKED LOG ERROR: {decision_error}")
         return f"BUY BLOCKED | {block_reason}"
+
     if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
         return f"BUY BLOCKED | PDT-aware max new buys today reached ({MAX_NEW_BUYS_PER_DAY_PDT_AWARE})"
 
-    picks = pick_money_mode_stocks(scans)
-    if manual and not picks:
-        if A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY:
-            return "No A+ sniper candidates ready. Manual Money Buy blocked by Trade Quality Gate."
-        picks = [s for s in scans if can_buy_symbol(s["symbol"])[0] and s["spread"] <= MAX_SPREAD]
-        picks.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
+    portfolio = {}
+    if AI_PORTFOLIO_MANAGER_ENABLED and V16_PORTFOLIO_EXECUTION_ENABLED:
+        # Important: feed the complete current scanner batch to V16. The old
+        # code filtered through Sniper/A+ first, which made Portfolio QUALIFIED
+        # rows impossible to execute when legacy confidence/quality were lower.
+        portfolio = build_v16_portfolio_plan(list(scans), manual=manual)
+        execution_rows = portfolio.get("internalAllocations") or []
+    else:
+        picks = pick_money_mode_stocks(scans)
+        if manual and not picks:
+            if A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY:
+                return "No A+ sniper candidates ready. Manual Money Buy blocked by Trade Quality Gate."
+            picks = [s for s in scans if can_buy_symbol(s["symbol"])[0] and s["spread"] <= MAX_SPREAD]
+            picks.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
+        if not picks:
+            return "No sniper candidates ready."
+        execution_rows = [{
+            "symbol": c["symbol"], "scan": c, "notionalUsd": ai_risk_notional(c),
+            "rank": index + 1, "portfolioScore": _v16_portfolio_score(c),
+        } for index, c in enumerate(picks[:MAX_NEW_BUYS_PER_LOOP])]
 
-    if not picks:
-        return "No sniper candidates ready."
+    if not execution_rows:
+        plan = portfolio.get("plan") if portfolio else {}
+        return str(plan.get("explanation") or "No portfolio allocations passed the score, capital and safety rules.")
 
     bought = 0
     messages = []
-    if AI_PORTFOLIO_MANAGER_ENABLED:
-        portfolio = build_v16_portfolio_plan(picks, manual=manual)
-        execution_rows = portfolio.get("internalAllocations") or []
-    else:
-        execution_rows = [{"symbol": c["symbol"], "scan": c, "notionalUsd": ai_risk_notional(c), "rank": index + 1, "portfolioScore": _v16_portfolio_score(c)} for index, c in enumerate(picks[:MAX_NEW_BUYS_PER_LOOP])]
-
-    if not execution_rows:
-        plan = portfolio.get("plan") if AI_PORTFOLIO_MANAGER_ENABLED else {}
-        return str(plan.get("explanation") or "No portfolio allocations passed the capital and safety rules.")
-
     for allocation in execution_rows:
         c = allocation["scan"]
         symbol = allocation["symbol"]
+
+        # Re-check every live safety condition immediately before submission.
+        if emergency_stop or not bot_enabled:
+            messages.append(f"SKIP {symbol} | bot disabled or emergency stop active")
+            continue
+        try:
+            if not bool(trading_client.get_clock().is_open):
+                messages.append(f"SKIP {symbol} | market closed")
+                continue
+        except Exception as exc:
+            messages.append(f"SKIP {symbol} | market status error: {exc}")
+            continue
         can_buy, block_reason = can_buy_symbol(symbol)
         if not can_buy:
             messages.append(f"SKIP {symbol} | {block_reason}")
             continue
+        spread = float(c.get("spread") or 0.0)
+        if spread > V16_PORTFOLIO_HARD_MAX_SPREAD:
+            messages.append(
+                f"SKIP {symbol} | spread {spread:.5f} above hard maximum {V16_PORTFOLIO_HARD_MAX_SPREAD:.5f}"
+            )
+            continue
+        if V16_PORTFOLIO_REQUIRE_READY_TRIGGER and not bool(c.get("ready_to_buy")) and not manual:
+            messages.append(f"WAIT {symbol} | portfolio qualified but entry trigger not ready")
+            continue
+
         notional = round(float(allocation.get("notionalUsd") or 0.0), 2)
         if notional < MIN_ORDER_NOTIONAL:
             messages.append(f"SKIP {symbol} | portfolio allocation too small {notional:.2f}")
             continue
+
         confidence, label = calculate_confidence(c)
-        reason = f"{'MANUAL' if manual else 'AUTO'} V16 PORTFOLIO #{allocation.get('rank', bought + 1)} {label} BUY"
+        score = float(allocation.get("portfolioScore") or 0.0)
+        reason = f"{'MANUAL' if manual else 'AUTO'} V16.5 PORTFOLIO #{allocation.get('rank', bought + 1)} SCORE BUY"
         try:
             market_buy_notional(symbol, notional, reason=reason, scan=c)
-            record_v2_setup_decision(c, "BOUGHT", "v16_portfolio_order_submitted", reason, c.get("v2Expectancy") or {})
+            record_v2_setup_decision(
+                c, "BOUGHT", "v16_portfolio_order_submitted", reason,
+                {"portfolioScore": score, "legacyConfidence": confidence, "executionGate": "V16_PORTFOLIO"},
+            )
             state[symbol]["ref"] = c["price"]
             state[symbol]["highest_since_entry"] = c["price"]
-            messages.append(f"{reason} ${notional:.2f} {symbol} score={float(allocation.get('portfolioScore') or 0):.3f} confidence={confidence:.2f}")
+            messages.append(
+                f"{reason} ${notional:.2f} {symbol} score={score:.3f} legacy_confidence={confidence:.2f}"
+            )
             bought += 1
         except Exception as e:
             messages.append(f"BUY ERROR {symbol}: {e}")
-    return " | ".join(messages)
 
+    return " | ".join(messages)
 
 def buy_custom_symbol(symbol: str):
     if TRADEBOT_V2_ENABLED and not PAPER and not TRADEBOT_V2_LIVE_ENABLED:
