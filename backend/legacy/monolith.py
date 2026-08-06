@@ -3302,11 +3302,37 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 @app.get("/v16/portfolio/status")
 def api_v16_portfolio_status(request: Request):
     verify_api_key(request)
+
+    # V16.2 live portfolio publishing fix:
+    # The old endpoint only loaded the last JSON file. If no buy cycle had run,
+    # the frontend remained on WAITING_FOR_PLAN even while the market and scanner
+    # were live. Build a read-only plan from the latest scan snapshot whenever
+    # the saved plan is missing, empty or stale. This does not submit orders.
     payload = _v16_load_portfolio_plan()
+    should_publish = payload.get("status") in (None, "WAITING_FOR_PLAN") or not payload.get("createdAt")
+    try:
+        created_at = payload.get("createdAt")
+        if created_at:
+            created = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            should_publish = should_publish or (datetime.now(UTC) - created).total_seconds() > max(30, CHECK_INTERVAL * 2)
+    except Exception:
+        should_publish = True
+
+    if AI_PORTFOLIO_MANAGER_ENABLED and latest_scans and should_publish:
+        try:
+            payload = build_v16_portfolio_plan(list(latest_scans), manual=False).get("plan") or payload
+            payload["source"] = "latest_live_scans"
+        except Exception as exc:
+            print(f"V16 PORTFOLIO STATUS REFRESH ERROR: {exc}")
+            payload["refreshError"] = str(exc)
+
     payload.setdefault("enabled", AI_PORTFOLIO_MANAGER_ENABLED)
     payload.setdefault("version", AI_PORTFOLIO_MANAGER_VERSION)
     payload["openPositions"] = len(get_all_positions())
     payload["capacity"] = ai_position_capacity_payload()
+    payload["latestScanCount"] = len(latest_scans)
     return payload
 
 def money_mode_buy(scans, manual=False):
@@ -7423,6 +7449,16 @@ def run_bot_loop():
 
                 latest_scans.clear()
                 latest_scans.extend(scans)
+
+                # Always publish the current AI Portfolio plan after a completed
+                # live scan. Previously this only happened inside money_mode_buy,
+                # so a paused bot, manual override or no order attempt left the
+                # dashboard stuck on WAITING_FOR_PLAN.
+                if AI_PORTFOLIO_MANAGER_ENABLED:
+                    try:
+                        build_v16_portfolio_plan(scans, manual=False)
+                    except Exception as portfolio_error:
+                        print(f"V16 PORTFOLIO AUTO-PUBLISH ERROR: {portfolio_error}")
 
                 if bot_enabled and not emergency_stop:
                     manage_money_mode_positions()
