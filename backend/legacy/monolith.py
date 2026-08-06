@@ -3235,17 +3235,25 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             "riskProfile": _ai_risk_build_profile(scan) if AI_RISK_ENGINE_ENABLED else {},
         })
     ranked.sort(key=lambda item: (-item["portfolioScore"], -item["confidence"], item["spread"]))
-    ranked = ranked[:order_limit]
 
-    reserve_pct = _v16_cash_reserve_pct(ranked)
+    # V16.2 scanner-to-portfolio fix:
+    # Keep every genuinely qualified candidate for visibility. The previous
+    # implementation sliced `ranked` by `order_limit` before reporting the
+    # qualified count. When PDT/daily/capacity safety left zero buy slots, the
+    # UI incorrectly displayed Qualified=0 even though the scanner had found
+    # valid candidates. Only the actionable allocation list is slot-limited.
+    qualified_ranked = list(ranked)
+    actionable_ranked = qualified_ranked[:order_limit] if order_limit > 0 else []
+
+    reserve_pct = _v16_cash_reserve_pct(actionable_ranked)
     deployable = round(max(0.0, usable_cash * (1.0 - reserve_pct)), 2)
     allocations = []
-    if ranked and deployable >= MIN_ORDER_NOTIONAL:
+    if actionable_ranked and deployable >= MIN_ORDER_NOTIONAL:
         power = 2.0
-        strengths = [max(0.001, item["portfolioScore"] - AI_PORTFOLIO_MIN_SCORE + 0.08) ** power for item in ranked]
+        strengths = [max(0.001, item["portfolioScore"] - AI_PORTFOLIO_MIN_SCORE + 0.08) ** power for item in actionable_ranked]
         total_strength = sum(strengths) or 1.0
         remaining = deployable
-        for index, (item, strength) in enumerate(zip(ranked, strengths)):
+        for index, (item, strength) in enumerate(zip(actionable_ranked, strengths)):
             raw_weight = strength / total_strength
             weight = min(AI_PORTFOLIO_MAX_SINGLE_WEIGHT, raw_weight)
             requested = round(deployable * weight, 2)
@@ -3280,13 +3288,32 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         "enabled": AI_PORTFOLIO_MANAGER_ENABLED,
         "createdAt": datetime.now(UTC).isoformat(),
         "manual": bool(manual),
-        "status": "READY" if allocations else "NO_QUALIFIED_PORTFOLIO",
+        "status": (
+            "READY" if allocations
+            else "QUALIFIED_WAITING_FOR_CAPACITY" if qualified_ranked and order_limit <= 0
+            else "QUALIFIED_BELOW_ORDER_MINIMUM" if qualified_ranked
+            else "NO_QUALIFIED_PORTFOLIO"
+        ),
         "managedCapitalUsd": round(managed_capital, 2),
         "managedCapitalGbp": round(money_gbp(managed_capital), 2),
         "buyingPowerUsd": round(buying_power, 2),
         "candidateCount": len(picks),
-        "qualifiedCount": len(ranked),
+        "qualifiedCount": len(qualified_ranked),
+        "actionableCount": len(actionable_ranked),
         "orderLimit": order_limit,
+        "qualifiedCandidates": [
+            {
+                "rank": index + 1,
+                "symbol": item["symbol"],
+                "portfolioScore": item["portfolioScore"],
+                "confidence": item["confidence"],
+                "confidenceLabel": item["confidenceLabel"],
+                "quality": item["quality"],
+                "spread": item["spread"],
+                "deployableNow": index < len(actionable_ranked),
+            }
+            for index, item in enumerate(qualified_ranked[:25])
+        ],
         "cashReservePct": round(reserve_pct * 100.0, 2),
         "cashReserveUsd": round(max(0.0, usable_cash - allocated), 2),
         "cashReserveGbp": round(money_gbp(max(0.0, usable_cash - allocated)), 2),
@@ -3296,12 +3323,23 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         "allocations": [{k: v for k, v in row.items() if k != "scan"} for row in allocations],
         "rejectedCount": max(0, len(picks) - len(ranked)),
         "explanation": (
-            f"Qualified {len(ranked)} candidate(s). Planned ${allocated:.2f} across {len(allocations)} position(s), "
-            f"with {reserve_pct * 100.0:.1f}% cash reserve. The highest score receives the largest allocation."
+            f"Qualified {len(qualified_ranked)} candidate(s) from {len(picks)} live scan(s). "
+            f"{len(actionable_ranked)} can be considered within the current capacity/daily safety limit. "
+            f"Planned ${allocated:.2f} across {len(allocations)} position(s), with {reserve_pct * 100.0:.1f}% cash reserve. "
+            + (
+                "Capital is retained because no new order slots are currently available."
+                if qualified_ranked and order_limit <= 0
+                else "The highest score receives the largest allocation."
+            )
         ),
     }
     _v16_save_portfolio_plan(plan)
-    print(f"V16 PORTFOLIO PLAN | qualified={len(ranked)} deploy=${allocated:.2f} reserve={reserve_pct*100:.1f}% allocations=" + ",".join(f"{a['symbol']}=${a['notionalUsd']:.2f}" for a in allocations))
+    print(
+        f"V16 PORTFOLIO PLAN | scans={len(picks)} qualified={len(qualified_ranked)} "
+        f"actionable={len(actionable_ranked)} order_limit={order_limit} deploy=${allocated:.2f} "
+        f"reserve={reserve_pct*100:.1f}% allocations="
+        + ",".join(f"{a['symbol']}=${a['notionalUsd']:.2f}" for a in allocations)
+    )
     return {"plan": plan, "internalAllocations": allocations}
 
 
