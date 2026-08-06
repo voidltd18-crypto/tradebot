@@ -3161,81 +3161,140 @@ def _v16_clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, float(value)))
 
 
+def _v16_curve_metrics(scan: Dict[str, Any]) -> Dict[str, float]:
+    """Calculate real short-horizon behaviour from the live price curve."""
+    symbol = str(scan.get("symbol") or "").upper().strip()
+    curve = scan.get("price_curve") or scan.get("priceCurve") or []
+    if not curve and symbol:
+        try:
+            curve = (state.get(symbol) or {}).get("price_curve") or []
+        except Exception:
+            curve = []
+    prices: List[float] = []
+    for point in curve[-60:]:
+        try:
+            value = float(point.get("value") if isinstance(point, dict) else point)
+            if value > 0:
+                prices.append(value)
+        except Exception:
+            continue
+    if len(prices) < 3:
+        return {"samples": float(len(prices)), "return": 0.0, "slope": 0.0, "consistency": 0.5, "volatility": 0.0, "drawdown": 0.0}
+    returns = [(prices[i] / prices[i - 1]) - 1.0 for i in range(1, len(prices)) if prices[i - 1] > 0]
+    total_return = (prices[-1] / prices[0]) - 1.0
+    n = len(prices)
+    x_mean = (n - 1) / 2.0
+    y_mean = sum(prices) / n
+    denom = sum((i - x_mean) ** 2 for i in range(n)) or 1.0
+    slope_abs = sum((i - x_mean) * (prices[i] - y_mean) for i in range(n)) / denom
+    slope = slope_abs / y_mean if y_mean > 0 else 0.0
+    positive = sum(1 for r in returns if r > 0)
+    negative = sum(1 for r in returns if r < 0)
+    consistency = max(positive, negative) / max(1, len(returns))
+    mean_r = sum(returns) / max(1, len(returns))
+    volatility = (sum((r - mean_r) ** 2 for r in returns) / max(1, len(returns))) ** 0.5
+    peak = prices[0]
+    max_drawdown = 0.0
+    for price in prices:
+        peak = max(peak, price)
+        if peak > 0:
+            max_drawdown = max(max_drawdown, (peak - price) / peak)
+    return {
+        "samples": float(n), "return": total_return, "slope": slope,
+        "consistency": consistency, "volatility": volatility, "drawdown": max_drawdown,
+    }
+
+
+def _v16_prepare_real_market_factors(picks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Enrich candidates with batch-relative strength and real curve metrics."""
+    enriched: List[Dict[str, Any]] = []
+    rows: List[tuple[int, float]] = []
+    for index, original in enumerate(picks):
+        scan = dict(original)
+        metrics = _v16_curve_metrics(scan)
+        scan["v16CurveMetrics"] = metrics
+        strength = (metrics["return"] * 0.65) + (metrics["slope"] * 8.0 * 0.35)
+        rows.append((index, strength))
+        enriched.append(scan)
+    ordered = sorted(rows, key=lambda row: row[1])
+    count = max(1, len(ordered) - 1)
+    percentiles = {idx: rank / count for rank, (idx, _) in enumerate(ordered)}
+    for index, scan in enumerate(enriched):
+        scan["v16BatchRelativeStrength"] = percentiles.get(index, 0.5)
+        try:
+            scan["market_regime"] = scan.get("market_regime") or scan.get("marketRegime") or _v4_market_regime()
+        except Exception:
+            scan["market_regime"] = scan.get("market_regime") or "UNKNOWN"
+    return enriched
+
+
 def _v16_factor_breakdown(scan: Dict[str, Any]) -> Dict[str, Any]:
-    """Transparent six-factor score using scanner data with conservative fallbacks."""
+    """V16.5 factors calculated from live curve, quote, reputation and regime data."""
     confidence, _ = calculate_confidence(scan)
     confidence = _v16_clamp(confidence)
+    metrics = scan.get("v16CurveMetrics") or _v16_curve_metrics(scan)
 
-    momentum_raw = float(scan.get("short_momentum") or scan.get("shortMomentum") or 0.0)
-    momentum = _v16_clamp(0.5 + momentum_raw * 12.0)
+    curve_return = float(metrics.get("return") or 0.0)
+    curve_slope = float(metrics.get("slope") or 0.0)
+    consistency = float(metrics.get("consistency") or 0.5)
+    momentum_raw = float(scan.get("short_momentum") or scan.get("shortMomentum") or curve_return)
+    directional = _v16_clamp(0.5 + (curve_return * 22.0) + (curve_slope * 95.0))
+    momentum = _v16_clamp((directional * 0.72) + (consistency * 0.28))
 
-    quality_raw = max(0.0, float(scan.get("quality_score") or scan.get("qualityScore") or 0.0))
-    quality = _v16_clamp(quality_raw / max(0.0001, float(A_PLUS_MIN_QUALITY or 0.026)))
+    relative_strength = _v16_clamp(float(scan.get("v16BatchRelativeStrength") or 0.5))
 
     spread = max(0.0, float(scan.get("spread") or 0.0))
     spread_quality = _v16_clamp(1.0 - spread / max(0.0001, float(MAX_SPREAD)))
     relative_volume = float(scan.get("relative_volume") or scan.get("relativeVolume") or scan.get("rvol") or 0.0)
-    volume_quality = _v16_clamp(relative_volume / 2.0) if relative_volume > 0 else confidence
-    liquidity = _v16_clamp((spread_quality * 0.72) + (volume_quality * 0.28))
+    volume_quality = _v16_clamp(relative_volume / 2.0) if relative_volume > 0 else 0.55
+    liquidity = _v16_clamp((spread_quality * 0.82) + (volume_quality * 0.18))
 
-    atr_pct = abs(float(scan.get("atr_pct") or scan.get("atrPct") or 0.0))
-    if atr_pct > 0:
-        volatility_quality = _v16_clamp(1.0 - abs(atr_pct - 2.2) / 5.0)
-    else:
-        volatility_quality = _v16_clamp((spread_quality * 0.65) + (quality * 0.35))
+    realised_vol = abs(float(metrics.get("volatility") or 0.0))
+    drawdown = abs(float(metrics.get("drawdown") or 0.0))
+    # Reward enough movement to trade, penalise unstable/noisy or sharply drawing-down curves.
+    movement_score = _v16_clamp(realised_vol / 0.0015)
+    noise_penalty = _v16_clamp(realised_vol / 0.008)
+    drawdown_penalty = _v16_clamp(drawdown / 0.025)
+    volatility_quality = _v16_clamp(0.48 + movement_score * 0.35 - noise_penalty * 0.18 - drawdown_penalty * 0.30)
 
-    relative_strength_raw = float(scan.get("sector_strength") or scan.get("sectorStrength") or scan.get("relative_strength") or scan.get("relativeStrength") or 0.0)
-    if relative_strength_raw:
-        relative_strength = _v16_clamp(0.5 + relative_strength_raw / 10.0)
-    else:
-        relative_strength = _v16_clamp((confidence * 0.55) + (momentum * 0.45))
+    historical_edge = 0.50
+    symbol = str(scan.get("symbol") or "").upper().strip()
+    try:
+        reputation = symbol_reputation_snapshot(force=False).get(symbol) or {}
+        samples = int(reputation.get("samples") or 0)
+        rep_score = float(reputation.get("score") or 0.5)
+        sample_weight = min(1.0, samples / 20.0)
+        historical_edge = _v16_clamp(0.5 * (1.0 - sample_weight) + rep_score * sample_weight)
+    except Exception:
+        history = scan.get("optimiserDecision") or {}
+        history_mult = max(0.65, min(1.25, float(history.get("multiplier") or 1.0)))
+        historical_edge = _v16_clamp((history_mult - 0.65) / 0.60)
 
-    history = scan.get("optimiserDecision") or {}
-    history_mult = max(0.65, min(1.25, float(history.get("multiplier") or 1.0)))
-    historical_edge = _v16_clamp((history_mult - 0.65) / 0.60)
-
-    regime_text = str(scan.get("market_regime") or scan.get("marketRegime") or "").upper()
-    gap_pct = float(scan.get("gap_pct") or scan.get("gapPct") or 0.0)
-    regime_fit = 0.55
+    regime_text = str(scan.get("market_regime") or scan.get("marketRegime") or "UNKNOWN").upper()
     if "BULL" in regime_text or "RISK_ON" in regime_text:
-        regime_fit = 0.72 if momentum_raw >= 0 else 0.42
+        regime_fit = _v16_clamp(0.45 + momentum * 0.45 + relative_strength * 0.10)
     elif "BEAR" in regime_text or "RISK_OFF" in regime_text:
-        regime_fit = 0.62 if momentum_raw <= 0 else 0.38
+        regime_fit = _v16_clamp(0.72 - momentum * 0.30 + volatility_quality * 0.18)
     elif "RANGE" in regime_text or "CHOP" in regime_text:
-        regime_fit = 0.62 if abs(gap_pct) < 2.0 else 0.42
-    regime_fit = _v16_clamp(regime_fit)
+        regime_fit = _v16_clamp(0.42 + volatility_quality * 0.38 + (1.0 - abs(momentum - 0.5) * 2.0) * 0.20)
+    else:
+        regime_fit = _v16_clamp(0.45 + momentum * 0.22 + volatility_quality * 0.18 + relative_strength * 0.15)
 
-    weights = {
-        "momentum": 0.25,
-        "relativeStrength": 0.18,
-        "liquidity": 0.15,
-        "volatilityQuality": 0.12,
-        "historicalEdge": 0.18,
-        "regimeFit": 0.12,
-    }
-    values = {
-        "momentum": momentum,
-        "relativeStrength": relative_strength,
-        "liquidity": liquidity,
-        "volatilityQuality": volatility_quality,
-        "historicalEdge": historical_edge,
-        "regimeFit": regime_fit,
-    }
+    quality_raw = max(0.0, float(scan.get("quality_score") or scan.get("qualityScore") or 0.0))
+    quality = _v16_clamp(quality_raw / max(0.0001, float(A_PLUS_MIN_QUALITY or 0.026)))
+    weights = {"momentum": 0.25, "relativeStrength": 0.18, "liquidity": 0.15, "volatilityQuality": 0.12, "historicalEdge": 0.18, "regimeFit": 0.12}
+    values = {"momentum": momentum, "relativeStrength": relative_strength, "liquidity": liquidity, "volatilityQuality": volatility_quality, "historicalEdge": historical_edge, "regimeFit": regime_fit}
     weighted = {key: round(values[key] * weights[key], 6) for key in weights}
     base = sum(weighted.values())
-    # Confidence and setup quality remain bounded validation signals rather than dominating the score.
     validation = (confidence * 0.60) + (quality * 0.40)
-    final = _v16_clamp((base * 0.78) + (validation * 0.22))
+    final = _v16_clamp((base * 0.82) + (validation * 0.18))
     return {
-        "version": "V16.4",
+        "version": "V16.5", "source": "LIVE_MARKET_DATA",
         "values": {key: round(value, 6) for key, value in values.items()},
-        "weights": weights,
-        "weighted": weighted,
-        "validation": round(validation, 6),
-        "final": round(final, 6),
-        "regime": regime_text or "UNKNOWN",
+        "weights": weights, "weighted": weighted, "validation": round(validation, 6),
+        "final": round(final, 6), "regime": regime_text,
+        "marketMetrics": {key: round(float(value), 8) for key, value in metrics.items()},
     }
-
 
 def _v16_portfolio_score(scan: Dict[str, Any]) -> float:
     return float(_v16_factor_breakdown(scan).get("final") or 0.0)
@@ -3329,6 +3388,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 
     ranked: List[Dict[str, Any]] = []
     decisions: List[Dict[str, Any]] = []
+    picks = _v16_prepare_real_market_factors(picks)
     score_profiles = _v16_calibrated_score_profiles(picks)
     effective_minimum_score, threshold_mode = _v16_effective_minimum_score(score_profiles, manual=manual)
 

@@ -106,7 +106,7 @@ export function PortfolioPage({ authToken }: { authToken: string }) {
           <button key={value} onClick={() => setFilter(value)} disabled={filter === value}>{value}</button>
         )}
       </div>
-      <p className="muted">Every candidate now shows its six-factor V16.4 score: momentum, relative strength, liquidity, volatility quality, historical edge and market-regime fit.</p>
+      <p className="muted">Every candidate now shows its six-factor V16.5 live-market score: momentum and volatility from the live price curve, batch-relative strength, quote liquidity, symbol history and market-regime fit.</p>
       <div className="table-wrap"><table><thead><tr><th>Rank</th><th>Symbol</th><th>Decision</th><th>Calibrated</th><th>Raw</th><th>Minimum</th><th>Confidence</th><th>Quality</th><th>Spread</th><th>Factor breakdown</th><th>Exact reason</th></tr></thead>
       <tbody>{filteredDecisions.map((row: AnyObj, index: number) => <tr key={`${row.symbol}-${row.scanIndex}-${index}`}>
         <td>{row.rank ? `#${row.rank}` : "—"}</td>
