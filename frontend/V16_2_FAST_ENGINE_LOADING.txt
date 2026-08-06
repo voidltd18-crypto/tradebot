@@ -10,3 +10,7 @@ Changes:
 - Adds the visible AI PORTFOLIO tab using /v16/portfolio/status.
 
 Frontend-only deployment. Replace/deploy the complete frontend folder.
+
+Correction package:
+- Restores src/pages/PortfolioPage.tsx.
+- Restores portfolio Tab type, AI PORTFOLIO navigation button, and App render route.

@@ -12,6 +12,7 @@ import { IntelligencePage } from "./pages/IntelligencePage";
 import { ExplorerPage } from "./pages/ExplorerPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { PositionsPage } from "./pages/PositionsPage";
+import { PortfolioPage } from "./pages/PortfolioPage";
 import { ReportsPage } from "./pages/ReportsPage";
 
 export default function App() {
@@ -47,6 +48,7 @@ export default function App() {
 
     {tab === "overview" && <OverviewPage {...bot} positionGlowStyle={positionGlowStyle} />}
     {tab === "positions" && <PositionsPage positions={bot.positions} rate={bot.rate} action={bot.action} positionGlowStyle={positionGlowStyle} />}
+    {tab === "portfolio" && <PortfolioPage authToken={bot.authToken} />}
     {tab === "reports" && <ReportsPage reports={bot.reports} data={bot.data} rate={bot.rate} closedTrades={bot.closedTrades} chartCurrency={bot.chartCurrency} setChartCurrency={bot.setChartCurrency} reportsLoading={bot.reportsLoading} reportsError={bot.reportsError} reportsUpdatedAt={bot.reportsUpdatedAt} loadReports={bot.loadReports} />}
     {tab === "intelligence" && <IntelligencePage authToken={bot.authToken} marketRegime={bot.marketRegime} botHealth={bot.botHealth} aiConfidence={bot.aiConfidence} fetchData={bot.fetchData} />}
     {tab === "explorer" && <ExplorerPage stockQuery={bot.stockQuery} setStockQuery={bot.setStockQuery} stockResults={bot.stockResults} setStockResults={bot.setStockResults} stockSearchLoading={bot.stockSearchLoading} searchStocks={bot.searchStocks} action={bot.action} />}
