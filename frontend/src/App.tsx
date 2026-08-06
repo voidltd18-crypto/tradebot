@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { DashboardStyles } from "./components/DashboardStyles";
 import { Header } from "./components/Header";
 import { Login } from "./components/Login";
@@ -7,17 +7,22 @@ import { Stat } from "./components/Stat";
 import { useTradeBot } from "./hooks/useTradeBot";
 import { gbp, tone, usd } from "./lib/format";
 import type { AnyObj, Tab } from "./lib/types";
-import { AdminPage } from "./pages/AdminPage";
-import { IntelligencePage } from "./pages/IntelligencePage";
-import { ExplorerPage } from "./pages/ExplorerPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { PositionsPage } from "./pages/PositionsPage";
-import { PortfolioPage } from "./pages/PortfolioPage";
-import { ReportsPage } from "./pages/ReportsPage";
+
+const AdminPage = lazy(() => import("./pages/AdminPage").then((module) => ({ default: module.AdminPage })));
+const IntelligencePage = lazy(() => import("./pages/IntelligencePage").then((module) => ({ default: module.IntelligencePage })));
+const ExplorerPage = lazy(() => import("./pages/ExplorerPage").then((module) => ({ default: module.ExplorerPage })));
+const PortfolioPage = lazy(() => import("./pages/PortfolioPage").then((module) => ({ default: module.PortfolioPage })));
+const ReportsPage = lazy(() => import("./pages/ReportsPage").then((module) => ({ default: module.ReportsPage })));
+
+function PageLoading() {
+  return <div className="card"><strong>Loading this page…</strong><div className="muted">Live balances and trading remain connected.</div></div>;
+}
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
-  const bot = useTradeBot();
+  const bot = useTradeBot(tab);
 
   function positionGlowStyle(position: AnyObj): React.CSSProperties {
     const pnlPct = Number(position?.pnlPct || 0);
@@ -48,10 +53,12 @@ export default function App() {
 
     {tab === "overview" && <OverviewPage {...bot} positionGlowStyle={positionGlowStyle} />}
     {tab === "positions" && <PositionsPage positions={bot.positions} rate={bot.rate} action={bot.action} positionGlowStyle={positionGlowStyle} />}
-    {tab === "portfolio" && <PortfolioPage authToken={bot.authToken} />}
-    {tab === "reports" && <ReportsPage reports={bot.reports} data={bot.data} rate={bot.rate} closedTrades={bot.closedTrades} chartCurrency={bot.chartCurrency} setChartCurrency={bot.setChartCurrency} reportsLoading={bot.reportsLoading} reportsError={bot.reportsError} reportsUpdatedAt={bot.reportsUpdatedAt} loadReports={bot.loadReports} />}
-    {tab === "intelligence" && <IntelligencePage authToken={bot.authToken} marketRegime={bot.marketRegime} botHealth={bot.botHealth} aiConfidence={bot.aiConfidence} fetchData={bot.fetchData} />}
-    {tab === "explorer" && <ExplorerPage stockQuery={bot.stockQuery} setStockQuery={bot.setStockQuery} stockResults={bot.stockResults} setStockResults={bot.setStockResults} stockSearchLoading={bot.stockSearchLoading} searchStocks={bot.searchStocks} action={bot.action} />}
-    {tab === "admin" && <AdminPage {...bot} />}
+    <Suspense fallback={<PageLoading />}>
+      {tab === "portfolio" && <PortfolioPage authToken={bot.authToken} />}
+      {tab === "reports" && <ReportsPage reports={bot.reports} data={bot.data} rate={bot.rate} closedTrades={bot.closedTrades} chartCurrency={bot.chartCurrency} setChartCurrency={bot.setChartCurrency} reportsLoading={bot.reportsLoading} reportsError={bot.reportsError} reportsUpdatedAt={bot.reportsUpdatedAt} loadReports={bot.loadReports} />}
+      {tab === "intelligence" && <IntelligencePage authToken={bot.authToken} marketRegime={bot.marketRegime} botHealth={bot.botHealth} aiConfidence={bot.aiConfidence} fetchData={bot.fetchData} />}
+      {tab === "explorer" && <ExplorerPage stockQuery={bot.stockQuery} setStockQuery={bot.setStockQuery} stockResults={bot.stockResults} setStockResults={bot.setStockResults} stockSearchLoading={bot.stockSearchLoading} searchStocks={bot.searchStocks} action={bot.action} />}
+      {tab === "admin" && <AdminPage {...bot} />}
+    </Suspense>
   </div>;
 }

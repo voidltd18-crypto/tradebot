@@ -194,104 +194,75 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     portfolio: "/v16/portfolio/status",
   }), []);
 
-  const load = useCallback(async () => {
+  const sectionKeys = useMemo<Record<IntelligenceSection, string[]>>(() => ({
+    ceo: ["ceoStatus", "ceoJournal", "ceoReviews", "ceoConstitution", "advisor"],
+    board: ["boardStatus", "boardHistory", "boardConstitution"],
+    brain: ["advisor", "decision", "strategy", "shadow", "operator", "status"],
+    market: ["marketDna", "patterns", "weekly", "status"],
+    research: ["research", "v7Status", "v8Status", "shadow"],
+    symbols: ["symbols", "reputation", "weakness"],
+    rules: ["rules", "strategy"],
+    evolution: ["promotion", "operator", "v7Status", "v8Status"],
+    memory: ["memoryStatus", "memoryKnowledge", "memoryEvents", "memoryConstitution"],
+    scientist: ["scientistStatus", "scientistHypotheses", "scientistExperiments", "scientistEvents", "scientistConstitution"],
+    portfolio: ["portfolio"],
+    operations: ["operationsStatus", "operationsEngineHealth", "operationsComponents", "operationsDependencies", "operationsWatchdogs", "operationsQueues", "operationsDoctor", "operationsAlerts", "operationsHistory", "operationsConstitution"],
+  }), []);
+
+  const load = useCallback(async (force = false) => {
     if (!authToken) return;
     setRefreshing(true);
     const headers = { "X-Auth-Token": authToken, "x-api-key": authToken };
+    const keys = sectionKeys[section].filter((key) => key in endpoints);
 
-    // Show engines progressively instead of waiting for the entire 43-endpoint sweep.
     setSources((previous) => {
       const next = { ...previous };
-      Object.keys(endpoints).forEach((key) => {
-        next[key] = { ...(previous[key] || EMPTY_ENDPOINT), loading: true, error: "" };
+      keys.forEach((key) => {
+        const current = previous[key] || EMPTY_ENDPOINT;
+        if (force || !current.data || Object.keys(current.data).length === 0) {
+          next[key] = { ...current, loading: true, error: "" };
+        }
       });
       return next;
     });
 
-    const priorityOrder = [
-      "ceoStatus", "boardStatus", "memoryStatus", "scientistStatus", "portfolio",
-      "advisor", "decision", "strategy", "shadow", "operator", "v7Status", "v8Status",
-      "marketDna", "research", "symbols", "rules", "weakness", "reputation", "promotion",
-      "ceoJournal", "ceoReviews", "ceoConstitution",
-      "boardHistory", "boardConstitution",
-      "memoryKnowledge", "memoryEvents", "memoryConstitution",
-      "scientistHypotheses", "scientistExperiments", "scientistEvents", "scientistConstitution",
-      "operationsStatus", "operationsEngineHealth", "operationsComponents",
-      "operationsDependencies", "operationsWatchdogs", "operationsQueues", "operationsDoctor",
-      "operationsAlerts", "operationsHistory", "operationsConstitution",
-      "patterns", "weekly", "status", "reports",
-    ].filter((key) => key in endpoints);
-
-    const entries = priorityOrder.map((key) => [key, endpoints[key as keyof typeof endpoints]] as [string, string]);
-
-    const fetchEndpoint = async (key: string, endpoint: string, retry = false): Promise<boolean> => {
+    const fetchEndpoint = async (key: string, endpoint: string): Promise<void> => {
       const controller = new AbortController();
       const slowEndpoint = ["reports", "operator", "operationsDoctor", "operationsEngineHealth"].includes(key);
       const timeoutSeconds = slowEndpoint ? 20 : 12;
       const timeout = window.setTimeout(() => controller.abort(), timeoutSeconds * 1000);
       try {
-        const response = await fetch(`${API_URL}${endpoint}`, {
-          cache: "no-store",
-          headers,
-          signal: controller.signal,
-        });
+        const response = await fetch(`${API_URL}${endpoint}`, { cache: "no-store", headers, signal: controller.signal });
         const json = await readJson(response);
         if (!response.ok) throw new Error(json?.detail || json?.message || `HTTP ${response.status}`);
-        setSources((previous) => ({
-          ...previous,
-          [key]: { data: json || {}, error: "", loading: false },
-        }));
-        return true;
+        setSources((previous) => ({ ...previous, [key]: { data: json || {}, error: "", loading: false } }));
       } catch (error: any) {
-        const message = error?.name === "AbortError"
-          ? `Request timed out after ${timeoutSeconds} seconds`
-          : error?.message || "Endpoint unavailable";
-        setSources((previous) => ({
-          ...previous,
-          [key]: { data: previous[key]?.data || {}, error: message, loading: false },
-        }));
-        if (!retry && error?.name !== "AbortError") console.warn(`${key} load failed`, error);
-        return false;
+        const message = error?.name === "AbortError" ? `Request timed out after ${timeoutSeconds} seconds` : error?.message || "Endpoint unavailable";
+        setSources((previous) => ({ ...previous, [key]: { data: previous[key]?.data || {}, error: message, loading: false } }));
       } finally {
         window.clearTimeout(timeout);
       }
     };
 
-    // A small worker pool prevents a CORS/SQLite request storm while still loading quickly.
-    const failed: [string, string][] = [];
-    let cursor = 0;
-    const worker = async () => {
-      while (cursor < entries.length) {
-        const item = entries[cursor++];
-        if (!item) return;
-        const [key, endpoint] = item;
-        const ok = await fetchEndpoint(key, endpoint);
-        if (!ok) failed.push(item);
-      }
-    };
-
     try {
-      await Promise.all(Array.from({ length: 5 }, () => worker()));
-      setLastUpdated(new Date().toLocaleTimeString("en-GB", {
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      }));
-
-      // Retry failures once in the background. This does not keep the page on REFRESHING.
-      if (failed.length) {
-        window.setTimeout(() => {
-          failed.forEach(([key, endpoint], index) => {
-            window.setTimeout(() => fetchEndpoint(key, endpoint, true), index * 250);
-          });
-        }, 5000);
-      }
+      // Three workers are enough for the selected subsection and avoid a request storm.
+      const queue = keys.map((key) => [key, endpoints[key as keyof typeof endpoints]] as [string, string]);
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < queue.length) {
+          const item = queue[cursor++];
+          if (!item) return;
+          await fetchEndpoint(item[0], item[1]);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(3, Math.max(1, queue.length)) }, () => worker()));
+      setLastUpdated(new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
     } finally {
       setRefreshing(false);
     }
-  }, [authToken, endpoints]);
+  }, [authToken, endpoints, section, sectionKeys]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { load(false); }, [load]);
 
   const advisor = sources.advisor.data;
   const shadow = sources.shadow.data;
@@ -570,7 +541,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const ceoCreatedAt = ceoBackend.createdAt ? new Date(String(ceoBackend.createdAt)).toLocaleString("en-GB") : "Not generated yet";
 
   const refreshAll = async () => {
-    await Promise.all([load(), fetchData(true)]);
+    await Promise.all([load(true), fetchData(true)]);
   };
 
   const promotionPost = async (endpoint: string, body: AnyObj) => {

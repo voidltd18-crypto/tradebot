@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { API_URL, readJson } from "../lib/api";
 import { clamp } from "../lib/format";
-import type { AnyObj, BuySizeMode, Currency } from "../lib/types";
+import type { AnyObj, BuySizeMode, Currency, Tab } from "../lib/types";
 
-export function useTradeBot() {
+export function useTradeBot(activeTab: Tab = "overview") {
   const [data, setData] = useState<AnyObj>({});
   const [reports, setReports] = useState<AnyObj>({});
   const [reportsLoading, setReportsLoading] = useState(false);
@@ -178,10 +178,9 @@ export function useTradeBot() {
   }, [authToken, fetchData]);
 
   useEffect(() => {
-    if (!authToken) return;
-    const timer = window.setTimeout(() => loadReports(false), 1500);
-    return () => window.clearTimeout(timer);
-  }, [authToken, loadReports]);
+    if (!authToken || activeTab !== "reports") return;
+    loadReports(false);
+  }, [authToken, activeTab, loadReports]);
   useEffect(() => { const cap = Number(banking?.maxTradingCapitalGbp ?? data?.banking?.maxTradingCapitalGbp ?? 0); if (cap > 0 && !tradingCapInput) setTradingCapInput(String(Math.round(cap))); if (cap > 0 && !replayCapInput) setReplayCapInput(String(Math.round(cap))); }, [banking?.maxTradingCapitalGbp, data?.banking?.maxTradingCapitalGbp]);
   useEffect(() => { const level = Number(data?.strategySettings?.level); if (Number.isFinite(level)) setStrategyStrictness(Math.max(0, Math.min(2, level))); }, [data?.strategySettings?.level]);
   useEffect(() => { const max = Number(data?.positionSettings?.maxPositions ?? data?.maxPositions ?? data?.config?.maxPositions); if (Number.isFinite(max) && max > 0) setMaxPositionsInput(Math.max(1, Math.min(10, max))); }, [data?.positionSettings?.maxPositions, data?.maxPositions, data?.config?.maxPositions]);
