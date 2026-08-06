@@ -110,7 +110,7 @@ AI_PORTFOLIO_MANAGER_ENABLED = os.getenv("AI_PORTFOLIO_MANAGER_ENABLED", "true")
 # evidence, but no longer silently veto a V16-qualified portfolio candidate.
 V16_PORTFOLIO_EXECUTION_ENABLED = os.getenv("V16_PORTFOLIO_EXECUTION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 V16_PORTFOLIO_REQUIRE_READY_TRIGGER = os.getenv("V16_PORTFOLIO_REQUIRE_READY_TRIGGER", "false").lower() in ("1", "true", "yes", "on")
-AI_PORTFOLIO_MANAGER_VERSION = "V16.5.2-LIVE-EXECUTION"
+AI_PORTFOLIO_MANAGER_VERSION = "V16.5.3-QUALITY-GUARD"
 AI_PORTFOLIO_MAX_SINGLE_WEIGHT = max(0.10, min(0.60, float(os.getenv("AI_PORTFOLIO_MAX_SINGLE_WEIGHT", "0.45") or 0.45)))
 AI_PORTFOLIO_MIN_CASH_RESERVE_PCT = max(0.02, min(0.50, float(os.getenv("AI_PORTFOLIO_MIN_CASH_RESERVE_PCT", "0.08") or 0.08)))
 AI_PORTFOLIO_MAX_CASH_RESERVE_PCT = max(AI_PORTFOLIO_MIN_CASH_RESERVE_PCT, min(0.80, float(os.getenv("AI_PORTFOLIO_MAX_CASH_RESERVE_PCT", "0.45") or 0.45)))
@@ -121,7 +121,7 @@ AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR = max(0.0, min(AI_PORTFOLIO_MIN_SCORE, float(o
 AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT = max(1, min(5, int(os.getenv("AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT", "2") or 2)))
 AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT = max(0.0, min(0.40, float(os.getenv("AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT", "0.22") or 0.22)))
 AI_PORTFOLIO_PLAN_FILE = os.getenv("AI_PORTFOLIO_PLAN_FILE", "/var/data/ai_portfolio_plan.json")
-AI_PORTFOLIO_SCORING_ENGINE_VERSION = "V16.5.1-REAL-MARKET-FACTORS"
+AI_PORTFOLIO_SCORING_ENGINE_VERSION = "V16.5.3-REAL-FACTORS-QUALITY-GUARD"
 AI_PORTFOLIO_BAR_FALLBACK_MINUTES = max(10, min(120, int(os.getenv("AI_PORTFOLIO_BAR_FALLBACK_MINUTES", "45") or 45)))
 AI_PORTFOLIO_BAR_CACHE_SECONDS = max(30, min(300, int(os.getenv("AI_PORTFOLIO_BAR_CACHE_SECONDS", "75") or 75)))
 _v16_bar_cache: Dict[str, Dict[str, Any]] = {}
@@ -142,6 +142,13 @@ PREFER_SPREAD_UNDER = 0.006
 # Hard execution safety. Portfolio scoring may reward liquidity, but a live
 # order is never sent through an excessively wide quote.
 V16_PORTFOLIO_HARD_MAX_SPREAD = max(0.0001, min(MAX_SPREAD, float(os.getenv("V16_PORTFOLIO_HARD_MAX_SPREAD", str(MAX_SPREAD)) or MAX_SPREAD)))
+# V16.5.3 execution-quality guard. Batch calibration may improve ranking, but it
+# cannot manufacture underlying setup quality. These floors are deliberately
+# modest and remain configurable in Render.
+V16_PORTFOLIO_MIN_RAW_SCORE = max(0.0, min(1.0, float(os.getenv("V16_PORTFOLIO_MIN_RAW_SCORE", "0.56") or 0.56)))
+V16_PORTFOLIO_MIN_QUALITY = max(0.0, float(os.getenv("V16_PORTFOLIO_MIN_QUALITY", "0.006") or 0.006))
+V16_PORTFOLIO_MIN_LIQUIDITY_FACTOR = max(0.0, min(1.0, float(os.getenv("V16_PORTFOLIO_MIN_LIQUIDITY_FACTOR", "0.45") or 0.45)))
+V16_PORTFOLIO_EXECUTION_MAX_SPREAD = max(0.0001, min(V16_PORTFOLIO_HARD_MAX_SPREAD, float(os.getenv("V16_PORTFOLIO_EXECUTION_MAX_SPREAD", "0.010") or 0.010)))
 
 BUY_DIP = 0.9985
 MIN_PULLBACK = 0.0010
@@ -3459,6 +3466,27 @@ def _v16_load_portfolio_plan() -> Dict[str, Any]:
         return {"ok": True, "version": AI_PORTFOLIO_MANAGER_VERSION, "enabled": AI_PORTFOLIO_MANAGER_ENABLED, "status": "WAITING_FOR_PLAN", "allocations": []}
 
 
+def _v16_execution_quality_gate(scan: Dict[str, Any], raw_score: float, factors: Dict[str, Any], manual: bool = False) -> tuple[bool, str, str]:
+    """Stop calibration-only candidates from reaching live execution."""
+    spread = max(0.0, float(scan.get("spread") or 0.0))
+    values = (factors or {}).get("values") or {}
+    liquidity_value = values.get("liquidity")
+    liquidity = float(liquidity_value if liquidity_value is not None else 0.0)
+    quality = max(0.0, float(scan.get("quality_score") or scan.get("qualityScore") or 0.0))
+
+    if spread > V16_PORTFOLIO_HARD_MAX_SPREAD:
+        return False, "HARD_SPREAD_LIMIT", f"Spread {spread:.5f} exceeds the absolute safety maximum {V16_PORTFOLIO_HARD_MAX_SPREAD:.5f}."
+    if spread > V16_PORTFOLIO_EXECUTION_MAX_SPREAD:
+        return False, "EXECUTION_SPREAD_TOO_WIDE", f"Spread {spread:.5f} exceeds the preferred live-entry maximum {V16_PORTFOLIO_EXECUTION_MAX_SPREAD:.5f}."
+    if liquidity < V16_PORTFOLIO_MIN_LIQUIDITY_FACTOR:
+        return False, "LIQUIDITY_FACTOR_TOO_LOW", f"Liquidity factor {liquidity:.3f} is below the minimum {V16_PORTFOLIO_MIN_LIQUIDITY_FACTOR:.3f}."
+    if not manual and raw_score < V16_PORTFOLIO_MIN_RAW_SCORE:
+        return False, "RAW_SCORE_TOO_LOW", f"Raw score {raw_score:.3f} is below the execution floor {V16_PORTFOLIO_MIN_RAW_SCORE:.3f}; calibration alone cannot qualify it."
+    if not manual and quality < V16_PORTFOLIO_MIN_QUALITY:
+        return False, "UNDERLYING_QUALITY_TOO_LOW", f"Underlying quality {quality:.4f} is below the execution floor {V16_PORTFOLIO_MIN_QUALITY:.4f}."
+    return True, "QUALITY_GUARD_PASS", "Raw score, setup quality, spread and liquidity all passed the live-execution guard."
+
+
 def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) -> Dict[str, Any]:
     account = get_account()
     equity = float(account.equity)
@@ -3573,17 +3601,20 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             print(f"V16 DECISION | symbol={symbol} decision=REJECTED reason=INVALID_PRICE price={price}")
             continue
 
-        if spread > V16_PORTFOLIO_HARD_MAX_SPREAD:
+        quality_ok, quality_code, quality_reason = _v16_execution_quality_gate(scan, raw_score, factors, manual=manual)
+        if not quality_ok:
             decisions.append({
                 "scanIndex": scan_index + 1, "symbol": symbol, "decision": "REJECTED",
-                "reasonCode": "HARD_SPREAD_LIMIT",
-                "reason": f"Spread {spread:.5f} exceeds the live-order safety maximum {V16_PORTFOLIO_HARD_MAX_SPREAD:.5f}.",
+                "reasonCode": quality_code, "reason": quality_reason,
                 "portfolioScore": score, "rawPortfolioScore": raw_score,
                 "minimumScore": effective_minimum_score, "confidence": round(confidence, 4),
                 "confidenceLabel": label, "quality": quality, "spread": spread,
                 "factors": factors, "deployableNow": False,
             })
-            print(f"V16 DECISION | symbol={symbol} decision=REJECTED reason=HARD_SPREAD_LIMIT spread={spread:.5f}")
+            print(
+                f"V16 DECISION | symbol={symbol} decision=REJECTED reason={quality_code} "
+                f"raw={raw_score:.3f} quality={quality:.4f} spread={spread:.5f} detail={quality_reason}"
+            )
             continue
 
         if V16_PORTFOLIO_REQUIRE_READY_TRIGGER and not bool(scan.get("ready_to_buy")) and not manual:
@@ -3767,6 +3798,10 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         "portfolioExecutionEnabled": V16_PORTFOLIO_EXECUTION_ENABLED,
         "requireReadyTrigger": V16_PORTFOLIO_REQUIRE_READY_TRIGGER,
         "hardMaxSpread": V16_PORTFOLIO_HARD_MAX_SPREAD,
+        "executionMaxSpread": V16_PORTFOLIO_EXECUTION_MAX_SPREAD,
+        "minimumRawScore": V16_PORTFOLIO_MIN_RAW_SCORE,
+        "minimumUnderlyingQuality": V16_PORTFOLIO_MIN_QUALITY,
+        "minimumLiquidityFactor": V16_PORTFOLIO_MIN_LIQUIDITY_FACTOR,
         "decisionReasonCounts": reason_counts,
         "decisions": decisions[:100],
         "qualifiedCandidates": [
@@ -3953,10 +3988,14 @@ def money_mode_buy(scans, manual=False):
             messages.append(f"SKIP {symbol} | {block_reason}")
             continue
         spread = float(c.get("spread") or 0.0)
-        if spread > V16_PORTFOLIO_HARD_MAX_SPREAD:
-            messages.append(
-                f"SKIP {symbol} | spread {spread:.5f} above hard maximum {V16_PORTFOLIO_HARD_MAX_SPREAD:.5f}"
-            )
+        execution_factors = _v16_factor_breakdown(c)
+        execution_raw_score = float((execution_factors or {}).get("final") or 0.0)
+        quality_ok, quality_code, quality_reason = _v16_execution_quality_gate(
+            c, execution_raw_score, execution_factors, manual=manual
+        )
+        if not quality_ok:
+            messages.append(f"SKIP {symbol} | {quality_code}: {quality_reason}")
+            print(f"V16 LIVE ORDER BLOCK | symbol={symbol} reason={quality_code} detail={quality_reason}")
             continue
         if V16_PORTFOLIO_REQUIRE_READY_TRIGGER and not bool(c.get("ready_to_buy")) and not manual:
             messages.append(f"WAIT {symbol} | portfolio qualified but entry trigger not ready")
@@ -3969,7 +4008,7 @@ def money_mode_buy(scans, manual=False):
 
         confidence, label = calculate_confidence(c)
         score = float(allocation.get("portfolioScore") or 0.0)
-        reason = f"{'MANUAL' if manual else 'AUTO'} V16.5 PORTFOLIO #{allocation.get('rank', bought + 1)} SCORE BUY"
+        reason = f"{'MANUAL' if manual else 'AUTO'} V16.5.3 PORTFOLIO #{allocation.get('rank', bought + 1)} SCORE BUY"
         try:
             market_buy_notional(symbol, notional, reason=reason, scan=c)
             record_v2_setup_decision(

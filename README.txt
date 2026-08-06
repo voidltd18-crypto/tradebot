@@ -1,14 +1,30 @@
-TradeBot V16.5.2 — Portfolio Live Execution
+TradeBot V16.5.3 — Portfolio Quality Guard
 
 Replace:
   backend/legacy/monolith.py
 
-What changed:
-- V16 portfolio score is now the live entry gate when AI Portfolio Manager is enabled.
-- The old Sniper/A+ confidence and quality gates remain visible as supporting evidence but no longer veto V16-qualified candidates.
-- Full safeguards remain: market open, emergency stop, bot enabled, PDT daily buy limit, position capacity, buying power, existing holdings, open orders, daily symbol locks, minimum order size, and hard spread limit.
-- Set V16_PORTFOLIO_EXECUTION_ENABLED=false to return to legacy Sniper/A+ execution.
-- Set V16_PORTFOLIO_REQUIRE_READY_TRIGGER=true to additionally require the old dip trigger.
+Purpose:
+- Keeps V16 portfolio-score live execution enabled.
+- Prevents batch calibration alone from promoting a weak setup into a live order.
+- Adds a second identical quality check immediately before order submission.
 
-Expected Render log after an order:
-  AUTO V16.5 PORTFOLIO #1 SCORE BUY $... SYMBOL score=...
+Automatic live-entry defaults:
+- calibrated portfolio score must meet the active portfolio threshold
+- raw score must be at least 0.560
+- underlying scanner quality must be at least 0.0060
+- liquidity factor must be at least 0.450
+- preferred execution spread must be no more than 0.0100
+- absolute spread ceiling remains unchanged
+- all existing PDT, daily lock, open-order, holding, capacity, cash and emergency protections remain active
+
+Optional Render environment variables:
+  V16_PORTFOLIO_MIN_RAW_SCORE=0.56
+  V16_PORTFOLIO_MIN_QUALITY=0.006
+  V16_PORTFOLIO_MIN_LIQUIDITY_FACTOR=0.45
+  V16_PORTFOLIO_EXECUTION_MAX_SPREAD=0.010
+
+Expected rejection log examples:
+  reason=UNDERLYING_QUALITY_TOO_LOW
+  reason=RAW_SCORE_TOO_LOW
+  reason=EXECUTION_SPREAD_TOO_WIDE
+  reason=LIQUIDITY_FACTOR_TOO_LOW
