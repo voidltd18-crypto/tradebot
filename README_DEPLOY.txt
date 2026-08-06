@@ -1,24 +1,13 @@
-TradeBot V16.2.1 — AI Explainability
+TradeBot V16.3 — Adaptive Scoring Calibration
 
-WHAT THIS FIXES
-- Shows every scanner candidate in the AI Portfolio.
-- Records QUALIFIED, WAITING, or REJECTED for each symbol.
-- Shows the exact rejection/safety reason and all score inputs.
-- Adds detailed V16 DECISION lines to Render logs.
-- Does not lower thresholds or bypass PDT, position, open-order, daily lockout, cash, or risk safeguards.
+This update keeps the absolute score dominant, adds bounded batch calibration, and permits a small adaptive threshold only when the market produces too few candidates. The threshold cannot fall below 0.520 by default. Existing PDT, buy lockouts, position limits, cash reserves, holdings checks and order limits remain active.
 
-DEPLOY BACKEND (RENDER)
-Replace: backend/legacy/monolith.py
+Deploy:
+- Render: backend/legacy/monolith.py
+- Vercel: frontend/src/pages/PortfolioPage.tsx
 
-DEPLOY FRONTEND (VERCEL)
-Replace the contents of your live frontend folder with the included frontend files, or at minimum replace:
-frontend/src/pages/PortfolioPage.tsx
-frontend/index.html
-
-VERIFY
-Render logs should show lines such as:
-V16 DECISION | symbol=SOFI decision=REJECTED reason=SCORE_BELOW_MINIMUM ...
-V16 DECISION | symbol=AMD decision=REJECTED reason=BUY_SAFETY_BLOCK ...
-V16 DECISION | symbol=NVDA decision=QUALIFIED ...
-
-The AI Portfolio page will show the same decisions in the AI Decision Inspector.
+Optional Render environment variables:
+AI_PORTFOLIO_ADAPTIVE_SCORE_ENABLED=true
+AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR=0.52
+AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT=2
+AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT=0.22

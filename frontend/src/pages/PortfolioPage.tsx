@@ -67,7 +67,9 @@ export function PortfolioPage({ authToken }: { authToken: string }) {
         <div><span>Qualified</span><b>{Number(plan?.qualifiedCount || 0)}</b></div>
         <div><span>Rejected</span><b>{Number(plan?.rejectedCount || 0)}</b></div>
         <div><span>Actionable</span><b>{Number(plan?.actionableCount || 0)} / {Number(plan?.orderLimit || 0)}</b></div>
-        <div><span>Minimum score</span><b>{Number(plan?.minimumPortfolioScore || 0).toFixed(3)}</b></div>
+        <div><span>Effective minimum</span><b>{Number(plan?.minimumPortfolioScore || 0).toFixed(3)}</b></div>
+        <div><span>Base minimum</span><b>{Number(plan?.baseMinimumPortfolioScore || plan?.minimumPortfolioScore || 0).toFixed(3)}</b></div>
+        <div><span>Threshold mode</span><b>{String(plan?.thresholdMode || "BASE").replaceAll("_", " ")}</b></div>
         <div><span>Deploy</span><b>{gbp(plan?.deployableGbp)} / {usd(plan?.deployableUsd)}</b></div>
         <div><span>Cash reserve</span><b>{pct(plan?.cashReservePct)} · {gbp(plan?.cashReserveGbp)}</b></div>
         <div><span>Managed capital</span><b>{gbp(plan?.managedCapitalGbp)} / {usd(plan?.managedCapitalUsd)}</b></div>
@@ -88,18 +90,19 @@ export function PortfolioPage({ authToken }: { authToken: string }) {
         )}
       </div>
       <p className="muted">Every live scanner candidate is shown here with the exact reason it qualified, was held back, or was rejected.</p>
-      <div className="table-wrap"><table><thead><tr><th>Rank</th><th>Symbol</th><th>Decision</th><th>Score</th><th>Minimum</th><th>Confidence</th><th>Quality</th><th>Spread</th><th>Exact reason</th></tr></thead>
+      <div className="table-wrap"><table><thead><tr><th>Rank</th><th>Symbol</th><th>Decision</th><th>Calibrated</th><th>Raw</th><th>Minimum</th><th>Confidence</th><th>Quality</th><th>Spread</th><th>Exact reason</th></tr></thead>
       <tbody>{filteredDecisions.map((row: AnyObj, index: number) => <tr key={`${row.symbol}-${row.scanIndex}-${index}`}>
         <td>{row.rank ? `#${row.rank}` : "—"}</td>
         <td><b>{row.symbol || "UNKNOWN"}</b></td>
         <td><b className={decisionClass(String(row.decision || "REJECTED"))}>{decisionLabel(String(row.decision || "REJECTED"))}</b></td>
         <td>{Number(row.portfolioScore || 0).toFixed(3)}</td>
+        <td>{Number(row.rawPortfolioScore ?? row.portfolioScore ?? 0).toFixed(3)}</td>
         <td>{Number(row.minimumScore || plan?.minimumPortfolioScore || 0).toFixed(3)}</td>
         <td>{pct(Number(row.confidence || 0) * 100)}</td>
         <td>{Number(row.quality || 0).toFixed(4)}</td>
         <td>{Number(row.spread || 0).toFixed(5)}</td>
         <td>{row.reason || row.reasonCode || "No reason supplied"}</td>
-      </tr>)}{!filteredDecisions.length && <tr><td colSpan={9}>{loading ? "Loading scanner decisions..." : "No scanner decisions are available yet."}</td></tr>}</tbody></table></div>
+      </tr>)}{!filteredDecisions.length && <tr><td colSpan={10}>{loading ? "Loading scanner decisions..." : "No scanner decisions are available yet."}</td></tr>}</tbody></table></div>
     </Card>
   </main>;
 }

@@ -111,6 +111,10 @@ AI_PORTFOLIO_MIN_CASH_RESERVE_PCT = max(0.02, min(0.50, float(os.getenv("AI_PORT
 AI_PORTFOLIO_MAX_CASH_RESERVE_PCT = max(AI_PORTFOLIO_MIN_CASH_RESERVE_PCT, min(0.80, float(os.getenv("AI_PORTFOLIO_MAX_CASH_RESERVE_PCT", "0.45") or 0.45)))
 AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE = max(1, min(10, int(os.getenv("AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE", "10") or 10)))
 AI_PORTFOLIO_MIN_SCORE = max(0.0, min(1.0, float(os.getenv("AI_PORTFOLIO_MIN_SCORE", "0.55") or 0.55)))
+AI_PORTFOLIO_ADAPTIVE_SCORE_ENABLED = os.getenv("AI_PORTFOLIO_ADAPTIVE_SCORE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR = max(0.0, min(AI_PORTFOLIO_MIN_SCORE, float(os.getenv("AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR", "0.52") or 0.52)))
+AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT = max(1, min(5, int(os.getenv("AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT", "2") or 2)))
+AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT = max(0.0, min(0.40, float(os.getenv("AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT", "0.22") or 0.22)))
 AI_PORTFOLIO_PLAN_FILE = os.getenv("AI_PORTFOLIO_PLAN_FILE", "/var/data/ai_portfolio_plan.json")
 MAX_NEW_BUYS_PER_LOOP = 1
 MAX_POSITION_VALUE_PCT = 0.12
@@ -3170,6 +3174,49 @@ def _v16_portfolio_score(scan: Dict[str, Any]) -> float:
     return round(score, 6)
 
 
+def _v16_calibrated_score_profiles(picks: List[Dict[str, Any]]) -> List[Dict[str, float]]:
+    """Blend absolute setup strength with bounded current-batch separation."""
+    import math
+    raw_scores: List[float] = []
+    for scan in picks:
+        try:
+            raw_scores.append(float(_v16_portfolio_score(scan)))
+        except Exception:
+            raw_scores.append(0.0)
+    if not raw_scores:
+        return []
+    mean = sum(raw_scores) / len(raw_scores)
+    variance = sum((value - mean) ** 2 for value in raw_scores) / max(1, len(raw_scores))
+    std = max(0.04, variance ** 0.5)
+    relative_weight = AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT if len(raw_scores) >= 4 else 0.0
+    profiles: List[Dict[str, float]] = []
+    for raw in raw_scores:
+        z_score = max(-2.5, min(2.5, (raw - mean) / std))
+        relative = 1.0 / (1.0 + math.exp(-1.35 * z_score))
+        calibrated = (raw * (1.0 - relative_weight)) + (relative * relative_weight)
+        profiles.append({
+            "raw": round(max(0.0, min(1.0, raw)), 6),
+            "relative": round(relative, 6),
+            "calibrated": round(max(0.0, min(1.0, calibrated)), 6),
+            "zScore": round(z_score, 4),
+        })
+    return profiles
+
+
+def _v16_effective_minimum_score(profiles: List[Dict[str, float]], manual: bool = False) -> tuple[float, str]:
+    if manual or not AI_PORTFOLIO_ADAPTIVE_SCORE_ENABLED or not profiles:
+        return AI_PORTFOLIO_MIN_SCORE, "BASE"
+    scores = sorted((float(row.get("calibrated") or 0.0) for row in profiles), reverse=True)
+    if sum(1 for score in scores if score >= AI_PORTFOLIO_MIN_SCORE) >= AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT:
+        return AI_PORTFOLIO_MIN_SCORE, "BASE"
+    target_index = min(len(scores), AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT) - 1
+    target_score = scores[target_index]
+    if target_score < AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR:
+        return AI_PORTFOLIO_MIN_SCORE, "BASE_QUALITY_TOO_LOW"
+    effective = max(AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR, min(AI_PORTFOLIO_MIN_SCORE, target_score - 0.001))
+    return (round(effective, 6), "ADAPTIVE_QUIET_MARKET") if effective < AI_PORTFOLIO_MIN_SCORE else (AI_PORTFOLIO_MIN_SCORE, "BASE")
+
+
 def _v16_cash_reserve_pct(candidates: List[Dict[str, Any]]) -> float:
     if not candidates:
         return 1.0
@@ -3216,6 +3263,8 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 
     ranked: List[Dict[str, Any]] = []
     decisions: List[Dict[str, Any]] = []
+    score_profiles = _v16_calibrated_score_profiles(picks)
+    effective_minimum_score, threshold_mode = _v16_effective_minimum_score(score_profiles, manual=manual)
 
     for scan_index, scan in enumerate(picks):
         symbol = str(scan.get("symbol") or "").upper().strip()
@@ -3227,7 +3276,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 "reasonCode": "MISSING_SYMBOL",
                 "reason": "Scanner result did not contain a symbol.",
                 "portfolioScore": 0.0,
-                "minimumScore": AI_PORTFOLIO_MIN_SCORE,
+                "minimumScore": effective_minimum_score,
                 "confidence": 0.0,
                 "quality": 0.0,
                 "spread": 0.0,
@@ -3237,8 +3286,12 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             continue
 
         try:
-            score = _v16_portfolio_score(scan)
+            profile = score_profiles[scan_index] if scan_index < len(score_profiles) else {"raw": _v16_portfolio_score(scan), "calibrated": _v16_portfolio_score(scan), "relative": 0.5, "zScore": 0.0}
+            raw_score = float(profile.get("raw") or 0.0)
+            score = float(profile.get("calibrated") or raw_score)
         except Exception as exc:
+            profile = {"raw": 0.0, "calibrated": 0.0, "relative": 0.0, "zScore": 0.0}
+            raw_score = 0.0
             score = 0.0
             decisions.append({
                 "scanIndex": scan_index + 1,
@@ -3247,7 +3300,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 "reasonCode": "SCORE_ERROR",
                 "reason": f"Portfolio score could not be calculated: {exc}",
                 "portfolioScore": 0.0,
-                "minimumScore": AI_PORTFOLIO_MIN_SCORE,
+                "minimumScore": effective_minimum_score,
                 "confidence": 0.0,
                 "quality": round(float(scan.get("quality_score") or 0.0), 6),
                 "spread": round(float(scan.get("spread") or 0.0), 6),
@@ -3280,7 +3333,10 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 "reasonCode": "BUY_SAFETY_BLOCK",
                 "reason": block_text,
                 "portfolioScore": score,
-                "minimumScore": AI_PORTFOLIO_MIN_SCORE,
+                "rawPortfolioScore": raw_score,
+                "relativeBatchScore": round(float(profile.get("relative") or 0.0), 6),
+                "scoreZ": round(float(profile.get("zScore") or 0.0), 4),
+                "minimumScore": effective_minimum_score,
                 "confidence": round(confidence, 4),
                 "confidenceLabel": label,
                 "quality": quality,
@@ -3293,8 +3349,8 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             )
             continue
 
-        if score < AI_PORTFOLIO_MIN_SCORE and not manual:
-            reason = f"Portfolio score {score:.3f} is below the minimum {AI_PORTFOLIO_MIN_SCORE:.3f}."
+        if score < effective_minimum_score and not manual:
+            reason = f"Calibrated portfolio score {score:.3f} (raw {raw_score:.3f}) is below the minimum {effective_minimum_score:.3f}."
             decisions.append({
                 "scanIndex": scan_index + 1,
                 "symbol": symbol,
@@ -3302,8 +3358,11 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 "reasonCode": "SCORE_BELOW_MINIMUM",
                 "reason": reason,
                 "portfolioScore": score,
-                "minimumScore": AI_PORTFOLIO_MIN_SCORE,
-                "scoreGap": round(AI_PORTFOLIO_MIN_SCORE - score, 6),
+                "rawPortfolioScore": raw_score,
+                "relativeBatchScore": round(float(profile.get("relative") or 0.0), 6),
+                "scoreZ": round(float(profile.get("zScore") or 0.0), 4),
+                "minimumScore": effective_minimum_score,
+                "scoreGap": round(effective_minimum_score - score, 6),
                 "confidence": round(confidence, 4),
                 "confidenceLabel": label,
                 "quality": quality,
@@ -3312,7 +3371,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             })
             print(
                 f"V16 DECISION | symbol={symbol} decision=REJECTED reason=SCORE_BELOW_MINIMUM "
-                f"score={score:.3f} minimum={AI_PORTFOLIO_MIN_SCORE:.3f} confidence={confidence:.3f} quality={quality:.4f} spread={spread:.5f}"
+                f"score={score:.3f} minimum={effective_minimum_score:.3f} confidence={confidence:.3f} quality={quality:.4f} spread={spread:.5f}"
             )
             continue
 
@@ -3320,6 +3379,9 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             "symbol": symbol,
             "scan": scan,
             "portfolioScore": score,
+            "rawPortfolioScore": raw_score,
+            "relativeBatchScore": round(float(profile.get("relative") or 0.0), 6),
+            "scoreZ": round(float(profile.get("zScore") or 0.0), 4),
             "confidence": round(confidence, 4),
             "confidenceLabel": label,
             "quality": quality,
@@ -3332,9 +3394,9 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             "symbol": symbol,
             "decision": "QUALIFIED",
             "reasonCode": "QUALIFIED",
-            "reason": f"Score {score:.3f} met the minimum {AI_PORTFOLIO_MIN_SCORE:.3f} and all symbol safety checks passed.",
+            "reason": f"Calibrated score {score:.3f} (raw {raw_score:.3f}) met the minimum {effective_minimum_score:.3f} and all symbol safety checks passed.",
             "portfolioScore": score,
-            "minimumScore": AI_PORTFOLIO_MIN_SCORE,
+            "minimumScore": effective_minimum_score,
             "confidence": round(confidence, 4),
             "confidenceLabel": label,
             "quality": quality,
@@ -3343,7 +3405,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         })
         print(
             f"V16 DECISION | symbol={symbol} decision=QUALIFIED score={score:.3f} "
-            f"minimum={AI_PORTFOLIO_MIN_SCORE:.3f} confidence={confidence:.3f} quality={quality:.4f} spread={spread:.5f}"
+            f"raw={raw_score:.3f} minimum={effective_minimum_score:.3f} mode={threshold_mode} confidence={confidence:.3f} quality={quality:.4f} spread={spread:.5f}"
         )
 
     ranked.sort(key=lambda item: (-item["portfolioScore"], -item["confidence"], item["spread"]))
@@ -3379,7 +3441,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
     allocations = []
     if actionable_ranked and deployable >= MIN_ORDER_NOTIONAL:
         power = 2.0
-        strengths = [max(0.001, item["portfolioScore"] - AI_PORTFOLIO_MIN_SCORE + 0.08) ** power for item in actionable_ranked]
+        strengths = [max(0.001, item["portfolioScore"] - effective_minimum_score + 0.08) ** power for item in actionable_ranked]
         total_strength = sum(strengths) or 1.0
         remaining = deployable
         for index, (item, strength) in enumerate(zip(actionable_ranked, strengths)):
@@ -3439,7 +3501,11 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         "rejectedCount": rejected_count,
         "waitingCount": waiting_count,
         "orderLimit": order_limit,
-        "minimumPortfolioScore": AI_PORTFOLIO_MIN_SCORE,
+        "minimumPortfolioScore": effective_minimum_score,
+        "baseMinimumPortfolioScore": AI_PORTFOLIO_MIN_SCORE,
+        "adaptiveScoreFloor": AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR,
+        "thresholdMode": threshold_mode,
+        "scoringMode": "ABSOLUTE_PLUS_BATCH_CALIBRATION",
         "decisionReasonCounts": reason_counts,
         "decisions": decisions[:100],
         "qualifiedCandidates": [
@@ -3463,7 +3529,8 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         "allocationMethod": "score-weighted; stronger qualified candidates receive more capital; cash remains only when breadth/quality is insufficient or safety caps apply",
         "allocations": [{k: v for k, v in row.items() if k != "scan"} for row in allocations],
         "explanation": (
-            f"Reviewed {len(picks)} live scanner candidate(s): {len(qualified_ranked)} qualified, "
+            f"Reviewed {len(picks)} live scanner candidate(s) using {threshold_mode.lower().replace('_', ' ')} thresholding "
+            f"(base {AI_PORTFOLIO_MIN_SCORE:.3f}, effective {effective_minimum_score:.3f}): {len(qualified_ranked)} qualified, "
             f"{rejected_count} rejected and {waiting_count} qualified but waiting for capacity. "
             f"{len(actionable_ranked)} can be considered within the current capacity/daily safety limit. "
             f"Planned ${allocated:.2f} across {len(allocations)} position(s), with {reserve_pct * 100.0:.1f}% cash reserve. "
@@ -3476,7 +3543,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
     }
     _v16_save_portfolio_plan(plan)
     print(
-        f"V16 PORTFOLIO PLAN | scans={len(picks)} qualified={len(qualified_ranked)} "
+        f"V16 PORTFOLIO PLAN | scans={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
         f"rejected={rejected_count} waiting={waiting_count} actionable={len(actionable_ranked)} "
         f"order_limit={order_limit} deploy=${allocated:.2f} reserve={reserve_pct*100:.1f}% allocations="
         + ",".join(f"{a['symbol']}=${a['notionalUsd']:.2f}" for a in allocations)
