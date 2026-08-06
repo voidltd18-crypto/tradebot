@@ -34,3 +34,5 @@
     min-width: 120px;
   }
 }
+
+.trade-explanation{margin-top:14px;border-top:1px solid rgba(148,163,184,.2);padding-top:12px;max-width:720px}.trade-explanation summary{cursor:pointer;font-weight:800;color:#38bdf8}.trade-explanation[open] summary{margin-bottom:12px}.explanation-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-bottom:10px}.explanation-grid>div{background:rgba(15,23,42,.55);border:1px solid rgba(148,163,184,.16);border-radius:10px;padding:9px 11px}.explanation-grid span{display:block;color:#94a3b8;font-size:.82rem}.explanation-grid b{display:block;margin-top:3px}.trade-explanation ul{margin:7px 0 10px 20px}.position-main{min-width:0;flex:1}
