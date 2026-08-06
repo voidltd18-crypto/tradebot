@@ -467,10 +467,16 @@ app = FastAPI(title="Rebuilt Sniper Profit Bot")
 
 app.add_middleware(
     CORSMiddleware,
+    # Token authentication is sent in headers, not browser cookies.
+    # Credentials + wildcard origins can cause browsers to accept OPTIONS
+    # but block the real GET request. Keep credential mode disabled.
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    # Cache successful preflight responses so the dashboard does not
+    # repeat OPTIONS before every polling request.
+    max_age=600,
 )
 
 
