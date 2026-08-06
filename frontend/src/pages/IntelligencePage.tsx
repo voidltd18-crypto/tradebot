@@ -17,7 +17,7 @@ import { API_URL, readJson } from "../lib/api";
 import { clamp } from "../lib/format";
 import type { AnyObj } from "../lib/types";
 
-type IntelligenceSection = "ceo" | "board" | "brain" | "market" | "research" | "symbols" | "rules" | "evolution" | "memory" | "scientist" | "operations";
+type IntelligenceSection = "ceo" | "board" | "brain" | "market" | "research" | "symbols" | "rules" | "evolution" | "memory" | "scientist" | "operations" | "portfolio";
 
 type EndpointState = {
   data: AnyObj;
@@ -143,6 +143,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     operationsQueues: EMPTY_ENDPOINT,
     operationsDoctor: EMPTY_ENDPOINT,
     operationsEngineHealth: EMPTY_ENDPOINT,
+    portfolioStatus: EMPTY_ENDPOINT,
   });
 
   const endpoints = useMemo(() => ({
@@ -190,6 +191,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     operationsQueues: "/v15/operations/queues",
     operationsDoctor: "/v15/operations/doctor",
     operationsEngineHealth: "/v15/operations/engine-health",
+    portfolioStatus: "/v16/portfolio/status",
   }), []);
 
   const load = useCallback(async () => {
@@ -445,6 +447,43 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     samples: num(row.samples ?? row.trades ?? row.count),
   }));
 
+  const portfolioStatus = sources.portfolioStatus.data || {};
+  const portfolioAllocations = firstArray(
+    portfolioStatus.allocations,
+    portfolioStatus.plan?.allocations,
+    portfolioStatus.portfolio?.allocations,
+    portfolioStatus.candidates,
+  );
+  const portfolioCapacity = firstObject(portfolioStatus.capacity, portfolioStatus.plan?.capacity);
+  const portfolioPlan = firstObject(portfolioStatus.plan, portfolioStatus.portfolio, portfolioStatus);
+  const portfolioDeployUsd = num(
+    portfolioPlan.deployCapitalUsd ?? portfolioPlan.deployUsd ?? portfolioPlan.totalAllocatedUsd ?? portfolioPlan.deploymentUsd,
+    portfolioAllocations.reduce((sum, row) => sum + num(row.allocationUsd ?? row.allocatedUsd ?? row.notionalUsd ?? row.amountUsd), 0),
+  );
+  const portfolioCashReserveUsd = num(
+    portfolioPlan.cashReserveUsd ?? portfolioPlan.reserveUsd ?? portfolioPlan.remainingCashUsd,
+    Math.max(0, num(portfolioCapacity.buyingPowerUsd) - portfolioDeployUsd),
+  );
+  const portfolioCapitalUsd = num(
+    portfolioPlan.capitalUsd ?? portfolioCapacity.capitalUsd ?? portfolioCapacity.buyingPowerUsd,
+    portfolioDeployUsd + portfolioCashReserveUsd,
+  );
+  const portfolioDeployPct = portfolioCapitalUsd > 0 ? (portfolioDeployUsd / portfolioCapitalUsd) * 100 : 0;
+  const portfolioReservePct = portfolioCapitalUsd > 0 ? (portfolioCashReserveUsd / portfolioCapitalUsd) * 100 : 0;
+  const portfolioQualified = num(
+    portfolioPlan.qualifiedCandidates ?? portfolioPlan.qualifiedCount ?? portfolioPlan.candidateCount,
+    portfolioAllocations.length,
+  );
+  const portfolioScanned = num(portfolioPlan.scannedCandidates ?? portfolioPlan.scannedCount ?? portfolioPlan.universeScanned);
+  const portfolioRejected = num(portfolioPlan.rejectedCandidates ?? portfolioPlan.rejectedCount, Math.max(0, portfolioScanned - portfolioQualified));
+  const portfolioStatusLabel = text(portfolioStatus.status ?? portfolioPlan.status, "WAITING_FOR_PLAN");
+  const portfolioReason = text(
+    portfolioPlan.reason ?? portfolioPlan.deploymentReason ?? portfolioPlan.cashReserveReason ?? portfolioStatus.reason,
+    portfolioStatusLabel === "WAITING_FOR_PLAN"
+      ? "The Portfolio Manager is waiting for the next completed scoring cycle."
+      : "Capital is allocated according to candidate strength, risk and available capacity.",
+  );
+
   const monitoredSourceEntries = Object.entries(sources).filter(([key]) => key !== "operationsEngineHealth");
   const endpointHealth = monitoredSourceEntries.filter(([, source]) => !source.error && !source.loading).length;
   const endpointTotal = monitoredSourceEntries.length;
@@ -597,9 +636,71 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     </Card>
 
     <nav className="intelligence-tabs">
-      {(["ceo", "board", "brain", "market", "research", "symbols", "rules", "evolution", "memory", "scientist", "operations"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "ceo" ? "AI CEO" : item === "board" ? "AI BOARD" : item === "brain" ? "AI BRAIN" : item === "memory" ? "AI MEMORY" : item === "scientist" ? "AI SCIENTIST" : item === "operations" ? "AI OPERATIONS" : item.toUpperCase()}</button>)}
+      {(["ceo", "board", "brain", "portfolio", "market", "research", "symbols", "rules", "evolution", "memory", "scientist", "operations"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "ceo" ? "AI CEO" : item === "board" ? "AI BOARD" : item === "brain" ? "AI BRAIN" : item === "portfolio" ? "AI PORTFOLIO" : item === "memory" ? "AI MEMORY" : item === "scientist" ? "AI SCIENTIST" : item === "operations" ? "AI OPERATIONS" : item.toUpperCase()}</button>)}
     </nav>
 
+
+    {section === "portfolio" && <div className="memory-view portfolio-view">
+      <Card wide className="intelligence-hero portfolio-command-card">
+        <div className="intelligence-hero-head">
+          <div>
+            <p className="eyebrow">V16 AUTONOMOUS CAPITAL ALLOCATION</p>
+            <h2>{portfolioStatusLabel.replace(/_/g, " ")}</h2>
+            <p className="muted">The Portfolio Manager ranks every qualified opportunity, allocates more capital to stronger candidates and keeps cash only when the evidence or safety limits justify it.</p>
+          </div>
+          <div className={`score-ring ${portfolioAllocations.length ? "good" : ""}`}>
+            <strong>{portfolioAllocations.length}</strong><span>planned positions</span>
+          </div>
+        </div>
+        <div className="intelligence-stats four">
+          <StatTile label="Qualified candidates" value={portfolioQualified.toLocaleString("en-GB")} sub={portfolioScanned ? `${portfolioScanned.toLocaleString("en-GB")} scanned` : "Waiting for full scan"} />
+          <StatTile label="Deploy capital" value={`$${portfolioDeployUsd.toFixed(2)}`} sub={`${portfolioDeployPct.toFixed(1)}% of managed capital`} tone={portfolioDeployUsd > 0 ? "positive" : ""} />
+          <StatTile label="Cash reserve" value={`$${portfolioCashReserveUsd.toFixed(2)}`} sub={`${portfolioReservePct.toFixed(1)}% retained`} />
+          <StatTile label="Available slots" value={num(portfolioCapacity.availableSlots).toFixed(0)} sub={`${num(portfolioCapacity.openPositions).toFixed(0)} currently open`} />
+        </div>
+        <div className="status-strip"><span>SCORE-WEIGHTED ALLOCATION</span><span>MAX {num(portfolioCapacity.hardSafetyCap, 10).toFixed(0)} POSITIONS</span><span>CASH IS AN ACTIVE DECISION</span><span>EXISTING RISK GATES REMAIN ACTIVE</span></div>
+      </Card>
+
+      <Card title="Why this amount of cash is being deployed" wide>
+        <div className="recommendation-box"><strong>{portfolioStatusLabel.replace(/_/g, " ")}</strong><p>{portfolioReason}</p></div>
+        <div className="summary">
+          <div><span>Managed capital</span><b>${portfolioCapitalUsd.toFixed(2)}</b></div>
+          <div><span>Deploy now</span><b>${portfolioDeployUsd.toFixed(2)} · {portfolioDeployPct.toFixed(1)}%</b></div>
+          <div><span>Keep available</span><b>${portfolioCashReserveUsd.toFixed(2)} · {portfolioReservePct.toFixed(1)}%</b></div>
+          <div><span>Rejected candidates</span><b>{portfolioRejected.toLocaleString("en-GB")}</b></div>
+        </div>
+      </Card>
+
+      <Card title="Ranked Portfolio Plan" wide>
+        {portfolioAllocations.length ? <DataTable rows={portfolioAllocations} columns={[
+          { key: "rank", label: "Rank", render: (row) => `#${num(row.rank ?? row.position ?? portfolioAllocations.indexOf(row) + 1).toFixed(0)}` },
+          { key: "symbol", label: "Symbol", render: (row) => <b>{text(row.symbol ?? row.ticker)}</b> },
+          { key: "score", label: "Portfolio score", render: (row) => num(row.portfolioScore ?? row.score ?? row.finalScore).toFixed(2) },
+          { key: "confidence", label: "Confidence", render: (row) => `${pct(row.confidence ?? row.confidenceScore).toFixed(0)}%` },
+          { key: "quality", label: "Quality", render: (row) => num(row.quality ?? row.qualityScore).toFixed(4) },
+          { key: "allocation", label: "Allocation", render: (row) => `$${num(row.allocationUsd ?? row.allocatedUsd ?? row.notionalUsd ?? row.amountUsd).toFixed(2)}` },
+          { key: "weight", label: "Weight", render: (row) => `${pct(row.weightPct ?? row.weight ?? row.allocationPct).toFixed(1)}%` },
+          { key: "reason", label: "Why", render: (row) => text(row.reason ?? row.allocationReason ?? row.rationale, "Ranked by portfolio strength") },
+        ]} /> : <EmptyState endpoint="V16 portfolio plan" error={sources.portfolioStatus.error || portfolioReason} />}
+      </Card>
+
+      <div className="grid two">
+        <Card title="Capacity & Funding"><div className="summary">
+          <div><span>Effective capacity</span><b>{num(portfolioCapacity.effectiveMaxPositions).toFixed(0)}</b></div>
+          <div><span>Open positions</span><b>{num(portfolioCapacity.openPositions).toFixed(0)}</b></div>
+          <div><span>Structural slots</span><b>{num(portfolioCapacity.structuralAvailableSlots).toFixed(0)}</b></div>
+          <div><span>Affordable new positions</span><b>{num(portfolioCapacity.affordableNewPositions).toFixed(0)}</b></div>
+          <div><span>Buying power</span><b>${num(portfolioCapacity.buyingPowerUsd).toFixed(2)}</b></div>
+          <div><span>Target reference size</span><b>${num(portfolioCapacity.targetPositionNotionalUsd).toFixed(2)}</b></div>
+        </div><p className="muted">{text(portfolioCapacity.reason, "Capacity will populate when the backend returns its live funding calculation.")}</p></Card>
+        <Card title="Portfolio Manager Rules"><div className="constitution-list">
+          <div><span>1</span><p>Every approved candidate competes against every other approved candidate.</p></div>
+          <div><span>2</span><p>Higher portfolio scores earn larger allocations; weaker approved candidates receive less.</p></div>
+          <div><span>3</span><p>Cash remains unallocated only when candidate breadth, market quality, capacity or safety constraints require it.</p></div>
+          <div><span>4</span><p>Existing confidence, quality, PDT, daily lockout, spread, risk and capital protections still apply.</p></div>
+        </div></Card>
+      </div>
+    </div>}
 
     {section === "ceo" && <div className="grid two ceo-view">
       <Card title="AI Chief Executive" wide className="ceo-command-card">
