@@ -116,6 +116,10 @@ AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR = max(0.0, min(AI_PORTFOLIO_MIN_SCORE, float(o
 AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT = max(1, min(5, int(os.getenv("AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT", "2") or 2)))
 AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT = max(0.0, min(0.40, float(os.getenv("AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT", "0.22") or 0.22)))
 AI_PORTFOLIO_PLAN_FILE = os.getenv("AI_PORTFOLIO_PLAN_FILE", "/var/data/ai_portfolio_plan.json")
+AI_PORTFOLIO_SCORING_ENGINE_VERSION = "V16.5.1-REAL-MARKET-FACTORS"
+AI_PORTFOLIO_BAR_FALLBACK_MINUTES = max(10, min(120, int(os.getenv("AI_PORTFOLIO_BAR_FALLBACK_MINUTES", "45") or 45)))
+AI_PORTFOLIO_BAR_CACHE_SECONDS = max(30, min(300, int(os.getenv("AI_PORTFOLIO_BAR_CACHE_SECONDS", "75") or 75)))
+_v16_bar_cache: Dict[str, Dict[str, Any]] = {}
 MAX_NEW_BUYS_PER_LOOP = 1
 MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
@@ -3161,25 +3165,83 @@ def _v16_clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, float(value)))
 
 
-def _v16_curve_metrics(scan: Dict[str, Any]) -> Dict[str, float]:
-    """Calculate real short-horizon behaviour from the live price curve."""
+def _v16_recent_bar_prices(symbol: str) -> List[float]:
+    """Return cached recent one-minute closes when the in-memory curve is cold.
+
+    A Render restart clears ``state[symbol][price_curve]``. Without this fallback,
+    every symbol began at neutral momentum for the first several scan cycles.
+    The cache keeps the fallback lightweight and avoids repeated data requests.
+    """
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return []
+    now = time.time()
+    cached = _v16_bar_cache.get(sym) or {}
+    if cached.get("prices") and (now - float(cached.get("updated") or 0.0)) < AI_PORTFOLIO_BAR_CACHE_SECONDS:
+        return list(cached.get("prices") or [])
+    try:
+        end = datetime.now(UTC)
+        start = end - timedelta(minutes=AI_PORTFOLIO_BAR_FALLBACK_MINUTES)
+        req = StockBarsRequest(
+            symbol_or_symbols=[sym],
+            timeframe=TimeFrame.Minute,
+            start=start,
+            end=end,
+            feed=DataFeed.IEX,
+        )
+        response = data_client.get_stock_bars(req)
+        try:
+            bars = list(response[sym])
+        except Exception:
+            bars = list((getattr(response, "data", {}) or {}).get(sym, []))
+        prices: List[float] = []
+        for bar in bars:
+            try:
+                close = float(getattr(bar, "close", 0.0) or 0.0)
+                if close > 0 and math.isfinite(close):
+                    prices.append(close)
+            except Exception:
+                continue
+        prices = prices[-60:]
+        _v16_bar_cache[sym] = {"updated": now, "prices": prices}
+        return prices
+    except Exception as exc:
+        print(f"V16 FACTOR BAR FALLBACK ERROR {sym}: {exc}")
+        _v16_bar_cache[sym] = {"updated": now, "prices": []}
+        return []
+
+
+def _v16_curve_metrics(scan: Dict[str, Any]) -> Dict[str, Any]:
+    """Calculate short-horizon behaviour from the live curve or recent bars."""
     symbol = str(scan.get("symbol") or "").upper().strip()
     curve = scan.get("price_curve") or scan.get("priceCurve") or []
     if not curve and symbol:
-        try:
-            curve = (state.get(symbol) or {}).get("price_curve") or []
-        except Exception:
-            curve = []
+        curve = (state.get(symbol) or {}).get("price_curve") or []
+
     prices: List[float] = []
     for point in curve[-60:]:
         try:
             value = float(point.get("value") if isinstance(point, dict) else point)
-            if value > 0:
+            if value > 0 and math.isfinite(value):
                 prices.append(value)
         except Exception:
             continue
+
+    source = "LIVE_CURVE"
+    # A few repeated quote samples are not enough to infer a useful trend.
+    if len(prices) < 8 and symbol:
+        fallback = _v16_recent_bar_prices(symbol)
+        if len(fallback) >= 3:
+            prices = fallback
+            source = "ALPACA_1MIN_BARS"
+
     if len(prices) < 3:
-        return {"samples": float(len(prices)), "return": 0.0, "slope": 0.0, "consistency": 0.5, "volatility": 0.0, "drawdown": 0.0}
+        return {
+            "samples": len(prices), "return": 0.0, "slope": 0.0,
+            "consistency": 0.5, "volatility": 0.0, "drawdown": 0.0,
+            "source": "INSUFFICIENT_DATA",
+        }
+
     returns = [(prices[i] / prices[i - 1]) - 1.0 for i in range(1, len(prices)) if prices[i - 1] > 0]
     total_return = (prices[-1] / prices[0]) - 1.0
     n = len(prices)
@@ -3200,27 +3262,35 @@ def _v16_curve_metrics(scan: Dict[str, Any]) -> Dict[str, float]:
         if peak > 0:
             max_drawdown = max(max_drawdown, (peak - price) / peak)
     return {
-        "samples": float(n), "return": total_return, "slope": slope,
-        "consistency": consistency, "volatility": volatility, "drawdown": max_drawdown,
+        "samples": n, "return": total_return, "slope": slope,
+        "consistency": consistency, "volatility": volatility,
+        "drawdown": max_drawdown, "source": source,
     }
 
 
 def _v16_prepare_real_market_factors(picks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Enrich candidates with batch-relative strength and real curve metrics."""
+    """Enrich candidates with real curve metrics and batch-relative strength."""
     enriched: List[Dict[str, Any]] = []
-    rows: List[tuple[int, float]] = []
+    rows: List[Tuple[int, float]] = []
     for index, original in enumerate(picks):
         scan = dict(original)
         metrics = _v16_curve_metrics(scan)
         scan["v16CurveMetrics"] = metrics
-        strength = (metrics["return"] * 0.65) + (metrics["slope"] * 8.0 * 0.35)
+        # Return dominates; slope and the scanner's own short momentum break ties.
+        scanner_momentum = float(scan.get("short_momentum") or scan.get("shortMomentum") or 0.0)
+        strength = (
+            float(metrics.get("return") or 0.0) * 0.55
+            + float(metrics.get("slope") or 0.0) * 8.0 * 0.30
+            + scanner_momentum * 0.15
+        )
         rows.append((index, strength))
         enriched.append(scan)
-    ordered = sorted(rows, key=lambda row: row[1])
-    count = max(1, len(ordered) - 1)
-    percentiles = {idx: rank / count for rank, (idx, _) in enumerate(ordered)}
+
+    ordered = sorted(rows, key=lambda row: (row[1], row[0]))
+    denominator = max(1, len(ordered) - 1)
+    percentiles = {idx: rank / denominator for rank, (idx, _) in enumerate(ordered)}
     for index, scan in enumerate(enriched):
-        scan["v16BatchRelativeStrength"] = percentiles.get(index, 0.5)
+        scan["v16BatchRelativeStrength"] = float(percentiles.get(index, 0.5))
         try:
             scan["market_regime"] = scan.get("market_regime") or scan.get("marketRegime") or _v4_market_regime()
         except Exception:
@@ -3229,56 +3299,56 @@ def _v16_prepare_real_market_factors(picks: List[Dict[str, Any]]) -> List[Dict[s
 
 
 def _v16_factor_breakdown(scan: Dict[str, Any]) -> Dict[str, Any]:
-    """V16.5 factors calculated from live curve, quote, reputation and regime data."""
+    """V16.5.1 factors calculated from live/bars, quote, history and regime data."""
     confidence, _ = calculate_confidence(scan)
     confidence = _v16_clamp(confidence)
     metrics = scan.get("v16CurveMetrics") or _v16_curve_metrics(scan)
 
     curve_return = float(metrics.get("return") or 0.0)
     curve_slope = float(metrics.get("slope") or 0.0)
-    consistency = float(metrics.get("consistency") or 0.5)
-    momentum_raw = float(scan.get("short_momentum") or scan.get("shortMomentum") or curve_return)
-    directional = _v16_clamp(0.5 + (curve_return * 22.0) + (curve_slope * 95.0))
-    momentum = _v16_clamp((directional * 0.72) + (consistency * 0.28))
+    consistency = float(metrics.get("consistency") if metrics.get("consistency") is not None else 0.5)
+    scanner_momentum = float(scan.get("short_momentum") or scan.get("shortMomentum") or 0.0)
+    directional = _v16_clamp(0.5 + curve_return * 24.0 + curve_slope * 110.0 + scanner_momentum * 10.0)
+    momentum = _v16_clamp(directional * 0.74 + consistency * 0.26)
 
-    relative_strength = _v16_clamp(float(scan.get("v16BatchRelativeStrength") or 0.5))
+    rs_value = scan.get("v16BatchRelativeStrength")
+    relative_strength = _v16_clamp(0.5 if rs_value is None else float(rs_value))
 
     spread = max(0.0, float(scan.get("spread") or 0.0))
     spread_quality = _v16_clamp(1.0 - spread / max(0.0001, float(MAX_SPREAD)))
     relative_volume = float(scan.get("relative_volume") or scan.get("relativeVolume") or scan.get("rvol") or 0.0)
-    volume_quality = _v16_clamp(relative_volume / 2.0) if relative_volume > 0 else 0.55
-    liquidity = _v16_clamp((spread_quality * 0.82) + (volume_quality * 0.18))
+    volume_quality = _v16_clamp(relative_volume / 2.0) if relative_volume > 0 else 0.50
+    liquidity = _v16_clamp(spread_quality * 0.85 + volume_quality * 0.15)
 
     realised_vol = abs(float(metrics.get("volatility") or 0.0))
     drawdown = abs(float(metrics.get("drawdown") or 0.0))
-    # Reward enough movement to trade, penalise unstable/noisy or sharply drawing-down curves.
     movement_score = _v16_clamp(realised_vol / 0.0015)
     noise_penalty = _v16_clamp(realised_vol / 0.008)
     drawdown_penalty = _v16_clamp(drawdown / 0.025)
-    volatility_quality = _v16_clamp(0.48 + movement_score * 0.35 - noise_penalty * 0.18 - drawdown_penalty * 0.30)
+    volatility_quality = _v16_clamp(0.46 + movement_score * 0.38 - noise_penalty * 0.18 - drawdown_penalty * 0.30)
 
     historical_edge = 0.50
+    historical_source = "NEUTRAL_NO_HISTORY"
     symbol = str(scan.get("symbol") or "").upper().strip()
     try:
         reputation = symbol_reputation_snapshot(force=False).get(symbol) or {}
         samples = int(reputation.get("samples") or 0)
-        rep_score = float(reputation.get("score") or 0.5)
+        rep_score = float(reputation.get("score") if reputation.get("score") is not None else 0.5)
         sample_weight = min(1.0, samples / 20.0)
         historical_edge = _v16_clamp(0.5 * (1.0 - sample_weight) + rep_score * sample_weight)
-    except Exception:
-        history = scan.get("optimiserDecision") or {}
-        history_mult = max(0.65, min(1.25, float(history.get("multiplier") or 1.0)))
-        historical_edge = _v16_clamp((history_mult - 0.65) / 0.60)
+        historical_source = f"SYMBOL_REPUTATION_{samples}_SAMPLES"
+    except Exception as exc:
+        historical_source = f"HISTORY_FALLBACK:{exc.__class__.__name__}"
 
     regime_text = str(scan.get("market_regime") or scan.get("marketRegime") or "UNKNOWN").upper()
     if "BULL" in regime_text or "RISK_ON" in regime_text:
-        regime_fit = _v16_clamp(0.45 + momentum * 0.45 + relative_strength * 0.10)
+        regime_fit = _v16_clamp(0.42 + momentum * 0.46 + relative_strength * 0.12)
     elif "BEAR" in regime_text or "RISK_OFF" in regime_text:
-        regime_fit = _v16_clamp(0.72 - momentum * 0.30 + volatility_quality * 0.18)
+        regime_fit = _v16_clamp(0.70 - momentum * 0.28 + volatility_quality * 0.20)
     elif "RANGE" in regime_text or "CHOP" in regime_text:
-        regime_fit = _v16_clamp(0.42 + volatility_quality * 0.38 + (1.0 - abs(momentum - 0.5) * 2.0) * 0.20)
+        regime_fit = _v16_clamp(0.40 + volatility_quality * 0.40 + (1.0 - abs(momentum - 0.5) * 2.0) * 0.20)
     else:
-        regime_fit = _v16_clamp(0.45 + momentum * 0.22 + volatility_quality * 0.18 + relative_strength * 0.15)
+        regime_fit = _v16_clamp(0.40 + momentum * 0.24 + volatility_quality * 0.18 + relative_strength * 0.18)
 
     quality_raw = max(0.0, float(scan.get("quality_score") or scan.get("qualityScore") or 0.0))
     quality = _v16_clamp(quality_raw / max(0.0001, float(A_PLUS_MIN_QUALITY or 0.026)))
@@ -3286,14 +3356,19 @@ def _v16_factor_breakdown(scan: Dict[str, Any]) -> Dict[str, Any]:
     values = {"momentum": momentum, "relativeStrength": relative_strength, "liquidity": liquidity, "volatilityQuality": volatility_quality, "historicalEdge": historical_edge, "regimeFit": regime_fit}
     weighted = {key: round(values[key] * weights[key], 6) for key in weights}
     base = sum(weighted.values())
-    validation = (confidence * 0.60) + (quality * 0.40)
-    final = _v16_clamp((base * 0.82) + (validation * 0.18))
+    validation = confidence * 0.60 + quality * 0.40
+    final = _v16_clamp(base * 0.82 + validation * 0.18)
+    numeric_metrics = {key: round(float(value), 8) for key, value in metrics.items() if isinstance(value, (int, float))}
     return {
-        "version": "V16.5", "source": "LIVE_MARKET_DATA",
+        "version": AI_PORTFOLIO_SCORING_ENGINE_VERSION,
+        "source": "REAL_MARKET_DATA",
         "values": {key: round(value, 6) for key, value in values.items()},
-        "weights": weights, "weighted": weighted, "validation": round(validation, 6),
-        "final": round(final, 6), "regime": regime_text,
-        "marketMetrics": {key: round(float(value), 8) for key, value in metrics.items()},
+        "weights": weights, "weighted": weighted,
+        "validation": round(validation, 6), "final": round(final, 6),
+        "regime": regime_text,
+        "marketMetrics": numeric_metrics,
+        "marketDataSource": str(metrics.get("source") or "UNKNOWN"),
+        "historicalSource": historical_source,
     }
 
 def _v16_portfolio_score(scan: Dict[str, Any]) -> float:
@@ -3465,11 +3540,9 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 "scoreZ": round(float(profile.get("zScore") or 0.0), 4),
                 "minimumScore": effective_minimum_score,
                 "confidence": round(confidence, 4),
-            "factors": factors,
                 "confidenceLabel": label,
                 "quality": quality,
                 "spread": spread,
-            "factors": factors,
                 "factors": factors,
                 "deployableNow": False,
             })
@@ -3497,7 +3570,6 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 "confidenceLabel": label,
                 "quality": quality,
                 "spread": spread,
-            "factors": factors,
                 "factors": factors,
                 "deployableNow": False,
             })
@@ -3519,7 +3591,6 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             "quality": quality,
             "spread": spread,
             "factors": factors,
-                "factors": factors,
             "riskProfile": _ai_risk_build_profile(scan) if AI_RISK_ENGINE_ENABLED else {},
         }
         ranked.append(item)
@@ -3530,13 +3601,15 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             "reasonCode": "QUALIFIED",
             "reason": f"Calibrated score {score:.3f} (raw {raw_score:.3f}) met the minimum {effective_minimum_score:.3f} and all symbol safety checks passed.",
             "portfolioScore": score,
+            "rawPortfolioScore": raw_score,
+            "relativeBatchScore": round(float(profile.get("relative") or 0.0), 6),
+            "scoreZ": round(float(profile.get("zScore") or 0.0), 4),
             "minimumScore": effective_minimum_score,
             "confidence": round(confidence, 4),
             "confidenceLabel": label,
             "quality": quality,
             "spread": spread,
             "factors": factors,
-                "factors": factors,
             "deployableNow": False,
         })
         print(
@@ -3618,7 +3691,8 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 
     plan = {
         "ok": True,
-        "version": "V16.2.1-AI-EXPLAINABILITY",
+        "version": "V16.5.1-REAL-MARKET-FACTORS",
+        "scoringEngineVersion": AI_PORTFOLIO_SCORING_ENGINE_VERSION,
         "enabled": AI_PORTFOLIO_MANAGER_ENABLED,
         "createdAt": datetime.now(UTC).isoformat(),
         "manual": bool(manual),
@@ -3697,7 +3771,11 @@ def api_v16_portfolio_status(request: Request):
     # were live. Build a read-only plan from the latest scan snapshot whenever
     # the saved plan is missing, empty or stale. This does not submit orders.
     payload = _v16_load_portfolio_plan()
-    should_publish = payload.get("status") in (None, "WAITING_FOR_PLAN") or not payload.get("createdAt")
+    should_publish = (
+        payload.get("status") in (None, "WAITING_FOR_PLAN")
+        or not payload.get("createdAt")
+        or payload.get("scoringEngineVersion") != AI_PORTFOLIO_SCORING_ENGINE_VERSION
+    )
     try:
         created_at = payload.get("createdAt")
         if created_at:
@@ -3718,6 +3796,7 @@ def api_v16_portfolio_status(request: Request):
 
     payload.setdefault("enabled", AI_PORTFOLIO_MANAGER_ENABLED)
     payload.setdefault("version", AI_PORTFOLIO_MANAGER_VERSION)
+    payload["scoringEngineVersion"] = AI_PORTFOLIO_SCORING_ENGINE_VERSION
     payload["openPositions"] = len(get_all_positions())
     payload["capacity"] = ai_position_capacity_payload()
     payload["latestScanCount"] = len(latest_scans)
