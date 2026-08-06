@@ -3214,36 +3214,165 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
     daily_slots = max(0, int(MAX_NEW_BUYS_PER_DAY_PDT_AWARE - today_buy_count())) if PDT_AWARE_MODE_ENABLED else AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE
     order_limit = max(0, min(structural_slots, daily_slots, AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE))
 
-    ranked = []
-    for scan in picks:
-        symbol = str(scan.get("symbol") or "").upper()
-        allowed, block = can_buy_symbol(symbol)
-        if not symbol or not allowed:
+    ranked: List[Dict[str, Any]] = []
+    decisions: List[Dict[str, Any]] = []
+
+    for scan_index, scan in enumerate(picks):
+        symbol = str(scan.get("symbol") or "").upper().strip()
+        if not symbol:
+            decisions.append({
+                "scanIndex": scan_index + 1,
+                "symbol": "UNKNOWN",
+                "decision": "REJECTED",
+                "reasonCode": "MISSING_SYMBOL",
+                "reason": "Scanner result did not contain a symbol.",
+                "portfolioScore": 0.0,
+                "minimumScore": AI_PORTFOLIO_MIN_SCORE,
+                "confidence": 0.0,
+                "quality": 0.0,
+                "spread": 0.0,
+                "deployableNow": False,
+            })
+            print(f"V16 DECISION | symbol=UNKNOWN decision=REJECTED reason=MISSING_SYMBOL scan={scan_index + 1}")
             continue
-        score = _v16_portfolio_score(scan)
+
+        try:
+            score = _v16_portfolio_score(scan)
+        except Exception as exc:
+            score = 0.0
+            decisions.append({
+                "scanIndex": scan_index + 1,
+                "symbol": symbol,
+                "decision": "REJECTED",
+                "reasonCode": "SCORE_ERROR",
+                "reason": f"Portfolio score could not be calculated: {exc}",
+                "portfolioScore": 0.0,
+                "minimumScore": AI_PORTFOLIO_MIN_SCORE,
+                "confidence": 0.0,
+                "quality": round(float(scan.get("quality_score") or 0.0), 6),
+                "spread": round(float(scan.get("spread") or 0.0), 6),
+                "deployableNow": False,
+            })
+            print(f"V16 DECISION | symbol={symbol} decision=REJECTED reason=SCORE_ERROR error={exc}")
+            continue
+
+        try:
+            confidence, label = calculate_confidence(scan)
+            confidence = float(confidence)
+        except Exception as exc:
+            confidence, label = 0.0, "UNKNOWN"
+            print(f"V16 DECISION CONFIDENCE ERROR | symbol={symbol} error={exc}")
+
+        quality = round(float(scan.get("quality_score") or 0.0), 6)
+        spread = round(float(scan.get("spread") or 0.0), 6)
+
+        try:
+            allowed, block = can_buy_symbol(symbol)
+        except Exception as exc:
+            allowed, block = False, f"BUY_CHECK_ERROR: {exc}"
+
+        if not allowed:
+            block_text = str(block or "Symbol blocked by buy safety checks")
+            decisions.append({
+                "scanIndex": scan_index + 1,
+                "symbol": symbol,
+                "decision": "REJECTED",
+                "reasonCode": "BUY_SAFETY_BLOCK",
+                "reason": block_text,
+                "portfolioScore": score,
+                "minimumScore": AI_PORTFOLIO_MIN_SCORE,
+                "confidence": round(confidence, 4),
+                "confidenceLabel": label,
+                "quality": quality,
+                "spread": spread,
+                "deployableNow": False,
+            })
+            print(
+                f"V16 DECISION | symbol={symbol} decision=REJECTED reason=BUY_SAFETY_BLOCK "
+                f"detail={block_text} score={score:.3f} confidence={confidence:.3f} quality={quality:.4f}"
+            )
+            continue
+
         if score < AI_PORTFOLIO_MIN_SCORE and not manual:
+            reason = f"Portfolio score {score:.3f} is below the minimum {AI_PORTFOLIO_MIN_SCORE:.3f}."
+            decisions.append({
+                "scanIndex": scan_index + 1,
+                "symbol": symbol,
+                "decision": "REJECTED",
+                "reasonCode": "SCORE_BELOW_MINIMUM",
+                "reason": reason,
+                "portfolioScore": score,
+                "minimumScore": AI_PORTFOLIO_MIN_SCORE,
+                "scoreGap": round(AI_PORTFOLIO_MIN_SCORE - score, 6),
+                "confidence": round(confidence, 4),
+                "confidenceLabel": label,
+                "quality": quality,
+                "spread": spread,
+                "deployableNow": False,
+            })
+            print(
+                f"V16 DECISION | symbol={symbol} decision=REJECTED reason=SCORE_BELOW_MINIMUM "
+                f"score={score:.3f} minimum={AI_PORTFOLIO_MIN_SCORE:.3f} confidence={confidence:.3f} quality={quality:.4f} spread={spread:.5f}"
+            )
             continue
-        confidence, label = calculate_confidence(scan)
-        ranked.append({
+
+        item = {
             "symbol": symbol,
             "scan": scan,
             "portfolioScore": score,
-            "confidence": round(float(confidence), 4),
+            "confidence": round(confidence, 4),
             "confidenceLabel": label,
-            "quality": round(float(scan.get("quality_score") or 0.0), 6),
-            "spread": round(float(scan.get("spread") or 0.0), 6),
+            "quality": quality,
+            "spread": spread,
             "riskProfile": _ai_risk_build_profile(scan) if AI_RISK_ENGINE_ENABLED else {},
+        }
+        ranked.append(item)
+        decisions.append({
+            "scanIndex": scan_index + 1,
+            "symbol": symbol,
+            "decision": "QUALIFIED",
+            "reasonCode": "QUALIFIED",
+            "reason": f"Score {score:.3f} met the minimum {AI_PORTFOLIO_MIN_SCORE:.3f} and all symbol safety checks passed.",
+            "portfolioScore": score,
+            "minimumScore": AI_PORTFOLIO_MIN_SCORE,
+            "confidence": round(confidence, 4),
+            "confidenceLabel": label,
+            "quality": quality,
+            "spread": spread,
+            "deployableNow": False,
         })
-    ranked.sort(key=lambda item: (-item["portfolioScore"], -item["confidence"], item["spread"]))
+        print(
+            f"V16 DECISION | symbol={symbol} decision=QUALIFIED score={score:.3f} "
+            f"minimum={AI_PORTFOLIO_MIN_SCORE:.3f} confidence={confidence:.3f} quality={quality:.4f} spread={spread:.5f}"
+        )
 
-    # V16.2 scanner-to-portfolio fix:
-    # Keep every genuinely qualified candidate for visibility. The previous
-    # implementation sliced `ranked` by `order_limit` before reporting the
-    # qualified count. When PDT/daily/capacity safety left zero buy slots, the
-    # UI incorrectly displayed Qualified=0 even though the scanner had found
-    # valid candidates. Only the actionable allocation list is slot-limited.
+    ranked.sort(key=lambda item: (-item["portfolioScore"], -item["confidence"], item["spread"]))
     qualified_ranked = list(ranked)
     actionable_ranked = qualified_ranked[:order_limit] if order_limit > 0 else []
+    actionable_symbols = {item["symbol"] for item in actionable_ranked}
+
+    for decision in decisions:
+        if decision.get("decision") == "QUALIFIED":
+            decision["deployableNow"] = decision.get("symbol") in actionable_symbols
+            if not decision["deployableNow"]:
+                decision["decision"] = "QUALIFIED_WAITING"
+                decision["reasonCode"] = "CAPACITY_OR_RANK_LIMIT"
+                decision["reason"] = (
+                    "Candidate qualified, but it is outside the current available order capacity."
+                    if order_limit > 0
+                    else "Candidate qualified, but no new order slots are currently available."
+                )
+
+    decision_rank = {item["symbol"]: index + 1 for index, item in enumerate(qualified_ranked)}
+    for decision in decisions:
+        if decision.get("symbol") in decision_rank:
+            decision["rank"] = decision_rank[decision["symbol"]]
+    decisions.sort(key=lambda row: (
+        0 if row.get("decision") == "QUALIFIED" else 1 if row.get("decision") == "QUALIFIED_WAITING" else 2,
+        int(row.get("rank") or 9999),
+        -float(row.get("portfolioScore") or 0.0),
+        str(row.get("symbol") or ""),
+    ))
 
     reserve_pct = _v16_cash_reserve_pct(actionable_ranked)
     deployable = round(max(0.0, usable_cash * (1.0 - reserve_pct)), 2)
@@ -3259,7 +3388,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             requested = round(deployable * weight, 2)
             constitutional_cap = round(managed_capital * min(float(V10_CONSTITUTION["positionValuePct"]["max"]), AI_PORTFOLIO_MAX_SINGLE_WEIGHT), 2)
             amount = round(max(0.0, min(requested, constitutional_cap, remaining)), 2)
-            if index == len(ranked) - 1:
+            if index == len(actionable_ranked) - 1:
                 amount = round(max(0.0, min(remaining, constitutional_cap)), 2)
             remaining = round(max(0.0, remaining - amount), 2)
             if amount < MIN_ORDER_NOTIONAL:
@@ -3282,9 +3411,16 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             })
 
     allocated = round(sum(float(a["notionalUsd"]) for a in allocations), 2)
+    rejected_count = sum(1 for d in decisions if d.get("decision") == "REJECTED")
+    waiting_count = sum(1 for d in decisions if d.get("decision") == "QUALIFIED_WAITING")
+    reason_counts: Dict[str, int] = {}
+    for decision in decisions:
+        code = str(decision.get("reasonCode") or "UNKNOWN")
+        reason_counts[code] = reason_counts.get(code, 0) + 1
+
     plan = {
         "ok": True,
-        "version": AI_PORTFOLIO_MANAGER_VERSION,
+        "version": "V16.2.1-AI-EXPLAINABILITY",
         "enabled": AI_PORTFOLIO_MANAGER_ENABLED,
         "createdAt": datetime.now(UTC).isoformat(),
         "manual": bool(manual),
@@ -3300,7 +3436,12 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         "candidateCount": len(picks),
         "qualifiedCount": len(qualified_ranked),
         "actionableCount": len(actionable_ranked),
+        "rejectedCount": rejected_count,
+        "waitingCount": waiting_count,
         "orderLimit": order_limit,
+        "minimumPortfolioScore": AI_PORTFOLIO_MIN_SCORE,
+        "decisionReasonCounts": reason_counts,
+        "decisions": decisions[:100],
         "qualifiedCandidates": [
             {
                 "rank": index + 1,
@@ -3321,23 +3462,23 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         "deployableGbp": round(money_gbp(allocated), 2),
         "allocationMethod": "score-weighted; stronger qualified candidates receive more capital; cash remains only when breadth/quality is insufficient or safety caps apply",
         "allocations": [{k: v for k, v in row.items() if k != "scan"} for row in allocations],
-        "rejectedCount": max(0, len(picks) - len(ranked)),
         "explanation": (
-            f"Qualified {len(qualified_ranked)} candidate(s) from {len(picks)} live scan(s). "
+            f"Reviewed {len(picks)} live scanner candidate(s): {len(qualified_ranked)} qualified, "
+            f"{rejected_count} rejected and {waiting_count} qualified but waiting for capacity. "
             f"{len(actionable_ranked)} can be considered within the current capacity/daily safety limit. "
             f"Planned ${allocated:.2f} across {len(allocations)} position(s), with {reserve_pct * 100.0:.1f}% cash reserve. "
             + (
                 "Capital is retained because no new order slots are currently available."
                 if qualified_ranked and order_limit <= 0
-                else "The highest score receives the largest allocation."
+                else "Open the Decision Inspector below to see the exact reason for every candidate."
             )
         ),
     }
     _v16_save_portfolio_plan(plan)
     print(
         f"V16 PORTFOLIO PLAN | scans={len(picks)} qualified={len(qualified_ranked)} "
-        f"actionable={len(actionable_ranked)} order_limit={order_limit} deploy=${allocated:.2f} "
-        f"reserve={reserve_pct*100:.1f}% allocations="
+        f"rejected={rejected_count} waiting={waiting_count} actionable={len(actionable_ranked)} "
+        f"order_limit={order_limit} deploy=${allocated:.2f} reserve={reserve_pct*100:.1f}% allocations="
         + ",".join(f"{a['symbol']}=${a['notionalUsd']:.2f}" for a in allocations)
     )
     return {"plan": plan, "internalAllocations": allocations}
