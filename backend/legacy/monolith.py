@@ -105,7 +105,12 @@ AI_POSITION_CAPACITY_ENABLED = os.getenv("AI_POSITION_CAPACITY_ENABLED", "true")
 AI_POSITION_HARD_CAP = max(1, min(10, int(os.getenv("AI_POSITION_HARD_CAP", "10") or 10)))
 AI_POSITION_MIN_NOTIONAL_USD = max(10.0, float(os.getenv("AI_POSITION_MIN_NOTIONAL_USD", "25") or 25))
 AI_PORTFOLIO_MANAGER_ENABLED = os.getenv("AI_PORTFOLIO_MANAGER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-AI_PORTFOLIO_MANAGER_VERSION = "V16.0"
+# V16.5.2 — the live order engine can execute candidates approved by the
+# portfolio score. Legacy Sniper/A+ scores remain visible as supporting
+# evidence, but no longer silently veto a V16-qualified portfolio candidate.
+V16_PORTFOLIO_EXECUTION_ENABLED = os.getenv("V16_PORTFOLIO_EXECUTION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+V16_PORTFOLIO_REQUIRE_READY_TRIGGER = os.getenv("V16_PORTFOLIO_REQUIRE_READY_TRIGGER", "false").lower() in ("1", "true", "yes", "on")
+AI_PORTFOLIO_MANAGER_VERSION = "V16.7-ADAPTIVE-EXIT-ROTATION"
 AI_PORTFOLIO_MAX_SINGLE_WEIGHT = max(0.10, min(0.60, float(os.getenv("AI_PORTFOLIO_MAX_SINGLE_WEIGHT", "0.45") or 0.45)))
 AI_PORTFOLIO_MIN_CASH_RESERVE_PCT = max(0.02, min(0.50, float(os.getenv("AI_PORTFOLIO_MIN_CASH_RESERVE_PCT", "0.08") or 0.08)))
 AI_PORTFOLIO_MAX_CASH_RESERVE_PCT = max(AI_PORTFOLIO_MIN_CASH_RESERVE_PCT, min(0.80, float(os.getenv("AI_PORTFOLIO_MAX_CASH_RESERVE_PCT", "0.45") or 0.45)))
@@ -117,16 +122,22 @@ AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT = max(1, min(5, int(os.getenv("AI_PORTFOLIO_A
 AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT = max(0.0, min(0.40, float(os.getenv("AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT", "0.22") or 0.22)))
 AI_PORTFOLIO_PLAN_FILE = os.getenv("AI_PORTFOLIO_PLAN_FILE", "/var/data/ai_portfolio_plan.json")
 
-# V16.6 — AI portfolio exit manager. Hard stops remain authoritative and
-# immediate; ordinary AI thesis exits require repeated weakness and never sell
-# a same-day purchase unless an existing emergency/hard-stop rule fires.
+# V16.7 — adaptive AI exit and portfolio rotation manager.
 AI_PORTFOLIO_EXIT_ENABLED = os.getenv("AI_PORTFOLIO_EXIT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-AI_PORTFOLIO_EXIT_SCORE = max(0.20, min(0.70, float(os.getenv("AI_PORTFOLIO_EXIT_SCORE", "0.48") or 0.48)))
-AI_PORTFOLIO_EXIT_HARD_SCORE = max(0.10, min(AI_PORTFOLIO_EXIT_SCORE, float(os.getenv("AI_PORTFOLIO_EXIT_HARD_SCORE", "0.40") or 0.40)))
-AI_PORTFOLIO_EXIT_CONFIRMATIONS = max(2, min(10, int(os.getenv("AI_PORTFOLIO_EXIT_CONFIRMATIONS", "3") or 3)))
 AI_PORTFOLIO_EXIT_MIN_HOLD_MINUTES = max(60, int(os.getenv("AI_PORTFOLIO_EXIT_MIN_HOLD_MINUTES", "1440") or 1440))
-AI_PORTFOLIO_EXIT_SCORE_GAP = max(0.05, min(0.50, float(os.getenv("AI_PORTFOLIO_EXIT_SCORE_GAP", "0.16") or 0.16)))
 AI_PORTFOLIO_EXIT_MAX_PER_CYCLE = max(1, min(3, int(os.getenv("AI_PORTFOLIO_EXIT_MAX_PER_CYCLE", "1") or 1)))
+AI_PORTFOLIO_ROTATION_ENABLED = os.getenv("AI_PORTFOLIO_ROTATION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+AI_PORTFOLIO_ROTATION_MARGIN = max(0.05, min(0.40, float(os.getenv("AI_PORTFOLIO_ROTATION_MARGIN", "0.15") or 0.15)))
+AI_PORTFOLIO_ROTATION_MIN_REPLACEMENT_SCORE = max(0.50, min(0.90, float(os.getenv("AI_PORTFOLIO_ROTATION_MIN_REPLACEMENT_SCORE", "0.60") or 0.60)))
+AI_PORTFOLIO_EXIT_IMMEDIATE_SCORE = max(0.10, min(0.40, float(os.getenv("AI_PORTFOLIO_EXIT_IMMEDIATE_SCORE", "0.35") or 0.35)))
+AI_PORTFOLIO_EXIT_FAST_SCORE = max(AI_PORTFOLIO_EXIT_IMMEDIATE_SCORE, min(0.50, float(os.getenv("AI_PORTFOLIO_EXIT_FAST_SCORE", "0.45") or 0.45)))
+AI_PORTFOLIO_EXIT_NORMAL_SCORE = max(AI_PORTFOLIO_EXIT_FAST_SCORE, min(0.60, float(os.getenv("AI_PORTFOLIO_EXIT_NORMAL_SCORE", "0.55") or 0.55)))
+AI_PORTFOLIO_EXIT_HEALTHY_SCORE = max(AI_PORTFOLIO_EXIT_NORMAL_SCORE, min(0.80, float(os.getenv("AI_PORTFOLIO_EXIT_HEALTHY_SCORE", "0.65") or 0.65)))
+AI_PORTFOLIO_EXIT_REVIEW_FILE = os.getenv("AI_PORTFOLIO_EXIT_REVIEW_FILE", "/var/data/v16_exit_reviews.json")
+AI_PORTFOLIO_SCORING_ENGINE_VERSION = "V16.5.3-REAL-FACTORS-QUALITY-GUARD"
+AI_PORTFOLIO_BAR_FALLBACK_MINUTES = max(10, min(120, int(os.getenv("AI_PORTFOLIO_BAR_FALLBACK_MINUTES", "45") or 45)))
+AI_PORTFOLIO_BAR_CACHE_SECONDS = max(30, min(300, int(os.getenv("AI_PORTFOLIO_BAR_CACHE_SECONDS", "75") or 75)))
+_v16_bar_cache: Dict[str, Dict[str, Any]] = {}
 MAX_NEW_BUYS_PER_LOOP = 1
 MAX_POSITION_VALUE_PCT = 0.12
 TARGET_POSITION_VALUE_PCT = 0.08
@@ -141,6 +152,16 @@ FULL_BUY_CASH_BUFFER = float(os.getenv("FULL_BUY_CASH_BUFFER", "2.00") or 2.00)
 
 MAX_SPREAD = 0.015
 PREFER_SPREAD_UNDER = 0.006
+# Hard execution safety. Portfolio scoring may reward liquidity, but a live
+# order is never sent through an excessively wide quote.
+V16_PORTFOLIO_HARD_MAX_SPREAD = max(0.0001, min(MAX_SPREAD, float(os.getenv("V16_PORTFOLIO_HARD_MAX_SPREAD", str(MAX_SPREAD)) or MAX_SPREAD)))
+# V16.5.3 execution-quality guard. Batch calibration may improve ranking, but it
+# cannot manufacture underlying setup quality. These floors are deliberately
+# modest and remain configurable in Render.
+V16_PORTFOLIO_MIN_RAW_SCORE = max(0.0, min(1.0, float(os.getenv("V16_PORTFOLIO_MIN_RAW_SCORE", "0.56") or 0.56)))
+V16_PORTFOLIO_MIN_QUALITY = max(0.0, float(os.getenv("V16_PORTFOLIO_MIN_QUALITY", "0.006") or 0.006))
+V16_PORTFOLIO_MIN_LIQUIDITY_FACTOR = max(0.0, min(1.0, float(os.getenv("V16_PORTFOLIO_MIN_LIQUIDITY_FACTOR", "0.45") or 0.45)))
+V16_PORTFOLIO_EXECUTION_MAX_SPREAD = max(0.0001, min(V16_PORTFOLIO_HARD_MAX_SPREAD, float(os.getenv("V16_PORTFOLIO_EXECUTION_MAX_SPREAD", "0.010") or 0.010)))
 
 BUY_DIP = 0.9985
 MIN_PULLBACK = 0.0010
@@ -436,10 +457,11 @@ last_universe_refresh_ts = 0
 latest_status: Dict[str, Any] = {}
 latest_scans: List[Dict[str, Any]] = []
 
-# In-memory confirmation state for AI thesis exits. It intentionally resets on
-# deployment; this makes a fresh deploy more conservative, not more aggressive.
+# V16.7 in-memory confirmation state. A restart resets confirmations, which is
+# intentionally conservative. Completed exit evidence is persisted separately.
 v16_exit_weak_counts: Dict[str, int] = {}
 v16_exit_latest_decisions: List[Dict[str, Any]] = []
+v16_exit_review_events: List[Dict[str, Any]] = []
 
 trade_events: List[Dict[str, Any]] = []
 trade_history: List[Dict[str, Any]] = []
@@ -3057,12 +3079,9 @@ def maybe_rotate_weakest_into_best(scans):
         return f"ROTATION ERROR | {e}"
 
 
-def _v16_exit_scan_profiles(scans: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Dict[str, Any]]:
-    """Return factor/score profiles for held-symbol exit review.
 
-    This deliberately does not call can_buy_symbol(), because an existing
-    holding is exactly what the exit manager needs to evaluate.
-    """
+def _v16_exit_scan_profiles(scans: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Dict[str, Any]]:
+    """Build live score profiles for both holdings and possible replacements."""
     source = [dict(row) for row in (scans or latest_scans or []) if isinstance(row, dict)]
     if not source:
         return {}
@@ -3075,111 +3094,217 @@ def _v16_exit_scan_profiles(scans: Optional[List[Dict[str, Any]]] = None) -> Dic
         try:
             factors = _v16_factor_breakdown(scan)
             raw_score = float(factors.get("final") or 0.0)
+            guard_ok, guard_code, guard_reason = _v16_execution_quality_gate(scan, raw_score, factors, manual=False)
         except Exception as exc:
-            factors = {"version": "V16.6", "error": str(exc), "values": {}}
+            factors = {"version": "V16.7", "error": str(exc), "values": {}}
             raw_score = 0.0
-        profiles[symbol] = {"scan": scan, "score": raw_score, "factors": factors}
+            guard_ok, guard_code, guard_reason = False, "PROFILE_ERROR", str(exc)
+        profiles[symbol] = {
+            "scan": scan, "score": raw_score, "factors": factors,
+            "qualityGuardPass": bool(guard_ok), "qualityGuardCode": guard_code,
+            "qualityGuardReason": guard_reason,
+        }
     return profiles
 
 
-def _v16_ai_exit_review(position: Dict[str, Any], profile: Optional[Dict[str, Any]], best_score: float) -> Dict[str, Any]:
+def _v16_best_rotation_candidate(profiles: Dict[str, Dict[str, Any]], held_symbols: set[str]) -> Optional[Dict[str, Any]]:
+    if not AI_PORTFOLIO_ROTATION_ENABLED:
+        return None
+    candidates: List[Dict[str, Any]] = []
+    for symbol, profile in profiles.items():
+        if symbol in held_symbols:
+            continue
+        score = float(profile.get("score") or 0.0)
+        if score < AI_PORTFOLIO_ROTATION_MIN_REPLACEMENT_SCORE or not profile.get("qualityGuardPass"):
+            continue
+        try:
+            allowed, _ = can_buy_symbol(symbol)
+        except Exception:
+            allowed = False
+        if allowed:
+            candidates.append({"symbol": symbol, **profile})
+    candidates.sort(key=lambda row: -float(row.get("score") or 0.0))
+    return candidates[0] if candidates else None
+
+
+def _v16_required_exit_confirmations(score: float, rotation_gap: float = 0.0) -> int:
+    """More severe deterioration receives faster action."""
+    if score < AI_PORTFOLIO_EXIT_IMMEDIATE_SCORE:
+        return 1
+    if score < AI_PORTFOLIO_EXIT_FAST_SCORE:
+        return 1
+    if score < AI_PORTFOLIO_EXIT_NORMAL_SCORE:
+        return 2
+    if score < AI_PORTFOLIO_EXIT_HEALTHY_SCORE and rotation_gap >= AI_PORTFOLIO_ROTATION_MARGIN:
+        return 3
+    return 0
+
+
+def _v16_load_exit_reviews() -> List[Dict[str, Any]]:
+    try:
+        with open(AI_PORTFOLIO_EXIT_REVIEW_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _v16_save_exit_reviews(events: List[Dict[str, Any]]) -> None:
+    try:
+        os.makedirs(os.path.dirname(AI_PORTFOLIO_EXIT_REVIEW_FILE), exist_ok=True)
+        tmp = AI_PORTFOLIO_EXIT_REVIEW_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(events[-500:], handle, indent=2, default=str)
+        os.replace(tmp, AI_PORTFOLIO_EXIT_REVIEW_FILE)
+    except Exception as exc:
+        print(f"V16 EXIT REVIEW SAVE ERROR: {exc}")
+
+
+def _v16_record_exit_review(position: Dict[str, Any], review: Dict[str, Any]) -> None:
+    global v16_exit_review_events
+    events = _v16_load_exit_reviews()
+    event = {
+        "id": secrets.token_hex(8), "soldAt": datetime.now(UTC).isoformat(),
+        "symbol": review.get("symbol"), "exitPrice": float(position.get("price") or 0.0),
+        "entryPrice": float(position.get("entry") or 0.0), "pnlPctAtExit": float(position.get("pnlPct") or 0.0),
+        "keepScore": float(review.get("score") or 0.0), "reasonCode": review.get("reasonCode"),
+        "reason": review.get("reason"), "replacementSymbol": review.get("replacementSymbol"),
+        "replacementScore": review.get("replacementScore"), "rotationGap": review.get("rotationGap"),
+        "checkpoints": {},
+    }
+    events.append(event)
+    _v16_save_exit_reviews(events)
+    v16_exit_review_events = events[-100:]
+
+
+def _v16_update_exit_reviews(scans: Optional[List[Dict[str, Any]]] = None) -> None:
+    global v16_exit_review_events
+    events = _v16_load_exit_reviews()
+    if not events:
+        return
+    prices = {str(row.get("symbol") or "").upper(): float(row.get("price") or 0.0) for row in (scans or latest_scans or []) if isinstance(row, dict)}
+    changed = False
+    now = datetime.now(UTC)
+    for event in events:
+        try:
+            sold = datetime.fromisoformat(str(event.get("soldAt") or "").replace("Z", "+00:00"))
+            if sold.tzinfo is None: sold = sold.replace(tzinfo=UTC)
+            hours = (now - sold).total_seconds() / 3600.0
+            symbol = str(event.get("symbol") or "").upper()
+            price = float(prices.get(symbol) or 0.0)
+            exit_price = float(event.get("exitPrice") or 0.0)
+            if price <= 0 or exit_price <= 0: continue
+            checkpoints = event.setdefault("checkpoints", {})
+            for label, due in (("24h",24),("72h",72),("120h",120)):
+                if hours >= due and label not in checkpoints:
+                    move = ((price / exit_price) - 1.0) * 100.0
+                    checkpoints[label] = {"capturedAt": now.isoformat(), "price": price, "moveAfterExitPct": round(move,4),
+                                          "exitAssessment": "GOOD_EXIT" if move < 0 else "EARLY_EXIT"}
+                    changed = True
+        except Exception:
+            continue
+    if changed: _v16_save_exit_reviews(events)
+    v16_exit_review_events = events[-100:]
+
+
+def _v16_ai_exit_review(position: Dict[str, Any], profile: Optional[Dict[str, Any]], replacement: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     symbol = str(position.get("symbol") or "").upper().strip()
     pnl_pct = float(position.get("pnlPct") or 0.0)
     minutes = int(position.get("minutesSinceBuy") or 999999)
     score = float((profile or {}).get("score") or 0.0)
-    gap = max(0.0, float(best_score) - score)
+    replacement_symbol = str((replacement or {}).get("symbol") or "")
+    replacement_score = float((replacement or {}).get("score") or 0.0)
+    rotation_gap = max(0.0, replacement_score - score) if replacement_symbol else 0.0
 
-    decision = "HOLD"
-    reason_code = "THESIS_HEALTHY"
-    reason = f"Portfolio thesis remains acceptable at score {score:.3f}."
-    weak = False
+    decision, reason_code = "HOLD", "THESIS_HEALTHY"
+    reason = f"Keep score {score:.3f} remains healthy."
+    required = 0
 
     if not AI_PORTFOLIO_EXIT_ENABLED:
         reason_code, reason = "EXIT_MANAGER_DISABLED", "AI portfolio exit manager is disabled."
     elif not profile:
         reason_code, reason = "NO_CURRENT_SCAN", "No current scanner profile is available for this holding."
     elif was_bought_today(symbol):
-        reason_code, reason = "SAME_DAY_PDT_HOLD", "Same-day AI thesis exit blocked; hard stops remain active."
+        reason_code, reason = "SAME_DAY_PDT_HOLD", "Same-day AI exit blocked; hard stops remain active."
     elif minutes < AI_PORTFOLIO_EXIT_MIN_HOLD_MINUTES:
         reason_code, reason = "MINIMUM_HOLD", f"Held {minutes}m; AI exit review requires {AI_PORTFOLIO_EXIT_MIN_HOLD_MINUTES}m."
     else:
-        hard_weak = score < AI_PORTFOLIO_EXIT_HARD_SCORE
-        normal_weak = score < AI_PORTFOLIO_EXIT_SCORE and (gap >= AI_PORTFOLIO_EXIT_SCORE_GAP or pnl_pct <= -0.50)
-        weak = bool(hard_weak or normal_weak)
-        if hard_weak:
-            reason_code = "AI_THESIS_FAILED_HARD"
-            reason = f"Score {score:.3f} is below hard thesis floor {AI_PORTFOLIO_EXIT_HARD_SCORE:.3f}."
-        elif normal_weak:
-            reason_code = "AI_THESIS_WEAK"
-            reason = f"Score {score:.3f} below {AI_PORTFOLIO_EXIT_SCORE:.3f}; leader gap={gap:.3f}, pnl={pnl_pct:.2f}%."
+        required = _v16_required_exit_confirmations(score, rotation_gap)
+        if score < AI_PORTFOLIO_EXIT_IMMEDIATE_SCORE:
+            reason_code = "THESIS_COLLAPSED"
+            reason = f"Keep score {score:.3f} is below immediate exit level {AI_PORTFOLIO_EXIT_IMMEDIATE_SCORE:.3f}."
+        elif score < AI_PORTFOLIO_EXIT_FAST_SCORE:
+            reason_code = "THESIS_SEVERELY_WEAK"
+            reason = f"Keep score {score:.3f} is below fast exit level {AI_PORTFOLIO_EXIT_FAST_SCORE:.3f}."
+        elif score < AI_PORTFOLIO_EXIT_NORMAL_SCORE:
+            reason_code = "THESIS_WEAK"
+            reason = f"Keep score {score:.3f} is below normal hold level {AI_PORTFOLIO_EXIT_NORMAL_SCORE:.3f}."
+        elif required and replacement_symbol:
+            reason_code = "ROTATION_ADVANTAGE"
+            reason = f"{replacement_symbol} scores {replacement_score:.3f}, improving on {symbol} by {rotation_gap:.3f}."
         else:
-            reason = f"Score {score:.3f}; leader gap={gap:.3f}; pnl={pnl_pct:.2f}%."
+            reason = f"Keep score {score:.3f}; replacement gap {rotation_gap:.3f}; pnl={pnl_pct:.2f}%."
 
     count = v16_exit_weak_counts.get(symbol, 0)
-    if weak:
+    if required > 0:
         count += 1
         v16_exit_weak_counts[symbol] = count
-        if count >= AI_PORTFOLIO_EXIT_CONFIRMATIONS:
+        if count >= required:
             decision = "EXIT"
-            reason += f" Weakness confirmed for {count} consecutive scans."
+            reason += f" Required evidence confirmed for {count}/{required} scans."
         else:
             decision = "WATCH"
-            reason += f" Confirmation {count}/{AI_PORTFOLIO_EXIT_CONFIRMATIONS}."
+            reason += f" Confirmation {count}/{required}."
     else:
         v16_exit_weak_counts.pop(symbol, None)
         count = 0
 
     return {
-        "timestamp": datetime.now(UTC).isoformat(), "symbol": symbol,
-        "decision": decision, "reasonCode": reason_code, "reason": reason,
-        "score": round(score, 6), "bestScore": round(float(best_score), 6),
-        "scoreGap": round(gap, 6), "pnlPct": round(pnl_pct, 4),
-        "minutesSinceBuy": minutes, "confirmations": count,
-        "requiredConfirmations": AI_PORTFOLIO_EXIT_CONFIRMATIONS,
-        "sameDay": bool(was_bought_today(symbol)),
-        "factors": (profile or {}).get("factors") or {},
+        "timestamp": datetime.now(UTC).isoformat(), "symbol": symbol, "decision": decision,
+        "reasonCode": reason_code, "reason": reason, "score": round(score,6),
+        "pnlPct": round(pnl_pct,4), "minutesSinceBuy": minutes,
+        "confirmations": count, "requiredConfirmations": required,
+        "sameDay": bool(was_bought_today(symbol)), "factors": (profile or {}).get("factors") or {},
+        "replacementSymbol": replacement_symbol or None,
+        "replacementScore": round(replacement_score,6) if replacement_symbol else None,
+        "rotationGap": round(rotation_gap,6),
     }
 
 
 def manage_money_mode_positions(scans: Optional[List[Dict[str, Any]]] = None):
     global v16_exit_latest_decisions
+    _v16_update_exit_reviews(scans)
     exit_profiles = _v16_exit_scan_profiles(scans)
-    best_exit_score = max((float(row.get("score") or 0.0) for row in exit_profiles.values()), default=0.0)
+    positions = get_all_positions()
+    held_symbols = {str(p.get("symbol") or "").upper() for p in positions}
+    replacement = _v16_best_rotation_candidate(exit_profiles, held_symbols)
     cycle_exit_count = 0
     cycle_decisions: List[Dict[str, Any]] = []
-    for p in get_all_positions():
+    for p in positions:
         symbol = p["symbol"]
 
         if not MANAGE_OUTSIDE_UNIVERSE_POSITIONS and symbol not in current_universe:
             continue
-
         if has_open_order(symbol):
             continue
 
-        price = float(p["price"])
-        entry = float(p["entry"])
-        qty = float(p["qty"])
-        highest = p["highest"]
-
+        price = float(p["price"]); entry = float(p["entry"]); qty = float(p["qty"]); highest = p["highest"]
         if price <= 0 or entry <= 0 or qty <= DUST_THRESHOLD:
             continue
 
         fast_stop, fast_stop_reason = should_fast_stop(p)
         if fast_stop:
             try:
-                if pdt_aware_should_avoid_sell(symbol, "FAST EXIT STOP LOSS", p["pnlPct"], allow_hard_stop=True):
-                    continue
-
+                if pdt_aware_should_avoid_sell(symbol, "FAST EXIT STOP LOSS", p["pnlPct"], allow_hard_stop=True): continue
                 market_sell_qty(symbol, qty, entry=entry, price=price, reason="FAST EXIT STOP LOSS")
                 state[symbol]["highest_since_entry"] = None
                 print(f"FAST EXIT STOP LOSS SELL {qty:.6f} {symbol}")
-            except Exception as e:
-                print(f"SELL ERROR {symbol}: {e}")
+            except Exception as e: print(f"SELL ERROR {symbol}: {e}")
             continue
 
         risk_profile = _ai_risk_effective_profile(symbol) if "_ai_risk_effective_profile" in globals() else {}
         adaptive_stop_pct = abs(float(risk_profile.get("stopLossPct") or ((1.0 - STOP_LOSS) * 100.0)))
-        emergency_stop_pct = abs(float(risk_profile.get("emergencyStopPct") or AI_RISK_EMERGENCY_STOP_PCT if "AI_RISK_EMERGENCY_STOP_PCT" in globals() else 10.0))
+        emergency_stop_pct = abs(float(risk_profile.get("emergencyStopPct") or (AI_RISK_EMERGENCY_STOP_PCT if "AI_RISK_EMERGENCY_STOP_PCT" in globals() else 10.0)))
         stop_price = entry * (1.0 - adaptive_stop_pct / 100.0)
         emergency_stop_price = entry * (1.0 - emergency_stop_pct / 100.0)
         if price <= emergency_stop_price:
@@ -3187,113 +3312,84 @@ def manage_money_mode_positions(scans: Optional[List[Dict[str, Any]]] = None):
                 market_sell_qty(symbol, qty, entry=entry, price=price, reason="AI RISK EMERGENCY STOP")
                 state[symbol]["highest_since_entry"] = None
                 print(f"AI RISK EMERGENCY STOP {symbol} | pnl={p['pnlPct']:.2f}% limit=-{emergency_stop_pct:.2f}%")
-            except Exception as e:
-                print(f"EMERGENCY SELL ERROR {symbol}: {e}")
+            except Exception as e: print(f"EMERGENCY SELL ERROR {symbol}: {e}")
             continue
         if price <= stop_price:
             try:
-                if pdt_aware_should_avoid_sell(symbol, "MONEY MODE STOP LOSS", p["pnlPct"], allow_hard_stop=True):
-                    continue
-
+                if pdt_aware_should_avoid_sell(symbol, "MONEY MODE STOP LOSS", p["pnlPct"], allow_hard_stop=True): continue
                 market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
                 state[symbol]["highest_since_entry"] = None
-            except Exception as e:
-                print(f"SELL ERROR {symbol}: {e}")
+            except Exception as e: print(f"SELL ERROR {symbol}: {e}")
             continue
 
-        # V16.6 AI thesis review. Existing emergency, fast-stop and adaptive
-        # stop-loss rules above always run first and remain authoritative.
-        exit_review = _v16_ai_exit_review(p, exit_profiles.get(symbol), best_exit_score)
-        cycle_decisions.append(exit_review)
-        print(
-            f"V16 AI EXIT | symbol={symbol} decision={exit_review['decision']} "
-            f"score={exit_review['score']:.3f} gap={exit_review['scoreGap']:.3f} "
-            f"pnl={exit_review['pnlPct']:.2f}% reason={exit_review['reasonCode']} "
-            f"confirm={exit_review['confirmations']}/{exit_review['requiredConfirmations']}"
-        )
-        if exit_review["decision"] == "EXIT" and cycle_exit_count < AI_PORTFOLIO_EXIT_MAX_PER_CYCLE:
-            ai_block, ai_reason = hold_ai_blocks_soft_exit(p, "V16 AI THESIS EXIT")
+        review = _v16_ai_exit_review(p, exit_profiles.get(symbol), replacement)
+        cycle_decisions.append(review)
+        print(f"V16.7 AI EXIT | symbol={symbol} decision={review['decision']} keep={review['score']:.3f} "
+              f"replacement={review.get('replacementSymbol') or '-'} gap={review['rotationGap']:.3f} "
+              f"pnl={review['pnlPct']:.2f}% reason={review['reasonCode']} "
+              f"confirm={review['confirmations']}/{review['requiredConfirmations']}")
+        if review["decision"] == "EXIT" and cycle_exit_count < AI_PORTFOLIO_EXIT_MAX_PER_CYCLE:
+            exit_reason = "V16 AI ROTATION EXIT" if review.get("replacementSymbol") and review.get("rotationGap",0) >= AI_PORTFOLIO_ROTATION_MARGIN else "V16 AI THESIS EXIT"
+            ai_block, ai_reason = hold_ai_blocks_soft_exit(p, exit_reason)
             if ai_block:
-                exit_review["decision"] = "HOLD"
-                exit_review["reasonCode"] = "HOLD_AI_BLOCK"
-                exit_review["reason"] = ai_reason
-                print(f"V16 AI EXIT BLOCKED | symbol={symbol} | {ai_reason}")
-            elif pdt_aware_should_avoid_sell(symbol, "V16 AI THESIS EXIT", p["pnlPct"], allow_hard_stop=False):
-                exit_review["decision"] = "HOLD"
-                exit_review["reasonCode"] = "PDT_AWARE_BLOCK"
-                exit_review["reason"] = "PDT-aware mode blocked the ordinary AI thesis exit."
+                review.update({"decision":"HOLD","reasonCode":"HOLD_AI_BLOCK","reason":ai_reason})
+                print(f"V16.7 AI EXIT BLOCKED | symbol={symbol} | {ai_reason}")
+            elif pdt_aware_should_avoid_sell(symbol, exit_reason, p["pnlPct"], allow_hard_stop=False):
+                review.update({"decision":"HOLD","reasonCode":"PDT_AWARE_BLOCK","reason":"PDT-aware mode blocked the ordinary AI exit."})
             else:
                 try:
-                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="V16 AI THESIS EXIT")
+                    _v16_record_exit_review(p, review)
+                    market_sell_qty(symbol, qty, entry=entry, price=price,
+                                    reason=f"{exit_reason}{' FOR ' + review['replacementSymbol'] if review.get('replacementSymbol') else ''}")
                     state[symbol]["highest_since_entry"] = None
                     v16_exit_weak_counts.pop(symbol, None)
                     cycle_exit_count += 1
-                    exit_review["executed"] = True
-                    print(f"V16 AI EXIT EXECUTED | symbol={symbol} qty={qty:.6f} score={exit_review['score']:.3f} pnl={p['pnlPct']:.2f}%")
+                    review["executed"] = True
+                    print(f"V16.7 AI EXIT EXECUTED | symbol={symbol} qty={qty:.6f} keep={review['score']:.3f} "
+                          f"replacement={review.get('replacementSymbol') or '-'} pnl={p['pnlPct']:.2f}%")
                     continue
                 except Exception as exc:
-                    exit_review["executed"] = False
-                    exit_review["executionError"] = str(exc)
-                    print(f"V16 AI EXIT ERROR | symbol={symbol} error={exc}")
+                    review["executed"] = False; review["executionError"] = str(exc)
+                    print(f"V16.7 AI EXIT ERROR | symbol={symbol} error={exc}")
 
         partial_ok, partial_reason = should_partial_profit(p)
         if partial_ok:
             ai_block, ai_reason = hold_ai_blocks_soft_exit(p, "PARTIAL PROFIT TAKE")
-            if ai_block:
-                print(ai_reason)
-                continue
+            if ai_block: print(ai_reason); continue
             try:
-                if pdt_aware_should_avoid_sell(symbol, "PARTIAL PROFIT TAKE", p["pnlPct"], allow_hard_stop=False):
-                    continue
-
+                if pdt_aware_should_avoid_sell(symbol, "PARTIAL PROFIT TAKE", p["pnlPct"], allow_hard_stop=False): continue
                 sell_qty = partial_profit_qty(p)
                 market_sell_qty(symbol, sell_qty, entry=entry, price=price, reason="PARTIAL PROFIT TAKE")
-                mark_partial_profit_taken(symbol)
-                print(f"PARTIAL PROFIT SELL {sell_qty:.6f} {symbol}")
-            except Exception as e:
-                print(f"PARTIAL SELL ERROR {symbol}: {e}")
+                mark_partial_profit_taken(symbol); print(f"PARTIAL PROFIT SELL {sell_qty:.6f} {symbol}")
+            except Exception as e: print(f"PARTIAL SELL ERROR {symbol}: {e}")
             continue
 
         stall_ok, stall_reason = should_stall_exit(p)
         if stall_ok:
             ai_block, ai_reason = hold_ai_blocks_soft_exit(p, "STALL EXIT")
-            if ai_block:
-                print(ai_reason)
-                continue
+            if ai_block: print(ai_reason); continue
             try:
-                if pdt_aware_should_avoid_sell(symbol, "STALL EXIT", p["pnlPct"], allow_hard_stop=False):
-                    continue
-
+                if pdt_aware_should_avoid_sell(symbol, "STALL EXIT", p["pnlPct"], allow_hard_stop=False): continue
                 market_sell_qty(symbol, qty, entry=entry, price=price, reason="STALL EXIT")
                 state[symbol]["highest_since_entry"] = None
                 print(f"STALL EXIT SELL {qty:.6f} {symbol} | {stall_reason}")
-            except Exception as e:
-                print(f"STALL SELL ERROR {symbol}: {e}")
+            except Exception as e: print(f"STALL SELL ERROR {symbol}: {e}")
             continue
 
         adaptive_trail_start_pct = abs(float(risk_profile.get("trailStartPct") or ((TRAIL_START - 1.0) * 100.0)))
         adaptive_giveback_pct = abs(float(risk_profile.get("trailGivebackPct") or ((1.0 - TRAIL_GIVEBACK) * 100.0)))
         trail_start_price = entry * (1.0 + adaptive_trail_start_pct / 100.0)
         if price >= trail_start_price and highest is not None:
-            if has_taken_partial_profit(symbol):
-                giveback = POST_PARTIAL_TRAIL_GIVEBACK
-            else:
-                giveback = 1.0 - adaptive_giveback_pct / 100.0
+            giveback = POST_PARTIAL_TRAIL_GIVEBACK if has_taken_partial_profit(symbol) else 1.0 - adaptive_giveback_pct / 100.0
             trail_floor = highest * giveback
-
             if price <= trail_floor:
                 ai_block, ai_reason = hold_ai_blocks_soft_exit(p, "MONEY MODE TRAILING PROFIT")
-                if ai_block:
-                    print(ai_reason)
-                    continue
+                if ai_block: print(ai_reason); continue
                 try:
-                    if pdt_aware_should_avoid_sell(symbol, "MONEY MODE TRAILING PROFIT", p["pnlPct"]):
-                        continue
-
+                    if pdt_aware_should_avoid_sell(symbol, "MONEY MODE TRAILING PROFIT", p["pnlPct"]): continue
                     market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
                     state[symbol]["highest_since_entry"] = None
-                except Exception as e:
-                    print(f"SELL ERROR {symbol}: {e}")
+                except Exception as e: print(f"SELL ERROR {symbol}: {e}")
                 continue
 
     v16_exit_latest_decisions = cycle_decisions[-100:]
@@ -3303,25 +3399,83 @@ def _v16_clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, float(value)))
 
 
-def _v16_curve_metrics(scan: Dict[str, Any]) -> Dict[str, float]:
-    """Calculate real short-horizon behaviour from the live price curve."""
+def _v16_recent_bar_prices(symbol: str) -> List[float]:
+    """Return cached recent one-minute closes when the in-memory curve is cold.
+
+    A Render restart clears ``state[symbol][price_curve]``. Without this fallback,
+    every symbol began at neutral momentum for the first several scan cycles.
+    The cache keeps the fallback lightweight and avoids repeated data requests.
+    """
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return []
+    now = time.time()
+    cached = _v16_bar_cache.get(sym) or {}
+    if cached.get("prices") and (now - float(cached.get("updated") or 0.0)) < AI_PORTFOLIO_BAR_CACHE_SECONDS:
+        return list(cached.get("prices") or [])
+    try:
+        end = datetime.now(UTC)
+        start = end - timedelta(minutes=AI_PORTFOLIO_BAR_FALLBACK_MINUTES)
+        req = StockBarsRequest(
+            symbol_or_symbols=[sym],
+            timeframe=TimeFrame.Minute,
+            start=start,
+            end=end,
+            feed=DataFeed.IEX,
+        )
+        response = data_client.get_stock_bars(req)
+        try:
+            bars = list(response[sym])
+        except Exception:
+            bars = list((getattr(response, "data", {}) or {}).get(sym, []))
+        prices: List[float] = []
+        for bar in bars:
+            try:
+                close = float(getattr(bar, "close", 0.0) or 0.0)
+                if close > 0 and math.isfinite(close):
+                    prices.append(close)
+            except Exception:
+                continue
+        prices = prices[-60:]
+        _v16_bar_cache[sym] = {"updated": now, "prices": prices}
+        return prices
+    except Exception as exc:
+        print(f"V16 FACTOR BAR FALLBACK ERROR {sym}: {exc}")
+        _v16_bar_cache[sym] = {"updated": now, "prices": []}
+        return []
+
+
+def _v16_curve_metrics(scan: Dict[str, Any]) -> Dict[str, Any]:
+    """Calculate short-horizon behaviour from the live curve or recent bars."""
     symbol = str(scan.get("symbol") or "").upper().strip()
     curve = scan.get("price_curve") or scan.get("priceCurve") or []
     if not curve and symbol:
-        try:
-            curve = (state.get(symbol) or {}).get("price_curve") or []
-        except Exception:
-            curve = []
+        curve = (state.get(symbol) or {}).get("price_curve") or []
+
     prices: List[float] = []
     for point in curve[-60:]:
         try:
             value = float(point.get("value") if isinstance(point, dict) else point)
-            if value > 0:
+            if value > 0 and math.isfinite(value):
                 prices.append(value)
         except Exception:
             continue
+
+    source = "LIVE_CURVE"
+    # A few repeated quote samples are not enough to infer a useful trend.
+    if len(prices) < 8 and symbol:
+        fallback = _v16_recent_bar_prices(symbol)
+        if len(fallback) >= 3:
+            prices = fallback
+            source = "ALPACA_1MIN_BARS"
+
     if len(prices) < 3:
-        return {"samples": float(len(prices)), "return": 0.0, "slope": 0.0, "consistency": 0.5, "volatility": 0.0, "drawdown": 0.0}
+        return {
+            "samples": len(prices), "return": 0.0, "slope": 0.0,
+            "consistency": 0.5, "volatility": 0.0, "drawdown": 0.0,
+            "source": "INSUFFICIENT_DATA",
+        }
+
     returns = [(prices[i] / prices[i - 1]) - 1.0 for i in range(1, len(prices)) if prices[i - 1] > 0]
     total_return = (prices[-1] / prices[0]) - 1.0
     n = len(prices)
@@ -3342,27 +3496,35 @@ def _v16_curve_metrics(scan: Dict[str, Any]) -> Dict[str, float]:
         if peak > 0:
             max_drawdown = max(max_drawdown, (peak - price) / peak)
     return {
-        "samples": float(n), "return": total_return, "slope": slope,
-        "consistency": consistency, "volatility": volatility, "drawdown": max_drawdown,
+        "samples": n, "return": total_return, "slope": slope,
+        "consistency": consistency, "volatility": volatility,
+        "drawdown": max_drawdown, "source": source,
     }
 
 
 def _v16_prepare_real_market_factors(picks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Enrich candidates with batch-relative strength and real curve metrics."""
+    """Enrich candidates with real curve metrics and batch-relative strength."""
     enriched: List[Dict[str, Any]] = []
-    rows: List[tuple[int, float]] = []
+    rows: List[Tuple[int, float]] = []
     for index, original in enumerate(picks):
         scan = dict(original)
         metrics = _v16_curve_metrics(scan)
         scan["v16CurveMetrics"] = metrics
-        strength = (metrics["return"] * 0.65) + (metrics["slope"] * 8.0 * 0.35)
+        # Return dominates; slope and the scanner's own short momentum break ties.
+        scanner_momentum = float(scan.get("short_momentum") or scan.get("shortMomentum") or 0.0)
+        strength = (
+            float(metrics.get("return") or 0.0) * 0.55
+            + float(metrics.get("slope") or 0.0) * 8.0 * 0.30
+            + scanner_momentum * 0.15
+        )
         rows.append((index, strength))
         enriched.append(scan)
-    ordered = sorted(rows, key=lambda row: row[1])
-    count = max(1, len(ordered) - 1)
-    percentiles = {idx: rank / count for rank, (idx, _) in enumerate(ordered)}
+
+    ordered = sorted(rows, key=lambda row: (row[1], row[0]))
+    denominator = max(1, len(ordered) - 1)
+    percentiles = {idx: rank / denominator for rank, (idx, _) in enumerate(ordered)}
     for index, scan in enumerate(enriched):
-        scan["v16BatchRelativeStrength"] = percentiles.get(index, 0.5)
+        scan["v16BatchRelativeStrength"] = float(percentiles.get(index, 0.5))
         try:
             scan["market_regime"] = scan.get("market_regime") or scan.get("marketRegime") or _v4_market_regime()
         except Exception:
@@ -3371,56 +3533,56 @@ def _v16_prepare_real_market_factors(picks: List[Dict[str, Any]]) -> List[Dict[s
 
 
 def _v16_factor_breakdown(scan: Dict[str, Any]) -> Dict[str, Any]:
-    """V16.5 factors calculated from live curve, quote, reputation and regime data."""
+    """V16.5.1 factors calculated from live/bars, quote, history and regime data."""
     confidence, _ = calculate_confidence(scan)
     confidence = _v16_clamp(confidence)
     metrics = scan.get("v16CurveMetrics") or _v16_curve_metrics(scan)
 
     curve_return = float(metrics.get("return") or 0.0)
     curve_slope = float(metrics.get("slope") or 0.0)
-    consistency = float(metrics.get("consistency") or 0.5)
-    momentum_raw = float(scan.get("short_momentum") or scan.get("shortMomentum") or curve_return)
-    directional = _v16_clamp(0.5 + (curve_return * 22.0) + (curve_slope * 95.0))
-    momentum = _v16_clamp((directional * 0.72) + (consistency * 0.28))
+    consistency = float(metrics.get("consistency") if metrics.get("consistency") is not None else 0.5)
+    scanner_momentum = float(scan.get("short_momentum") or scan.get("shortMomentum") or 0.0)
+    directional = _v16_clamp(0.5 + curve_return * 24.0 + curve_slope * 110.0 + scanner_momentum * 10.0)
+    momentum = _v16_clamp(directional * 0.74 + consistency * 0.26)
 
-    relative_strength = _v16_clamp(float(scan.get("v16BatchRelativeStrength") or 0.5))
+    rs_value = scan.get("v16BatchRelativeStrength")
+    relative_strength = _v16_clamp(0.5 if rs_value is None else float(rs_value))
 
     spread = max(0.0, float(scan.get("spread") or 0.0))
     spread_quality = _v16_clamp(1.0 - spread / max(0.0001, float(MAX_SPREAD)))
     relative_volume = float(scan.get("relative_volume") or scan.get("relativeVolume") or scan.get("rvol") or 0.0)
-    volume_quality = _v16_clamp(relative_volume / 2.0) if relative_volume > 0 else 0.55
-    liquidity = _v16_clamp((spread_quality * 0.82) + (volume_quality * 0.18))
+    volume_quality = _v16_clamp(relative_volume / 2.0) if relative_volume > 0 else 0.50
+    liquidity = _v16_clamp(spread_quality * 0.85 + volume_quality * 0.15)
 
     realised_vol = abs(float(metrics.get("volatility") or 0.0))
     drawdown = abs(float(metrics.get("drawdown") or 0.0))
-    # Reward enough movement to trade, penalise unstable/noisy or sharply drawing-down curves.
     movement_score = _v16_clamp(realised_vol / 0.0015)
     noise_penalty = _v16_clamp(realised_vol / 0.008)
     drawdown_penalty = _v16_clamp(drawdown / 0.025)
-    volatility_quality = _v16_clamp(0.48 + movement_score * 0.35 - noise_penalty * 0.18 - drawdown_penalty * 0.30)
+    volatility_quality = _v16_clamp(0.46 + movement_score * 0.38 - noise_penalty * 0.18 - drawdown_penalty * 0.30)
 
     historical_edge = 0.50
+    historical_source = "NEUTRAL_NO_HISTORY"
     symbol = str(scan.get("symbol") or "").upper().strip()
     try:
         reputation = symbol_reputation_snapshot(force=False).get(symbol) or {}
         samples = int(reputation.get("samples") or 0)
-        rep_score = float(reputation.get("score") or 0.5)
+        rep_score = float(reputation.get("score") if reputation.get("score") is not None else 0.5)
         sample_weight = min(1.0, samples / 20.0)
         historical_edge = _v16_clamp(0.5 * (1.0 - sample_weight) + rep_score * sample_weight)
-    except Exception:
-        history = scan.get("optimiserDecision") or {}
-        history_mult = max(0.65, min(1.25, float(history.get("multiplier") or 1.0)))
-        historical_edge = _v16_clamp((history_mult - 0.65) / 0.60)
+        historical_source = f"SYMBOL_REPUTATION_{samples}_SAMPLES"
+    except Exception as exc:
+        historical_source = f"HISTORY_FALLBACK:{exc.__class__.__name__}"
 
     regime_text = str(scan.get("market_regime") or scan.get("marketRegime") or "UNKNOWN").upper()
     if "BULL" in regime_text or "RISK_ON" in regime_text:
-        regime_fit = _v16_clamp(0.45 + momentum * 0.45 + relative_strength * 0.10)
+        regime_fit = _v16_clamp(0.42 + momentum * 0.46 + relative_strength * 0.12)
     elif "BEAR" in regime_text or "RISK_OFF" in regime_text:
-        regime_fit = _v16_clamp(0.72 - momentum * 0.30 + volatility_quality * 0.18)
+        regime_fit = _v16_clamp(0.70 - momentum * 0.28 + volatility_quality * 0.20)
     elif "RANGE" in regime_text or "CHOP" in regime_text:
-        regime_fit = _v16_clamp(0.42 + volatility_quality * 0.38 + (1.0 - abs(momentum - 0.5) * 2.0) * 0.20)
+        regime_fit = _v16_clamp(0.40 + volatility_quality * 0.40 + (1.0 - abs(momentum - 0.5) * 2.0) * 0.20)
     else:
-        regime_fit = _v16_clamp(0.45 + momentum * 0.22 + volatility_quality * 0.18 + relative_strength * 0.15)
+        regime_fit = _v16_clamp(0.40 + momentum * 0.24 + volatility_quality * 0.18 + relative_strength * 0.18)
 
     quality_raw = max(0.0, float(scan.get("quality_score") or scan.get("qualityScore") or 0.0))
     quality = _v16_clamp(quality_raw / max(0.0001, float(A_PLUS_MIN_QUALITY or 0.026)))
@@ -3428,14 +3590,19 @@ def _v16_factor_breakdown(scan: Dict[str, Any]) -> Dict[str, Any]:
     values = {"momentum": momentum, "relativeStrength": relative_strength, "liquidity": liquidity, "volatilityQuality": volatility_quality, "historicalEdge": historical_edge, "regimeFit": regime_fit}
     weighted = {key: round(values[key] * weights[key], 6) for key in weights}
     base = sum(weighted.values())
-    validation = (confidence * 0.60) + (quality * 0.40)
-    final = _v16_clamp((base * 0.82) + (validation * 0.18))
+    validation = confidence * 0.60 + quality * 0.40
+    final = _v16_clamp(base * 0.82 + validation * 0.18)
+    numeric_metrics = {key: round(float(value), 8) for key, value in metrics.items() if isinstance(value, (int, float))}
     return {
-        "version": "V16.5", "source": "LIVE_MARKET_DATA",
+        "version": AI_PORTFOLIO_SCORING_ENGINE_VERSION,
+        "source": "REAL_MARKET_DATA",
         "values": {key: round(value, 6) for key, value in values.items()},
-        "weights": weights, "weighted": weighted, "validation": round(validation, 6),
-        "final": round(final, 6), "regime": regime_text,
-        "marketMetrics": {key: round(float(value), 8) for key, value in metrics.items()},
+        "weights": weights, "weighted": weighted,
+        "validation": round(validation, 6), "final": round(final, 6),
+        "regime": regime_text,
+        "marketMetrics": numeric_metrics,
+        "marketDataSource": str(metrics.get("source") or "UNKNOWN"),
+        "historicalSource": historical_source,
     }
 
 def _v16_portfolio_score(scan: Dict[str, Any]) -> float:
@@ -3516,6 +3683,27 @@ def _v16_load_portfolio_plan() -> Dict[str, Any]:
             return json.load(handle)
     except Exception:
         return {"ok": True, "version": AI_PORTFOLIO_MANAGER_VERSION, "enabled": AI_PORTFOLIO_MANAGER_ENABLED, "status": "WAITING_FOR_PLAN", "allocations": []}
+
+
+def _v16_execution_quality_gate(scan: Dict[str, Any], raw_score: float, factors: Dict[str, Any], manual: bool = False) -> tuple[bool, str, str]:
+    """Stop calibration-only candidates from reaching live execution."""
+    spread = max(0.0, float(scan.get("spread") or 0.0))
+    values = (factors or {}).get("values") or {}
+    liquidity_value = values.get("liquidity")
+    liquidity = float(liquidity_value if liquidity_value is not None else 0.0)
+    quality = max(0.0, float(scan.get("quality_score") or scan.get("qualityScore") or 0.0))
+
+    if spread > V16_PORTFOLIO_HARD_MAX_SPREAD:
+        return False, "HARD_SPREAD_LIMIT", f"Spread {spread:.5f} exceeds the absolute safety maximum {V16_PORTFOLIO_HARD_MAX_SPREAD:.5f}."
+    if spread > V16_PORTFOLIO_EXECUTION_MAX_SPREAD:
+        return False, "EXECUTION_SPREAD_TOO_WIDE", f"Spread {spread:.5f} exceeds the preferred live-entry maximum {V16_PORTFOLIO_EXECUTION_MAX_SPREAD:.5f}."
+    if liquidity < V16_PORTFOLIO_MIN_LIQUIDITY_FACTOR:
+        return False, "LIQUIDITY_FACTOR_TOO_LOW", f"Liquidity factor {liquidity:.3f} is below the minimum {V16_PORTFOLIO_MIN_LIQUIDITY_FACTOR:.3f}."
+    if not manual and raw_score < V16_PORTFOLIO_MIN_RAW_SCORE:
+        return False, "RAW_SCORE_TOO_LOW", f"Raw score {raw_score:.3f} is below the execution floor {V16_PORTFOLIO_MIN_RAW_SCORE:.3f}; calibration alone cannot qualify it."
+    if not manual and quality < V16_PORTFOLIO_MIN_QUALITY:
+        return False, "UNDERLYING_QUALITY_TOO_LOW", f"Underlying quality {quality:.4f} is below the execution floor {V16_PORTFOLIO_MIN_QUALITY:.4f}."
+    return True, "QUALITY_GUARD_PASS", "Raw score, setup quality, spread and liquidity all passed the live-execution guard."
 
 
 def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) -> Dict[str, Any]:
@@ -3607,11 +3795,9 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 "scoreZ": round(float(profile.get("zScore") or 0.0), 4),
                 "minimumScore": effective_minimum_score,
                 "confidence": round(confidence, 4),
-            "factors": factors,
                 "confidenceLabel": label,
                 "quality": quality,
                 "spread": spread,
-            "factors": factors,
                 "factors": factors,
                 "deployableNow": False,
             })
@@ -3619,6 +3805,48 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 f"V16 DECISION | symbol={symbol} decision=REJECTED reason=BUY_SAFETY_BLOCK "
                 f"detail={block_text} score={score:.3f} confidence={confidence:.3f} quality={quality:.4f}"
             )
+            continue
+
+        price = float(scan.get("price") or 0.0)
+        if price <= 0:
+            decisions.append({
+                "scanIndex": scan_index + 1, "symbol": symbol, "decision": "REJECTED",
+                "reasonCode": "INVALID_PRICE", "reason": "Live price is unavailable or invalid.",
+                "portfolioScore": score, "rawPortfolioScore": raw_score,
+                "minimumScore": effective_minimum_score, "confidence": round(confidence, 4),
+                "confidenceLabel": label, "quality": quality, "spread": spread,
+                "factors": factors, "deployableNow": False,
+            })
+            print(f"V16 DECISION | symbol={symbol} decision=REJECTED reason=INVALID_PRICE price={price}")
+            continue
+
+        quality_ok, quality_code, quality_reason = _v16_execution_quality_gate(scan, raw_score, factors, manual=manual)
+        if not quality_ok:
+            decisions.append({
+                "scanIndex": scan_index + 1, "symbol": symbol, "decision": "REJECTED",
+                "reasonCode": quality_code, "reason": quality_reason,
+                "portfolioScore": score, "rawPortfolioScore": raw_score,
+                "minimumScore": effective_minimum_score, "confidence": round(confidence, 4),
+                "confidenceLabel": label, "quality": quality, "spread": spread,
+                "factors": factors, "deployableNow": False,
+            })
+            print(
+                f"V16 DECISION | symbol={symbol} decision=REJECTED reason={quality_code} "
+                f"raw={raw_score:.3f} quality={quality:.4f} spread={spread:.5f} detail={quality_reason}"
+            )
+            continue
+
+        if V16_PORTFOLIO_REQUIRE_READY_TRIGGER and not bool(scan.get("ready_to_buy")) and not manual:
+            decisions.append({
+                "scanIndex": scan_index + 1, "symbol": symbol, "decision": "QUALIFIED_WAITING",
+                "reasonCode": "WAITING_FOR_ENTRY_TRIGGER",
+                "reason": "Portfolio score qualified, but the optional legacy entry trigger is not ready.",
+                "portfolioScore": score, "rawPortfolioScore": raw_score,
+                "minimumScore": effective_minimum_score, "confidence": round(confidence, 4),
+                "confidenceLabel": label, "quality": quality, "spread": spread,
+                "factors": factors, "deployableNow": False,
+            })
+            print(f"V16 DECISION | symbol={symbol} decision=WAITING reason=WAITING_FOR_ENTRY_TRIGGER score={score:.3f}")
             continue
 
         if score < effective_minimum_score and not manual:
@@ -3639,7 +3867,6 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 "confidenceLabel": label,
                 "quality": quality,
                 "spread": spread,
-            "factors": factors,
                 "factors": factors,
                 "deployableNow": False,
             })
@@ -3661,7 +3888,6 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             "quality": quality,
             "spread": spread,
             "factors": factors,
-                "factors": factors,
             "riskProfile": _ai_risk_build_profile(scan) if AI_RISK_ENGINE_ENABLED else {},
         }
         ranked.append(item)
@@ -3672,13 +3898,15 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             "reasonCode": "QUALIFIED",
             "reason": f"Calibrated score {score:.3f} (raw {raw_score:.3f}) met the minimum {effective_minimum_score:.3f} and all symbol safety checks passed.",
             "portfolioScore": score,
+            "rawPortfolioScore": raw_score,
+            "relativeBatchScore": round(float(profile.get("relative") or 0.0), 6),
+            "scoreZ": round(float(profile.get("zScore") or 0.0), 4),
             "minimumScore": effective_minimum_score,
             "confidence": round(confidence, 4),
             "confidenceLabel": label,
             "quality": quality,
             "spread": spread,
             "factors": factors,
-                "factors": factors,
             "deployableNow": False,
         })
         print(
@@ -3760,7 +3988,8 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 
     plan = {
         "ok": True,
-        "version": "V16.6-AI-BUY-AND-EXIT",
+        "version": "V16.5.1-REAL-MARKET-FACTORS",
+        "scoringEngineVersion": AI_PORTFOLIO_SCORING_ENGINE_VERSION,
         "enabled": AI_PORTFOLIO_MANAGER_ENABLED,
         "createdAt": datetime.now(UTC).isoformat(),
         "manual": bool(manual),
@@ -3784,6 +4013,14 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         "adaptiveScoreFloor": AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR,
         "thresholdMode": threshold_mode,
         "scoringMode": "ABSOLUTE_PLUS_BATCH_CALIBRATION",
+        "executionMode": "V16_PORTFOLIO_SCORE" if V16_PORTFOLIO_EXECUTION_ENABLED else "LEGACY_SNIPER_A_PLUS",
+        "portfolioExecutionEnabled": V16_PORTFOLIO_EXECUTION_ENABLED,
+        "requireReadyTrigger": V16_PORTFOLIO_REQUIRE_READY_TRIGGER,
+        "hardMaxSpread": V16_PORTFOLIO_HARD_MAX_SPREAD,
+        "executionMaxSpread": V16_PORTFOLIO_EXECUTION_MAX_SPREAD,
+        "minimumRawScore": V16_PORTFOLIO_MIN_RAW_SCORE,
+        "minimumUnderlyingQuality": V16_PORTFOLIO_MIN_QUALITY,
+        "minimumLiquidityFactor": V16_PORTFOLIO_MIN_LIQUIDITY_FACTOR,
         "decisionReasonCounts": reason_counts,
         "decisions": decisions[:100],
         "qualifiedCandidates": [
@@ -3833,17 +4070,24 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 def api_v16_exit_status(request: Request):
     verify_api_key(request)
     return {
-        "ok": True,
-        "version": "V16.6-AI-EXIT-MANAGER",
+        "ok": True, "version": "V16.7-ADAPTIVE-EXIT-ROTATION",
         "enabled": AI_PORTFOLIO_EXIT_ENABLED,
-        "exitScore": AI_PORTFOLIO_EXIT_SCORE,
-        "hardExitScore": AI_PORTFOLIO_EXIT_HARD_SCORE,
-        "confirmationsRequired": AI_PORTFOLIO_EXIT_CONFIRMATIONS,
+        "rotationEnabled": AI_PORTFOLIO_ROTATION_ENABLED,
+        "rotationMargin": AI_PORTFOLIO_ROTATION_MARGIN,
+        "minimumReplacementScore": AI_PORTFOLIO_ROTATION_MIN_REPLACEMENT_SCORE,
+        "exitLevels": {"immediate": AI_PORTFOLIO_EXIT_IMMEDIATE_SCORE, "fast": AI_PORTFOLIO_EXIT_FAST_SCORE,
+                       "normal": AI_PORTFOLIO_EXIT_NORMAL_SCORE, "healthy": AI_PORTFOLIO_EXIT_HEALTHY_SCORE},
         "minimumHoldMinutes": AI_PORTFOLIO_EXIT_MIN_HOLD_MINUTES,
         "maxExitsPerCycle": AI_PORTFOLIO_EXIT_MAX_PER_CYCLE,
-        "weakCounts": dict(v16_exit_weak_counts),
-        "decisions": list(v16_exit_latest_decisions),
+        "weakCounts": dict(v16_exit_weak_counts), "decisions": list(v16_exit_latest_decisions),
     }
+
+
+@app.get("/v16/exits/reviews")
+def api_v16_exit_reviews(request: Request):
+    verify_api_key(request)
+    events = _v16_load_exit_reviews()
+    return {"ok": True, "version": "V16.7", "count": len(events), "items": events[-200:]}
 
 
 @app.get("/v16/portfolio/status")
@@ -3856,7 +4100,11 @@ def api_v16_portfolio_status(request: Request):
     # were live. Build a read-only plan from the latest scan snapshot whenever
     # the saved plan is missing, empty or stale. This does not submit orders.
     payload = _v16_load_portfolio_plan()
-    should_publish = payload.get("status") in (None, "WAITING_FOR_PLAN") or not payload.get("createdAt")
+    should_publish = (
+        payload.get("status") in (None, "WAITING_FOR_PLAN")
+        or not payload.get("createdAt")
+        or payload.get("scoringEngineVersion") != AI_PORTFOLIO_SCORING_ENGINE_VERSION
+    )
     try:
         created_at = payload.get("createdAt")
         if created_at:
@@ -3877,109 +4125,182 @@ def api_v16_portfolio_status(request: Request):
 
     payload.setdefault("enabled", AI_PORTFOLIO_MANAGER_ENABLED)
     payload.setdefault("version", AI_PORTFOLIO_MANAGER_VERSION)
+    payload["scoringEngineVersion"] = AI_PORTFOLIO_SCORING_ENGINE_VERSION
     payload["openPositions"] = len(get_all_positions())
     payload["capacity"] = ai_position_capacity_payload()
     payload["latestScanCount"] = len(latest_scans)
     return payload
 
 def money_mode_buy(scans, manual=False):
+    """Submit live buys from the V16 portfolio plan.
+
+    When V16 execution is enabled, portfolio qualification is the live entry
+    gate. Legacy Sniper/A+ metrics remain in the scan and inspector as evidence,
+    but they do not veto a candidate that passes the portfolio score and all
+    account/risk safeguards.
+    """
     if TRADEBOT_V2_ENABLED and not PAPER and not TRADEBOT_V2_LIVE_ENABLED:
-        # Validation mode must still run the complete decision pipeline so V2 can
-        # record approved/rejected observations without submitting a live order.
         try:
-            validation_picks = pick_money_mode_stocks(scans)
-            print(f"V2 VALIDATION | observations processed={len(scans)} approved={len(validation_picks)} live_order=False")
+            if AI_PORTFOLIO_MANAGER_ENABLED and V16_PORTFOLIO_EXECUTION_ENABLED:
+                validation = build_v16_portfolio_plan(list(scans), manual=manual).get("plan") or {}
+                print(
+                    f"V16 VALIDATION | observations={len(scans)} qualified={validation.get('qualifiedCount', 0)} "
+                    f"actionable={validation.get('actionableCount', 0)} live_order=False"
+                )
+            else:
+                validation_picks = pick_money_mode_stocks(scans)
+                print(f"V2 VALIDATION | observations processed={len(scans)} approved={len(validation_picks)} live_order=False")
         except Exception as e:
-            print(f"V2 VALIDATION LOG ERROR: {e}")
+            print(f"V16 VALIDATION LOG ERROR: {e}")
         return "BUY BLOCKED | TradeBot V2 validation mode. Decisions recorded; live ordering remains disabled."
+
     if emergency_stop:
         return "BUY BLOCKED | emergency stop active"
+
+    try:
+        if not bool(trading_client.get_clock().is_open):
+            return "BUY BLOCKED | market closed"
+    except Exception as exc:
+        return f"BUY BLOCKED | market status unavailable: {exc}"
+
     blocked, reason = risk_blocked()
     if blocked:
         return f"BUY BLOCKED | {reason}"
-    if allowed_new_position_count() <= 0:
-        capacity = ai_position_capacity_payload()
+
+    # V16 portfolio execution sizes orders from the live portfolio plan.
+    # Do not require enough cash for the legacy fixed target notional here: the
+    # planner may intentionally create a smaller, affordable allocation. Only
+    # structural capacity is checked before planning; actual affordability is
+    # re-checked against each allocation immediately before submission.
+    capacity = ai_position_capacity_payload()
+    if AI_PORTFOLIO_MANAGER_ENABLED and V16_PORTFOLIO_EXECUTION_ENABLED:
+        structural_slots = int(capacity.get("structuralAvailableSlots") or 0)
+        if structural_slots <= 0:
+            return (
+                "BUY BLOCKED | AI portfolio capacity reached "
+                f"({capacity.get('effectiveMaxPositions', effective_max_positions())})"
+            )
+    elif allowed_new_position_count() <= 0:
         structural_slots = int(capacity.get("structuralAvailableSlots") or 0)
         affordable_slots = int(capacity.get("affordableNewPositions") or 0)
         if structural_slots <= 0:
             block_reason = f"AI portfolio capacity reached ({capacity.get('effectiveMaxPositions', effective_max_positions())})"
-            approval_stage = "position_limit"
         elif affordable_slots <= 0:
             buying_power = float(capacity.get("buyingPowerUsd") or 0.0)
             target_notional = float(capacity.get("targetPositionNotionalUsd") or 0.0)
             block_reason = f"insufficient buying power (${buying_power:.2f}) for AI target position (${target_notional:.2f})"
-            approval_stage = "buying_power"
         else:
             block_reason = str(capacity.get("reason") or "no AI-approved portfolio slot available")
-            approval_stage = "portfolio_capacity"
-        # Preserve decision evidence even when account-level capacity blocks an order.
-        try:
-            blocked_picks = pick_money_mode_stocks(
-                scans,
-                approval_decision="BLOCKED",
-                approval_stage=approval_stage,
-                approval_reason=block_reason,
-            )
-            if blocked_picks:
-                best = blocked_picks[0]
-                print(
-                    "DECISION INTELLIGENCE | "
-                    f"blocked={len(blocked_picks)} best={best.get('symbol')} "
-                    f"confidence={float(best.get('confidence') or 0.0):.2f} "
-                    f"reason={block_reason}"
-                )
-        except Exception as decision_error:
-            print(f"DECISION INTELLIGENCE BLOCKED LOG ERROR: {decision_error}")
         return f"BUY BLOCKED | {block_reason}"
+
     if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
         return f"BUY BLOCKED | PDT-aware max new buys today reached ({MAX_NEW_BUYS_PER_DAY_PDT_AWARE})"
 
-    picks = pick_money_mode_stocks(scans)
-    if manual and not picks:
-        if A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY:
-            return "No A+ sniper candidates ready. Manual Money Buy blocked by Trade Quality Gate."
-        picks = [s for s in scans if can_buy_symbol(s["symbol"])[0] and s["spread"] <= MAX_SPREAD]
-        picks.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
+    portfolio = {}
+    if AI_PORTFOLIO_MANAGER_ENABLED and V16_PORTFOLIO_EXECUTION_ENABLED:
+        # Important: feed the complete current scanner batch to V16. The old
+        # code filtered through Sniper/A+ first, which made Portfolio QUALIFIED
+        # rows impossible to execute when legacy confidence/quality were lower.
+        portfolio = build_v16_portfolio_plan(list(scans), manual=manual)
+        execution_rows = portfolio.get("internalAllocations") or []
+    else:
+        picks = pick_money_mode_stocks(scans)
+        if manual and not picks:
+            if A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY:
+                return "No A+ sniper candidates ready. Manual Money Buy blocked by Trade Quality Gate."
+            picks = [s for s in scans if can_buy_symbol(s["symbol"])[0] and s["spread"] <= MAX_SPREAD]
+            picks.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
+        if not picks:
+            return "No sniper candidates ready."
+        execution_rows = [{
+            "symbol": c["symbol"], "scan": c, "notionalUsd": ai_risk_notional(c),
+            "rank": index + 1, "portfolioScore": _v16_portfolio_score(c),
+        } for index, c in enumerate(picks[:MAX_NEW_BUYS_PER_LOOP])]
 
-    if not picks:
-        return "No sniper candidates ready."
+    if not execution_rows:
+        plan = portfolio.get("plan") if portfolio else {}
+        return str(plan.get("explanation") or "No portfolio allocations passed the score, capital and safety rules.")
 
     bought = 0
     messages = []
-    if AI_PORTFOLIO_MANAGER_ENABLED:
-        portfolio = build_v16_portfolio_plan(picks, manual=manual)
-        execution_rows = portfolio.get("internalAllocations") or []
-    else:
-        execution_rows = [{"symbol": c["symbol"], "scan": c, "notionalUsd": ai_risk_notional(c), "rank": index + 1, "portfolioScore": _v16_portfolio_score(c)} for index, c in enumerate(picks[:MAX_NEW_BUYS_PER_LOOP])]
-
-    if not execution_rows:
-        plan = portfolio.get("plan") if AI_PORTFOLIO_MANAGER_ENABLED else {}
-        return str(plan.get("explanation") or "No portfolio allocations passed the capital and safety rules.")
-
     for allocation in execution_rows:
         c = allocation["scan"]
         symbol = allocation["symbol"]
+
+        # Re-check every live safety condition immediately before submission.
+        if emergency_stop or not bot_enabled:
+            messages.append(f"SKIP {symbol} | bot disabled or emergency stop active")
+            continue
+        try:
+            if not bool(trading_client.get_clock().is_open):
+                messages.append(f"SKIP {symbol} | market closed")
+                continue
+        except Exception as exc:
+            messages.append(f"SKIP {symbol} | market status error: {exc}")
+            continue
         can_buy, block_reason = can_buy_symbol(symbol)
         if not can_buy:
             messages.append(f"SKIP {symbol} | {block_reason}")
             continue
+        spread = float(c.get("spread") or 0.0)
+        execution_factors = _v16_factor_breakdown(c)
+        execution_raw_score = float((execution_factors or {}).get("final") or 0.0)
+        quality_ok, quality_code, quality_reason = _v16_execution_quality_gate(
+            c, execution_raw_score, execution_factors, manual=manual
+        )
+        if not quality_ok:
+            messages.append(f"SKIP {symbol} | {quality_code}: {quality_reason}")
+            print(f"V16 LIVE ORDER BLOCK | symbol={symbol} reason={quality_code} detail={quality_reason}")
+            continue
+        if V16_PORTFOLIO_REQUIRE_READY_TRIGGER and not bool(c.get("ready_to_buy")) and not manual:
+            messages.append(f"WAIT {symbol} | portfolio qualified but entry trigger not ready")
+            continue
+
         notional = round(float(allocation.get("notionalUsd") or 0.0), 2)
         if notional < MIN_ORDER_NOTIONAL:
             messages.append(f"SKIP {symbol} | portfolio allocation too small {notional:.2f}")
             continue
+
+        # Use the plan's actual allocation for affordability, not the legacy
+        # target-position size. Re-read buying power immediately before each
+        # order so multiple allocations cannot overspend stale cash telemetry.
+        try:
+            live_account = get_account()
+            live_buying_power = max(0.0, float(live_account.buying_power))
+            affordable_now = max(0.0, live_buying_power - float(CASH_BUFFER))
+        except Exception as exc:
+            messages.append(f"SKIP {symbol} | buying power unavailable: {exc}")
+            continue
+        if notional > affordable_now + 0.005:
+            messages.append(
+                f"SKIP {symbol} | allocation ${notional:.2f} exceeds available buying power "
+                f"${affordable_now:.2f}"
+            )
+            print(
+                f"V16 LIVE ORDER BLOCK | symbol={symbol} reason=ALLOCATION_EXCEEDS_BUYING_POWER "
+                f"allocation=${notional:.2f} available=${affordable_now:.2f}"
+            )
+            continue
+
         confidence, label = calculate_confidence(c)
-        reason = f"{'MANUAL' if manual else 'AUTO'} V16 PORTFOLIO #{allocation.get('rank', bought + 1)} {label} BUY"
+        score = float(allocation.get("portfolioScore") or 0.0)
+        reason = f"{'MANUAL' if manual else 'AUTO'} V16.5.5 PORTFOLIO #{allocation.get('rank', bought + 1)} SCORE BUY"
         try:
             market_buy_notional(symbol, notional, reason=reason, scan=c)
-            record_v2_setup_decision(c, "BOUGHT", "v16_portfolio_order_submitted", reason, c.get("v2Expectancy") or {})
+            record_v2_setup_decision(
+                c, "BOUGHT", "v16_portfolio_order_submitted", reason,
+                {"portfolioScore": score, "legacyConfidence": confidence, "executionGate": "V16_PORTFOLIO"},
+            )
             state[symbol]["ref"] = c["price"]
             state[symbol]["highest_since_entry"] = c["price"]
-            messages.append(f"{reason} ${notional:.2f} {symbol} score={float(allocation.get('portfolioScore') or 0):.3f} confidence={confidence:.2f}")
+            messages.append(
+                f"{reason} ${notional:.2f} {symbol} score={score:.3f} legacy_confidence={confidence:.2f}"
+            )
             bought += 1
         except Exception as e:
             messages.append(f"BUY ERROR {symbol}: {e}")
-    return " | ".join(messages)
 
+    return " | ".join(messages)
 
 def buy_custom_symbol(symbol: str):
     if TRADEBOT_V2_ENABLED and not PAPER and not TRADEBOT_V2_LIVE_ENABLED:
