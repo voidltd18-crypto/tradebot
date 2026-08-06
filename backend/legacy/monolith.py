@@ -110,11 +110,13 @@ AI_PORTFOLIO_MANAGER_ENABLED = os.getenv("AI_PORTFOLIO_MANAGER_ENABLED", "true")
 # evidence, but no longer silently veto a V16-qualified portfolio candidate.
 V16_PORTFOLIO_EXECUTION_ENABLED = os.getenv("V16_PORTFOLIO_EXECUTION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 V16_PORTFOLIO_REQUIRE_READY_TRIGGER = os.getenv("V16_PORTFOLIO_REQUIRE_READY_TRIGGER", "false").lower() in ("1", "true", "yes", "on")
-AI_PORTFOLIO_MANAGER_VERSION = "V16.7-ADAPTIVE-EXIT-ROTATION"
+AI_PORTFOLIO_MANAGER_VERSION = "V16.7.2-MINIMUM-ALLOCATION-GUARD"
 AI_PORTFOLIO_MAX_SINGLE_WEIGHT = max(0.10, min(0.60, float(os.getenv("AI_PORTFOLIO_MAX_SINGLE_WEIGHT", "0.45") or 0.45)))
 AI_PORTFOLIO_MIN_CASH_RESERVE_PCT = max(0.02, min(0.50, float(os.getenv("AI_PORTFOLIO_MIN_CASH_RESERVE_PCT", "0.08") or 0.08)))
 AI_PORTFOLIO_MAX_CASH_RESERVE_PCT = max(AI_PORTFOLIO_MIN_CASH_RESERVE_PCT, min(0.80, float(os.getenv("AI_PORTFOLIO_MAX_CASH_RESERVE_PCT", "0.45") or 0.45)))
 AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE = max(1, min(10, int(os.getenv("AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE", "10") or 10)))
+# Prevent token-sized residual positions; small leftovers remain as cash.
+AI_PORTFOLIO_MIN_ALLOCATION_USD = max(1.0, float(os.getenv("AI_PORTFOLIO_MIN_ALLOCATION_USD", "10") or 10))
 AI_PORTFOLIO_MIN_SCORE = max(0.0, min(1.0, float(os.getenv("AI_PORTFOLIO_MIN_SCORE", "0.55") or 0.55)))
 AI_PORTFOLIO_ADAPTIVE_SCORE_ENABLED = os.getenv("AI_PORTFOLIO_ADAPTIVE_SCORE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR = max(0.0, min(AI_PORTFOLIO_MIN_SCORE, float(os.getenv("AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR", "0.52") or 0.52)))
@@ -3945,7 +3947,8 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
     reserve_pct = _v16_cash_reserve_pct(actionable_ranked)
     deployable = round(max(0.0, usable_cash * (1.0 - reserve_pct)), 2)
     allocations = []
-    if actionable_ranked and deployable >= MIN_ORDER_NOTIONAL:
+    allocation_floor = max(float(MIN_ORDER_NOTIONAL), float(AI_PORTFOLIO_MIN_ALLOCATION_USD))
+    if actionable_ranked and deployable >= allocation_floor:
         power = 2.0
         strengths = [max(0.001, item["portfolioScore"] - effective_minimum_score + 0.08) ** power for item in actionable_ranked]
         total_strength = sum(strengths) or 1.0
@@ -3959,7 +3962,11 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             if index == len(actionable_ranked) - 1:
                 amount = round(max(0.0, min(remaining, constitutional_cap)), 2)
             remaining = round(max(0.0, remaining - amount), 2)
-            if amount < MIN_ORDER_NOTIONAL:
+            if amount < allocation_floor:
+                print(
+                    f"V16 ALLOCATION SKIP | symbol={item['symbol']} amount=${amount:.2f} "
+                    f"minimum=${allocation_floor:.2f} reason=ALLOCATION_BELOW_MINIMUM"
+                )
                 continue
             allocations.append({
                 "rank": index + 1,
@@ -4009,6 +4016,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         "waitingCount": waiting_count,
         "orderLimit": order_limit,
         "minimumPortfolioScore": effective_minimum_score,
+        "minimumAllocationUsd": round(allocation_floor, 2),
         "baseMinimumPortfolioScore": AI_PORTFOLIO_MIN_SCORE,
         "adaptiveScoreFloor": AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR,
         "thresholdMode": threshold_mode,
@@ -4257,8 +4265,15 @@ def money_mode_buy(scans, manual=False):
             continue
 
         notional = round(float(allocation.get("notionalUsd") or 0.0), 2)
-        if notional < MIN_ORDER_NOTIONAL:
-            messages.append(f"SKIP {symbol} | portfolio allocation too small {notional:.2f}")
+        allocation_floor = max(float(MIN_ORDER_NOTIONAL), float(AI_PORTFOLIO_MIN_ALLOCATION_USD))
+        if notional < allocation_floor:
+            messages.append(
+                f"SKIP {symbol} | allocation ${notional:.2f} below AI portfolio minimum ${allocation_floor:.2f}"
+            )
+            print(
+                f"V16 ORDER BLOCK | symbol={symbol} amount=${notional:.2f} "
+                f"minimum=${allocation_floor:.2f} reason=ALLOCATION_BELOW_MINIMUM"
+            )
             continue
 
         # Use the plan's actual allocation for affordability, not the legacy

@@ -1,8 +1,15 @@
-TradeBot V16.7.1 Autonomous Reliability Fix
+TradeBot V16.7.2 - Minimum Meaningful Allocation Guard
 
-Fixes:
-1. V10 autonomous operator crash: defines profit factor and total realised P&L before proposal logic.
-2. V14 Scientist SQLite lock: closes the experiment write transaction before writing its event.
+Replace:
+  backend/legacy/monolith.py
 
-Includes all V16.7 adaptive exit and rotation features.
-Replace backend/legacy/monolith.py and redeploy Render.
+Default behaviour:
+- AI portfolio allocations below $10 are not submitted.
+- Tiny residual buying power remains as cash.
+- The guard runs during planning and again immediately before order submission.
+- All V16.7.1 buy, adaptive exit, rotation, PDT, quality and reliability protections remain included.
+
+Optional Render environment variable:
+  AI_PORTFOLIO_MIN_ALLOCATION_USD=10
+
+You can later raise this to 15 or 20 without another code deployment.
