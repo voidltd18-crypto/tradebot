@@ -154,7 +154,20 @@ AI_PORTFOLIO_EXIT_FAST_SCORE = max(AI_PORTFOLIO_EXIT_IMMEDIATE_SCORE, min(0.50, 
 AI_PORTFOLIO_EXIT_NORMAL_SCORE = max(AI_PORTFOLIO_EXIT_FAST_SCORE, min(0.60, float(os.getenv("AI_PORTFOLIO_EXIT_NORMAL_SCORE", "0.55") or 0.55)))
 AI_PORTFOLIO_EXIT_HEALTHY_SCORE = max(AI_PORTFOLIO_EXIT_NORMAL_SCORE, min(0.80, float(os.getenv("AI_PORTFOLIO_EXIT_HEALTHY_SCORE", "0.65") or 0.65)))
 AI_PORTFOLIO_EXIT_REVIEW_FILE = os.getenv("AI_PORTFOLIO_EXIT_REVIEW_FILE", "/var/data/v16_exit_reviews.json")
-AI_PORTFOLIO_SCORING_ENGINE_VERSION = "V17.0-ELITE-TOP3-REAL-FACTORS"
+
+# V17.1 — portfolio-level recovery / profit protection.
+# The existing exit engine scores each stock independently. This layer also
+# watches total account equity so a strong recovery is not allowed to round-trip
+# simply because the individual holding still has a healthy thesis score.
+AI_PORTFOLIO_EQUITY_TRAIL_ENABLED = os.getenv("AI_PORTFOLIO_EQUITY_TRAIL_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+AI_PORTFOLIO_EQUITY_TRAIL_ARM_PCT = max(0.5, min(10.0, float(os.getenv("AI_PORTFOLIO_EQUITY_TRAIL_ARM_PCT", "1.50") or 1.50)))
+AI_PORTFOLIO_EQUITY_TRAIL_GIVEBACK_FRACTION = max(0.10, min(0.75, float(os.getenv("AI_PORTFOLIO_EQUITY_TRAIL_GIVEBACK_FRACTION", "0.25") or 0.25)))
+AI_PORTFOLIO_EQUITY_TRAIL_MIN_GIVEBACK_USD = max(1.0, float(os.getenv("AI_PORTFOLIO_EQUITY_TRAIL_MIN_GIVEBACK_USD", "6.00") or 6.00))
+AI_PORTFOLIO_EQUITY_TRAIL_MAX_GIVEBACK_PCT = max(0.25, min(3.0, float(os.getenv("AI_PORTFOLIO_EQUITY_TRAIL_MAX_GIVEBACK_PCT", "0.90") or 0.90)))
+AI_PORTFOLIO_EQUITY_TRAIL_MAX_EXITS_PER_CYCLE = max(1, min(3, int(os.getenv("AI_PORTFOLIO_EQUITY_TRAIL_MAX_EXITS_PER_CYCLE", "1") or 1)))
+AI_PORTFOLIO_EQUITY_TRAIL_STATE_FILE = os.getenv("AI_PORTFOLIO_EQUITY_TRAIL_STATE_FILE", "/var/data/v171_portfolio_equity_trail.json")
+
+AI_PORTFOLIO_SCORING_ENGINE_VERSION = "V17.1-PORTFOLIO-EQUITY-TRAIL"
 AI_PORTFOLIO_BAR_FALLBACK_MINUTES = max(10, min(120, int(os.getenv("AI_PORTFOLIO_BAR_FALLBACK_MINUTES", "45") or 45)))
 AI_PORTFOLIO_BAR_CACHE_SECONDS = max(30, min(300, int(os.getenv("AI_PORTFOLIO_BAR_CACHE_SECONDS", "75") or 75)))
 _v16_bar_cache: Dict[str, Dict[str, Any]] = {}
@@ -3382,6 +3395,226 @@ def _v16_ai_exit_review(position: Dict[str, Any], profile: Optional[Dict[str, An
     }
 
 
+def _v171_market_session_key() -> str:
+    """Stable US-market session key used to reset the intraday equity trail."""
+    try:
+        clock = trading_client.get_clock()
+        ts = getattr(clock, "timestamp", None)
+        if ts is not None:
+            if getattr(ts, "tzinfo", None) is None:
+                ts = ts.replace(tzinfo=UTC)
+            return ts.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:
+        pass
+    return datetime.now(UTC).astimezone(ZoneInfo("America/New_York")).date().isoformat()
+
+
+def _v171_equity_trail_state() -> Dict[str, Any]:
+    state_data = safe_load_json(AI_PORTFOLIO_EQUITY_TRAIL_STATE_FILE, {})
+    return state_data if isinstance(state_data, dict) else {}
+
+
+def _v171_save_equity_trail_state(payload: Dict[str, Any]) -> None:
+    safe_save_json(AI_PORTFOLIO_EQUITY_TRAIL_STATE_FILE, payload)
+
+
+def _v171_equity_trail_snapshot() -> Dict[str, Any]:
+    """Return a dashboard-safe view without changing the trail state."""
+    data = _v171_equity_trail_state()
+    if not data:
+        return {
+            "enabled": AI_PORTFOLIO_EQUITY_TRAIL_ENABLED,
+            "armed": False,
+            "session": _v171_market_session_key(),
+            "status": "WAITING_FOR_MARKET_DATA",
+        }
+    out = dict(data)
+    out["enabled"] = AI_PORTFOLIO_EQUITY_TRAIL_ENABLED
+    out["armPct"] = AI_PORTFOLIO_EQUITY_TRAIL_ARM_PCT
+    out["givebackFraction"] = AI_PORTFOLIO_EQUITY_TRAIL_GIVEBACK_FRACTION
+    out["minGivebackUsd"] = AI_PORTFOLIO_EQUITY_TRAIL_MIN_GIVEBACK_USD
+    out["maxGivebackPct"] = AI_PORTFOLIO_EQUITY_TRAIL_MAX_GIVEBACK_PCT
+    return out
+
+
+def _v171_manage_portfolio_equity_trail(
+    positions: List[Dict[str, Any]],
+    exit_profiles: Dict[str, Dict[str, Any]],
+) -> set[str]:
+    """Protect a meaningful recovery in total account equity.
+
+    The trail arms only after equity has recovered materially from the session
+    trough. Once armed, it follows the recovery peak. If total equity gives back
+    too much of that recovery, the weakest eligible live holding is sold first.
+
+    This is deliberately portfolio-level: a symbol can still have a healthy
+    thesis while the account as a whole is surrendering a valuable recovery.
+    Existing same-day/PDT protection remains in force.
+    """
+    sold: set[str] = set()
+    if not AI_PORTFOLIO_EQUITY_TRAIL_ENABLED or not positions:
+        return sold
+
+    try:
+        clock = trading_client.get_clock()
+        if not bool(clock.is_open):
+            return sold
+        account = get_account()
+        equity = float(account.equity)
+    except Exception as exc:
+        print(f"V17.1 PORTFOLIO TRAIL SKIP | telemetry error={exc}")
+        return sold
+
+    if equity <= 0:
+        return sold
+
+    now = datetime.now(UTC).isoformat()
+    session = _v171_market_session_key()
+    data = _v171_equity_trail_state()
+    if data.get("session") != session:
+        data = {
+            "session": session,
+            "startedAt": now,
+            "startEquity": equity,
+            "troughEquity": equity,
+            "peakEquity": equity,
+            "armed": False,
+            "triggerCount": 0,
+            "lastAction": "SESSION_RESET",
+        }
+
+    trough = min(float(data.get("troughEquity") or equity), equity)
+    # If a fresh lower trough is made before the trail is armed, start measuring
+    # the next recovery from that new low.
+    if equity < float(data.get("troughEquity") or equity) and not bool(data.get("armed")):
+        data["peakEquity"] = equity
+    data["troughEquity"] = trough
+
+    peak = max(float(data.get("peakEquity") or equity), equity)
+    data["peakEquity"] = peak
+    recovery_usd = max(0.0, peak - trough)
+    recovery_pct = (recovery_usd / trough * 100.0) if trough > 0 else 0.0
+
+    if recovery_pct >= AI_PORTFOLIO_EQUITY_TRAIL_ARM_PCT:
+        data["armed"] = True
+        data.setdefault("armedAt", now)
+
+    # Give back only a controlled piece of the recovery. The percentage cap
+    # prevents a large account from receiving an excessively loose dollar trail.
+    giveback_usd = max(
+        AI_PORTFOLIO_EQUITY_TRAIL_MIN_GIVEBACK_USD,
+        recovery_usd * AI_PORTFOLIO_EQUITY_TRAIL_GIVEBACK_FRACTION,
+    )
+    giveback_usd = min(giveback_usd, peak * (AI_PORTFOLIO_EQUITY_TRAIL_MAX_GIVEBACK_PCT / 100.0))
+    floor_equity = peak - giveback_usd
+
+    data.update({
+        "updatedAt": now,
+        "currentEquity": round(equity, 4),
+        "troughEquity": round(trough, 4),
+        "peakEquity": round(peak, 4),
+        "recoveryUsd": round(recovery_usd, 4),
+        "recoveryPct": round(recovery_pct, 4),
+        "trailGivebackUsd": round(giveback_usd, 4),
+        "trailFloorEquity": round(floor_equity, 4),
+        "distanceToFloorUsd": round(equity - floor_equity, 4),
+    })
+
+    if not bool(data.get("armed")):
+        data["status"] = "BUILDING_RECOVERY"
+        data["lastAction"] = "HOLD"
+        _v171_save_equity_trail_state(data)
+        print(
+            f"V17.1 PORTFOLIO TRAIL | armed=False equity=${equity:.2f} trough=${trough:.2f} "
+            f"peak=${peak:.2f} recovery={recovery_pct:.2f}% arm={AI_PORTFOLIO_EQUITY_TRAIL_ARM_PCT:.2f}%"
+        )
+        return sold
+
+    if equity > floor_equity:
+        data["status"] = "ARMED"
+        data["lastAction"] = "HOLD"
+        _v171_save_equity_trail_state(data)
+        print(
+            f"V17.1 PORTFOLIO TRAIL | armed=True equity=${equity:.2f} peak=${peak:.2f} "
+            f"floor=${floor_equity:.2f} recovery={recovery_pct:.2f}%"
+        )
+        return sold
+
+    # Floor breached: rank holdings by current keep score, then P&L, weakest first.
+    ranked = sorted(
+        positions,
+        key=lambda p: (
+            float((exit_profiles.get(str(p.get("symbol") or "").upper()) or {}).get("score") or 0.0),
+            float(p.get("pnlPct") or 0.0),
+            str(p.get("symbol") or ""),
+        ),
+    )
+
+    data["status"] = "TRIGGERED"
+    data["lastTriggerAt"] = now
+    exits = 0
+    for p in ranked:
+        if exits >= AI_PORTFOLIO_EQUITY_TRAIL_MAX_EXITS_PER_CYCLE:
+            break
+        symbol = str(p.get("symbol") or "").upper().strip()
+        qty = float(p.get("qty") or 0.0)
+        entry = float(p.get("entry") or 0.0)
+        price = float(p.get("price") or 0.0)
+        if not symbol or qty <= DUST_THRESHOLD or entry <= 0 or price <= 0:
+            continue
+        if has_open_order(symbol):
+            continue
+        # Keep the bot's existing PDT policy. This prevents a portfolio trail
+        # from silently re-introducing prohibited same-day churn.
+        if pdt_aware_should_avoid_sell(symbol, "V17.1 PORTFOLIO EQUITY TRAIL", float(p.get("pnlPct") or 0.0), allow_hard_stop=False):
+            continue
+        try:
+            score = float((exit_profiles.get(symbol) or {}).get("score") or 0.0)
+            market_sell_qty(
+                symbol,
+                qty,
+                entry=entry,
+                price=price,
+                reason=f"V17.1 PORTFOLIO EQUITY TRAIL | peak={peak:.2f} floor={floor_equity:.2f}",
+            )
+            state[symbol]["highest_since_entry"] = None
+            sold.add(symbol)
+            exits += 1
+            data["triggerCount"] = int(data.get("triggerCount") or 0) + 1
+            data["lastAction"] = "SELL_WEAKEST"
+            data["lastSoldSymbol"] = symbol
+            data["lastSoldKeepScore"] = round(score, 6)
+            data["lastSoldPnlPct"] = round(float(p.get("pnlPct") or 0.0), 4)
+            print(
+                f"V17.1 PORTFOLIO TRAIL EXECUTED | symbol={symbol} qty={qty:.6f} keep={score:.3f} "
+                f"equity=${equity:.2f} peak=${peak:.2f} floor=${floor_equity:.2f}"
+            )
+        except Exception as exc:
+            data["lastAction"] = "SELL_ERROR"
+            data["lastError"] = str(exc)
+            print(f"V17.1 PORTFOLIO TRAIL ERROR | symbol={symbol} error={exc}")
+
+    if not sold:
+        data["lastAction"] = "TRIGGER_BLOCKED"
+        data["status"] = "TRIGGERED_BUT_NO_ELIGIBLE_EXIT"
+
+    # After a successful protection exit, disarm and use the post-trigger equity
+    # as the beginning of the next recovery leg. This prevents repeated selling
+    # on every loop from one old peak.
+    if sold:
+        data["armed"] = False
+        data["troughEquity"] = equity
+        data["peakEquity"] = equity
+        data["recoveryUsd"] = 0.0
+        data["recoveryPct"] = 0.0
+        data["trailFloorEquity"] = equity
+        data["status"] = "RESET_AFTER_PROTECTION_EXIT"
+        data.pop("armedAt", None)
+
+    _v171_save_equity_trail_state(data)
+    return sold
+
+
 def manage_money_mode_positions(scans: Optional[List[Dict[str, Any]]] = None):
     global v16_exit_latest_decisions
     _v16_update_exit_reviews(scans)
@@ -3389,6 +3622,14 @@ def manage_money_mode_positions(scans: Optional[List[Dict[str, Any]]] = None):
     positions = get_all_positions()
     held_symbols = {str(p.get("symbol") or "").upper() for p in positions}
     replacement = _v16_best_rotation_candidate(exit_profiles, held_symbols)
+
+    # V17.1 account-level intelligence runs before per-symbol thesis exits.
+    # If a recovery trail exit executes, omit that symbol from the remainder of
+    # this cycle so no second exit path can touch the same position.
+    v171_portfolio_trail_sold = _v171_manage_portfolio_equity_trail(positions, exit_profiles)
+    if v171_portfolio_trail_sold:
+        positions = [p for p in positions if str(p.get("symbol") or "").upper() not in v171_portfolio_trail_sold]
+        held_symbols = {str(p.get("symbol") or "").upper() for p in positions}
 
     # V17 Elite Top-3 transition. Rank current holdings by their live keep
     # score and mark only the strongest three as the core portfolio. Existing
@@ -4206,6 +4447,12 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         + ",".join(f"{a['symbol']}=${a['notionalUsd']:.2f}" for a in allocations)
     )
     return {"plan": plan, "internalAllocations": allocations}
+
+
+@app.get("/v17/portfolio/equity-trail/status")
+def api_v171_equity_trail_status(request: Request):
+    require_api_key(request)
+    return _v171_equity_trail_snapshot()
 
 
 @app.get("/v16/exits/status")
