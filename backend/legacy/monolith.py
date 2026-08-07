@@ -124,6 +124,15 @@ AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT = max(1, min(5, int(os.getenv("AI_PORTFOLIO_A
 AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT = max(0.0, min(0.40, float(os.getenv("AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT", "0.22") or 0.22)))
 AI_PORTFOLIO_PLAN_FILE = os.getenv("AI_PORTFOLIO_PLAN_FILE", "/var/data/ai_portfolio_plan.json")
 
+# V16.8 — dynamic AI profit trailing. The trigger is no longer one fixed
+# percentage for every symbol. Stronger / more volatile setups get more room;
+# ordinary setups begin protecting profit sooner. Hard/emergency stops are unchanged.
+AI_DYNAMIC_TRAIL_ENABLED = os.getenv("AI_DYNAMIC_TRAIL_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+AI_DYNAMIC_TRAIL_MIN_START_PCT = max(1.0, float(os.getenv("AI_DYNAMIC_TRAIL_MIN_START_PCT", "2.0") or 2.0))
+AI_DYNAMIC_TRAIL_MAX_START_PCT = max(AI_DYNAMIC_TRAIL_MIN_START_PCT, float(os.getenv("AI_DYNAMIC_TRAIL_MAX_START_PCT", "6.0") or 6.0))
+AI_DYNAMIC_TRAIL_MIN_GIVEBACK_PCT = max(0.3, float(os.getenv("AI_DYNAMIC_TRAIL_MIN_GIVEBACK_PCT", "0.7") or 0.7))
+AI_DYNAMIC_TRAIL_MAX_GIVEBACK_PCT = max(AI_DYNAMIC_TRAIL_MIN_GIVEBACK_PCT, float(os.getenv("AI_DYNAMIC_TRAIL_MAX_GIVEBACK_PCT", "2.2") or 2.2))
+
 # V16.7 — adaptive AI exit and portfolio rotation manager.
 AI_PORTFOLIO_EXIT_ENABLED = os.getenv("AI_PORTFOLIO_EXIT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 AI_PORTFOLIO_EXIT_MIN_HOLD_MINUTES = max(60, int(os.getenv("AI_PORTFOLIO_EXIT_MIN_HOLD_MINUTES", "1440") or 1440))
@@ -930,6 +939,74 @@ def has_open_order(symbol: str):
     return len(get_open_orders(symbol)) > 0
 
 
+def _v168_dynamic_trail_profile(symbol: str, scan: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return a live AI trail for an open position.
+
+    Uses the latest V16 portfolio score when available plus realised short-term
+    volatility. This changes only profit trailing; hard and emergency stops are
+    deliberately untouched.
+    """
+    fallback = _ai_risk_effective_profile(symbol) if "_ai_risk_effective_profile" in globals() else {
+        "trailStartPct": (float(TRAIL_START) - 1.0) * 100.0,
+        "trailGivebackPct": (1.0 - float(TRAIL_GIVEBACK)) * 100.0,
+    }
+    if not AI_DYNAMIC_TRAIL_ENABLED:
+        return {**fallback, "trailMode": "STATIC"}
+
+    score = None
+    # Prefer the already-published portfolio decision: it is the exact score the
+    # AI used and avoids inventing a second ranking inside the positions endpoint.
+    try:
+        plan = _v16_load_portfolio_plan() if "_v16_load_portfolio_plan" in globals() else {}
+        for row in plan.get("decisions") or []:
+            if str(row.get("symbol") or "").upper() == str(symbol).upper():
+                value = row.get("portfolioScore")
+                if value is not None:
+                    score = float(value)
+                break
+    except Exception:
+        pass
+
+    if scan is None:
+        try:
+            scan = next((x for x in latest_scans if str(x.get("symbol") or "").upper() == str(symbol).upper()), None)
+        except Exception:
+            scan = None
+
+    # If there is no published score yet, use current confidence as a neutral
+    # approximation until the next portfolio plan is produced.
+    if score is None:
+        try:
+            score = float((scan or {}).get("confidence") or calculate_confidence(scan or {"symbol": symbol})[0] or 0.55)
+        except Exception:
+            score = 0.55
+
+    metrics = {}
+    try:
+        metrics = _v16_curve_metrics(scan or {"symbol": symbol}) if "_v16_curve_metrics" in globals() else {}
+    except Exception:
+        metrics = {}
+    realised_vol = abs(float(metrics.get("volatility") or 0.0))
+
+    # 0.55 is the normal portfolio qualification line. A 0.55 setup starts
+    # trailing close to 2%; exceptional 0.85+ setups can earn ~5.5%+ room.
+    score_strength = _v16_clamp((float(score) - 0.55) / 0.30) if "_v16_clamp" in globals() else max(0.0, min(1.0, (float(score)-0.55)/0.30))
+    vol_strength = max(0.0, min(1.0, realised_vol / 0.0040))
+    start_pct = AI_DYNAMIC_TRAIL_MIN_START_PCT + (3.1 * score_strength) + (0.8 * vol_strength)
+    giveback_pct = AI_DYNAMIC_TRAIL_MIN_GIVEBACK_PCT + (0.9 * score_strength) + (0.6 * vol_strength)
+
+    start_pct = max(AI_DYNAMIC_TRAIL_MIN_START_PCT, min(AI_DYNAMIC_TRAIL_MAX_START_PCT, start_pct))
+    giveback_pct = max(AI_DYNAMIC_TRAIL_MIN_GIVEBACK_PCT, min(AI_DYNAMIC_TRAIL_MAX_GIVEBACK_PCT, giveback_pct))
+    return {
+        **fallback,
+        "trailStartPct": round(start_pct, 3),
+        "trailGivebackPct": round(giveback_pct, 3),
+        "trailMode": "V16.8_DYNAMIC",
+        "trailPortfolioScore": round(float(score), 4),
+        "trailRealisedVolatility": round(realised_vol, 8),
+    }
+
+
 def get_all_positions():
     positions = []
     try:
@@ -971,8 +1048,11 @@ def get_all_positions():
             if quote_price > 0 and (highest is None or quote_price > highest):
                 state[symbol]["highest_since_entry"] = quote_price
 
-            trail_start_price = entry * TRAIL_START if entry > 0 else 0.0
-            trail_floor = (state[symbol].get("highest_since_entry") or 0.0) * TRAIL_GIVEBACK
+            trail_profile = _v168_dynamic_trail_profile(symbol)
+            trail_start_pct = abs(float(trail_profile.get("trailStartPct") or ((TRAIL_START - 1.0) * 100.0)))
+            trail_giveback_pct = abs(float(trail_profile.get("trailGivebackPct") or ((1.0 - TRAIL_GIVEBACK) * 100.0)))
+            trail_start_price = entry * (1.0 + trail_start_pct / 100.0) if entry > 0 else 0.0
+            trail_floor = (state[symbol].get("highest_since_entry") or 0.0) * (1.0 - trail_giveback_pct / 100.0)
             trailing_active = quote_price >= trail_start_price if quote_price > 0 and trail_start_price > 0 else False
 
             positions.append({
@@ -990,6 +1070,10 @@ def get_all_positions():
                 "trailStartPrice": trail_start_price,
                 "trailFloor": trail_floor,
                 "trailingActive": trailing_active,
+                "trailStartPct": round(trail_start_pct, 3),
+                "trailGivebackPct": round(trail_giveback_pct, 3),
+                "trailMode": trail_profile.get("trailMode", "STATIC"),
+                "trailPortfolioScore": trail_profile.get("trailPortfolioScore"),
                 "inUniverse": symbol in current_universe,
                 "custom": bool(state.get(symbol, {}).get("custom")),
                 "lockedToday": is_locked_today(symbol),
@@ -3378,8 +3462,10 @@ def manage_money_mode_positions(scans: Optional[List[Dict[str, Any]]] = None):
             except Exception as e: print(f"STALL SELL ERROR {symbol}: {e}")
             continue
 
-        adaptive_trail_start_pct = abs(float(risk_profile.get("trailStartPct") or ((TRAIL_START - 1.0) * 100.0)))
-        adaptive_giveback_pct = abs(float(risk_profile.get("trailGivebackPct") or ((1.0 - TRAIL_GIVEBACK) * 100.0)))
+        current_scan = next((x for x in (scans or []) if str(x.get("symbol") or "").upper() == symbol), None)
+        trail_profile = _v168_dynamic_trail_profile(symbol, current_scan)
+        adaptive_trail_start_pct = abs(float(trail_profile.get("trailStartPct") or ((TRAIL_START - 1.0) * 100.0)))
+        adaptive_giveback_pct = abs(float(trail_profile.get("trailGivebackPct") or ((1.0 - TRAIL_GIVEBACK) * 100.0)))
         trail_start_price = entry * (1.0 + adaptive_trail_start_pct / 100.0)
         if price >= trail_start_price and highest is not None:
             giveback = POST_PARTIAL_TRAIL_GIVEBACK if has_taken_partial_profit(symbol) else 1.0 - adaptive_giveback_pct / 100.0
@@ -4299,6 +4385,7 @@ def money_mode_buy(scans, manual=False):
 
         confidence, label = calculate_confidence(c)
         score = float(allocation.get("portfolioScore") or 0.0)
+        c["portfolioScore"] = score
         reason = f"{'MANUAL' if manual else 'AUTO'} V16.5.5 PORTFOLIO #{allocation.get('rank', bought + 1)} SCORE BUY"
         try:
             market_buy_notional(symbol, notional, reason=reason, scan=c)
