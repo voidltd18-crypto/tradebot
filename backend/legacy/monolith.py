@@ -102,7 +102,11 @@ MAX_POSITIONS = 1
 # The effective capacity is derived from the AI-promoted position sizing and
 # available trading capital, then bounded by an immutable safety ceiling.
 AI_POSITION_CAPACITY_ENABLED = os.getenv("AI_POSITION_CAPACITY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-AI_POSITION_HARD_CAP = max(1, min(10, int(os.getenv("AI_POSITION_HARD_CAP", "10") or 10)))
+# V17 Elite Portfolio: the live AI portfolio may hold at most three positions.
+# Clamp the old environment value as well, so a stale Render setting of 10
+# cannot silently reopen the portfolio beyond the requested Top-3 model.
+AI_ELITE_PORTFOLIO_MAX_POSITIONS = max(1, min(3, int(os.getenv("AI_ELITE_PORTFOLIO_MAX_POSITIONS", "3") or 3)))
+AI_POSITION_HARD_CAP = min(AI_ELITE_PORTFOLIO_MAX_POSITIONS, max(1, int(os.getenv("AI_POSITION_HARD_CAP", str(AI_ELITE_PORTFOLIO_MAX_POSITIONS)) or AI_ELITE_PORTFOLIO_MAX_POSITIONS)))
 AI_POSITION_MIN_NOTIONAL_USD = max(10.0, float(os.getenv("AI_POSITION_MIN_NOTIONAL_USD", "25") or 25))
 AI_PORTFOLIO_MANAGER_ENABLED = os.getenv("AI_PORTFOLIO_MANAGER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 # V16.5.2 — the live order engine can execute candidates approved by the
@@ -110,11 +114,16 @@ AI_PORTFOLIO_MANAGER_ENABLED = os.getenv("AI_PORTFOLIO_MANAGER_ENABLED", "true")
 # evidence, but no longer silently veto a V16-qualified portfolio candidate.
 V16_PORTFOLIO_EXECUTION_ENABLED = os.getenv("V16_PORTFOLIO_EXECUTION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 V16_PORTFOLIO_REQUIRE_READY_TRIGGER = os.getenv("V16_PORTFOLIO_REQUIRE_READY_TRIGGER", "false").lower() in ("1", "true", "yes", "on")
-AI_PORTFOLIO_MANAGER_VERSION = "V16.7.2-MINIMUM-ALLOCATION-GUARD"
+AI_PORTFOLIO_MANAGER_VERSION = "V17.0-ELITE-TOP3-PORTFOLIO"
 AI_PORTFOLIO_MAX_SINGLE_WEIGHT = max(0.10, min(0.60, float(os.getenv("AI_PORTFOLIO_MAX_SINGLE_WEIGHT", "0.45") or 0.45)))
 AI_PORTFOLIO_MIN_CASH_RESERVE_PCT = max(0.02, min(0.50, float(os.getenv("AI_PORTFOLIO_MIN_CASH_RESERVE_PCT", "0.08") or 0.08)))
 AI_PORTFOLIO_MAX_CASH_RESERVE_PCT = max(AI_PORTFOLIO_MIN_CASH_RESERVE_PCT, min(0.80, float(os.getenv("AI_PORTFOLIO_MAX_CASH_RESERVE_PCT", "0.45") or 0.45)))
-AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE = max(1, min(10, int(os.getenv("AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE", "10") or 10)))
+AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE = max(1, min(AI_ELITE_PORTFOLIO_MAX_POSITIONS, int(os.getenv("AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE", str(AI_ELITE_PORTFOLIO_MAX_POSITIONS)) or AI_ELITE_PORTFOLIO_MAX_POSITIONS)))
+# Rank-weighted deployment for the Top-3. Weights are normalised across the
+# currently actionable ranks, so 1/2 available slots still use all deployable
+# capital without creating a fourth position.
+AI_ELITE_RANK_WEIGHTS = (0.40, 0.35, 0.25)
+AI_ELITE_OVER_CAP_CONFIRMATIONS = max(2, min(5, int(os.getenv("AI_ELITE_OVER_CAP_CONFIRMATIONS", "3") or 3)))
 # Prevent token-sized residual positions; small leftovers remain as cash.
 AI_PORTFOLIO_MIN_ALLOCATION_USD = max(1.0, float(os.getenv("AI_PORTFOLIO_MIN_ALLOCATION_USD", "10") or 10))
 AI_PORTFOLIO_MIN_SCORE = max(0.0, min(1.0, float(os.getenv("AI_PORTFOLIO_MIN_SCORE", "0.55") or 0.55)))
@@ -145,7 +154,7 @@ AI_PORTFOLIO_EXIT_FAST_SCORE = max(AI_PORTFOLIO_EXIT_IMMEDIATE_SCORE, min(0.50, 
 AI_PORTFOLIO_EXIT_NORMAL_SCORE = max(AI_PORTFOLIO_EXIT_FAST_SCORE, min(0.60, float(os.getenv("AI_PORTFOLIO_EXIT_NORMAL_SCORE", "0.55") or 0.55)))
 AI_PORTFOLIO_EXIT_HEALTHY_SCORE = max(AI_PORTFOLIO_EXIT_NORMAL_SCORE, min(0.80, float(os.getenv("AI_PORTFOLIO_EXIT_HEALTHY_SCORE", "0.65") or 0.65)))
 AI_PORTFOLIO_EXIT_REVIEW_FILE = os.getenv("AI_PORTFOLIO_EXIT_REVIEW_FILE", "/var/data/v16_exit_reviews.json")
-AI_PORTFOLIO_SCORING_ENGINE_VERSION = "V16.5.3-REAL-FACTORS-QUALITY-GUARD"
+AI_PORTFOLIO_SCORING_ENGINE_VERSION = "V17.0-ELITE-TOP3-REAL-FACTORS"
 AI_PORTFOLIO_BAR_FALLBACK_MINUTES = max(10, min(120, int(os.getenv("AI_PORTFOLIO_BAR_FALLBACK_MINUTES", "45") or 45)))
 AI_PORTFOLIO_BAR_CACHE_SECONDS = max(30, min(300, int(os.getenv("AI_PORTFOLIO_BAR_CACHE_SECONDS", "75") or 75)))
 _v16_bar_cache: Dict[str, Dict[str, Any]] = {}
@@ -1384,7 +1393,7 @@ def ai_position_capacity_payload() -> Dict[str, Any]:
     pass every existing entry, quality, risk, PDT and cash check.
     """
     configured = int(globals().get("MAX_POSITIONS", 1) or 1)
-    hard_cap = int(globals().get("AI_POSITION_HARD_CAP", 10) or 10)
+    hard_cap = min(int(globals().get("AI_ELITE_PORTFOLIO_MAX_POSITIONS", 3) or 3), int(globals().get("AI_POSITION_HARD_CAP", 3) or 3))
     if not bool(globals().get("AI_POSITION_CAPACITY_ENABLED", True)):
         return {
             "enabled": False, "configuredMaxPositions": configured,
@@ -1437,6 +1446,8 @@ def ai_position_capacity_payload() -> Dict[str, Any]:
         "configuredMaxPositions": configured,
         "effectiveMaxPositions": effective,
         "hardSafetyCap": hard_cap,
+        "elitePortfolio": True,
+        "eliteMaxPositions": AI_ELITE_PORTFOLIO_MAX_POSITIONS,
         "targetPositionValuePct": round(target_pct, 4),
         "maxPositionValuePct": round(max_pct, 4),
         "capitalUsd": round(float(cap_usd), 2) if cap_usd is not None else None,
@@ -3293,7 +3304,7 @@ def _v16_update_exit_reviews(scans: Optional[List[Dict[str, Any]]] = None) -> No
     v16_exit_review_events = events[-100:]
 
 
-def _v16_ai_exit_review(position: Dict[str, Any], profile: Optional[Dict[str, Any]], replacement: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _v16_ai_exit_review(position: Dict[str, Any], profile: Optional[Dict[str, Any]], replacement: Optional[Dict[str, Any]], elite_over_cap: bool = False) -> Dict[str, Any]:
     symbol = str(position.get("symbol") or "").upper().strip()
     pnl_pct = float(position.get("pnlPct") or 0.0)
     minutes = int(position.get("minutesSinceBuy") or 999999)
@@ -3315,8 +3326,22 @@ def _v16_ai_exit_review(position: Dict[str, Any], profile: Optional[Dict[str, An
     elif minutes < AI_PORTFOLIO_EXIT_MIN_HOLD_MINUTES:
         reason_code, reason = "MINIMUM_HOLD", f"Held {minutes}m; AI exit review requires {AI_PORTFOLIO_EXIT_MIN_HOLD_MINUTES}m."
     else:
-        required = _v16_required_exit_confirmations(score, rotation_gap)
-        if score < AI_PORTFOLIO_EXIT_IMMEDIATE_SCORE:
+        # V17 Elite transition: if a legacy portfolio still contains more than
+        # three holdings, gradually remove holdings outside the live Top-3.
+        # This is confirmation-based and still respects same-day/PDT/min-hold
+        # protections above; it never dumps the old portfolio all at once.
+        if elite_over_cap:
+            required = AI_ELITE_OVER_CAP_CONFIRMATIONS
+            reason_code = "ELITE_TOP3_REBALANCE"
+            reason = (
+                f"{symbol} is outside the current Top-{AI_ELITE_PORTFOLIO_MAX_POSITIONS} held positions "
+                f"by keep score ({score:.3f}); reduce legacy over-cap portfolio after confirmation."
+            )
+        else:
+            required = _v16_required_exit_confirmations(score, rotation_gap)
+        if elite_over_cap:
+            pass
+        elif score < AI_PORTFOLIO_EXIT_IMMEDIATE_SCORE:
             reason_code = "THESIS_COLLAPSED"
             reason = f"Keep score {score:.3f} is below immediate exit level {AI_PORTFOLIO_EXIT_IMMEDIATE_SCORE:.3f}."
         elif score < AI_PORTFOLIO_EXIT_FAST_SCORE:
@@ -3364,6 +3389,20 @@ def manage_money_mode_positions(scans: Optional[List[Dict[str, Any]]] = None):
     positions = get_all_positions()
     held_symbols = {str(p.get("symbol") or "").upper() for p in positions}
     replacement = _v16_best_rotation_candidate(exit_profiles, held_symbols)
+
+    # V17 Elite Top-3 transition. Rank current holdings by their live keep
+    # score and mark only the strongest three as the core portfolio. Existing
+    # legacy holdings outside the Top-3 are reduced gradually by the normal AI
+    # exit confirmation path, one exit per cycle by default.
+    held_ranked = sorted(
+        [
+            (str(p.get("symbol") or "").upper(), float((exit_profiles.get(str(p.get("symbol") or "").upper()) or {}).get("score") or 0.0))
+            for p in positions
+        ],
+        key=lambda row: (-row[1], row[0]),
+    )
+    elite_core_symbols = {symbol for symbol, _ in held_ranked[:AI_ELITE_PORTFOLIO_MAX_POSITIONS]}
+    elite_over_cap_symbols = {symbol for symbol, _ in held_ranked[AI_ELITE_PORTFOLIO_MAX_POSITIONS:]}
     cycle_exit_count = 0
     cycle_decisions: List[Dict[str, Any]] = []
     for p in positions:
@@ -3408,7 +3447,7 @@ def manage_money_mode_positions(scans: Optional[List[Dict[str, Any]]] = None):
             except Exception as e: print(f"SELL ERROR {symbol}: {e}")
             continue
 
-        review = _v16_ai_exit_review(p, exit_profiles.get(symbol), replacement)
+        review = _v16_ai_exit_review(p, exit_profiles.get(symbol), replacement, elite_over_cap=(symbol in elite_over_cap_symbols))
         cycle_decisions.append(review)
         print(f"V16.7 AI EXIT | symbol={symbol} decision={review['decision']} keep={review['score']:.3f} "
               f"replacement={review.get('replacementSymbol') or '-'} gap={review['rotationGap']:.3f} "
@@ -4004,7 +4043,10 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 
     ranked.sort(key=lambda item: (-item["portfolioScore"], -item["confidence"], item["spread"]))
     qualified_ranked = list(ranked)
-    actionable_ranked = qualified_ranked[:order_limit] if order_limit > 0 else []
+    # V17: rank the whole qualified batch, but only the highest-ranked names
+    # can occupy the three-position elite portfolio.
+    elite_ranked = qualified_ranked[:AI_ELITE_PORTFOLIO_MAX_POSITIONS]
+    actionable_ranked = elite_ranked[:order_limit] if order_limit > 0 else []
     actionable_symbols = {item["symbol"] for item in actionable_ranked}
 
     for decision in decisions:
@@ -4035,13 +4077,15 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
     allocations = []
     allocation_floor = max(float(MIN_ORDER_NOTIONAL), float(AI_PORTFOLIO_MIN_ALLOCATION_USD))
     if actionable_ranked and deployable >= allocation_floor:
-        power = 2.0
-        strengths = [max(0.001, item["portfolioScore"] - effective_minimum_score + 0.08) ** power for item in actionable_ranked]
-        total_strength = sum(strengths) or 1.0
+        # V17 Elite allocation: rank #1 / #2 / #3 receive 40 / 35 / 25 of the
+        # deployable portfolio capital. If fewer than three slots are open, the
+        # applicable weights are normalised across those actionable ranks.
+        base_weights = list(AI_ELITE_RANK_WEIGHTS[:len(actionable_ranked)])
+        weight_total = sum(base_weights) or 1.0
+        rank_weights = [weight / weight_total for weight in base_weights]
         remaining = deployable
-        for index, (item, strength) in enumerate(zip(actionable_ranked, strengths)):
-            raw_weight = strength / total_strength
-            weight = min(AI_PORTFOLIO_MAX_SINGLE_WEIGHT, raw_weight)
+        for index, (item, weight) in enumerate(zip(actionable_ranked, rank_weights)):
+            weight = min(AI_PORTFOLIO_MAX_SINGLE_WEIGHT, weight)
             requested = round(deployable * weight, 2)
             constitutional_cap = round(managed_capital * min(float(V10_CONSTITUTION["positionValuePct"]["max"]), AI_PORTFOLIO_MAX_SINGLE_WEIGHT), 2)
             amount = round(max(0.0, min(requested, constitutional_cap, remaining)), 2)
@@ -4067,7 +4111,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 "notionalUsd": amount,
                 "notionalGbp": round(money_gbp(amount), 2),
                 "riskMultiplier": round(float(item["riskProfile"].get("positionMultiplier") or 1.0), 3),
-                "reason": f"Rank #{index + 1}; score={item['portfolioScore']:.3f}; confidence={item['confidence']:.2f}; quality={item['quality']:.4f}",
+                "reason": f"Elite rank #{index + 1}; target rank weight={rank_weights[index]*100:.1f}%; score={item['portfolioScore']:.3f}; confidence={item['confidence']:.2f}; quality={item['quality']:.4f}",
                 "scan": item["scan"],
             })
 
@@ -4081,7 +4125,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 
     plan = {
         "ok": True,
-        "version": "V16.5.1-REAL-MARKET-FACTORS",
+        "version": "V17.0-ELITE-TOP3-PORTFOLIO",
         "scoringEngineVersion": AI_PORTFOLIO_SCORING_ENGINE_VERSION,
         "enabled": AI_PORTFOLIO_MANAGER_ENABLED,
         "createdAt": datetime.now(UTC).isoformat(),
@@ -4096,6 +4140,10 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         "managedCapitalGbp": round(money_gbp(managed_capital), 2),
         "buyingPowerUsd": round(buying_power, 2),
         "candidateCount": len(picks),
+        "eliteMaxPositions": AI_ELITE_PORTFOLIO_MAX_POSITIONS,
+        "eliteRankWeightsPct": [round(x * 100.0, 1) for x in AI_ELITE_RANK_WEIGHTS],
+        "rotationMargin": AI_PORTFOLIO_ROTATION_MARGIN,
+        "eliteCoreCandidates": [item["symbol"] for item in elite_ranked],
         "qualifiedCount": len(qualified_ranked),
         "actionableCount": len(actionable_ranked),
         "rejectedCount": rejected_count,
@@ -4135,13 +4183,13 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         "cashReserveGbp": round(money_gbp(max(0.0, usable_cash - allocated)), 2),
         "deployableUsd": allocated,
         "deployableGbp": round(money_gbp(allocated), 2),
-        "allocationMethod": "score-weighted; stronger qualified candidates receive more capital; cash remains only when breadth/quality is insufficient or safety caps apply",
+        "allocationMethod": "V17 Elite Top-3 rank weighted: #1=40%, #2=35%, #3=25% of deployable capital (normalised when fewer slots are available); no fourth live position",
         "allocations": [{k: v for k, v in row.items() if k != "scan"} for row in allocations],
         "explanation": (
             f"Reviewed {len(picks)} live scanner candidate(s) using {threshold_mode.lower().replace('_', ' ')} thresholding "
             f"(base {AI_PORTFOLIO_MIN_SCORE:.3f}, effective {effective_minimum_score:.3f}): {len(qualified_ranked)} qualified, "
             f"{rejected_count} rejected and {waiting_count} qualified but waiting for capacity. "
-            f"{len(actionable_ranked)} can be considered within the current capacity/daily safety limit. "
+            f"Top-{AI_ELITE_PORTFOLIO_MAX_POSITIONS} elite mode is active; {len(actionable_ranked)} ranked candidate(s) can be considered within the current capacity/daily safety limit. "
             f"Planned ${allocated:.2f} across {len(allocations)} position(s), with {reserve_pct * 100.0:.1f}% cash reserve. "
             + (
                 "Capital is retained because no new order slots are currently available."
@@ -4152,7 +4200,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
     }
     _v16_save_portfolio_plan(plan)
     print(
-        f"V16 PORTFOLIO PLAN | scans={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
+        f"V17 ELITE PORTFOLIO PLAN | max_positions={AI_ELITE_PORTFOLIO_MAX_POSITIONS} scans={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
         f"rejected={rejected_count} waiting={waiting_count} actionable={len(actionable_ranked)} "
         f"order_limit={order_limit} deploy=${allocated:.2f} reserve={reserve_pct*100:.1f}% allocations="
         + ",".join(f"{a['symbol']}=${a['notionalUsd']:.2f}" for a in allocations)
@@ -4164,7 +4212,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 def api_v16_exit_status(request: Request):
     verify_api_key(request)
     return {
-        "ok": True, "version": "V16.7-ADAPTIVE-EXIT-ROTATION",
+        "ok": True, "version": "V17.0-ELITE-TOP3-ADAPTIVE-EXIT-ROTATION",
         "enabled": AI_PORTFOLIO_EXIT_ENABLED,
         "rotationEnabled": AI_PORTFOLIO_ROTATION_ENABLED,
         "rotationMargin": AI_PORTFOLIO_ROTATION_MARGIN,
