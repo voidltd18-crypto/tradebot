@@ -105,7 +105,7 @@ AI_POSITION_CAPACITY_ENABLED = os.getenv("AI_POSITION_CAPACITY_ENABLED", "true")
 # V17 Elite Portfolio: the live AI portfolio may hold at most three positions.
 # Clamp the old environment value as well, so a stale Render setting of 10
 # cannot silently reopen the portfolio beyond the requested Top-3 model.
-AI_ELITE_PORTFOLIO_MAX_POSITIONS = max(1, min(3, int(os.getenv("AI_ELITE_PORTFOLIO_MAX_POSITIONS", "3") or 3)))
+AI_ELITE_PORTFOLIO_MAX_POSITIONS = max(1, min(1, int(os.getenv("AI_ELITE_PORTFOLIO_MAX_POSITIONS", "1") or 1)))
 AI_POSITION_HARD_CAP = min(AI_ELITE_PORTFOLIO_MAX_POSITIONS, max(1, int(os.getenv("AI_POSITION_HARD_CAP", str(AI_ELITE_PORTFOLIO_MAX_POSITIONS)) or AI_ELITE_PORTFOLIO_MAX_POSITIONS)))
 AI_POSITION_MIN_NOTIONAL_USD = max(10.0, float(os.getenv("AI_POSITION_MIN_NOTIONAL_USD", "25") or 25))
 AI_PORTFOLIO_MANAGER_ENABLED = os.getenv("AI_PORTFOLIO_MANAGER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
