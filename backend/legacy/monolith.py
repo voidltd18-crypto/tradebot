@@ -102,8 +102,11 @@ MAX_POSITIONS = 1
 # The effective capacity is derived from the AI-promoted position sizing and
 # available trading capital, then bounded by an immutable safety ceiling.
 AI_POSITION_CAPACITY_ENABLED = os.getenv("AI_POSITION_CAPACITY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-# V17.0.2 Single Full-Buy Portfolio: hold only the single highest-ranked position.
-# Clamp stale Render values so older Top-3/Top-10 settings cannot reopen extra slots.
+# V17 Elite Portfolio: the live AI portfolio may hold at most three positions.
+# Clamp the old environment value as well, so a stale Render setting of 10
+# cannot silently reopen the portfolio beyond the requested Top-3 model.
+# V17.0.3 Connection-safe single-position mode.
+# Keep server/CORS/startup paths untouched; only portfolio capacity is changed.
 AI_ELITE_PORTFOLIO_MAX_POSITIONS = 1
 AI_POSITION_HARD_CAP = 1
 AI_POSITION_MIN_NOTIONAL_USD = max(10.0, float(os.getenv("AI_POSITION_MIN_NOTIONAL_USD", "25") or 25))
@@ -113,12 +116,14 @@ AI_PORTFOLIO_MANAGER_ENABLED = os.getenv("AI_PORTFOLIO_MANAGER_ENABLED", "true")
 # evidence, but no longer silently veto a V16-qualified portfolio candidate.
 V16_PORTFOLIO_EXECUTION_ENABLED = os.getenv("V16_PORTFOLIO_EXECUTION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 V16_PORTFOLIO_REQUIRE_READY_TRIGGER = os.getenv("V16_PORTFOLIO_REQUIRE_READY_TRIGGER", "false").lower() in ("1", "true", "yes", "on")
-AI_PORTFOLIO_MANAGER_VERSION = "V17.0.2-SINGLE-FULL-BUY"
+AI_PORTFOLIO_MANAGER_VERSION = "V17.0.3-SINGLE-FULL-BUY-CONNECTION-SAFE"
 AI_PORTFOLIO_MAX_SINGLE_WEIGHT = 1.0
 AI_PORTFOLIO_MIN_CASH_RESERVE_PCT = max(0.02, min(0.50, float(os.getenv("AI_PORTFOLIO_MIN_CASH_RESERVE_PCT", "0.08") or 0.08)))
 AI_PORTFOLIO_MAX_CASH_RESERVE_PCT = max(AI_PORTFOLIO_MIN_CASH_RESERVE_PCT, min(0.80, float(os.getenv("AI_PORTFOLIO_MAX_CASH_RESERVE_PCT", "0.45") or 0.45)))
 AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE = max(1, min(AI_ELITE_PORTFOLIO_MAX_POSITIONS, int(os.getenv("AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE", str(AI_ELITE_PORTFOLIO_MAX_POSITIONS)) or AI_ELITE_PORTFOLIO_MAX_POSITIONS)))
-# Single-position full-buy deployment: only rank #1 can receive capital.
+# Rank-weighted deployment for the Top-3. Weights are normalised across the
+# currently actionable ranks, so 1/2 available slots still use all deployable
+# capital without creating a fourth position.
 AI_ELITE_RANK_WEIGHTS = (1.0,)
 AI_ELITE_OVER_CAP_CONFIRMATIONS = max(2, min(5, int(os.getenv("AI_ELITE_OVER_CAP_CONFIRMATIONS", "3") or 3)))
 # Prevent token-sized residual positions; small leftovers remain as cash.
@@ -151,7 +156,7 @@ AI_PORTFOLIO_EXIT_FAST_SCORE = max(AI_PORTFOLIO_EXIT_IMMEDIATE_SCORE, min(0.50, 
 AI_PORTFOLIO_EXIT_NORMAL_SCORE = max(AI_PORTFOLIO_EXIT_FAST_SCORE, min(0.60, float(os.getenv("AI_PORTFOLIO_EXIT_NORMAL_SCORE", "0.55") or 0.55)))
 AI_PORTFOLIO_EXIT_HEALTHY_SCORE = max(AI_PORTFOLIO_EXIT_NORMAL_SCORE, min(0.80, float(os.getenv("AI_PORTFOLIO_EXIT_HEALTHY_SCORE", "0.65") or 0.65)))
 AI_PORTFOLIO_EXIT_REVIEW_FILE = os.getenv("AI_PORTFOLIO_EXIT_REVIEW_FILE", "/var/data/v16_exit_reviews.json")
-AI_PORTFOLIO_SCORING_ENGINE_VERSION = "V17.0.2-SINGLE-FULL-BUY-REAL-FACTORS"
+AI_PORTFOLIO_SCORING_ENGINE_VERSION = "V17.0.3-SINGLE-FULL-BUY-REAL-FACTORS"
 AI_PORTFOLIO_BAR_FALLBACK_MINUTES = max(10, min(120, int(os.getenv("AI_PORTFOLIO_BAR_FALLBACK_MINUTES", "45") or 45)))
 AI_PORTFOLIO_BAR_CACHE_SECONDS = max(30, min(300, int(os.getenv("AI_PORTFOLIO_BAR_CACHE_SECONDS", "75") or 75)))
 _v16_bar_cache: Dict[str, Dict[str, Any]] = {}
@@ -4044,9 +4049,9 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 
     ranked.sort(key=lambda item: (-item["portfolioScore"], -item["confidence"], item["spread"]))
     qualified_ranked = list(ranked)
-    # V17.0.2: rank the whole qualified batch, but only the #1 candidate
-    # can occupy the live portfolio.
-    elite_ranked = qualified_ranked[:1]
+    # V17: rank the whole qualified batch, but only the highest-ranked names
+    # can occupy the three-position elite portfolio.
+    elite_ranked = qualified_ranked[:AI_ELITE_PORTFOLIO_MAX_POSITIONS]
     actionable_ranked = elite_ranked[:order_limit] if order_limit > 0 else []
     actionable_symbols = {item["symbol"] for item in actionable_ranked}
 
@@ -4073,19 +4078,16 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         str(row.get("symbol") or ""),
     ))
 
-    # Single-position full-buy mode deliberately keeps no portfolio reserve.
-    # Retain only the existing small full-buy cash buffer for fees/rounding.
-    if actionable_ranked:
-        reserve_pct = 0.0
-        deployable = round(max(0.0, min(buying_power, managed_capital) - FULL_BUY_CASH_BUFFER), 2)
-    else:
-        reserve_pct = 1.0
-        deployable = 0.0
+    # V17.0.3: when the #1 candidate is actionable, deploy all usable trading cash.
+    # `usable_cash` already respects account buying power, managed capital and CASH_BUFFER.
+    reserve_pct = 0.0 if actionable_ranked else 1.0
+    deployable = round(max(0.0, usable_cash), 2) if actionable_ranked else 0.0
     allocations = []
     allocation_floor = max(float(MIN_ORDER_NOTIONAL), float(AI_PORTFOLIO_MIN_ALLOCATION_USD))
     if actionable_ranked and deployable >= allocation_floor:
-        # V17.0.2 single full-buy allocation: rank #1 receives 100% of
-        # deployable capital (minus the small full-buy cash buffer).
+        # V17 Elite allocation: rank #1 / #2 / #3 receive 40 / 35 / 25 of the
+        # deployable portfolio capital. If fewer than three slots are open, the
+        # applicable weights are normalised across those actionable ranks.
         base_weights = list(AI_ELITE_RANK_WEIGHTS[:len(actionable_ranked)])
         weight_total = sum(base_weights) or 1.0
         rank_weights = [weight / weight_total for weight in base_weights]
@@ -4131,7 +4133,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 
     plan = {
         "ok": True,
-        "version": "V17.0.2-SINGLE-FULL-BUY",
+        "version": "V17.0.3-SINGLE-FULL-BUY-CONNECTION-SAFE",
         "scoringEngineVersion": AI_PORTFOLIO_SCORING_ENGINE_VERSION,
         "enabled": AI_PORTFOLIO_MANAGER_ENABLED,
         "createdAt": datetime.now(UTC).isoformat(),
@@ -4189,7 +4191,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         "cashReserveGbp": round(money_gbp(max(0.0, usable_cash - allocated)), 2),
         "deployableUsd": allocated,
         "deployableGbp": round(money_gbp(allocated), 2),
-        "allocationMethod": "V17.0.2 single-position full-buy: only rank #1 is eligible and receives 100% of deployable capital minus the full-buy cash buffer",
+        "allocationMethod": "V17 Elite Top-3 rank weighted: #1=40%, #2=35%, #3=25% of deployable capital (normalised when fewer slots are available); no fourth live position",
         "allocations": [{k: v for k, v in row.items() if k != "scan"} for row in allocations],
         "explanation": (
             f"Reviewed {len(picks)} live scanner candidate(s) using {threshold_mode.lower().replace('_', ' ')} thresholding "
@@ -4206,7 +4208,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
     }
     _v16_save_portfolio_plan(plan)
     print(
-        f"V17 SINGLE FULL-BUY PLAN | max_positions=1 scans={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
+        f"V17.0.3 SINGLE FULL-BUY PLAN | max_positions={AI_ELITE_PORTFOLIO_MAX_POSITIONS} scans={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
         f"rejected={rejected_count} waiting={waiting_count} actionable={len(actionable_ranked)} "
         f"order_limit={order_limit} deploy=${allocated:.2f} reserve={reserve_pct*100:.1f}% allocations="
         + ",".join(f"{a['symbol']}=${a['notionalUsd']:.2f}" for a in allocations)
@@ -4218,7 +4220,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 def api_v16_exit_status(request: Request):
     verify_api_key(request)
     return {
-        "ok": True, "version": "V17.0.2-SINGLE-FULL-BUY-ADAPTIVE-EXIT-ROTATION",
+        "ok": True, "version": "V17.0-ELITE-TOP3-ADAPTIVE-EXIT-ROTATION",
         "enabled": AI_PORTFOLIO_EXIT_ENABLED,
         "rotationEnabled": AI_PORTFOLIO_ROTATION_ENABLED,
         "rotationMargin": AI_PORTFOLIO_ROTATION_MARGIN,
