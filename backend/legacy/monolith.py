@@ -1270,7 +1270,10 @@ def ai_position_capacity_payload() -> Dict[str, Any]:
             account = get_account()
             equity = float(account.equity)
             buying_power = max(0.0, float(account.buying_power))
-            cap_usd = effective_trading_equity(equity) if "effective_trading_equity" in globals() else equity
+            # V17.0.5: explicit single-position FULL BUY means use live buying power,
+            # not the saved profit-banking/trading-cap value. The cap remains active
+            # for every non-full-buy mode.
+            cap_usd = equity
             open_count = len(get_all_positions())
         except Exception:
             buying_power = None
@@ -1290,12 +1293,12 @@ def ai_position_capacity_payload() -> Dict[str, Any]:
             "maxPositionValuePct": 1.0,
             "capitalUsd": round(float(cap_usd), 2) if cap_usd is not None else None,
             "buyingPowerUsd": round(float(buying_power), 2) if buying_power is not None else None,
-            "targetPositionNotionalUsd": round(max(0.0, min(float(cap_usd or 0.0), float(buying_power or 0.0)) - float(globals().get("FULL_BUY_CASH_BUFFER", 2.0))), 2) if cap_usd is not None and buying_power is not None else None,
+            "targetPositionNotionalUsd": round(max(0.0, float(buying_power or 0.0) - float(globals().get("FULL_BUY_CASH_BUFFER", 2.0))), 2) if buying_power is not None else None,
             "openPositions": int(open_count),
             "structuralAvailableSlots": int(structural_slots),
             "affordableNewPositions": int(affordable),
             "availableSlots": int(min(structural_slots, affordable)),
-            "reason": "V17.0.4 single-position full-buy mode: MAX_POSITIONS=1 is authoritative.",
+            "reason": "V17.0.5 single-position full-buy mode: live buying power is authoritative and the trading-cap reserve is bypassed only for this mode.",
         }
 
     if not bool(globals().get("AI_POSITION_CAPACITY_ENABLED", True)):
@@ -1393,8 +1396,11 @@ def calculate_new_position_notional():
     # Full-buy mode for one-position trading.
     # Uses nearly all available capped trading capital/buying power, leaving a small buffer.
     if FULL_BUY_WHEN_ONE_POSITION and effective_max_positions() <= 1:
+        # V17.0.5: in explicit full-buy mode the user wants the actual available
+        # buying power deployed into the single #1 position. Do not constrain this
+        # branch with effective_trading_equity()/profit-banking cap.
         usable_cash = max(0.0, buying_power - FULL_BUY_CASH_BUFFER)
-        return round(max(0.0, min(sizing_equity, usable_cash)), 2)
+        return round(usable_cash, 2)
 
     target_value = sizing_equity * TARGET_POSITION_VALUE_PCT
     max_value = sizing_equity * MAX_POSITION_VALUE_PCT
@@ -3615,7 +3621,10 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         # Use all currently available deployable cash for the #1 qualified candidate,
         # leaving only the explicit full-buy cash buffer. Do not apply the legacy
         # 45% portfolio weight or V10 per-position cap to this user-selected mode.
-        deployable = round(max(0.0, min(buying_power, managed_capital) - FULL_BUY_CASH_BUFFER), 2)
+        # V17.0.5: actual full-buy amount is based on LIVE BUYING POWER.
+        # managed_capital may be intentionally capped for profit banking, but that
+        # must not silently turn explicit full-buy mode into a partial buy.
+        deployable = round(max(0.0, buying_power - FULL_BUY_CASH_BUFFER), 2)
         actionable_ranked = actionable_ranked[:1]
     else:
         deployable = round(max(0.0, usable_cash * (1.0 - reserve_pct)), 2)
@@ -3648,7 +3657,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 "confidenceLabel": item["confidenceLabel"],
                 "quality": item["quality"],
                 "spread": item["spread"],
-                "weightPct": round((amount / managed_capital) * 100.0, 2) if managed_capital else 0.0,
+                "weightPct": round((amount / (buying_power if single_full_buy else managed_capital)) * 100.0, 2) if (buying_power if single_full_buy else managed_capital) else 0.0,
                 "shareOfDeployedPct": round((amount / deployable) * 100.0, 2) if deployable else 0.0,
                 "notionalUsd": amount,
                 "notionalGbp": round(money_gbp(amount), 2),
@@ -3667,7 +3676,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 
     plan = {
         "ok": True,
-        "version": "V17.0.4-SINGLE-FULL-BUY",
+        "version": "V17.0.5-ACTUAL-BUYING-POWER-FULL-BUY",
         "enabled": AI_PORTFOLIO_MANAGER_ENABLED,
         "createdAt": datetime.now(UTC).isoformat(),
         "manual": bool(manual),
@@ -3677,8 +3686,8 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             else "QUALIFIED_BELOW_ORDER_MINIMUM" if qualified_ranked
             else "NO_QUALIFIED_PORTFOLIO"
         ),
-        "managedCapitalUsd": round(managed_capital, 2),
-        "managedCapitalGbp": round(money_gbp(managed_capital), 2),
+        "managedCapitalUsd": round(buying_power if single_full_buy else managed_capital, 2),
+        "managedCapitalGbp": round(money_gbp(buying_power if single_full_buy else managed_capital), 2),
         "buyingPowerUsd": round(buying_power, 2),
         "candidateCount": len(picks),
         "qualifiedCount": len(qualified_ranked),
@@ -3728,7 +3737,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
     }
     _v16_save_portfolio_plan(plan)
     print(
-        f"V17.0.4 SINGLE FULL-BUY PLAN | scans={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
+        f"V17.0.5 ACTUAL BUYING-POWER FULL-BUY PLAN | scans={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
         f"rejected={rejected_count} waiting={waiting_count} actionable={len(actionable_ranked)} "
         f"order_limit={order_limit} deploy=${allocated:.2f} reserve={reserve_pct*100:.1f}% allocations="
         + ",".join(f"{a['symbol']}=${a['notionalUsd']:.2f}" for a in allocations)
