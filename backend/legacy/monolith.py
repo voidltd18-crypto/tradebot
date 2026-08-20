@@ -3,6 +3,7 @@ import json
 import time
 import secrets
 import hashlib
+import shutil
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "200") or 200)
 
 import sqlite3
@@ -127,6 +128,7 @@ CASH_BUFFER = 0.50
 # instead of small partial sizing.
 FULL_BUY_WHEN_ONE_POSITION = os.getenv("FULL_BUY_WHEN_ONE_POSITION", "true").lower() == "true"
 FULL_BUY_CASH_BUFFER = float(os.getenv("FULL_BUY_CASH_BUFFER", "2.00") or 2.00)
+V17_SINGLE_FULL_BUY_MODE = os.getenv("V17_SINGLE_FULL_BUY_MODE", "true").lower() in ("1", "true", "yes", "on")
 
 MAX_SPREAD = 0.015
 PREFER_SPREAD_UNDER = 0.006
@@ -1265,7 +1267,7 @@ def ai_position_capacity_payload() -> Dict[str, Any]:
     # V17.0.4: a configured one-position full-buy mode is authoritative.
     # Do not let the legacy AI capacity estimator expand MAX_POSITIONS=1 back
     # to 8-10 slots based on TARGET_POSITION_VALUE_PCT.
-    if bool(globals().get("FULL_BUY_WHEN_ONE_POSITION", False)) and configured <= 1:
+    if bool(globals().get("V17_SINGLE_FULL_BUY_MODE", False)) or (bool(globals().get("FULL_BUY_WHEN_ONE_POSITION", False)) and configured <= 1):
         try:
             account = get_account()
             equity = float(account.equity)
@@ -1395,7 +1397,8 @@ def calculate_new_position_notional():
 
     # Full-buy mode for one-position trading.
     # Uses nearly all available capped trading capital/buying power, leaving a small buffer.
-    if FULL_BUY_WHEN_ONE_POSITION and effective_max_positions() <= 1:
+    if V17_SINGLE_FULL_BUY_MODE or (FULL_BUY_WHEN_ONE_POSITION and effective_max_positions() <= 1):
+        # V17.0.6: authoritative one-position full-buy mode.
         # V17.0.5: in explicit full-buy mode the user wants the actual available
         # buying power deployed into the single #1 position. Do not constrain this
         # branch with effective_trading_equity()/profit-banking cap.
@@ -1413,7 +1416,7 @@ def confidence_notional(scan):
 
     # In one-position full-buy mode, do not downsize by confidence.
     # The entry gates still control trade quality; this only changes allocation size.
-    if FULL_BUY_WHEN_ONE_POSITION and effective_max_positions() <= 1:
+    if V17_SINGLE_FULL_BUY_MODE or (FULL_BUY_WHEN_ONE_POSITION and effective_max_positions() <= 1):
         return base
 
     if not CONFIDENCE_SIZING_ENABLED:
@@ -3615,7 +3618,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         str(row.get("symbol") or ""),
     ))
 
-    single_full_buy = bool(FULL_BUY_WHEN_ONE_POSITION and effective_max_positions() <= 1)
+    single_full_buy = bool(V17_SINGLE_FULL_BUY_MODE or (FULL_BUY_WHEN_ONE_POSITION and effective_max_positions() <= 1))
     reserve_pct = 0.0 if single_full_buy else _v16_cash_reserve_pct(actionable_ranked)
     if single_full_buy:
         # Use all currently available deployable cash for the #1 qualified candidate,
@@ -3676,7 +3679,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 
     plan = {
         "ok": True,
-        "version": "V17.0.5-ACTUAL-BUYING-POWER-FULL-BUY",
+        "version": "V17.0.7-ORDER-LEVEL-FULL-BUY-LOCK",
         "enabled": AI_PORTFOLIO_MANAGER_ENABLED,
         "createdAt": datetime.now(UTC).isoformat(),
         "manual": bool(manual),
@@ -3737,7 +3740,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
     }
     _v16_save_portfolio_plan(plan)
     print(
-        f"V17.0.5 ACTUAL BUYING-POWER FULL-BUY PLAN | scans={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
+        f"V17.0.7 ORDER-LEVEL FULL-BUY LOCK PLAN | scans={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
         f"rejected={rejected_count} waiting={waiting_count} actionable={len(actionable_ranked)} "
         f"order_limit={order_limit} deploy=${allocated:.2f} reserve={reserve_pct*100:.1f}% allocations="
         + ",".join(f"{a['symbol']}=${a['notionalUsd']:.2f}" for a in allocations)
@@ -3862,7 +3865,32 @@ def money_mode_buy(scans, manual=False):
         if not can_buy:
             messages.append(f"SKIP {symbol} | {block_reason}")
             continue
-        notional = round(float(allocation.get("notionalUsd") or 0.0), 2)
+        planned_notional = round(float(allocation.get("notionalUsd") or 0.0), 2)
+        notional = planned_notional
+
+        # V17.0.7 FINAL EXECUTION LOCK:
+        # Re-read Alpaca buying power at the exact moment the #1 portfolio order
+        # is submitted. This is authoritative in one-position/full-buy mode and
+        # prevents any stale planner value, V10 sizing, AI risk multiplier,
+        # profit-banking cap or portfolio-weight rule from shrinking the order.
+        if bool(globals().get("V17_SINGLE_FULL_BUY_MODE", False)) or (
+            bool(globals().get("FULL_BUY_WHEN_ONE_POSITION", False))
+            and effective_max_positions() <= 1
+        ):
+            try:
+                live_account = get_account()
+                live_buying_power = max(0.0, float(live_account.buying_power))
+                full_buffer = float(globals().get("FULL_BUY_CASH_BUFFER", 2.0))
+                notional = round(max(0.0, live_buying_power - full_buffer), 2)
+                allocation["notionalUsd"] = notional
+                print(
+                    f"V17.0.7 FULL BUY EXECUTION LOCK | symbol={symbol} "
+                    f"planned=${planned_notional:.2f} live_buying_power=${live_buying_power:.2f} "
+                    f"buffer=${full_buffer:.2f} final=${notional:.2f}"
+                )
+            except Exception as full_buy_exc:
+                print(f"V17.0.7 FULL BUY EXECUTION LOCK ERROR | symbol={symbol} error={full_buy_exc}")
+
         if notional < MIN_ORDER_NOTIONAL:
             messages.append(f"SKIP {symbol} | portfolio allocation too small {notional:.2f}")
             continue
@@ -4072,6 +4100,231 @@ def db_connect():
         conn.execute("PRAGMA synchronous=NORMAL")
 
     return conn
+
+
+# ============================================================
+# V17.0.8 DATABASE STORAGE AUDIT + SAFE HOUSEKEEPING
+# ============================================================
+# Purpose: keep high-frequency audit/event tables bounded without deleting
+# trading history, completed outcomes, AI Memory knowledge, hypotheses,
+# experiments, or research evidence used by the live intelligence stack.
+DB_HOUSEKEEPING_ENABLED = os.getenv("DB_HOUSEKEEPING_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+DB_HOUSEKEEPING_INTERVAL_SECONDS = max(3600, int(os.getenv("DB_HOUSEKEEPING_INTERVAL_SECONDS", "21600") or 21600))
+DB_HOUSEKEEPING_STARTUP_DELAY_SECONDS = max(60, int(os.getenv("DB_HOUSEKEEPING_STARTUP_DELAY_SECONDS", "120") or 120))
+DB_HOUSEKEEPING_RETENTION_DAYS = max(14, int(os.getenv("DB_HOUSEKEEPING_RETENTION_DAYS", "90") or 90))
+DB_HEALTH_WARN_PCT = max(50.0, min(99.0, float(os.getenv("DB_HEALTH_WARN_PCT", "80") or 80)))
+DB_HEALTH_FAIL_PCT = max(DB_HEALTH_WARN_PCT + 1.0, min(99.9, float(os.getenv("DB_HEALTH_FAIL_PCT", "95") or 95)))
+db_housekeeping_thread_started = False
+_db_housekeeping_lock = threading.RLock()
+_db_last_housekeeping: Dict[str, Any] = {}
+
+
+def _db_file_size(path: str) -> int:
+    try:
+        return int(os.path.getsize(path))
+    except Exception:
+        return 0
+
+
+def _db_storage_snapshot(include_tables: bool = True) -> Dict[str, Any]:
+    db_path = os.path.abspath(SQLITE_DB_FILE)
+    base_dir = os.path.dirname(db_path) or "."
+    main_bytes = _db_file_size(db_path)
+    wal_bytes = _db_file_size(db_path + "-wal")
+    shm_bytes = _db_file_size(db_path + "-shm")
+    try:
+        usage = shutil.disk_usage(base_dir)
+        total_bytes, used_bytes, free_bytes = int(usage.total), int(usage.used), int(usage.free)
+    except Exception:
+        total_bytes = used_bytes = free_bytes = 0
+    pct = (used_bytes / total_bytes * 100.0) if total_bytes else 0.0
+    payload: Dict[str, Any] = {
+        "ok": True, "version": "V17.0.8", "databaseFile": db_path,
+        "mainBytes": main_bytes, "walBytes": wal_bytes, "shmBytes": shm_bytes,
+        "sqliteBytes": main_bytes + wal_bytes + shm_bytes,
+        "diskTotalBytes": total_bytes, "diskUsedBytes": used_bytes, "diskFreeBytes": free_bytes,
+        "diskUsedPct": round(pct, 2),
+        "thresholds": {"warnPct": DB_HEALTH_WARN_PCT, "failPct": DB_HEALTH_FAIL_PCT},
+        "lastHousekeeping": dict(_db_last_housekeeping),
+    }
+    if not include_tables or not SQLITE_ENABLED:
+        return payload
+    conn = None
+    try:
+        conn = db_connect()
+        tables = [str(r[0]) for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()]
+        row_counts = []
+        for table in tables:
+            try:
+                count = int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+            except Exception:
+                count = -1
+            row_counts.append({"table": table, "rows": count})
+        payload["tablesByRows"] = sorted(row_counts, key=lambda x: x.get("rows", -1), reverse=True)
+        try:
+            # dbstat is built into most SQLite builds and gives true on-disk bytes per table/index.
+            rows = conn.execute(
+                "SELECT name, SUM(pgsize) AS bytes FROM dbstat GROUP BY name ORDER BY bytes DESC"
+            ).fetchall()
+            payload["objectsByBytes"] = [{"name": str(r[0]), "bytes": int(r[1] or 0)} for r in rows]
+        except Exception as exc:
+            payload["dbstatUnavailable"] = str(exc)[:300]
+    except Exception as exc:
+        payload["tableAuditError"] = str(exc)[:500]
+    finally:
+        try:
+            if conn is not None: conn.close()
+        except Exception:
+            pass
+    return payload
+
+
+def _db_table_exists(conn, table: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() is not None
+
+
+def _db_column_exists(conn, table: str, column: str) -> bool:
+    try:
+        return any(str(r[1]) == column for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall())
+    except Exception:
+        return False
+
+
+def _db_delete_older_than(conn, table: str, column: str, cutoff: str) -> int:
+    if not _db_table_exists(conn, table) or not _db_column_exists(conn, table, column):
+        return 0
+    before = conn.total_changes
+    conn.execute(f'DELETE FROM "{table}" WHERE "{column}" < ?', (cutoff,))
+    return int(conn.total_changes - before)
+
+
+def _db_safe_housekeeping(force: bool = False) -> Dict[str, Any]:
+    global _db_last_housekeeping
+    if not SQLITE_ENABLED:
+        return {"ok": False, "skipped": True, "reason": "SQLite disabled"}
+    if not DB_HOUSEKEEPING_ENABLED and not force:
+        return {"ok": True, "skipped": True, "reason": "DB housekeeping disabled"}
+    # Routine pruning is intentionally closed-market only. A manual forced run is still safe
+    # because it only touches audit/event history and takes the serial SQLite writer lock.
+    if not force:
+        try:
+            if bool(trading_client.get_clock().is_open):
+                return {"ok": True, "skipped": True, "reason": "Market open"}
+        except Exception:
+            pass
+    with _db_housekeeping_lock:
+        started = datetime.now(UTC)
+        before = _db_storage_snapshot(include_tables=False)
+        cutoff = (started - timedelta(days=DB_HOUSEKEEPING_RETENTION_DAYS)).isoformat()
+        short_cutoff = (started - timedelta(days=min(30, DB_HOUSEKEEPING_RETENTION_DAYS))).isoformat()
+        deleted: Dict[str, int] = {}
+        conn = None
+        try:
+            conn = db_connect()
+            # Reconstructable operational/audit data only. Core learning evidence is deliberately retained.
+            retention_targets = [
+                ("universe_refresh_log", "refreshed_at", cutoff),
+                ("v7_maintenance_runs", "created_at", cutoff),
+                ("v7_research_runs", "created_at", cutoff),
+                ("v9_memory_runs", "created_at", cutoff),
+                ("v11_learning_history", "created_at", cutoff),
+                ("v11_capture_verification", "created_at", short_cutoff),
+                ("v11_capture_tests", "created_at", short_cutoff),
+                ("v10_operator_actions", "created_at", cutoff),
+                ("v12_ceo_reviews", "created_at", cutoff),
+                ("v12_ceo_journal", "created_at", cutoff),
+                ("v13_memory_events", "created_at", cutoff),
+                ("v14_scientist_events", "created_at", cutoff),
+                ("v15_health_audits", "created_at", short_cutoff),
+            ]
+            for table, column, table_cutoff in retention_targets:
+                removed = _db_delete_older_than(conn, table, column, table_cutoff)
+                if removed:
+                    deleted[table] = removed
+
+            # Board votes must be removed before their parent meetings.
+            if _db_table_exists(conn, "v121_board_votes") and _db_table_exists(conn, "v121_board_meetings"):
+                old_ids = [int(r[0]) for r in conn.execute(
+                    "SELECT id FROM v121_board_meetings WHERE created_at < ?", (cutoff,)
+                ).fetchall()]
+                if old_ids:
+                    marks = ",".join("?" for _ in old_ids)
+                    before_changes = conn.total_changes
+                    conn.execute(f"DELETE FROM v121_board_votes WHERE meeting_id IN ({marks})", old_ids)
+                    vote_removed = int(conn.total_changes - before_changes)
+                    if vote_removed: deleted["v121_board_votes"] = vote_removed
+                    before_changes = conn.total_changes
+                    conn.execute(f"DELETE FROM v121_board_meetings WHERE id IN ({marks})", old_ids)
+                    meeting_removed = int(conn.total_changes - before_changes)
+                    if meeting_removed: deleted["v121_board_meetings"] = meeting_removed
+
+            # Resolved alerts are useful briefly, but do not need to grow forever.
+            if _db_table_exists(conn, "v15_health_alerts") and _db_column_exists(conn, "v15_health_alerts", "resolved_at"):
+                before_changes = conn.total_changes
+                conn.execute("DELETE FROM v15_health_alerts WHERE status='RESOLVED' AND resolved_at IS NOT NULL AND resolved_at < ?", (cutoff,))
+                removed = int(conn.total_changes - before_changes)
+                if removed: deleted["v15_health_alerts"] = removed
+
+            conn.commit()
+            # Return WAL pages to the filesystem. This is safe and materially helps persistent-disk usage.
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            except Exception as exc:
+                checkpoint_error = str(exc)[:300]
+            else:
+                checkpoint_error = None
+            conn.close(); conn = None
+            after = _db_storage_snapshot(include_tables=False)
+            result = {
+                "ok": True, "version": "V17.0.8", "ranAt": started.isoformat(),
+                "retentionDays": DB_HOUSEKEEPING_RETENTION_DAYS, "deletedRows": deleted,
+                "deletedTotal": int(sum(deleted.values())),
+                "before": before, "after": after,
+                "sqliteBytesFreed": max(0, int(before.get("sqliteBytes", 0)) - int(after.get("sqliteBytes", 0))),
+                "checkpointError": checkpoint_error,
+                "protectedData": [
+                    "trades", "closed_trades", "performance_state", "v2_setup_decisions",
+                    "v2_observation_outcomes", "v4_market_dna", "v6_brain_observations",
+                    "v9_market_memory", "v10_evidence_lineage", "v11_discoveries",
+                    "v13_knowledge", "v14_hypotheses", "v14_experiments"
+                ],
+            }
+            _db_last_housekeeping = result
+            print(f"V17.0.8 DB HOUSEKEEPING | deleted={result['deletedTotal']} sqlite_freed={result['sqliteBytesFreed']} disk_used={after.get('diskUsedPct',0):.1f}%")
+            return result
+        except Exception as exc:
+            try:
+                if conn is not None: conn.rollback(); conn.close()
+            except Exception:
+                pass
+            result = {"ok": False, "version": "V17.0.8", "ranAt": started.isoformat(), "error": str(exc)[:1000]}
+            _db_last_housekeeping = result
+            print(f"V17.0.8 DB HOUSEKEEPING ERROR: {exc}")
+            return result
+
+
+def _db_housekeeping_worker() -> None:
+    time.sleep(DB_HOUSEKEEPING_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            _db_safe_housekeeping(False)
+        except Exception as exc:
+            print(f"V17.0.8 DB HOUSEKEEPING WORKER ERROR: {exc}")
+        time.sleep(DB_HOUSEKEEPING_INTERVAL_SECONDS)
+
+
+@app.get("/admin/db-storage-audit")
+def api_db_storage_audit(request: Request):
+    verify_api_key(request)
+    return _db_storage_snapshot(include_tables=True)
+
+
+@app.post("/admin/db-housekeeping")
+def api_db_housekeeping(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return _db_safe_housekeeping(bool(payload.get("force", True)))
 
 
 def _init_db_impl():
@@ -6122,7 +6375,7 @@ def build_status_payload(bot_name, scans):
             "checkInterval": CHECK_INTERVAL,
             "maxPositions": effective_max_positions(),
         "positionCapacity": ai_position_capacity_payload(),
-            "fullBuyWhenOnePosition": False if AI_POSITION_CAPACITY_ENABLED else FULL_BUY_WHEN_ONE_POSITION,
+            "fullBuyWhenOnePosition": True if V17_SINGLE_FULL_BUY_MODE else (False if AI_POSITION_CAPACITY_ENABLED else FULL_BUY_WHEN_ONE_POSITION),
             "fullBuyCashBuffer": FULL_BUY_CASH_BUFFER,
             "targetPositionValuePct": TARGET_POSITION_VALUE_PCT,
             "maxPositionValuePct": MAX_POSITION_VALUE_PCT,
@@ -6471,7 +6724,9 @@ def apply_position_settings(max_positions: int = None, save: bool = True) -> Dic
         value = int(MAX_POSITIONS)
 
     value = max(1, min(10, value))
-    if globals().get("SWING_SNIPER_SAFE_MODE", False):
+    if globals().get("V17_SINGLE_FULL_BUY_MODE", False):
+        value = 1
+    elif globals().get("SWING_SNIPER_SAFE_MODE", False):
         value = 1
 
     MAX_POSITIONS = value
@@ -7927,7 +8182,7 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started
     # Initialise the shared SQLite schema synchronously before any worker threads start.
     # This removes the startup race where multiple workers all tried to create tables.
     init_db()
@@ -7954,6 +8209,9 @@ def startup_event():
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
+    if DB_HOUSEKEEPING_ENABLED and not db_housekeeping_thread_started:
+        db_housekeeping_thread_started = True
+        threading.Thread(target=_db_housekeeping_worker, daemon=True).start()
 
 
 
@@ -9531,6 +9789,8 @@ def _compat_save_buy_mode(mode):
     if mode not in ("full", "partial"):
         mode = "full"
     _compat_write(_COMPAT_BUY_SIZE_FILE, {"mode": mode})
+    if globals().get("V17_SINGLE_FULL_BUY_MODE", False):
+        mode = "full"
     globals()["BUY_SIZE_MODE"] = mode
     globals()["FULL_BUY_WHEN_ONE_POSITION"] = mode == "full"
     return mode
@@ -9565,7 +9825,10 @@ def _compat_buy_preview():
         full_buffer = 2.00
 
     partial_usd = max(0.0, min(capped_equity / max(1, max_positions), max(0.0, buying_power - cash_buffer)))
-    full_usd = max(0.0, min(capped_equity, max(0.0, buying_power - full_buffer)))
+    if bool(globals().get("V17_SINGLE_FULL_BUY_MODE", False)):
+        full_usd = max(0.0, buying_power - full_buffer)
+    else:
+        full_usd = max(0.0, min(capped_equity, max(0.0, buying_power - full_buffer)))
     mode = _compat_load_buy_mode()
 
     return {
@@ -14087,6 +14350,21 @@ def _ai_risk_latest_profile(symbol: str) -> Dict[str, Any]:
 
 def ai_risk_notional(scan: Dict[str, Any]) -> float:
     base = float(confidence_notional(scan))
+
+    # V17.0.7: in explicit single-position full-buy mode, risk intelligence
+    # may tune stops/trails but MUST NOT reduce the requested order notional.
+    # Entry quality gates still decide whether a trade is permitted.
+    if bool(globals().get("V17_SINGLE_FULL_BUY_MODE", False)) or (
+        bool(globals().get("FULL_BUY_WHEN_ONE_POSITION", False))
+        and effective_max_positions() <= 1
+    ):
+        try:
+            account = get_account()
+            live_bp = max(0.0, float(account.buying_power))
+            return round(max(0.0, live_bp - float(globals().get("FULL_BUY_CASH_BUFFER", 2.0))), 2)
+        except Exception:
+            return base
+
     if not AI_RISK_ENGINE_ENABLED:
         return base
     profile = _ai_risk_build_profile(scan)
@@ -14426,10 +14704,19 @@ def _v10_operator_apply_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     global TRAIL_START, TRAIL_GIVEBACK, OPTIMIZED_TRAIL_START, OPTIMIZED_TRAIL_GIVEBACK
     global V10_ORDER_EXECUTION_MODE
 
-    MAX_POSITIONS = int(_v10_clamp(config.get("maxPositions", AI_POSITION_HARD_CAP), V10_CONSTITUTION["maxPositions"]["min"], V10_CONSTITUTION["maxPositions"]["max"]))
-    TARGET_POSITION_VALUE_PCT = _v10_clamp(config["targetPositionValuePct"], V10_CONSTITUTION["positionValuePct"]["min"], V10_CONSTITUTION["positionValuePct"]["max"])
-    MAX_POSITION_VALUE_PCT = max(TARGET_POSITION_VALUE_PCT, min(1.0, float(config.get("maxPositionValuePct") or TARGET_POSITION_VALUE_PCT)))
-    FULL_BUY_WHEN_ONE_POSITION = False if AI_POSITION_CAPACITY_ENABLED else bool(config.get("fullBuyWhenOnePosition") and MAX_POSITIONS == 1)
+    if V17_SINGLE_FULL_BUY_MODE:
+        # V17.0.6: user-selected one-position full-buy mode is authoritative.
+        # The autonomous V10 operator may still tune exits/research, but it must
+        # not expand position count or silently switch sizing back to partial.
+        MAX_POSITIONS = 1
+        TARGET_POSITION_VALUE_PCT = 1.0
+        MAX_POSITION_VALUE_PCT = 1.0
+        FULL_BUY_WHEN_ONE_POSITION = True
+    else:
+        MAX_POSITIONS = int(_v10_clamp(config.get("maxPositions", AI_POSITION_HARD_CAP), V10_CONSTITUTION["maxPositions"]["min"], V10_CONSTITUTION["maxPositions"]["max"]))
+        TARGET_POSITION_VALUE_PCT = _v10_clamp(config["targetPositionValuePct"], V10_CONSTITUTION["positionValuePct"]["min"], V10_CONSTITUTION["positionValuePct"]["max"])
+        MAX_POSITION_VALUE_PCT = max(TARGET_POSITION_VALUE_PCT, min(1.0, float(config.get("maxPositionValuePct") or TARGET_POSITION_VALUE_PCT)))
+        FULL_BUY_WHEN_ONE_POSITION = False if AI_POSITION_CAPACITY_ENABLED else bool(config.get("fullBuyWhenOnePosition") and MAX_POSITIONS == 1)
 
     stop_pct = _v10_clamp(config["stopLossPct"], V10_CONSTITUTION["stopLossPct"]["min"], V10_CONSTITUTION["stopLossPct"]["max"])
     STOP_LOSS = 1.0 - stop_pct / 100.0
@@ -16239,8 +16526,16 @@ def _v15_database_check():
     conn = db_connect(); row = conn.execute("SELECT 1 AS ok").fetchone()
     tables = conn.execute("SELECT COUNT(*) AS c FROM sqlite_master WHERE type='table'").fetchone()
     conn.close()
-    return ("PASS", "Persistent database is readable and writable infrastructure is available.",
-            {"sqliteEnabled": True, "query": int(dict(row).get("ok", 0)), "tables": int(dict(tables).get("c", 0))})
+    storage = _db_storage_snapshot(include_tables=False)
+    used_pct = float(storage.get("diskUsedPct") or 0.0)
+    details = {"sqliteEnabled": True, "query": int(dict(row).get("ok", 0)), "tables": int(dict(tables).get("c", 0)),
+               "diskUsedPct": used_pct, "diskFreeBytes": storage.get("diskFreeBytes"),
+               "databaseBytes": storage.get("mainBytes"), "walBytes": storage.get("walBytes")}
+    if used_pct >= DB_HEALTH_FAIL_PCT:
+        return ("FAIL", f"Persistent disk is critically full ({used_pct:.1f}% used).", details)
+    if used_pct >= DB_HEALTH_WARN_PCT:
+        return ("WARN", f"Persistent disk usage is elevated ({used_pct:.1f}% used).", details)
+    return ("PASS", "Persistent database is readable and disk capacity is healthy.", details)
 
 
 def _v15_broker_check():
