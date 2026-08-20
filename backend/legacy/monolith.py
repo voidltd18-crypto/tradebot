@@ -14840,6 +14840,12 @@ def _v10_operator_propose(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     # Position sizing and trading cap: only scale up after positive realised evidence; scale down sooner.
     win_rate = float(analytics.get("winRate") or 0.0)
     closed_count = int(analytics.get("closedTrades") or 0)
+    # V17.0.12: V10 Operator metrics must come from the analytics snapshot.
+    # These names were previously referenced without assignment, causing
+    # `V10 OPERATOR ERROR: name 'pf' is not defined`. This is a diagnostics/
+    # operator reliability fix only; all promotion thresholds remain unchanged.
+    pf = float(analytics.get("profitFactor") or 0.0)
+    total_pnl = float(analytics.get("totalPnl") or 0.0)
     cap_bounds = V10_CONSTITUTION["tradingCapUsd"]
     size_bounds = V10_CONSTITUTION["positionValuePct"]
     if closed_count >= 20 and pf >= 1.30 and win_rate >= 0.55 and total_pnl > 0:
