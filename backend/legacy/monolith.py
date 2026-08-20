@@ -3005,23 +3005,30 @@ def pick_money_mode_stocks(
     approval_decision: str = "APPROVED",
     approval_stage: str = "final_gate",
     approval_reason: str = "all V2 gates passed",
+    persist_decisions: bool = True,
+    log_rejections: bool = True,
 ):
-    """Evaluate scans through the normal live gates and persist every decision.
+    """Evaluate scans through the exact live entry gates.
 
-    The optional approval labels let the same exact gate pipeline record a
-    qualifying setup as BLOCKED when account-level rules (for example the
-    maximum-position limit) prevent a live order. This is research-only; it
-    does not alter which setups pass or place any order.
+    V17.0.13 adds a read-only mode for portfolio publishing. Live order paths
+    keep persist_decisions=True so every real decision is recorded exactly as
+    before. Dashboard/status refreshes use persist_decisions=False and
+    log_rejections=False, which means they can reuse the *same* eligibility
+    pipeline without creating duplicate learning rows or noisy rejection logs.
     """
+    def persist(scan, decision, stage, reason, profile=None):
+        if persist_decisions:
+            record_v2_setup_decision(scan, decision, stage, reason, profile)
+
     candidates = []
     for scan in scans:
         symbol = scan["symbol"]
         can_buy, reason = can_buy_symbol(symbol)
         if not can_buy:
-            record_v2_setup_decision(scan, "REJECTED", "account_gate", reason)
+            persist(scan, "REJECTED", "account_gate", reason)
             continue
         if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
-            record_v2_setup_decision(scan, "REJECTED", "pdt_gate", "maximum new buys for today reached")
+            persist(scan, "REJECTED", "pdt_gate", "maximum new buys for today reached")
             continue
 
         # V10.5 Symbol Reputation Gate: prevent repeated live entries into symbols
@@ -3030,31 +3037,35 @@ def pick_money_mode_stocks(
         reputation_ok, reputation_reason, reputation = symbol_reputation_allows_live_buy(symbol)
         scan["symbolReputation"] = reputation
         if not reputation_ok:
-            print(f"REPUTATION SKIP {symbol} | {reputation_reason}")
-            record_v2_setup_decision(scan, "REJECTED", "symbol_reputation_gate", reputation_reason)
+            if log_rejections:
+                print(f"REPUTATION SKIP {symbol} | {reputation_reason}")
+            persist(scan, "REJECTED", "symbol_reputation_gate", reputation_reason)
             continue
 
         sniper_ok, sniper_reason = sniper_passes(scan)
         if not sniper_ok:
-            print(f"SNIPER SKIP {symbol} | {sniper_reason}")
-            record_v2_setup_decision(scan, "REJECTED", "sniper_gate", sniper_reason)
+            if log_rejections:
+                print(f"SNIPER SKIP {symbol} | {sniper_reason}")
+            persist(scan, "REJECTED", "sniper_gate", sniper_reason)
             continue
 
         aplus_ok, aplus_reason = a_plus_gate(scan)
         if not aplus_ok:
-            print(f"A+ SKIP {symbol} | {aplus_reason}")
-            record_v2_setup_decision(scan, "REJECTED", "a_plus_gate", aplus_reason)
+            if log_rejections:
+                print(f"A+ SKIP {symbol} | {aplus_reason}")
+            persist(scan, "REJECTED", "a_plus_gate", aplus_reason)
             continue
         if not scan["ready_to_buy"]:
-            record_v2_setup_decision(scan, "REJECTED", "trigger_gate", "entry trigger not ready")
+            persist(scan, "REJECTED", "trigger_gate", "entry trigger not ready")
             continue
         v2_ok, v2_profile = v2_trade_gate(scan)
         if not v2_ok:
-            print(f"V2 SKIP {symbol} | {v2_profile.get('reason')}")
-            record_v2_setup_decision(scan, "REJECTED", "expectancy_gate", v2_profile.get("reason", "not approved"), v2_profile)
+            if log_rejections:
+                print(f"V2 SKIP {symbol} | {v2_profile.get('reason')}")
+            persist(scan, "REJECTED", "expectancy_gate", v2_profile.get("reason", "not approved"), v2_profile)
             continue
         scan["v2Expectancy"] = v2_profile
-        record_v2_setup_decision(
+        persist(
             scan,
             approval_decision,
             approval_stage,
@@ -3700,7 +3711,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 
     plan = {
         "ok": True,
-        "version": "V17.0.7-ORDER-LEVEL-FULL-BUY-LOCK",
+        "version": "V17.0.13-LIVE-GATE-ALIGNED-PLANNER",
         "enabled": AI_PORTFOLIO_MANAGER_ENABLED,
         "createdAt": datetime.now(UTC).isoformat(),
         "manual": bool(manual),
@@ -3761,7 +3772,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
     }
     _v16_save_portfolio_plan(plan)
     print(
-        f"V17.0.7 ORDER-LEVEL FULL-BUY LOCK PLAN | scans={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
+        f"V17.0.13 LIVE-GATE-ALIGNED FULL-BUY PLAN | scans={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
         f"rejected={rejected_count} waiting={waiting_count} actionable={len(actionable_ranked)} "
         f"order_limit={order_limit} deploy=${allocated:.2f} reserve={reserve_pct*100:.1f}% allocations="
         + ",".join(f"{a['symbol']}=${a['notionalUsd']:.2f}" for a in allocations)
@@ -3792,10 +3803,23 @@ def api_v16_portfolio_status(request: Request):
 
     if AI_PORTFOLIO_MANAGER_ENABLED and latest_scans and should_publish:
         try:
-            payload = build_v16_portfolio_plan(list(latest_scans), manual=False).get("plan") or payload
-            payload["source"] = "latest_live_scans"
+            # V17.0.13 PLANNER ALIGNMENT:
+            # Never rank raw scanner rows on the dashboard. First pass them
+            # through the exact same entry gates used by money_mode_buy(), but
+            # read-only so a status refresh cannot create duplicate evidence.
+            raw_scans = list(latest_scans)
+            gate_eligible = pick_money_mode_stocks(
+                raw_scans,
+                persist_decisions=False,
+                log_rejections=False,
+            )
+            payload = build_v16_portfolio_plan(gate_eligible, manual=False).get("plan") or payload
+            payload["source"] = "latest_live_scans_after_live_gates"
+            payload["rawScanCount"] = len(raw_scans)
+            payload["gateEligibleCount"] = len(gate_eligible)
+            payload["plannerAlignmentVersion"] = "V17.0.13"
         except Exception as exc:
-            print(f"V16 PORTFOLIO STATUS REFRESH ERROR: {exc}")
+            print(f"V17.0.13 PORTFOLIO STATUS REFRESH ERROR: {exc}")
             payload["refreshError"] = str(exc)
 
     payload.setdefault("enabled", AI_PORTFOLIO_MANAGER_ENABLED)
