@@ -218,6 +218,17 @@ V2_OUTCOME_DRAIN_PAUSE_SECONDS = max(0.0, float(os.getenv("V2_OUTCOME_DRAIN_PAUS
 V2_INDEPENDENT_SAMPLE_MINUTES = int(os.getenv("V2_INDEPENDENT_SAMPLE_MINUTES", "30"))
 V2_ESTIMATED_COST_BPS = float(os.getenv("V2_ESTIMATED_COST_BPS", "10"))
 
+# V17.0.15 — V2 cold-start qualification for genuinely new symbols.
+# Established symbols (>= V2_MIN_SYMBOL_SAMPLES) still require the normal V2
+# expectancy gate. A new symbol can only bypass the sample-count deadlock when
+# the *current live setup* is exceptionally strong and every preceding safety
+# gate (account lock, reputation, Sniper and A+) has already passed.
+V17_V2_COLD_START_ENABLED = os.getenv("V17_V2_COLD_START_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+V17_V2_COLD_START_MIN_CONFIDENCE = max(0.70, min(0.99, float(os.getenv("V17_V2_COLD_START_MIN_CONFIDENCE", "0.80") or 0.80)))
+V17_V2_COLD_START_MIN_QUALITY = max(0.0, float(os.getenv("V17_V2_COLD_START_MIN_QUALITY", "0.030") or 0.030))
+V17_V2_COLD_START_MAX_SPREAD = max(0.0005, min(MAX_SPREAD, float(os.getenv("V17_V2_COLD_START_MAX_SPREAD", "0.006") or 0.006)))
+V17_V2_COLD_START_MIN_MOMENTUM = max(0.0, float(os.getenv("V17_V2_COLD_START_MIN_MOMENTUM", "0.0") or 0.0))
+
 # TradeBot V4.1 intelligence foundation. Advisory/data-collection only.
 V4_MARKET_DNA_ENABLED = os.getenv("V4_MARKET_DNA_ENABLED", "true").lower() == "true"
 V4_SIMILARITY_MIN_SAMPLES = int(os.getenv("V4_SIMILARITY_MIN_SAMPLES", "8") or 8)
@@ -1919,6 +1930,92 @@ def v2_trade_gate(scan: Dict[str, Any]):
     return bool(profile.get("approved")), profile
 
 
+def v17_v2_trade_gate_with_cold_start(scan: Dict[str, Any], log_decision: bool = True):
+    """V17.0.15 V2 gate with a bounded cold-start path for new symbols.
+
+    This never overrides mature negative evidence.  Once a symbol has the normal
+    V2 sample minimum it must pass the established expectancy gate exactly as
+    before.  For fewer samples, the symbol may proceed only when the current
+    setup is unusually strong.  Earlier account/reputation/Sniper/A+ gates are
+    intentionally evaluated by the caller before this function is reached.
+    """
+    ok, profile = v2_trade_gate(scan)
+    profile = dict(profile or {})
+    if ok or not TRADEBOT_V2_ENABLED:
+        profile.setdefault("coldStart", False)
+        return ok, profile
+
+    samples = int(profile.get("samples") or 0)
+    if not V17_V2_COLD_START_ENABLED or samples >= V2_MIN_SYMBOL_SAMPLES:
+        return False, profile
+
+    symbol = str(scan.get("symbol") or "").upper().strip()
+    confidence = float(scan.get("confidence") or calculate_confidence(scan)[0] or 0.0)
+    quality = float(scan.get("quality_score") or scan.get("qualityScore") or 0.0)
+    spread = float(scan.get("spread") or 1.0)
+    momentum = float(scan.get("short_momentum") or scan.get("shortMomentum") or 0.0)
+
+    # Require at least the current A+ quality floor as well as the dedicated
+    # cold-start floor so autonomous tuning cannot accidentally weaken it.
+    required_quality = max(float(A_PLUS_MIN_QUALITY), float(V17_V2_COLD_START_MIN_QUALITY))
+    required_spread = min(float(A_PLUS_MAX_SPREAD), float(V17_V2_COLD_START_MAX_SPREAD))
+
+    failures = []
+    if confidence < V17_V2_COLD_START_MIN_CONFIDENCE:
+        failures.append(f"confidence {confidence:.2f} < {V17_V2_COLD_START_MIN_CONFIDENCE:.2f}")
+    if quality < required_quality:
+        failures.append(f"quality {quality:.4f} < {required_quality:.4f}")
+    if spread > required_spread:
+        failures.append(f"spread {spread:.5f} > {required_spread:.5f}")
+    if momentum <= V17_V2_COLD_START_MIN_MOMENTUM:
+        failures.append(f"momentum {momentum:.4f} <= {V17_V2_COLD_START_MIN_MOMENTUM:.4f}")
+
+    if failures:
+        cold = {
+            **profile,
+            "approved": False,
+            "historicalApproved": bool(profile.get("approved")),
+            "coldStart": True,
+            "coldStartApproved": False,
+            "coldStartReason": "; ".join(failures),
+            "coldStartRequirements": {
+                "minConfidence": V17_V2_COLD_START_MIN_CONFIDENCE,
+                "minQuality": required_quality,
+                "maxSpread": required_spread,
+                "minMomentumExclusive": V17_V2_COLD_START_MIN_MOMENTUM,
+            },
+        }
+        if log_decision:
+            print(
+                f"V17.0.15 V2 COLD START REJECT | {symbol} samples={samples}/{V2_MIN_SYMBOL_SAMPLES} "
+                f"confidence={confidence:.2f} quality={quality:.4f} spread={spread:.5f} momentum={momentum:.4f} "
+                f"reason={cold['coldStartReason']}"
+            )
+        return False, cold
+
+    cold = {
+        **profile,
+        "approved": True,
+        "historicalApproved": False,
+        "coldStart": True,
+        "coldStartApproved": True,
+        "reason": "V17.0.15 exceptional live setup cold-start pass",
+        "coldStartReason": "exceptional live setup passed bounded cold-start requirements",
+        "coldStartRequirements": {
+            "minConfidence": V17_V2_COLD_START_MIN_CONFIDENCE,
+            "minQuality": required_quality,
+            "maxSpread": required_spread,
+            "minMomentumExclusive": V17_V2_COLD_START_MIN_MOMENTUM,
+        },
+    }
+    if log_decision:
+        print(
+            f"V17.0.15 V2 COLD START PASS | {symbol} samples={samples}/{V2_MIN_SYMBOL_SAMPLES} "
+            f"confidence={confidence:.2f} quality={quality:.4f} spread={spread:.5f} momentum={momentum:.4f}"
+        )
+    return True, cold
+
+
 # =========================
 # TRADEBOT V2 SESSION / SAMPLE HELPERS
 # =========================
@@ -3010,7 +3107,7 @@ def pick_money_mode_stocks(
 ):
     """Evaluate scans through the exact live entry gates.
 
-    V17.0.14 retains read-only portfolio publishing and makes this gate path the single source of truth. Live order paths
+    V17.0.15 retains read-only portfolio publishing and makes this gate path the single source of truth. Live order paths
     keep persist_decisions=True so every real decision is recorded exactly as
     before. Dashboard/status refreshes use persist_decisions=False and
     log_rejections=False, which means they can reuse the *same* eligibility
@@ -3058,11 +3155,13 @@ def pick_money_mode_stocks(
         if not scan["ready_to_buy"]:
             persist(scan, "REJECTED", "trigger_gate", "entry trigger not ready")
             continue
-        v2_ok, v2_profile = v2_trade_gate(scan)
+        v2_ok, v2_profile = v17_v2_trade_gate_with_cold_start(scan, log_decision=log_rejections)
         if not v2_ok:
-            if log_rejections:
+            if log_rejections and not v2_profile.get("coldStart"):
                 print(f"V2 SKIP {symbol} | {v2_profile.get('reason')}")
-            persist(scan, "REJECTED", "expectancy_gate", v2_profile.get("reason", "not approved"), v2_profile)
+            stage = "v17_cold_start_gate" if v2_profile.get("coldStart") else "expectancy_gate"
+            reason_text = v2_profile.get("coldStartReason") or v2_profile.get("reason", "not approved")
+            persist(scan, "REJECTED", stage, reason_text, v2_profile)
             continue
         scan["v2Expectancy"] = v2_profile
         persist(
@@ -3086,7 +3185,7 @@ def v17_live_entry_gate_pipeline(
     log_rejections: bool = True,
     log_summary: bool = False,
 ):
-    """V17.0.14 single source of truth for pre-portfolio entry eligibility.
+    """V17.0.15 single source of truth for pre-portfolio entry eligibility.
 
     Every portfolio planner/order path must call this function before V16/V17
     scoring.  It delegates to the established live gate implementation so the
@@ -3105,7 +3204,7 @@ def v17_live_entry_gate_pipeline(
     if log_summary:
         survivor_symbols = ",".join(str(row.get("symbol") or "") for row in survivors) or "-"
         print(
-            f"V17.0.14 ENTRY GATES | scanned={len(raw)} passed={len(survivors)} "
+            f"V17.0.15 ENTRY GATES | scanned={len(raw)} passed={len(survivors)} "
             f"rejected={max(0, len(raw)-len(survivors))} survivors={survivor_symbols}"
         )
     return survivors
@@ -3806,7 +3905,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
     }
     _v16_save_portfolio_plan(plan)
     print(
-        f"V17.0.14 SINGLE-SOURCE FULL-BUY PLAN | gate_eligible={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
+        f"V17.0.15 SINGLE-SOURCE FULL-BUY PLAN | gate_eligible={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
         f"rejected={rejected_count} waiting={waiting_count} actionable={len(actionable_ranked)} "
         f"order_limit={order_limit} deploy=${allocated:.2f} reserve={reserve_pct*100:.1f}% allocations="
         + ",".join(f"{a['symbol']}=${a['notionalUsd']:.2f}" for a in allocations)
@@ -3852,9 +3951,9 @@ def api_v16_portfolio_status(request: Request):
             payload["source"] = "latest_live_scans_after_live_gates"
             payload["rawScanCount"] = len(raw_scans)
             payload["gateEligibleCount"] = len(gate_eligible)
-            payload["plannerAlignmentVersion"] = "V17.0.14"
+            payload["plannerAlignmentVersion"] = "V17.0.15-COLD-START"
         except Exception as exc:
-            print(f"V17.0.14 PORTFOLIO STATUS REFRESH ERROR: {exc}")
+            print(f"V17.0.15 PORTFOLIO STATUS REFRESH ERROR: {exc}")
             payload["refreshError"] = str(exc)
 
     payload.setdefault("enabled", AI_PORTFOLIO_MANAGER_ENABLED)
@@ -8441,7 +8540,7 @@ def run_bot_loop():
                         )
                         build_v16_portfolio_plan(gate_eligible, manual=False)
                     except Exception as portfolio_error:
-                        print(f"V17.0.14 PORTFOLIO AUTO-PUBLISH ERROR: {portfolio_error}")
+                        print(f"V17.0.15 PORTFOLIO AUTO-PUBLISH ERROR: {portfolio_error}")
 
                 if bot_enabled and not emergency_stop:
                     manage_money_mode_positions()
