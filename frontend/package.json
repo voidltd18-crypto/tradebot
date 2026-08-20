@@ -10,7 +10,8 @@
     "typescript": "latest",
     "react": "latest",
     "react-dom": "latest",
-    "recharts": "latest"
+    "recharts": "latest",
+    "html2pdf.js": "^0.10.2"
   },
   "devDependencies": {}
 }

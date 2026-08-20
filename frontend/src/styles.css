@@ -34,3 +34,61 @@
     min-width: 120px;
   }
 }
+
+/* V17.0.9 - one-click full AI Intelligence PDF export */
+.pdf-section-title { display: none; }
+.pdf-export-mode {
+  width: 1500px !important;
+  max-width: 1500px !important;
+  margin: 0 auto !important;
+  padding: 14px !important;
+  background: #07111f !important;
+}
+.pdf-export-mode .intelligence-tabs,
+.pdf-export-mode .pdf-export-button,
+.pdf-export-mode button,
+.pdf-export-mode .operator-actions button,
+.pdf-export-mode .admin-section button {
+  display: none !important;
+}
+.pdf-export-mode .intelligence-hero .actions .pill {
+  display: inline-flex !important;
+}
+.pdf-export-mode .pdf-section {
+  display: grid !important;
+  break-before: page;
+  page-break-before: always;
+  break-inside: auto;
+  page-break-inside: auto;
+  padding-top: 42px;
+  position: relative;
+}
+.pdf-export-mode .pdf-section::before {
+  content: attr(data-pdf-title);
+  position: absolute;
+  top: 6px;
+  left: 2px;
+  color: #f4f8ff;
+  font-size: 25px;
+  font-weight: 800;
+  letter-spacing: .04em;
+}
+.pdf-export-mode .card,
+.pdf-export-mode table,
+.pdf-export-mode .intelligence-stat,
+.pdf-export-mode .summary,
+.pdf-export-mode .meter-row {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+.pdf-export-mode .table-wrap {
+  overflow: visible !important;
+  max-height: none !important;
+}
+.pdf-export-mode .compact-table {
+  font-size: 11px !important;
+}
+.pdf-export-mode .compact-table th,
+.pdf-export-mode .compact-table td {
+  white-space: normal !important;
+}

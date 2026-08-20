@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -98,6 +98,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const [refreshing, setRefreshing] = useState(false);
   const [promotionBusy, setPromotionBusy] = useState(false);
   const [promotionMessage, setPromotionMessage] = useState("");
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const reportRef = useRef<HTMLDivElement | null>(null);
   const [sources, setSources] = useState<Record<string, EndpointState>>({
     advisor: EMPTY_ENDPOINT,
     shadow: EMPTY_ENDPOINT,
@@ -544,6 +547,80 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     await Promise.all([load(true), fetchData(true)]);
   };
 
+  const exportFullAiReport = async () => {
+    if (!authToken || exportBusy) return;
+    setExportBusy(true);
+    const headers = { "X-Auth-Token": authToken, "x-api-key": authToken };
+
+    try {
+      // Fetch every intelligence endpoint so the PDF is a complete snapshot, not only the open tab.
+      const entries = Object.entries(endpoints);
+      const results: Record<string, EndpointState> = {};
+      let cursor = 0;
+
+      const worker = async () => {
+        while (cursor < entries.length) {
+          const index = cursor++;
+          const [key, endpoint] = entries[index];
+          const controller = new AbortController();
+          const timeoutSeconds = ["reports", "operator", "operationsDoctor", "operationsEngineHealth"].includes(key) ? 25 : 15;
+          const timeout = window.setTimeout(() => controller.abort(), timeoutSeconds * 1000);
+          try {
+            const response = await fetch(`${API_URL}${endpoint}`, {
+              cache: "no-store",
+              headers,
+              signal: controller.signal,
+            });
+            const json = await readJson(response);
+            if (!response.ok) throw new Error(text(json?.detail ?? json?.message, `HTTP ${response.status}`));
+            results[key] = { data: firstObject(json), error: "", loading: false };
+          } catch (error: any) {
+            const message = error?.name === "AbortError" ? "Timed out while building report" : (error?.message || "Failed to load");
+            results[key] = { data: {}, error: message, loading: false };
+          } finally {
+            window.clearTimeout(timeout);
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: 4 }, () => worker()));
+      setSources((previous) => ({ ...previous, ...results }));
+      setLastUpdated(new Date().toLocaleTimeString("en-GB"));
+      setExportingPdf(true);
+
+      // Let React paint all twelve report sections and wait for fonts/charts before capture.
+      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+      if (document.fonts?.ready) await document.fonts.ready;
+      await new Promise((resolve) => window.setTimeout(resolve, 450));
+
+      const element = reportRef.current;
+      if (!element) throw new Error("AI report view is unavailable.");
+
+      const html2pdfModule = await import("html2pdf.js");
+      const html2pdf = (html2pdfModule as any).default || html2pdfModule;
+      const now = new Date();
+      const stamp = [
+        String(now.getDate()).padStart(2, "0"),
+        String(now.getMonth() + 1).padStart(2, "0"),
+        now.getFullYear(),
+      ].join("-") + "_" + [String(now.getHours()).padStart(2, "0"), String(now.getMinutes()).padStart(2, "0")].join("-");
+
+      await html2pdf().set({
+        margin: [7, 7, 8, 7],
+        filename: `TradeBot_AI_Intelligence_${stamp}.pdf`,
+        image: { type: "jpeg", quality: 0.96 },
+        html2canvas: { scale: 1.45, useCORS: true, backgroundColor: "#07111f", logging: false },
+        jsPDF: { unit: "mm", format: "a4", orientation: "landscape", compress: true },
+        pagebreak: { mode: ["css", "legacy"], before: ".pdf-section" },
+      }).from(element).save();
+    } catch (error: any) {
+      window.alert(`AI PDF export failed: ${error?.message || "Unknown error"}`);
+    } finally {
+      setExportingPdf(false);
+      setExportBusy(false);
+    }
+  };
+
   const promotionPost = async (endpoint: string, body: AnyObj) => {
     if (!authToken) return;
     setPromotionBusy(true);
@@ -588,7 +665,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     if (confirmation !== null) promotionPost("/v10/operator/rollback", { confirmation });
   };
 
-  return <div className="intelligence-page">
+  return <div ref={reportRef} className={`intelligence-page ${exportingPdf ? "pdf-export-mode" : ""}`}>
     <Card wide className="intelligence-hero">
       <div className="intelligence-hero-head">
         <div>
@@ -598,7 +675,8 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         </div>
         <div className="actions">
           <span className={`pill ${endpointHealth === endpointTotal ? "ok" : endpointHealth ? "warn" : "bad"}`}>{endpointHealth}/{endpointTotal} engines online</span>
-          <button className="ghost" disabled={refreshing} onClick={refreshAll}>{refreshing ? "REFRESHING..." : "REFRESH INTELLIGENCE"}</button>
+          <button className="ghost pdf-export-button" disabled={exportBusy} onClick={exportFullAiReport}>{exportBusy ? "BUILDING PDF..." : "EXPORT FULL AI REPORT PDF"}</button>
+          <button className="ghost" disabled={refreshing || exportBusy} onClick={refreshAll}>{refreshing ? "REFRESHING..." : "REFRESH INTELLIGENCE"}</button>
         </div>
       </div>
       <div className="intelligence-stat-grid">
@@ -614,7 +692,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     </nav>
 
 
-    {section === "ceo" && <div className="grid two ceo-view">
+    {(section === "ceo" || exportingPdf) && <div className="pdf-section grid two ceo-view" data-pdf-title="AI CEO">
       <Card title="AI Chief Executive" wide className="ceo-command-card">
         <div className="ceo-command-head">
           <div>
@@ -693,7 +771,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     </div>}
 
 
-    {section === "board" && <div className="grid two ceo-view">
+    {(section === "board" || exportingPdf) && <div className="pdf-section grid two ceo-view" data-pdf-title="AI BOARD">
       <Card title="AI Board of Directors" wide className="ceo-command-card">
         <div className="ceo-command-head">
           <div>
@@ -748,7 +826,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
     </div>}
 
-    {section === "brain" && <div className="grid two">
+    {(section === "brain" || exportingPdf) && <div className="pdf-section grid two" data-pdf-title="AI BRAIN">
       <Card title="AI Readiness">
         <Meter label="Learning progress" value={learningProgress} />
         <Meter label="Shadow accuracy" value={shadowAccuracy} />
@@ -882,7 +960,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
     </div>}
 
-    {section === "market" && <div className="grid two">
+    {(section === "market" || exportingPdf) && <div className="pdf-section grid two" data-pdf-title="MARKET">
       <Card title="Current Market DNA">
         <div className="summary">
           {Object.entries(firstObject(marketDna.current, marketDna.snapshot, marketDna.market, marketDna.dna)).slice(0, 10).map(([key, value]) => <div key={key}><span>{keyLabel(key)}</span><b>{typeof value === "number" ? value.toFixed(2) : text(value)}</b></div>)}
@@ -908,7 +986,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
     </div>}
 
-    {section === "research" && <div className="grid two">
+    {(section === "research" || exportingPdf) && <div className="pdf-section grid two" data-pdf-title="RESEARCH">
       <Card title="Research Lab Status">
         <div className="summary">
           <div><span>Version</span><b>{text(v8Status.version ?? v7Status.version ?? research.version)}</b></div>
@@ -933,7 +1011,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
     </div>}
 
-    {section === "symbols" && <div className="grid two">
+    {(section === "symbols" || exportingPdf) && <div className="pdf-section grid two" data-pdf-title="SYMBOLS">
       <Card title="Symbol Expectancy" wide>
         {chartSymbolRows.length ? <div className="chart"><ResponsiveContainer width="100%" height="100%"><BarChart data={chartSymbolRows}><CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,.16)" /><XAxis dataKey="name" stroke="#94a3b8" /><YAxis stroke="#94a3b8" /><Tooltip contentStyle={{ background: "#020617", border: "1px solid #263450", borderRadius: 12 }} /><Bar dataKey="expectancy" name="Expectancy %">{chartSymbolRows.map((row, index) => <Cell key={index} fill={row.expectancy >= 0 ? "#22c55e" : "#fb7185"} />)}</Bar></BarChart></ResponsiveContainer></div> : <EmptyState endpoint="symbol intelligence" error={sources.symbols.error} />}
       </Card>
@@ -950,7 +1028,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     </div>}
 
 
-    {section === "memory" && <div className="memory-view">
+    {(section === "memory" || exportingPdf) && <div className="pdf-section memory-view" data-pdf-title="AI MEMORY">
       <Card title="V13 Long-Term AI Memory">
         <div className="intelligence-hero-head"><div><span className="eyebrow">AUTONOMOUS KNOWLEDGE LAYER</span><h2>{memoryStatus.enabled === false ? "MEMORY DISABLED" : "MEMORY LEARNING ACTIVE"}</h2><p>Evidence-backed knowledge shared with the CEO, Board, Research and Evolution engines.</p></div><div className="score-ring"><strong>{num(memorySummary.highConfidence)}</strong><span>high-confidence claims</span></div></div>
         <div className="intelligence-stats four"><StatTile label="Active knowledge" value={num(memorySummary.activeKnowledge).toLocaleString("en-GB")} /><StatTile label="High confidence" value={num(memorySummary.highConfidence).toLocaleString("en-GB")} /><StatTile label="Positive claims" value={num(memorySummary.positiveClaims).toLocaleString("en-GB")} tone="positive" /><StatTile label="Negative claims" value={num(memorySummary.negativeClaims).toLocaleString("en-GB")} tone="negative" /></div>
@@ -973,7 +1051,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     </div>}
 
 
-    {section === "scientist" && <div className="memory-view scientist-view">
+    {(section === "scientist" || exportingPdf) && <div className="pdf-section memory-view scientist-view" data-pdf-title="AI SCIENTIST">
       <Card title="V14 Autonomous AI Scientist">
         <div className="intelligence-hero-head"><div><span className="eyebrow">AUTOMATIC RESEARCH ORGANISATION</span><h2>{scientistStatus.enabled === false ? "SCIENTIST DISABLED" : "SCIENTIST ACTIVE"}</h2><p>Generates evidence-backed hypotheses from AI Memory and designs controlled shadow experiments. It cannot alter live trading.</p></div><div className="score-ring"><strong>{num(scientistSummary.hypotheses)}</strong><span>active hypotheses</span></div></div>
         <div className="intelligence-stats four"><StatTile label="Hypotheses" value={num(scientistSummary.hypotheses).toLocaleString("en-GB")} /><StatTile label="Experiments" value={num(scientistSummary.experiments).toLocaleString("en-GB")} /><StatTile label="Shadow ready" value={num(scientistSummary.shadowReady).toLocaleString("en-GB")} /><StatTile label="Board eligible" value={num(scientistSummary.boardEligible).toLocaleString("en-GB")} tone={num(scientistSummary.boardEligible) ? "positive" : ""} /></div>
@@ -1011,7 +1089,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
 
 
 
-    {section === "portfolio" && <div className="grid two portfolio-view">
+    {(section === "portfolio" || exportingPdf) && <div className="pdf-section grid two portfolio-view" data-pdf-title="AI PORTFOLIO">
       <Card title="AI Portfolio Manager" wide>
         <div className="intelligence-hero-head">
           <div>
@@ -1062,7 +1140,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
     </div>}
 
-    {section === "operations" && <div className="memory-view operations-view">
+    {(section === "operations" || exportingPdf) && <div className="pdf-section memory-view operations-view" data-pdf-title="AI OPERATIONS">
       <Card title="V15.1 AI Operations Centre Pro">
         <div className="intelligence-hero-head"><div><span className="eyebrow">AUTOMATIC FULL-SYSTEM MONITORING</span><h2>{text(operationsSummary.overallStatus, "STARTING")}</h2><p>Continuously checks the full dependency tree, registered APIs, database integrity, queues, workers, intelligence, governance and host resources.</p></div><div className="score-ring"><strong>{num(operationsSummary.healthScore).toFixed(0)}%</strong><span>system health</span></div></div>
         <div className="intelligence-stats four"><StatTile label="Passed" value={num(operationsSummary.passed).toLocaleString("en-GB")} tone="positive" /><StatTile label="Warnings" value={num(operationsSummary.warnings).toLocaleString("en-GB")} /><StatTile label="Failed" value={num(operationsSummary.failed).toLocaleString("en-GB")} tone={num(operationsSummary.failed) ? "negative" : ""} /><StatTile label="Active alerts" value={operationsAlerts.length.toLocaleString("en-GB")} tone={operationsAlerts.length ? "negative" : "positive"} /></div>
@@ -1122,7 +1200,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="Operations Constitution"><div className="constitution-list">{Array.isArray(operationsConstitution.rules) && operationsConstitution.rules.length ? operationsConstitution.rules.map((rule: unknown, index: number) => <div key={index}><span>{index + 1}</span><p>{text(rule)}</p></div>) : <EmptyState endpoint="V15 operations constitution" error={sources.operationsConstitution.error} />}</div></Card>
     </div>}
 
-    {section === "evolution" && <div className="grid two evolution-view">
+    {(section === "evolution" || exportingPdf) && <div className="pdf-section grid two evolution-view" data-pdf-title="EVOLUTION">
       <Card title="Current Evolution State">
         <div className="evolution-current">
           <span className="pill ok">GENERATION {currentGeneration}</span>
@@ -1168,7 +1246,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
     </div>}
 
-    {section === "rules" && <div className="grid two">
+    {(section === "rules" || exportingPdf) && <div className="pdf-section grid two" data-pdf-title="RULES">
       <Card title="Rule Intelligence" wide>
         <DataTable rows={ruleRows.slice(0, 30)} columns={[
           { key: "rule", label: "Rule", render: (row) => <b>{text(row.rule ?? row.name ?? row.key)}</b> },
