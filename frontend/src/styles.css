@@ -56,8 +56,6 @@
 }
 .pdf-export-mode .pdf-section {
   display: grid !important;
-  break-before: page;
-  page-break-before: always;
   break-inside: auto;
   page-break-inside: auto;
   padding-top: 42px;

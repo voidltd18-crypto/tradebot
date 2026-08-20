@@ -588,16 +588,74 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       setLastUpdated(new Date().toLocaleTimeString("en-GB"));
       setExportingPdf(true);
 
-      // Let React paint all twelve report sections and wait for fonts/charts before capture.
-      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+      // Wait until React has actually mounted all twelve report sections.
+      const waitForReport = async () => {
+        const started = Date.now();
+        while (Date.now() - started < 5000) {
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+          const root = reportRef.current;
+          const count = root?.querySelectorAll(".pdf-section").length ?? 0;
+          if (root && count >= 12 && root.scrollHeight > 1000) return root;
+        }
+        throw new Error("The full AI report did not finish rendering in time.");
+      };
+
+      const element = await waitForReport();
       if (document.fonts?.ready) await document.fonts.ready;
-      await new Promise((resolve) => window.setTimeout(resolve, 450));
+      await new Promise((resolve) => window.setTimeout(resolve, 650));
 
-      const element = reportRef.current;
-      if (!element) throw new Error("AI report view is unavailable.");
+      const [{ default: html2canvas }, jsPdfModule] = await Promise.all([
+        import("html2canvas"),
+        import("jspdf"),
+      ]);
+      const JsPDF = (jsPdfModule as any).jsPDF || (jsPdfModule as any).default;
+      const pdf = new JsPDF({ orientation: "landscape", unit: "mm", format: "a4", compress: true });
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const margin = 7;
+      const usableWidth = pageWidth - margin * 2;
+      const usableHeight = pageHeight - margin * 2;
 
-      const html2pdfModule = await import("html2pdf.js");
-      const html2pdf = (html2pdfModule as any).default || html2pdfModule;
+      const sections = Array.from(element.querySelectorAll<HTMLElement>(".pdf-section"));
+      if (!sections.length) throw new Error("No AI Intelligence sections were available for export.");
+
+      let firstPage = true;
+      for (const sectionElement of sections) {
+        // Capture each subsection separately. Capturing the entire 12-section page as one canvas
+        // exceeds browser canvas limits on large reports and produces blank PDFs.
+        const canvas = await html2canvas(sectionElement, {
+          scale: 1.25,
+          useCORS: true,
+          backgroundColor: "#07111f",
+          logging: false,
+          scrollX: 0,
+          scrollY: -window.scrollY,
+          windowWidth: 1500,
+        });
+
+        if (!canvas.width || !canvas.height) continue;
+        const pxPerMm = canvas.width / usableWidth;
+        const sliceHeightPx = Math.max(1, Math.floor(usableHeight * pxPerMm));
+
+        for (let y = 0; y < canvas.height; y += sliceHeightPx) {
+          const currentSliceHeight = Math.min(sliceHeightPx, canvas.height - y);
+          const slice = document.createElement("canvas");
+          slice.width = canvas.width;
+          slice.height = currentSliceHeight;
+          const context = slice.getContext("2d");
+          if (!context) continue;
+          context.drawImage(canvas, 0, y, canvas.width, currentSliceHeight, 0, 0, canvas.width, currentSliceHeight);
+
+          const imageData = slice.toDataURL("image/jpeg", 0.92);
+          const imageHeightMm = currentSliceHeight / pxPerMm;
+          if (!firstPage) pdf.addPage("a4", "landscape");
+          firstPage = false;
+          pdf.addImage(imageData, "JPEG", margin, margin, usableWidth, imageHeightMm, undefined, "FAST");
+        }
+      }
+
+      if (firstPage) throw new Error("AI report capture returned no printable content.");
+
       const now = new Date();
       const stamp = [
         String(now.getDate()).padStart(2, "0"),
@@ -605,14 +663,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         now.getFullYear(),
       ].join("-") + "_" + [String(now.getHours()).padStart(2, "0"), String(now.getMinutes()).padStart(2, "0")].join("-");
 
-      await html2pdf().set({
-        margin: [7, 7, 8, 7],
-        filename: `TradeBot_AI_Intelligence_${stamp}.pdf`,
-        image: { type: "jpeg", quality: 0.96 },
-        html2canvas: { scale: 1.45, useCORS: true, backgroundColor: "#07111f", logging: false },
-        jsPDF: { unit: "mm", format: "a4", orientation: "landscape", compress: true },
-        pagebreak: { mode: ["css", "legacy"], before: ".pdf-section" },
-      }).from(element).save();
+      pdf.save(`TradeBot_AI_Intelligence_${stamp}.pdf`);
     } catch (error: any) {
       window.alert(`AI PDF export failed: ${error?.message || "Unknown error"}`);
     } finally {

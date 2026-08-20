@@ -11,7 +11,8 @@
     "react": "latest",
     "react-dom": "latest",
     "recharts": "latest",
-    "html2pdf.js": "^0.10.2"
+    "html2canvas": "^1.4.1",
+    "jspdf": "^2.5.2"
   },
   "devDependencies": {}
 }
