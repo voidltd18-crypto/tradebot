@@ -399,6 +399,26 @@ AUTO_UNIVERSE_CANDIDATE_POOL = [
     "TSLA", "PLTR", "UBER", "QQQ", "SMH",
 ]
 
+# V17.0.11 — Locked Universe Auto-Replacement.
+# Daily locks remain strict. When too few unlocked names remain, the bot swaps
+# locked symbols out of the *runtime* scan universe and replenishes them from
+# fresh market discovery. The saved weekly universe is not deleted or unlocked.
+LOCKED_UNIVERSE_AUTO_REPLACEMENT_ENABLED = os.getenv("LOCKED_UNIVERSE_AUTO_REPLACEMENT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+LOCKED_UNIVERSE_TARGET_SIZE = max(6, int(os.getenv("LOCKED_UNIVERSE_TARGET_SIZE", str(AUTO_UNIVERSE_SIZE)) or AUTO_UNIVERSE_SIZE))
+LOCKED_UNIVERSE_MIN_UNLOCKED = max(1, min(LOCKED_UNIVERSE_TARGET_SIZE, int(os.getenv("LOCKED_UNIVERSE_MIN_UNLOCKED", "6") or 6)))
+LOCKED_UNIVERSE_DISCOVERY_COOLDOWN_SECONDS = max(60, int(os.getenv("LOCKED_UNIVERSE_DISCOVERY_COOLDOWN_SECONDS", "600") or 600))
+LOCKED_UNIVERSE_DISCOVERY_PER_SCREEN = max(20, min(100, int(os.getenv("LOCKED_UNIVERSE_DISCOVERY_PER_SCREEN", "60") or 60)))
+LOCKED_UNIVERSE_FALLBACK_POOL = [
+    "AAPL", "ABBV", "ADBE", "AMD", "AMAT", "AMGN", "AMZN", "AVGO",
+    "BAC", "CAT", "CMG", "COIN", "COST", "CRM", "CRWD", "CSCO",
+    "CVX", "DDOG", "DIS", "GE", "GM", "GOOG", "GOOGL", "GS",
+    "HD", "HOOD", "IBM", "INTC", "JNJ", "JPM", "KO", "LLY",
+    "MA", "META", "MSFT", "MU", "NFLX", "NOW", "NVDA", "ORCL",
+    "PANW", "PEP", "PFE", "QCOM", "QQQ", "ROKU", "SHOP", "SMH",
+    "SNOW", "SPY", "TGT", "TJX", "TSLA", "TXN", "UBER", "UNH",
+    "V", "WMT", "XOM", "ZS"
+]
+
 # =========================
 # CLIENTS
 # =========================
@@ -423,6 +443,7 @@ for symbol in current_universe:
 locked_today: Dict[str, str] = {}
 custom_symbols: Dict[str, bool] = {}
 last_universe_refresh_ts = 0
+locked_universe_runtime_cache: Dict[str, Any] = {"day": "", "symbols": [], "rows": [], "lastDiscoveryTs": 0.0}
 
 latest_status: Dict[str, Any] = {}
 latest_scans: List[Dict[str, Any]] = []
@@ -8096,6 +8117,182 @@ def closed_market_ai_research_worker() -> None:
         time.sleep(60)
 
 
+def _locked_universe_reset_cache_if_new_day() -> None:
+    today = today_str()
+    if str(locked_universe_runtime_cache.get("day") or "") != today:
+        locked_universe_runtime_cache.clear()
+        locked_universe_runtime_cache.update({"day": today, "symbols": [], "rows": [], "lastDiscoveryTs": 0.0})
+
+
+def _locked_universe_candidate_allowed(symbol: str, active_symbols: set[str]) -> bool:
+    sym = str(symbol or "").upper().strip()
+    if not sym or sym in active_symbols or is_locked_today(sym):
+        return False
+    try:
+        if sym in globals().get("BLOCKED_WEAK_TICKERS", set()):
+            return False
+    except Exception:
+        pass
+    try:
+        qty, _ = get_position(sym)
+        if qty > DUST_THRESHOLD:
+            # An already-held symbol should be managed, not introduced as a new replacement entry.
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _discover_locked_universe_replacements(active_symbols: set[str], need: int) -> List[Dict[str, Any]]:
+    """Find fresh unlocked symbols without changing any daily lock or buy gate."""
+    _locked_universe_reset_cache_if_new_day()
+    rows_by_symbol: Dict[str, Dict[str, Any]] = {}
+
+    # Reuse discoveries from this trading day first. This prevents a weekly-universe
+    # refresh from undoing runtime replacements every loop while avoiding repeated web calls.
+    for row in list(locked_universe_runtime_cache.get("rows") or []):
+        sym = str(row.get("symbol") or "").upper().strip()
+        if _locked_universe_candidate_allowed(sym, active_symbols):
+            rows_by_symbol[sym] = dict(row)
+
+    now_ts = time.time()
+    should_refresh = (
+        len(rows_by_symbol) < need
+        and (now_ts - float(locked_universe_runtime_cache.get("lastDiscoveryTs") or 0.0)) >= LOCKED_UNIVERSE_DISCOVERY_COOLDOWN_SECONDS
+    )
+
+    # Use the same Yahoo discovery screens as the existing dynamic scanner, but
+    # keep more than the normal top-12 so locked symbols have genuine alternatives.
+    if should_refresh:
+        try:
+            screens = list(globals().get("DYNAMIC_MARKET_YAHOO_SCREENS", []) or [])
+            yahoo_fn = globals().get("_yahoo_dynamic_screen")
+            score_fn = globals().get("_score_dynamic_quote")
+            if callable(yahoo_fn) and callable(score_fn):
+                for screen in screens:
+                    try:
+                        for quote in yahoo_fn(screen, count=LOCKED_UNIVERSE_DISCOVERY_PER_SCREEN):
+                            row = score_fn(quote, screen)
+                            if not row:
+                                continue
+                            sym = str(row.get("symbol") or "").upper().strip()
+                            if not _locked_universe_candidate_allowed(sym, active_symbols):
+                                continue
+                            previous = rows_by_symbol.get(sym)
+                            if previous is None or float(row.get("score") or 0.0) > float(previous.get("score") or 0.0):
+                                rows_by_symbol[sym] = dict(row)
+                    except Exception as screen_exc:
+                        print(f"V17.0.11 LOCKED UNIVERSE DISCOVERY SOURCE ERROR {screen}: {screen_exc}")
+        except Exception as exc:
+            print(f"V17.0.11 LOCKED UNIVERSE DISCOVERY ERROR: {exc}")
+        locked_universe_runtime_cache["lastDiscoveryTs"] = now_ts
+
+    # Stable broad fallback. These still go through all normal live score,
+    # reputation, sniper, A+, expectancy and spread checks before any order.
+    fallback = []
+    for sym in list(globals().get("LOCKED_UNIVERSE_FALLBACK_POOL", []) or []):
+        sym = str(sym).upper().strip()
+        if not _locked_universe_candidate_allowed(sym, active_symbols) or sym in rows_by_symbol:
+            continue
+        try:
+            row = score_candidate_symbol(sym)
+        except Exception:
+            row = {"symbol": sym, "score": 0.0, "reason": "locked-universe fallback", "status": "active"}
+        row = dict(row)
+        row["lockedUniverseReplacement"] = True
+        row.setdefault("source", "locked-universe-fallback")
+        fallback.append(row)
+
+    dynamic_rows = sorted(rows_by_symbol.values(), key=lambda r: float(r.get("score") or 0.0), reverse=True)
+    fallback.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
+    combined = dynamic_rows + fallback
+
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for row in combined:
+        sym = str(row.get("symbol") or "").upper().strip()
+        if not sym or sym in seen or not _locked_universe_candidate_allowed(sym, active_symbols):
+            continue
+        seen.add(sym)
+        item = dict(row)
+        item["symbol"] = sym
+        item["lockedUniverseReplacement"] = True
+        deduped.append(item)
+
+    locked_universe_runtime_cache["day"] = today_str()
+    locked_universe_runtime_cache["rows"] = deduped[:max(LOCKED_UNIVERSE_TARGET_SIZE * 4, 24)]
+    locked_universe_runtime_cache["symbols"] = [r["symbol"] for r in locked_universe_runtime_cache["rows"]]
+    return deduped[:max(need, LOCKED_UNIVERSE_TARGET_SIZE)]
+
+
+def replenish_locked_universe_if_needed() -> Dict[str, Any]:
+    """Swap daily-locked scan slots for fresh symbols; never clear a lock."""
+    global current_universe
+    _locked_universe_reset_cache_if_new_day()
+    if not LOCKED_UNIVERSE_AUTO_REPLACEMENT_ENABLED:
+        return {"ok": True, "changed": False, "reason": "disabled"}
+
+    active = list(dict.fromkeys(str(s).upper().strip() for s in current_universe if str(s).strip()))
+    if not active:
+        return {"ok": True, "changed": False, "reason": "empty universe"}
+
+    locked = [s for s in active if is_locked_today(s)]
+    unlocked = [s for s in active if not is_locked_today(s)]
+    if len(unlocked) >= LOCKED_UNIVERSE_MIN_UNLOCKED and len(active) >= LOCKED_UNIVERSE_TARGET_SIZE:
+        return {"ok": True, "changed": False, "locked": locked, "unlocked": unlocked}
+
+    # Keep every currently-held position in the scan/management universe even if
+    # a future rule ever marks it locked. Normally locks are created only after SELL.
+    held = []
+    try:
+        held = [str(p.get("symbol") or "").upper().strip() for p in get_all_positions() if p.get("symbol")]
+    except Exception:
+        held = []
+    keep = []
+    for sym in unlocked + held:
+        if sym and sym not in keep:
+            keep.append(sym)
+
+    target = max(LOCKED_UNIVERSE_TARGET_SIZE, len(keep))
+    need = max(0, target - len(keep))
+    active_set = set(active) | set(keep)
+    replacements = _discover_locked_universe_replacements(active_set, need)
+    added = []
+    for row in replacements:
+        sym = str(row.get("symbol") or "").upper().strip()
+        if not sym or sym in keep or is_locked_today(sym):
+            continue
+        keep.append(sym)
+        added.append(sym)
+        ensure_symbol_state(sym, custom=sym in custom_symbols)
+        if len(keep) >= target:
+            break
+
+    if not added:
+        return {"ok": True, "changed": False, "reason": "no fresh unlocked replacements available", "locked": locked, "unlocked": unlocked}
+
+    removed_locked = [s for s in active if s not in keep and is_locked_today(s)]
+    current_universe = keep[:target]
+    summary = {
+        "ok": True, "changed": True, "day": today_str(),
+        "lockedRemoved": removed_locked, "added": added,
+        "unlockedBefore": len(unlocked), "activeAfter": len(current_universe),
+        "symbols": list(current_universe),
+    }
+    try:
+        latest_status["lockedUniverseReplacement"] = summary
+        latest_status.setdefault("autoUniverse", {})["activeSymbols"] = list(current_universe)
+        latest_status["autoUniverse"]["size"] = len(current_universe)
+    except Exception:
+        pass
+    print(
+        "V17.0.11 LOCKED UNIVERSE REPLACEMENT | "
+        f"locked={len(locked)} unlocked_before={len(unlocked)} removed={','.join(removed_locked) or '-'} "
+        f"added={','.join(added) or '-'} universe={','.join(current_universe)}"
+    )
+    return summary
+
+
 def run_bot_loop():
     print("Rebuilt Sniper Profit Bot started...")
     init_db()
@@ -8103,10 +8300,18 @@ def run_bot_loop():
     if seeded_outcomes:
         print(f"V2 OUTCOMES | seeded={seeded_outcomes}")
     load_persistent_state()
-    refresh_universe_if_needed(force=True)
     reset_daily_flags_if_needed()
+    # V17.0.11 startup hardening: rebuild today's persisted sell locks before
+    # the first universe/scan can approve a symbol after a Render redeploy.
+    restored_at_boot = restore_today_sell_locks_from_db()
+    if restored_at_boot:
+        print(f"V17.0.11 STARTUP LOCK GUARD | restored={len(restored_at_boot)} symbols={','.join(restored_at_boot)}")
+    refresh_universe_if_needed(force=True)
     try:
         sync_recent_filled_orders_to_reports(force=True)
+        # The Alpaca sync may import a SELL that was not yet present locally when
+        # the process stopped. Re-read once more before entering the live loop.
+        restore_today_sell_locks_from_db()
     except Exception as e:
         print(f"AUTO REPORT STARTUP SYNC ERROR: {e}")
     update_status(BOT_NAME, [])
@@ -8132,6 +8337,13 @@ def run_bot_loop():
                     update_status(BOT_NAME, latest_scans)
                     time.sleep(CHECK_INTERVAL)
                     continue
+
+                # V17.0.11: preserve every daily lock but keep the scanner productive
+                # by replacing locked scan slots with fresh unlocked candidates.
+                try:
+                    replenish_locked_universe_if_needed()
+                except Exception as e:
+                    print(f"V17.0.11 LOCKED UNIVERSE REPLACEMENT ERROR: {e}")
 
                 if not AI_RESEARCH_CLOSED_MARKET_ONLY:
                     try:
@@ -8186,6 +8398,14 @@ def startup_event():
     # Initialise the shared SQLite schema synchronously before any worker threads start.
     # This removes the startup race where multiple workers all tried to create tables.
     init_db()
+    # V17.0.11: restore persisted daily SELL locks synchronously before the live
+    # bot thread starts. This closes the restart/redeploy eligibility window.
+    try:
+        startup_restored_locks = restore_today_sell_locks_from_db()
+        if startup_restored_locks:
+            print(f"V17.0.11 STARTUP EVENT LOCK GUARD | restored={len(startup_restored_locks)} symbols={','.join(startup_restored_locks)}")
+    except Exception as exc:
+        print(f"V17.0.11 STARTUP EVENT LOCK RESTORE ERROR: {exc}")
     try:
         latest_status.clear()
         latest_status.update(_quick_live_status_payload())
@@ -8219,7 +8439,7 @@ def startup_event():
 # V1.0 PRODUCTION STABLE ADDONS
 # =========================
 
-BOT_VERSION = "v1.1-strict-profit-mode"
+BOT_VERSION = "V17.0.11-LOCKED-UNIVERSE-REPLACEMENT"
 BOT_VERSION_NOTES = {
     "version": BOT_VERSION,
     "name": "TradeBot v1.0 Production Stable",
