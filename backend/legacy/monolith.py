@@ -3010,7 +3010,7 @@ def pick_money_mode_stocks(
 ):
     """Evaluate scans through the exact live entry gates.
 
-    V17.0.13 adds a read-only mode for portfolio publishing. Live order paths
+    V17.0.14 retains read-only portfolio publishing and makes this gate path the single source of truth. Live order paths
     keep persist_decisions=True so every real decision is recorded exactly as
     before. Dashboard/status refreshes use persist_decisions=False and
     log_rejections=False, which means they can reuse the *same* eligibility
@@ -3075,6 +3075,40 @@ def pick_money_mode_stocks(
         candidates.append(scan)
     candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
     return candidates
+
+
+def v17_live_entry_gate_pipeline(
+    scans,
+    approval_decision: str = "APPROVED",
+    approval_stage: str = "final_gate",
+    approval_reason: str = "all V2 gates passed",
+    persist_decisions: bool = True,
+    log_rejections: bool = True,
+    log_summary: bool = False,
+):
+    """V17.0.14 single source of truth for pre-portfolio entry eligibility.
+
+    Every portfolio planner/order path must call this function before V16/V17
+    scoring.  It delegates to the established live gate implementation so the
+    planner can never rank a symbol that Sniper/A+/Reputation/Trigger/V2 would
+    reject.  Read-only callers disable persistence to avoid duplicate learning.
+    """
+    raw = list(scans or [])
+    survivors = pick_money_mode_stocks(
+        raw,
+        approval_decision=approval_decision,
+        approval_stage=approval_stage,
+        approval_reason=approval_reason,
+        persist_decisions=persist_decisions,
+        log_rejections=log_rejections,
+    )
+    if log_summary:
+        survivor_symbols = ",".join(str(row.get("symbol") or "") for row in survivors) or "-"
+        print(
+            f"V17.0.14 ENTRY GATES | scanned={len(raw)} passed={len(survivors)} "
+            f"rejected={max(0, len(raw)-len(survivors))} survivors={survivor_symbols}"
+        )
+    return survivors
 
 
 def get_best_profit_candidate(scans):
@@ -3772,7 +3806,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
     }
     _v16_save_portfolio_plan(plan)
     print(
-        f"V17.0.13 LIVE-GATE-ALIGNED FULL-BUY PLAN | scans={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
+        f"V17.0.14 SINGLE-SOURCE FULL-BUY PLAN | gate_eligible={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
         f"rejected={rejected_count} waiting={waiting_count} actionable={len(actionable_ranked)} "
         f"order_limit={order_limit} deploy=${allocated:.2f} reserve={reserve_pct*100:.1f}% allocations="
         + ",".join(f"{a['symbol']}=${a['notionalUsd']:.2f}" for a in allocations)
@@ -3808,18 +3842,19 @@ def api_v16_portfolio_status(request: Request):
             # through the exact same entry gates used by money_mode_buy(), but
             # read-only so a status refresh cannot create duplicate evidence.
             raw_scans = list(latest_scans)
-            gate_eligible = pick_money_mode_stocks(
+            gate_eligible = v17_live_entry_gate_pipeline(
                 raw_scans,
                 persist_decisions=False,
                 log_rejections=False,
+                log_summary=False,
             )
             payload = build_v16_portfolio_plan(gate_eligible, manual=False).get("plan") or payload
             payload["source"] = "latest_live_scans_after_live_gates"
             payload["rawScanCount"] = len(raw_scans)
             payload["gateEligibleCount"] = len(gate_eligible)
-            payload["plannerAlignmentVersion"] = "V17.0.13"
+            payload["plannerAlignmentVersion"] = "V17.0.14"
         except Exception as exc:
-            print(f"V17.0.13 PORTFOLIO STATUS REFRESH ERROR: {exc}")
+            print(f"V17.0.14 PORTFOLIO STATUS REFRESH ERROR: {exc}")
             payload["refreshError"] = str(exc)
 
     payload.setdefault("enabled", AI_PORTFOLIO_MANAGER_ENABLED)
@@ -3881,7 +3916,12 @@ def money_mode_buy(scans, manual=False):
     if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
         return f"BUY BLOCKED | PDT-aware max new buys today reached ({MAX_NEW_BUYS_PER_DAY_PDT_AWARE})"
 
-    picks = pick_money_mode_stocks(scans)
+    picks = v17_live_entry_gate_pipeline(
+        scans,
+        persist_decisions=True,
+        log_rejections=True,
+        log_summary=True,
+    )
     if manual and not picks:
         if A_PLUS_BLOCK_LOW_CONFIDENCE_MANUAL_BUY:
             return "No A+ sniper candidates ready. Manual Money Buy blocked by Trade Quality Gate."
@@ -8393,9 +8433,15 @@ def run_bot_loop():
                 # dashboard stuck on WAITING_FOR_PLAN.
                 if AI_PORTFOLIO_MANAGER_ENABLED:
                     try:
-                        build_v16_portfolio_plan(scans, manual=False)
+                        gate_eligible = v17_live_entry_gate_pipeline(
+                            scans,
+                            persist_decisions=False,
+                            log_rejections=False,
+                            log_summary=True,
+                        )
+                        build_v16_portfolio_plan(gate_eligible, manual=False)
                     except Exception as portfolio_error:
-                        print(f"V16 PORTFOLIO AUTO-PUBLISH ERROR: {portfolio_error}")
+                        print(f"V17.0.14 PORTFOLIO AUTO-PUBLISH ERROR: {portfolio_error}")
 
                 if bot_enabled and not emergency_stop:
                     manage_money_mode_positions()
