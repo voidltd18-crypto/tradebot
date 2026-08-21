@@ -32,7 +32,7 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
     }
 
     load();
-    if (target.mode === "live") timer = window.setInterval(load, 30000);
+    if (target.mode === "live") timer = window.setInterval(load, 5000);
     return () => { cancelled = true; if (timer) window.clearInterval(timer); };
   }, [target, authToken]);
 
@@ -40,7 +40,7 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
     const dt = new Date(String(p.time || ""));
     return {
       ...p,
-      label: Number.isFinite(dt.getTime()) ? dt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }) : String(p.time || ""),
+      label: Number.isFinite(dt.getTime()) ? dt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : String(p.time || ""),
       price: Number(p.price || 0),
     };
   }), [payload?.points]);
@@ -58,6 +58,20 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
   const trailFloor = Number(last.trailFloor || 0);
   const stop = Number(last.stop || first.stop || 0);
   const trailingActive = Boolean(last.trailingActive);
+
+  // V17.1.1: auto-zoom to the movement that matters while still keeping the
+  // trade's entry/risk/profit reference levels visible. This avoids a tiny
+  // $0.02 move being flattened inside an arbitrary multi-dollar axis.
+  const yValues: number[] = chart.map((p: AnyObj) => Number(p.price || 0)).filter((v: number) => Number.isFinite(v) && v > 0);
+  [entry, stop, trailStart, trailingActive ? trailFloor : 0].forEach((v) => { if (Number.isFinite(v) && v > 0) yValues.push(v); });
+  let yDomain: [number, number] | [string, string] = ["auto", "auto"];
+  if (yValues.length) {
+    const low = Math.min(...yValues);
+    const high = Math.max(...yValues);
+    const spread = Math.max(high - low, Math.max(0.02, entry * 0.0025));
+    const pad = Math.max(spread * 0.12, Math.max(0.01, entry * 0.001));
+    yDomain = [Math.max(0, low - pad), high + pad];
+  }
 
   return <div className="replay-backdrop" onMouseDown={onClose}>
     <section className="replay-modal" onMouseDown={(e) => e.stopPropagation()}>
@@ -84,7 +98,7 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
             <LineChart data={chart} margin={{ top: 12, right: 24, bottom: 8, left: 8 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#263450" />
               <XAxis dataKey="label" stroke="#94a3b8" minTickGap={28} />
-              <YAxis stroke="#94a3b8" domain={["auto", "auto"]} tickFormatter={(v) => `$${Number(v).toFixed(2)}`} />
+              <YAxis stroke="#94a3b8" domain={yDomain as any} allowDataOverflow={false} tickFormatter={(v) => `$${Number(v).toFixed(2)}`} />
               <Tooltip labelFormatter={(label) => `Time ${label}`} formatter={(value: any, name: any) => [usd(value), name === "price" ? "Price" : name]} />
               {entry > 0 && <ReferenceLine y={entry} stroke="#38bdf8" strokeDasharray="6 5" label={{ value: `Entry ${usd(entry)}`, fill: "#7dd3fc", position: "insideTopLeft" }} />}
               {trailStart > 0 && <ReferenceLine y={trailStart} stroke="#facc15" strokeDasharray="6 5" label={{ value: `Trail start ${usd(trailStart)}`, fill: "#fde047", position: "insideTopRight" }} />}
@@ -95,7 +109,7 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
           </ResponsiveContainer>
         </div>
         <div className="replay-footer">
-          <span>{chart.length} saved points · approximately every {Number(payload?.sampleSeconds || 60)} seconds</span>
+          <span>{chart.length} saved points · recording every ~{Number(payload?.sampleSeconds || 10)} seconds · live refresh 5 seconds</span>
           <span>{session.startedAt ? `Recording since ${new Date(session.startedAt).toLocaleString("en-GB")}` : ""}</span>
         </div>
       </>}

@@ -8484,11 +8484,16 @@ def replenish_locked_universe_if_needed() -> Dict[str, Any]:
 # V17.1 TRADE REPLAY / PERSISTENT PRICE HISTORY
 # =========================
 TRADE_REPLAY_ENABLED = os.getenv("TRADE_REPLAY_ENABLED", "true").lower() == "true"
-TRADE_REPLAY_SAMPLE_SECONDS = max(15, int(os.getenv("TRADE_REPLAY_SAMPLE_SECONDS", "60")))
+# V17.1.1: 10-second live capture. This has its own lightweight worker so the
+# main trading/scanner cadence remains unchanged. A floor of 5s prevents an
+# accidental environment setting from hammering SQLite/broker state.
+TRADE_REPLAY_SAMPLE_SECONDS = max(5, int(os.getenv("TRADE_REPLAY_SAMPLE_SECONDS", "10")))
 TRADE_REPLAY_MAX_POINTS = max(500, int(os.getenv("TRADE_REPLAY_MAX_POINTS", "5000")))
 _trade_replay_last_sample: Dict[str, float] = {}
 _trade_replay_schema_ready = False
 _trade_replay_schema_lock = threading.RLock()
+_trade_replay_record_lock = threading.Lock()
+trade_replay_thread_started = False
 
 
 def _trade_replay_ensure_tables() -> None:
@@ -8582,14 +8587,17 @@ def _trade_replay_open_session(conn, position: Dict[str, Any], now_iso: str) -> 
 
 
 def record_trade_replay_snapshot(market_open: Optional[bool] = None) -> Dict[str, Any]:
-    """Persist one price point per open position at a storage-safe cadence.
+    """Persist one price point per open position at the replay cadence.
 
     This intentionally runs even when the regular market is closed so any quote
     updates available from the broker/feed (pre-market/after-hours included) can
-    be preserved for the chart.
+    be preserved for the chart. V17.1.1 serialises recorder calls because both
+    the main bot loop and the dedicated recorder worker may request a sample.
     """
     if not SQLITE_ENABLED or not TRADE_REPLAY_ENABLED:
         return {"ok": False, "enabled": False, "recorded": 0}
+    if not _trade_replay_record_lock.acquire(blocking=False):
+        return {"ok": True, "enabled": True, "recorded": 0, "busy": True}
     try:
         _trade_replay_ensure_tables()
         positions = get_all_positions()
@@ -8634,8 +8642,31 @@ def record_trade_replay_snapshot(market_open: Optional[bool] = None) -> Dict[str
         conn.commit(); conn.close()
         return {"ok": True, "enabled": True, "recorded": recorded}
     except Exception as exc:
-        print(f"V17.1 TRADE REPLAY RECORD ERROR: {exc}")
+        print(f"V17.1.1 TRADE REPLAY RECORD ERROR: {exc}")
         return {"ok": False, "enabled": True, "recorded": 0, "error": str(exc)}
+    finally:
+        _trade_replay_record_lock.release()
+
+
+def trade_replay_recorder_worker() -> None:
+    """High-frequency replay capture isolated from the trading decision loop."""
+    print(f"V17.1.1 TRADE REPLAY RECORDER | interval={TRADE_REPLAY_SAMPLE_SECONDS}s")
+    # Small startup delay lets account/broker state initialise normally.
+    time.sleep(2)
+    while True:
+        try:
+            # get_all_positions already reads live position data; market-open is
+            # informational for the saved point and does not control recording.
+            try:
+                is_open = bool(trading_client.get_clock().is_open)
+            except Exception:
+                is_open = False
+            record_trade_replay_snapshot(is_open)
+        except Exception as exc:
+            print(f"V17.1.1 TRADE REPLAY WORKER ERROR: {exc}")
+        # Wake more often than the sample cadence; record_trade_replay_snapshot
+        # decides whether a symbol is actually due.
+        time.sleep(max(1.0, min(2.0, TRADE_REPLAY_SAMPLE_SECONDS / 4.0)))
 
 
 def _trade_replay_close_for_trade(trade: Dict[str, Any], closed_trade_id: Optional[int] = None) -> None:
@@ -8852,7 +8883,7 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started
     # Initialise the shared SQLite schema synchronously before any worker threads start.
     # This removes the startup race where multiple workers all tried to create tables.
     init_db()
@@ -8872,6 +8903,9 @@ def startup_event():
     if not bot_thread_started:
         bot_thread_started = True
         threading.Thread(target=run_bot_loop, daemon=True).start()
+    if TRADE_REPLAY_ENABLED and not trade_replay_thread_started:
+        trade_replay_thread_started = True
+        threading.Thread(target=trade_replay_recorder_worker, daemon=True, name="v17-trade-replay-recorder").start()
     if V6_BRAINS_ENABLED and V6_AUTO_SYNC_ENABLED and not AI_RESEARCH_CLOSED_MARKET_ONLY and not v6_sync_thread_started:
         v6_sync_thread_started = True
         threading.Thread(target=v6_auto_sync_worker, daemon=True).start()
