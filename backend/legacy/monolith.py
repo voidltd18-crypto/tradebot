@@ -486,6 +486,7 @@ locked_universe_runtime_cache: Dict[str, Any] = {"day": "", "symbols": [], "rows
 
 latest_status: Dict[str, Any] = {}
 latest_scans: List[Dict[str, Any]] = []
+v174_final_gate_last_event: Dict[str, Any] = {}
 
 trade_events: List[Dict[str, Any]] = []
 trade_history: List[Dict[str, Any]] = []
@@ -3919,6 +3920,105 @@ def _v16_load_portfolio_plan() -> Dict[str, Any]:
         return {"ok": True, "version": AI_PORTFOLIO_MANAGER_VERSION, "enabled": AI_PORTFOLIO_MANAGER_ENABLED, "status": "WAITING_FOR_PLAN", "allocations": []}
 
 
+def _v174_final_gate_monitor_payload() -> Dict[str, Any]:
+    """Compact frontend view of the candidate(s) that reached the final pre-order gate.
+
+    The monitor is intentionally derived from the saved V16/V17 portfolio plan, whose
+    input has already passed the single-source live entry pipeline. This prevents the
+    frontend from presenting a raw scanner candidate as FINAL GATE when the real trader
+    would still reject it at Sniper/A+/Trigger/V2.
+    """
+    try:
+        plan = _v16_load_portfolio_plan() or {}
+        qualified = list(plan.get("qualifiedCandidates") or [])
+        allocations = list(plan.get("allocations") or [])
+        decisions = list(plan.get("decisions") or [])
+        allocation_by_symbol = {
+            str(row.get("symbol") or "").upper(): row
+            for row in allocations
+            if str(row.get("symbol") or "").strip()
+        }
+
+        candidates = []
+        for row in qualified[:8]:
+            symbol = str(row.get("symbol") or "").upper().strip()
+            if not symbol:
+                continue
+            allocation = allocation_by_symbol.get(symbol) or {}
+            deployable = bool(row.get("deployableNow") or allocation)
+            candidates.append({
+                "rank": int(row.get("rank") or len(candidates) + 1),
+                "symbol": symbol,
+                "portfolioScore": round(float(row.get("portfolioScore") or 0.0), 4),
+                "minimumScore": round(float(plan.get("minimumPortfolioScore") or 0.0), 4),
+                "confidence": round(float(row.get("confidence") or 0.0), 4),
+                "confidenceLabel": str(row.get("confidenceLabel") or ""),
+                "quality": round(float(row.get("quality") or 0.0), 6),
+                "spread": round(float(row.get("spread") or 0.0), 6),
+                "deployableNow": deployable,
+                "plannedNotionalUsd": round(float(allocation.get("notionalUsd") or 0.0), 2),
+                "plannedNotionalGbp": round(float(allocation.get("notionalGbp") or 0.0), 2),
+                "gate": "FINAL_GATE",
+                "nextStep": "FULL_BUY_EXECUTION_LOCK" if deployable else "WAITING_FOR_CAPACITY",
+            })
+
+        top = candidates[0] if candidates else None
+        actionable = int(plan.get("actionableCount") or 0)
+        qualified_count = int(plan.get("qualifiedCount") or len(candidates))
+        order_limit = int(plan.get("orderLimit") or 0)
+        if top and actionable > 0:
+            state_name = "FINAL_GATE_READY"
+            headline = f"{top['symbol']} reached the final gate"
+            detail = "All live entry gates and portfolio score passed. Next step: final execution lock / order submission."
+        elif top:
+            state_name = "FINAL_GATE_WAITING"
+            headline = f"{top['symbol']} reached the final gate"
+            detail = "Qualified at the final gate but waiting for portfolio capacity, buying power, or the daily order limit."
+        else:
+            state_name = "NO_FINAL_GATE_CANDIDATE"
+            headline = "No stock at the final gate yet"
+            detail = "The live scanner is still filtering candidates through the entry gates."
+
+        rejected = [
+            {
+                "symbol": str(d.get("symbol") or ""),
+                "reasonCode": str(d.get("reasonCode") or ""),
+                "reason": str(d.get("reason") or ""),
+                "portfolioScore": round(float(d.get("portfolioScore") or 0.0), 4),
+            }
+            for d in decisions
+            if d.get("decision") == "REJECTED"
+        ][:5]
+
+        return {
+            "ok": True,
+            "version": "V17.4-FINAL-GATE-MONITOR",
+            "state": state_name,
+            "headline": headline,
+            "detail": detail,
+            "updatedAt": plan.get("createdAt"),
+            "planStatus": plan.get("status"),
+            "thresholdMode": plan.get("thresholdMode"),
+            "minimumPortfolioScore": round(float(plan.get("minimumPortfolioScore") or 0.0), 4),
+            "qualifiedCount": qualified_count,
+            "actionableCount": actionable,
+            "orderLimit": order_limit,
+            "topCandidate": top,
+            "candidates": candidates,
+            "recentRejects": rejected,
+            "lastEvent": dict(v174_final_gate_last_event or {}),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "version": "V17.4-FINAL-GATE-MONITOR",
+            "state": "MONITOR_ERROR",
+            "headline": "Final gate monitor unavailable",
+            "detail": str(exc),
+            "candidates": [],
+        }
+
+
 def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) -> Dict[str, Any]:
     account = get_account()
     equity = float(account.equity)
@@ -4404,6 +4504,16 @@ def money_mode_buy(scans, manual=False):
                     f"planned=${planned_notional:.2f} live_buying_power=${live_buying_power:.2f} "
                     f"buffer=${full_buffer:.2f} final=${notional:.2f}"
                 )
+                v174_final_gate_last_event.clear()
+                v174_final_gate_last_event.update({
+                    "type": "EXECUTION_LOCK",
+                    "symbol": symbol,
+                    "at": datetime.now(UTC).isoformat(),
+                    "plannedNotionalUsd": planned_notional,
+                    "finalNotionalUsd": notional,
+                    "liveBuyingPowerUsd": round(live_buying_power, 2),
+                    "message": f"{symbol} passed the final gate and reached the full-buy execution lock.",
+                })
             except Exception as full_buy_exc:
                 print(f"V17.0.7 FULL BUY EXECUTION LOCK ERROR | symbol={symbol} error={full_buy_exc}")
 
@@ -4414,6 +4524,16 @@ def money_mode_buy(scans, manual=False):
         reason = f"{'MANUAL' if manual else 'AUTO'} V16 PORTFOLIO #{allocation.get('rank', bought + 1)} {label} BUY"
         try:
             market_buy_notional(symbol, notional, reason=reason, scan=c)
+            v174_final_gate_last_event.clear()
+            v174_final_gate_last_event.update({
+                "type": "BUY_SENT",
+                "symbol": symbol,
+                "at": datetime.now(UTC).isoformat(),
+                "finalNotionalUsd": round(notional, 2),
+                "portfolioScore": round(float(allocation.get("portfolioScore") or 0.0), 4),
+                "confidence": round(float(confidence or 0.0), 4),
+                "message": f"{symbol} cleared the final gate and the buy order was submitted.",
+            })
             record_v2_setup_decision(c, "BOUGHT", "v16_portfolio_order_submitted", reason, c.get("v2Expectancy") or {})
             state[symbol]["ref"] = c["price"]
             state[symbol]["highest_since_entry"] = c["price"]
@@ -8398,6 +8518,12 @@ def _quick_live_status_payload() -> Dict[str, Any]:
     }
 
 
+@app.get("/final-gate-monitor")
+def api_final_gate_monitor(request: Request):
+    verify_api_key(request)
+    return _v174_final_gate_monitor_payload()
+
+
 @app.get("/status")
 def get_status():
     # Never return an empty shell while the background loop is still warming up.
@@ -8424,6 +8550,7 @@ def get_status():
     payload.pop("stockMemory", None)
     payload["statusPayloadMode"] = "compact-live"
     payload["fullHistoryAvailableFrom"] = "/reports"
+    payload["finalGateMonitor"] = _v174_final_gate_monitor_payload()
     return payload
 
 
