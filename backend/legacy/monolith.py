@@ -146,6 +146,33 @@ STOP_LOSS = 0.960
 TRAIL_START = 1.060
 TRAIL_GIVEBACK = 0.980
 
+# V17.2 — continuation-aware trailing profit protection.
+# A strong winner gets ONE confirmation cycle after a very shallow trail-floor
+# breach. The protected floor is never moved down; a deeper breach still exits
+# immediately. This is designed to filter brief opening/quote whipsaws without
+# returning to the old behaviour of letting a large winner evaporate.
+ADAPTIVE_RUNNER_TRAIL_ENABLED = os.getenv("ADAPTIVE_RUNNER_TRAIL_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+ADAPTIVE_RUNNER_MIN_CURRENT_PNL_PCT = float(os.getenv("ADAPTIVE_RUNNER_MIN_CURRENT_PNL_PCT", "5.0") or 5.0)
+ADAPTIVE_RUNNER_MIN_PEAK_PNL_PCT = float(os.getenv("ADAPTIVE_RUNNER_MIN_PEAK_PNL_PCT", "6.0") or 6.0)
+ADAPTIVE_RUNNER_MAX_SHALLOW_BREACH_PCT = float(os.getenv("ADAPTIVE_RUNNER_MAX_SHALLOW_BREACH_PCT", "0.30") or 0.30)
+ADAPTIVE_RUNNER_MAX_NEGATIVE_MOMENTUM = float(os.getenv("ADAPTIVE_RUNNER_MAX_NEGATIVE_MOMENTUM", "-0.020") or -0.020)
+ADAPTIVE_RUNNER_CONFIRMATION_CHECKS = max(1, int(os.getenv("ADAPTIVE_RUNNER_CONFIRMATION_CHECKS", "2") or 2))
+
+# V17.3 — Peak Exhaustion / Failed Breakout Exit
+# Uses the persisted 10-second Trade Replay curve to detect repeated tests of
+# the same local high. A touch alone never sells: the position must have made
+# a worthwhile peak, recorded several time-separated peak tests, and then
+# rejected materially from that peak while remaining profitable.
+PEAK_EXHAUSTION_ENABLED = os.getenv("PEAK_EXHAUSTION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+PEAK_EXHAUSTION_REQUIRED_TOUCHES = max(3, int(os.getenv("PEAK_EXHAUSTION_REQUIRED_TOUCHES", "4") or 4))
+PEAK_EXHAUSTION_TOLERANCE_PCT = max(0.05, float(os.getenv("PEAK_EXHAUSTION_TOLERANCE_PCT", "0.20") or 0.20))
+PEAK_EXHAUSTION_MIN_SECONDS_BETWEEN_TOUCHES = max(20, int(os.getenv("PEAK_EXHAUSTION_MIN_SECONDS_BETWEEN_TOUCHES", "60") or 60))
+PEAK_EXHAUSTION_MIN_PEAK_PNL_PCT = max(0.0, float(os.getenv("PEAK_EXHAUSTION_MIN_PEAK_PNL_PCT", "2.0") or 2.0))
+PEAK_EXHAUSTION_MIN_CURRENT_PNL_PCT = max(0.0, float(os.getenv("PEAK_EXHAUSTION_MIN_CURRENT_PNL_PCT", "0.25") or 0.25))
+PEAK_EXHAUSTION_REJECTION_PCT = max(0.10, float(os.getenv("PEAK_EXHAUSTION_REJECTION_PCT", "0.50") or 0.50))
+PEAK_EXHAUSTION_LOOKBACK_POINTS = max(100, int(os.getenv("PEAK_EXHAUSTION_LOOKBACK_POINTS", "3000") or 3000))
+PEAK_EXHAUSTION_MARKET_OPEN_ONLY = os.getenv("PEAK_EXHAUSTION_MARKET_OPEN_ONLY", "true").lower() in ("1", "true", "yes", "on")
+
 MAX_DAILY_LOSS = -100.00
 MAX_TRADES_PER_DAY = 12
 DUST_THRESHOLD = 0.1
@@ -1000,6 +1027,17 @@ def get_all_positions():
                 "emergencyStopPrice": emergency_stop_price,
                 "trailStartPct": trail_start_pct,
                 "trailGivebackPct": trail_giveback_pct,
+                "runnerTrailEnabled": bool(ADAPTIVE_RUNNER_TRAIL_ENABLED),
+                "runnerGraceActive": bool(int(state[symbol].get("runner_trail_breach_count") or 0) > 0),
+                "runnerGraceCheck": int(state[symbol].get("runner_trail_breach_count") or 0),
+                "runnerGraceRequired": int(ADAPTIVE_RUNNER_CONFIRMATION_CHECKS),
+                "runnerLastBreachPct": float(state[symbol].get("runner_trail_last_breach_pct") or 0.0),
+                "peakExhaustionEnabled": bool(PEAK_EXHAUSTION_ENABLED),
+                "peakExhaustionTouches": int(state[symbol].get("peak_exhaustion_touch_count") or 0),
+                "peakExhaustionRequired": int(PEAK_EXHAUSTION_REQUIRED_TOUCHES),
+                "peakExhaustionPeak": float(state[symbol].get("peak_exhaustion_peak") or 0.0),
+                "peakExhaustionArmed": bool(state[symbol].get("peak_exhaustion_armed") or False),
+                "peakExhaustionRejectPct": float(state[symbol].get("peak_exhaustion_reject_pct") or 0.0),
                 "aiRiskProfile": risk_profile,
                 "inUniverse": symbol in current_universe,
                 "custom": bool(state.get(symbol, {}).get("custom")),
@@ -3269,6 +3307,251 @@ def maybe_rotate_weakest_into_best(scans):
         return f"ROTATION ERROR | {e}"
 
 
+def _v17_runner_trail_state(symbol: str) -> Dict[str, Any]:
+    ensure_symbol_state(symbol)
+    st = state[symbol]
+    if "runner_trail_breach_count" not in st:
+        st["runner_trail_breach_count"] = 0
+    if "runner_trail_last_reason" not in st:
+        st["runner_trail_last_reason"] = ""
+    if "runner_trail_last_breach_pct" not in st:
+        st["runner_trail_last_breach_pct"] = 0.0
+    return st
+
+
+def _v17_reset_runner_trail(symbol: str) -> None:
+    st = _v17_runner_trail_state(symbol)
+    st["runner_trail_breach_count"] = 0
+    st["runner_trail_last_reason"] = ""
+    st["runner_trail_last_breach_pct"] = 0.0
+
+
+def _v17_runner_trail_decision(p: Dict[str, Any], trail_floor: float) -> Dict[str, Any]:
+    """Return whether a breached trailing floor should sell now or get one grace check.
+
+    The trail floor itself is NEVER loosened. Grace is only available to an
+    already-strong winner when the breach is very shallow and recent momentum
+    is not collapsing. A persistent second breach exits normally.
+    """
+    symbol = str(p.get("symbol") or "").upper()
+    price = float(p.get("price") or 0.0)
+    entry = float(p.get("entry") or 0.0)
+    highest = float(p.get("highest") or 0.0)
+    pnl_pct = float(p.get("pnlPct") or 0.0)
+    st = _v17_runner_trail_state(symbol)
+
+    if not ADAPTIVE_RUNNER_TRAIL_ENABLED or price <= 0 or trail_floor <= 0 or entry <= 0:
+        _v17_reset_runner_trail(symbol)
+        return {"sell": True, "grace": False, "reason": "runner disabled/ineligible"}
+
+    # Any recovery above the protected floor clears a previous test breach.
+    if price > trail_floor:
+        if int(st.get("runner_trail_breach_count") or 0) > 0:
+            print(f"V17.2 RUNNER RECOVERED | {symbol} price={price:.2f} floor={trail_floor:.2f}")
+        _v17_reset_runner_trail(symbol)
+        return {"sell": False, "grace": False, "reason": "above floor"}
+
+    breach_pct = max(0.0, ((trail_floor - price) / trail_floor) * 100.0)
+    peak_pnl_pct = ((highest / entry) - 1.0) * 100.0 if highest > 0 and entry > 0 else pnl_pct
+    try:
+        short_momentum = float(compute_short_momentum(symbol, price))
+    except Exception:
+        short_momentum = 0.0
+
+    qualifies = (
+        pnl_pct >= ADAPTIVE_RUNNER_MIN_CURRENT_PNL_PCT
+        and peak_pnl_pct >= ADAPTIVE_RUNNER_MIN_PEAK_PNL_PCT
+        and breach_pct <= ADAPTIVE_RUNNER_MAX_SHALLOW_BREACH_PCT
+        and short_momentum >= ADAPTIVE_RUNNER_MAX_NEGATIVE_MOMENTUM
+    )
+    if not qualifies:
+        _v17_reset_runner_trail(symbol)
+        return {
+            "sell": True, "grace": False,
+            "reason": f"breach={breach_pct:.3f}% pnl={pnl_pct:.2f}% peak={peak_pnl_pct:.2f}% momentum={short_momentum:.4f}",
+            "breachPct": breach_pct, "peakPnlPct": peak_pnl_pct, "momentum": short_momentum,
+        }
+
+    count = int(st.get("runner_trail_breach_count") or 0) + 1
+    st["runner_trail_breach_count"] = count
+    st["runner_trail_last_breach_pct"] = breach_pct
+    st["runner_trail_last_reason"] = "SHALLOW_CONTINUATION_BREACH"
+
+    if count < ADAPTIVE_RUNNER_CONFIRMATION_CHECKS:
+        print(
+            f"V17.2 RUNNER GRACE HOLD | {symbol} check={count}/{ADAPTIVE_RUNNER_CONFIRMATION_CHECKS} "
+            f"price={price:.2f} floor={trail_floor:.2f} breach={breach_pct:.3f}% "
+            f"pnl={pnl_pct:.2f}% peak={peak_pnl_pct:.2f}% momentum={short_momentum:.4f}"
+        )
+        return {
+            "sell": False, "grace": True, "reason": "shallow continuation breach",
+            "check": count, "breachPct": breach_pct, "peakPnlPct": peak_pnl_pct, "momentum": short_momentum,
+        }
+
+    print(
+        f"V17.2 RUNNER CONFIRMED EXIT | {symbol} check={count}/{ADAPTIVE_RUNNER_CONFIRMATION_CHECKS} "
+        f"price={price:.2f} floor={trail_floor:.2f} breach={breach_pct:.3f}% "
+        f"pnl={pnl_pct:.2f}% peak={peak_pnl_pct:.2f}% momentum={short_momentum:.4f}"
+    )
+    _v17_reset_runner_trail(symbol)
+    return {
+        "sell": True, "grace": False, "reason": "confirmed trailing breach",
+        "check": count, "breachPct": breach_pct, "peakPnlPct": peak_pnl_pct, "momentum": short_momentum,
+    }
+
+
+
+def _v17_peak_exhaustion_state(symbol: str) -> Dict[str, Any]:
+    ensure_symbol_state(symbol)
+    st = state[symbol]
+    st.setdefault("peak_exhaustion_touch_count", 0)
+    st.setdefault("peak_exhaustion_peak", 0.0)
+    st.setdefault("peak_exhaustion_armed", False)
+    st.setdefault("peak_exhaustion_reject_pct", 0.0)
+    st.setdefault("peak_exhaustion_last_eval", "")
+    return st
+
+
+def _v17_reset_peak_exhaustion(symbol: str) -> None:
+    st = _v17_peak_exhaustion_state(symbol)
+    st["peak_exhaustion_touch_count"] = 0
+    st["peak_exhaustion_peak"] = 0.0
+    st["peak_exhaustion_armed"] = False
+    st["peak_exhaustion_reject_pct"] = 0.0
+    st["peak_exhaustion_last_eval"] = ""
+
+
+def _v17_peak_exhaustion_decision(p: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluate repeated failed tests of the persisted Trade Replay peak.
+
+    A 'touch' is a market-open replay sample within PEAK_EXHAUSTION_TOLERANCE_PCT
+    of the session's highest recorded price. Touches are clustered by time so
+    ten-second samples from one visit to resistance count as ONE attempt.
+
+    The rule is intentionally conservative: it only exits after the required
+    number of distinct attempts AND a subsequent rejection from the peak. This
+    avoids selling simply because a strong trend sits near fresh highs.
+    """
+    symbol = str(p.get("symbol") or "").upper()
+    price = float(p.get("price") or 0.0)
+    entry = float(p.get("entry") or 0.0)
+    pnl_pct = float(p.get("pnlPct") or 0.0)
+    st = _v17_peak_exhaustion_state(symbol)
+
+    if not PEAK_EXHAUSTION_ENABLED or not SQLITE_ENABLED or not TRADE_REPLAY_ENABLED or not symbol or price <= 0 or entry <= 0:
+        _v17_reset_peak_exhaustion(symbol)
+        return {"sell": False, "eligible": False, "reason": "disabled/ineligible"}
+
+    try:
+        _trade_replay_ensure_tables()
+        conn = db_connect()
+        session = conn.execute(
+            "SELECT id FROM trade_replay_sessions WHERE symbol=? AND status='OPEN' ORDER BY id DESC LIMIT 1",
+            (symbol,),
+        ).fetchone()
+        if not session:
+            conn.close()
+            return {"sell": False, "eligible": False, "reason": "no replay session"}
+        rows = conn.execute(
+            """SELECT observed_at,price,market_open FROM trade_replay_points
+               WHERE session_id=? ORDER BY observed_at DESC LIMIT ?""",
+            (int(session["id"]), int(PEAK_EXHAUSTION_LOOKBACK_POINTS)),
+        ).fetchall()
+        conn.close()
+    except Exception as exc:
+        return {"sell": False, "eligible": False, "reason": f"replay read failed: {exc}"}
+
+    pts = []
+    for row in reversed(rows):
+        try:
+            px = float(row["price"] or 0.0)
+            if px <= 0:
+                continue
+            if PEAK_EXHAUSTION_MARKET_OPEN_ONLY and not bool(row["market_open"]):
+                continue
+            ts_raw = str(row["observed_at"] or "")
+            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            pts.append((ts, px))
+        except Exception:
+            continue
+
+    if len(pts) < PEAK_EXHAUSTION_REQUIRED_TOUCHES:
+        st["peak_exhaustion_touch_count"] = 0
+        st["peak_exhaustion_armed"] = False
+        return {"sell": False, "eligible": False, "reason": "not enough replay samples"}
+
+    peak = max(px for _, px in pts)
+    peak_pnl_pct = ((peak / entry) - 1.0) * 100.0
+    if peak_pnl_pct < PEAK_EXHAUSTION_MIN_PEAK_PNL_PCT:
+        st["peak_exhaustion_peak"] = peak
+        st["peak_exhaustion_touch_count"] = 0
+        st["peak_exhaustion_armed"] = False
+        return {"sell": False, "eligible": False, "reason": f"peak pnl {peak_pnl_pct:.2f}% below minimum"}
+
+    touch_floor = peak * (1.0 - PEAK_EXHAUSTION_TOLERANCE_PCT / 100.0)
+    touch_times = []
+    last_touch_ts = None
+    for ts, px in pts:
+        if px < touch_floor:
+            continue
+        if last_touch_ts is None or (ts - last_touch_ts).total_seconds() >= PEAK_EXHAUSTION_MIN_SECONDS_BETWEEN_TOUCHES:
+            touch_times.append(ts)
+            last_touch_ts = ts
+
+    touches = len(touch_times)
+    reject_pct = max(0.0, ((peak - price) / peak) * 100.0) if peak > 0 else 0.0
+    armed = touches >= PEAK_EXHAUSTION_REQUIRED_TOUCHES
+    st["peak_exhaustion_touch_count"] = touches
+    st["peak_exhaustion_peak"] = peak
+    st["peak_exhaustion_armed"] = armed
+    st["peak_exhaustion_reject_pct"] = reject_pct
+    st["peak_exhaustion_last_eval"] = datetime.now(UTC).isoformat()
+
+    if touches > 0:
+        previous_logged = int(st.get("peak_exhaustion_last_logged_touches") or 0)
+        if touches != previous_logged:
+            print(
+                f"V17.3 PEAK RETEST | {symbol} attempts={touches}/{PEAK_EXHAUSTION_REQUIRED_TOUCHES} "
+                f"peak={peak:.2f} tolerance={PEAK_EXHAUSTION_TOLERANCE_PCT:.2f}% "
+                f"current={price:.2f} peak_pnl={peak_pnl_pct:.2f}%"
+            )
+            st["peak_exhaustion_last_logged_touches"] = touches
+
+    if not armed:
+        return {
+            "sell": False, "eligible": True, "armed": False, "touches": touches,
+            "peak": peak, "peakPnlPct": peak_pnl_pct, "rejectPct": reject_pct,
+            "reason": "collecting peak attempts",
+        }
+
+    # Once armed, require an actual rejection rather than selling merely because
+    # price revisits the high. This keeps clean breakouts alive.
+    if pnl_pct < PEAK_EXHAUSTION_MIN_CURRENT_PNL_PCT:
+        return {
+            "sell": False, "eligible": True, "armed": True, "touches": touches,
+            "peak": peak, "rejectPct": reject_pct,
+            "reason": f"current pnl {pnl_pct:.2f}% below protected-profit minimum",
+        }
+
+    if reject_pct < PEAK_EXHAUSTION_REJECTION_PCT:
+        return {
+            "sell": False, "eligible": True, "armed": True, "touches": touches,
+            "peak": peak, "rejectPct": reject_pct,
+            "reason": "peak exhaustion armed; waiting for rejection",
+        }
+
+    print(
+        f"V17.3 PEAK EXHAUSTION EXIT | {symbol} attempts={touches}/{PEAK_EXHAUSTION_REQUIRED_TOUCHES} "
+        f"peak={peak:.2f} current={price:.2f} rejection={reject_pct:.2f}% "
+        f"current_pnl={pnl_pct:.2f}% peak_pnl={peak_pnl_pct:.2f}%"
+    )
+    return {
+        "sell": True, "eligible": True, "armed": True, "touches": touches,
+        "peak": peak, "peakPnlPct": peak_pnl_pct, "rejectPct": reject_pct,
+        "reason": "repeated peak tests followed by failed breakout rejection",
+    }
+
+
 def manage_money_mode_positions():
     for p in get_all_positions():
         symbol = p["symbol"]
@@ -3295,6 +3578,7 @@ def manage_money_mode_positions():
 
                 market_sell_qty(symbol, qty, entry=entry, price=price, reason="FAST EXIT STOP LOSS")
                 state[symbol]["highest_since_entry"] = None
+                _v17_reset_peak_exhaustion(symbol)
                 print(f"FAST EXIT STOP LOSS SELL {qty:.6f} {symbol}")
             except Exception as e:
                 print(f"SELL ERROR {symbol}: {e}")
@@ -3309,6 +3593,7 @@ def manage_money_mode_positions():
             try:
                 market_sell_qty(symbol, qty, entry=entry, price=price, reason="AI RISK EMERGENCY STOP")
                 state[symbol]["highest_since_entry"] = None
+                _v17_reset_peak_exhaustion(symbol)
                 print(f"AI RISK EMERGENCY STOP {symbol} | pnl={p['pnlPct']:.2f}% limit=-{emergency_stop_pct:.2f}%")
             except Exception as e:
                 print(f"EMERGENCY SELL ERROR {symbol}: {e}")
@@ -3320,8 +3605,27 @@ def manage_money_mode_positions():
 
                 market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
                 state[symbol]["highest_since_entry"] = None
+                _v17_reset_peak_exhaustion(symbol)
             except Exception as e:
                 print(f"SELL ERROR {symbol}: {e}")
+            continue
+
+        peak_exit = _v17_peak_exhaustion_decision(p)
+        if peak_exit.get("sell"):
+            try:
+                if pdt_aware_should_avoid_sell(symbol, "PEAK EXHAUSTION PROFIT", p["pnlPct"], allow_hard_stop=False):
+                    continue
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason="PEAK EXHAUSTION PROFIT")
+                state[symbol]["highest_since_entry"] = None
+                _v17_reset_peak_exhaustion(symbol)
+                _v17_reset_runner_trail(symbol)
+                print(
+                    f"PEAK EXHAUSTION PROFIT SELL {qty:.6f} {symbol} | "
+                    f"attempts={peak_exit.get('touches', 0)} peak={float(peak_exit.get('peak') or 0):.2f} "
+                    f"rejection={float(peak_exit.get('rejectPct') or 0):.2f}%"
+                )
+            except Exception as e:
+                print(f"PEAK EXHAUSTION SELL ERROR {symbol}: {e}")
             continue
 
         partial_ok, partial_reason = should_partial_profit(p)
@@ -3354,6 +3658,7 @@ def manage_money_mode_positions():
 
                 market_sell_qty(symbol, qty, entry=entry, price=price, reason="STALL EXIT")
                 state[symbol]["highest_since_entry"] = None
+                _v17_reset_peak_exhaustion(symbol)
                 print(f"STALL EXIT SELL {qty:.6f} {symbol} | {stall_reason}")
             except Exception as e:
                 print(f"STALL SELL ERROR {symbol}: {e}")
@@ -3369,7 +3674,15 @@ def manage_money_mode_positions():
                 giveback = 1.0 - adaptive_giveback_pct / 100.0
             trail_floor = highest * giveback
 
+            if price > trail_floor:
+                _v17_reset_runner_trail(symbol)
+
             if price <= trail_floor:
+                runner_decision = _v17_runner_trail_decision(p, trail_floor)
+                if not runner_decision.get("sell"):
+                    # One shallow confirmation check lets a strong winner recover
+                    # from a brief floor touch without lowering the protected floor.
+                    continue
                 ai_block, ai_reason = hold_ai_blocks_soft_exit(p, "MONEY MODE TRAILING PROFIT")
                 if ai_block:
                     print(ai_reason)
@@ -3380,6 +3693,8 @@ def manage_money_mode_positions():
 
                     market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
                     state[symbol]["highest_since_entry"] = None
+                    _v17_reset_runner_trail(symbol)
+                    _v17_reset_peak_exhaustion(symbol)
                 except Exception as e:
                     print(f"SELL ERROR {symbol}: {e}")
                 continue
@@ -8634,7 +8949,7 @@ def record_trade_replay_snapshot(market_open: Optional[bool] = None) -> Dict[str
                  float(p.get("pnlPct") or 0.0), float(p.get("highest") or 0.0), float(p.get("trailStartPrice") or 0.0),
                  float(p.get("trailFloor") or 0.0), float(p.get("stopPrice") or 0.0),
                  float(p.get("emergencyStopPrice") or 0.0), 1 if p.get("trailingActive") else 0,
-                 1 if market_open else 0, "live-position"),
+                 1 if market_open else 0, "runner-grace" if p.get("runnerGraceActive") else ("peak-exhaustion" if p.get("peakExhaustionArmed") else "live-position")),
             )
             conn.execute("UPDATE trade_replay_sessions SET updated_at=? WHERE id=?", (now_iso, session_id))
             _trade_replay_last_sample[symbol] = now_mono
@@ -8710,7 +9025,9 @@ def _trade_replay_points_for_session(session_id: int, limit: int = TRADE_REPLAY_
          "highest": float(r["highest"] or 0.0), "trailStart": float(r["trail_start_price"] or 0.0),
          "trailFloor": float(r["trail_floor"] or 0.0), "stop": float(r["stop_price"] or 0.0),
          "emergencyStop": float(r["emergency_stop_price"] or 0.0), "trailingActive": bool(r["trailing_active"]),
-         "marketOpen": bool(r["market_open"])} for r in rows
+         "marketOpen": bool(r["market_open"]), "source": str(r["source"] or "live-position"),
+         "runnerGrace": str(r["source"] or "") == "runner-grace",
+         "peakExhaustion": str(r["source"] or "") == "peak-exhaustion"} for r in rows
     ]
 
 

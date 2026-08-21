@@ -58,6 +58,8 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
   const trailFloor = Number(last.trailFloor || 0);
   const stop = Number(last.stop || first.stop || 0);
   const trailingActive = Boolean(last.trailingActive);
+  const runnerGrace = Boolean(last.runnerGrace || last.source === "runner-grace");
+  const peakExhaustion = Boolean(last.peakExhaustion || last.source === "peak-exhaustion");
 
   // V17.1.1: auto-zoom to the movement that matters while still keeping the
   // trade's entry/risk/profit reference levels visible. This avoids a tiny
@@ -85,7 +87,7 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
         <div><span>{target.mode === "live" ? "Current" : "Exit"}</span><b>{usd(current)}</b></div>
         <div><span>Peak recorded</span><b>{usd(stats.peak)}</b></div>
         <div><span>PnL</span><b className={pnlPct >= 0 ? "profit" : "loss"}>{pct(pnlPct)}</b></div>
-        <div><span>Trail</span><b>{trailingActive ? `ACTIVE ${usd(trailFloor)}` : `Starts ${usd(trailStart)}`}</b></div>
+        <div><span>Exit state</span><b>{runnerGrace ? `RUNNER GRACE ${usd(trailFloor)}` : (peakExhaustion ? `PEAK EXHAUSTION ARMED` : (trailingActive ? `TRAIL ACTIVE ${usd(trailFloor)}` : `Trail starts ${usd(trailStart)}`))}</b></div>
       </div>
 
       {loading && !chart.length && <p className="muted">Loading recorded movement…</p>}
