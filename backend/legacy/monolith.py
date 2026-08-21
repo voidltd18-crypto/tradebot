@@ -129,6 +129,7 @@ CASH_BUFFER = 0.50
 FULL_BUY_WHEN_ONE_POSITION = os.getenv("FULL_BUY_WHEN_ONE_POSITION", "true").lower() == "true"
 FULL_BUY_CASH_BUFFER = float(os.getenv("FULL_BUY_CASH_BUFFER", "2.00") or 2.00)
 V17_SINGLE_FULL_BUY_MODE = os.getenv("V17_SINGLE_FULL_BUY_MODE", "true").lower() in ("1", "true", "yes", "on")
+V17_FULL_BUY_CONSTITUTION_LOCK = os.getenv("V17_FULL_BUY_CONSTITUTION_LOCK", "true").lower() in ("1", "true", "yes", "on")
 
 MAX_SPREAD = 0.015
 PREFER_SPREAD_UNDER = 0.006
@@ -14821,7 +14822,7 @@ def api_v10_risk_engine_position(symbol: str, request: Request):
 # Bounded self-optimisation with an immutable constitution.
 # It can manage approved runtime settings, but cannot disable core safety.
 # ============================================================
-V10_OPERATOR_VERSION = "V10.2"
+V10_OPERATOR_VERSION = "V10.3"
 V10_OPERATOR_ENABLED = os.getenv("V10_OPERATOR_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 V10_OPERATOR_MODE = os.getenv("V10_OPERATOR_MODE", "SHADOW").strip().upper() or "SHADOW"  # OFF, SHADOW, AUTO
 V10_OPERATOR_INTERVAL_SECONDS = max(900, int(os.getenv("V10_OPERATOR_INTERVAL_SECONDS", "3600") or 3600))
@@ -14860,6 +14861,17 @@ V10_CONSTITUTION = {
     "dailyLossGuardCannotBeDisabled": True,
     "emergencyStopCannotBeDisabled": True,
     "pdtProtectionCannotBeDisabled": True,
+    # V17.0.16: the user-selected single-position full-buy strategy is constitutional.
+    # Autonomous evolution may tune bounded risk/exits, but cannot silently change
+    # one-position/100%-target/full-buy mode while this strategy is enabled.
+    "v17SingleFullBuyMode": {
+        "locked": bool(V17_FULL_BUY_CONSTITUTION_LOCK and V17_SINGLE_FULL_BUY_MODE),
+        "maxPositions": 1,
+        "targetPositionValuePct": 1.0,
+        "maxPositionValuePct": 1.0,
+        "fullBuyWhenOnePosition": True,
+        "manualChangeRequired": True,
+    },
     "allChangesMustBeLogged": True,
     "allChangesMustBeReversible": True,
 }
@@ -14942,7 +14954,7 @@ def _v10_operator_current_config() -> Dict[str, Any]:
         "tradingCapUsd": float(cap),
         "targetPositionValuePct": float(TARGET_POSITION_VALUE_PCT),
         "maxPositionValuePct": float(MAX_POSITION_VALUE_PCT),
-        "fullBuyWhenOnePosition": bool(FULL_BUY_WHEN_ONE_POSITION),
+        "fullBuyWhenOnePosition": True if (V17_FULL_BUY_CONSTITUTION_LOCK and V17_SINGLE_FULL_BUY_MODE) else bool(FULL_BUY_WHEN_ONE_POSITION),
         "stopLossPct": round((1.0 - float(STOP_LOSS)) * 100.0, 4),
         "fastStopLossPct": abs(float(FAST_STOP_LOSS_PCT)),
         "trailStartPct": round((float(TRAIL_START) - 1.0) * 100.0, 4),
@@ -15077,9 +15089,20 @@ def _v10_operator_propose(snapshot: Dict[str, Any]) -> Dict[str, Any]:
     else:
         proposal["orderExecution"] = "MARKET"
 
-    # Full-buy is only permitted when max positions is one. Multi-position mode uses percentage sizing.
-    proposal["fullBuyWhenOnePosition"] = False  # autonomous capacity always uses bounded percentage sizing
-    proposal["maxPositionValuePct"] = max(proposal["targetPositionValuePct"], min(1.0, proposal["targetPositionValuePct"] * 1.25))
+    # V17.0.16 — constitutional single-position full-buy lock.
+    # The V10 Operator may still optimise trading cap, stops, trails, exclusions and
+    # approved execution templates, but it cannot evolve the user-selected V17
+    # one-position/full-buy strategy into multi-position or partial sizing.
+    if V17_FULL_BUY_CONSTITUTION_LOCK and V17_SINGLE_FULL_BUY_MODE:
+        proposal["maxPositions"] = 1
+        proposal["targetPositionValuePct"] = 1.0
+        proposal["maxPositionValuePct"] = 1.0
+        proposal["fullBuyWhenOnePosition"] = True
+        reasons.append("V17 single-position full-buy mode is constitution-locked; only a manual strategy change may disable it.")
+    else:
+        # Legacy autonomous-capacity behaviour outside the protected V17 mode.
+        proposal["fullBuyWhenOnePosition"] = False
+        proposal["maxPositionValuePct"] = max(proposal["targetPositionValuePct"], min(1.0, proposal["targetPositionValuePct"] * 1.25))
 
     changed = {k: {"before": current.get(k), "after": proposal.get(k)} for k in proposal if proposal.get(k) != current.get(k)}
     return {
@@ -15099,8 +15122,9 @@ def _v10_operator_apply_runtime(config: Dict[str, Any]) -> Dict[str, Any]:
     global TRAIL_START, TRAIL_GIVEBACK, OPTIMIZED_TRAIL_START, OPTIMIZED_TRAIL_GIVEBACK
     global V10_ORDER_EXECUTION_MODE
 
-    if V17_SINGLE_FULL_BUY_MODE:
-        # V17.0.6: user-selected one-position full-buy mode is authoritative.
+    if V17_FULL_BUY_CONSTITUTION_LOCK and V17_SINGLE_FULL_BUY_MODE:
+        # V17.0.16: constitution-locked user-selected one-position full-buy mode.
+        # This also protects restores/rollbacks created by older operator versions.
         # The autonomous V10 operator may still tune exits/research, but it must
         # not expand position count or silently switch sizing back to partial.
         MAX_POSITIONS = 1
