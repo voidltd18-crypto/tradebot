@@ -966,8 +966,19 @@ def get_all_positions():
             if quote_price > 0 and (highest is None or quote_price > highest):
                 state[symbol]["highest_since_entry"] = quote_price
 
-            trail_start_price = entry * TRAIL_START if entry > 0 else 0.0
-            trail_floor = (state[symbol].get("highest_since_entry") or 0.0) * TRAIL_GIVEBACK
+            # V17.1: expose the same adaptive AI risk levels that the live exit
+            # manager actually uses. This keeps the dashboard/replay chart from
+            # showing the older global trail value while execution uses a symbol-
+            # specific profile.
+            risk_profile = _ai_risk_effective_profile(symbol) if "_ai_risk_effective_profile" in globals() else {}
+            trail_start_pct = abs(float(risk_profile.get("trailStartPct") or ((TRAIL_START - 1.0) * 100.0)))
+            trail_giveback_pct = abs(float(risk_profile.get("trailGivebackPct") or ((1.0 - TRAIL_GIVEBACK) * 100.0)))
+            stop_loss_pct = abs(float(risk_profile.get("stopLossPct") or ((1.0 - STOP_LOSS) * 100.0)))
+            emergency_stop_pct = abs(float(risk_profile.get("emergencyStopPct") or (globals().get("AI_RISK_EMERGENCY_STOP_PCT", 10.0))))
+            trail_start_price = entry * (1.0 + trail_start_pct / 100.0) if entry > 0 else 0.0
+            trail_floor = (state[symbol].get("highest_since_entry") or 0.0) * (1.0 - trail_giveback_pct / 100.0)
+            stop_price = entry * (1.0 - stop_loss_pct / 100.0) if entry > 0 else 0.0
+            emergency_stop_price = entry * (1.0 - emergency_stop_pct / 100.0) if entry > 0 else 0.0
             trailing_active = quote_price >= trail_start_price if quote_price > 0 and trail_start_price > 0 else False
 
             positions.append({
@@ -985,6 +996,11 @@ def get_all_positions():
                 "trailStartPrice": trail_start_price,
                 "trailFloor": trail_floor,
                 "trailingActive": trailing_active,
+                "stopPrice": stop_price,
+                "emergencyStopPrice": emergency_stop_price,
+                "trailStartPct": trail_start_pct,
+                "trailGivebackPct": trail_giveback_pct,
+                "aiRiskProfile": risk_profile,
                 "inUniverse": symbol in current_universe,
                 "custom": bool(state.get(symbol, {}).get("custom")),
                 "lockedToday": is_locked_today(symbol),
@@ -5124,8 +5140,14 @@ def save_closed_trade_to_db(trade: Dict[str, Any]):
         trade.get("source", "matcher"),
     ))
 
+    closed_trade_id = int(cur.lastrowid) if cur.lastrowid else None
     conn.commit()
     conn.close()
+    try:
+        if "_trade_replay_close_for_trade" in globals():
+            _trade_replay_close_for_trade(trade, closed_trade_id)
+    except Exception as replay_error:
+        print(f"V17.1 TRADE REPLAY LINK ERROR: {replay_error}")
 
 
 def closed_trades_from_db(limit: int = 1000):
@@ -8457,6 +8479,268 @@ def replenish_locked_universe_if_needed() -> Dict[str, Any]:
     return summary
 
 
+
+# =========================
+# V17.1 TRADE REPLAY / PERSISTENT PRICE HISTORY
+# =========================
+TRADE_REPLAY_ENABLED = os.getenv("TRADE_REPLAY_ENABLED", "true").lower() == "true"
+TRADE_REPLAY_SAMPLE_SECONDS = max(15, int(os.getenv("TRADE_REPLAY_SAMPLE_SECONDS", "60")))
+TRADE_REPLAY_MAX_POINTS = max(500, int(os.getenv("TRADE_REPLAY_MAX_POINTS", "5000")))
+_trade_replay_last_sample: Dict[str, float] = {}
+_trade_replay_schema_ready = False
+_trade_replay_schema_lock = threading.RLock()
+
+
+def _trade_replay_ensure_tables() -> None:
+    """Create the small persistent recorder schema without touching trading logic."""
+    global _trade_replay_schema_ready
+    if not SQLITE_ENABLED or not TRADE_REPLAY_ENABLED or _trade_replay_schema_ready:
+        return
+    with _trade_replay_schema_lock:
+        if _trade_replay_schema_ready:
+            return
+        conn = db_connect()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trade_replay_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                entry_price REAL NOT NULL DEFAULT 0,
+                qty_initial REAL NOT NULL DEFAULT 0,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                exit_price REAL,
+                closed_trade_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'OPEN',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_trade_replay_sessions_symbol_status
+            ON trade_replay_sessions(symbol, status, started_at)
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trade_replay_points (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                price REAL NOT NULL DEFAULT 0,
+                entry_price REAL NOT NULL DEFAULT 0,
+                qty REAL NOT NULL DEFAULT 0,
+                market_value REAL NOT NULL DEFAULT 0,
+                pnl REAL NOT NULL DEFAULT 0,
+                pnl_pct REAL NOT NULL DEFAULT 0,
+                highest REAL NOT NULL DEFAULT 0,
+                trail_start_price REAL NOT NULL DEFAULT 0,
+                trail_floor REAL NOT NULL DEFAULT 0,
+                stop_price REAL NOT NULL DEFAULT 0,
+                emergency_stop_price REAL NOT NULL DEFAULT 0,
+                trailing_active INTEGER NOT NULL DEFAULT 0,
+                market_open INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'live-position',
+                FOREIGN KEY(session_id) REFERENCES trade_replay_sessions(id)
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_trade_replay_points_session_time
+            ON trade_replay_points(session_id, observed_at)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_trade_replay_points_symbol_time
+            ON trade_replay_points(symbol, observed_at)
+        """)
+        conn.commit(); conn.close()
+        _trade_replay_schema_ready = True
+
+
+def _trade_replay_open_session(conn, position: Dict[str, Any], now_iso: str) -> int:
+    symbol = str(position.get("symbol") or "").upper()
+    entry = float(position.get("entry") or 0.0)
+    # Keep an overnight position in the same replay session. A materially different
+    # entry price indicates a new trade in the same symbol.
+    row = conn.execute(
+        "SELECT * FROM trade_replay_sessions WHERE symbol=? AND status='OPEN' ORDER BY id DESC LIMIT 1",
+        (symbol,),
+    ).fetchone()
+    if row:
+        existing_entry = float(row["entry_price"] or 0.0)
+        tolerance = max(0.01, abs(entry) * 0.0005)
+        if abs(existing_entry - entry) <= tolerance:
+            return int(row["id"])
+        conn.execute(
+            "UPDATE trade_replay_sessions SET status='CLOSED', ended_at=?, updated_at=? WHERE id=?",
+            (now_iso, now_iso, int(row["id"])),
+        )
+    cur = conn.execute(
+        """INSERT INTO trade_replay_sessions
+           (symbol,entry_price,qty_initial,started_at,status,created_at,updated_at)
+           VALUES (?,?,?,?, 'OPEN', ?, ?)""",
+        (symbol, entry, float(position.get("qty") or 0.0), now_iso, now_iso, now_iso),
+    )
+    return int(cur.lastrowid)
+
+
+def record_trade_replay_snapshot(market_open: Optional[bool] = None) -> Dict[str, Any]:
+    """Persist one price point per open position at a storage-safe cadence.
+
+    This intentionally runs even when the regular market is closed so any quote
+    updates available from the broker/feed (pre-market/after-hours included) can
+    be preserved for the chart.
+    """
+    if not SQLITE_ENABLED or not TRADE_REPLAY_ENABLED:
+        return {"ok": False, "enabled": False, "recorded": 0}
+    try:
+        _trade_replay_ensure_tables()
+        positions = get_all_positions()
+        if not positions:
+            return {"ok": True, "enabled": True, "recorded": 0}
+        now_mono = time.monotonic()
+        now_iso = datetime.now(UTC).isoformat()
+        due = []
+        for p in positions:
+            symbol = str(p.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            last = float(_trade_replay_last_sample.get(symbol, 0.0))
+            if now_mono - last >= TRADE_REPLAY_SAMPLE_SECONDS:
+                due.append(p)
+        if not due:
+            return {"ok": True, "enabled": True, "recorded": 0}
+        if market_open is None:
+            try:
+                market_open = bool(trading_client.get_clock().is_open)
+            except Exception:
+                market_open = False
+        conn = db_connect(); recorded = 0
+        for p in due:
+            symbol = str(p.get("symbol") or "").upper()
+            session_id = _trade_replay_open_session(conn, p, now_iso)
+            conn.execute(
+                """INSERT INTO trade_replay_points
+                   (session_id,symbol,observed_at,price,entry_price,qty,market_value,pnl,pnl_pct,highest,
+                    trail_start_price,trail_floor,stop_price,emergency_stop_price,trailing_active,market_open,source)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (session_id, symbol, now_iso, float(p.get("price") or 0.0), float(p.get("entry") or 0.0),
+                 float(p.get("qty") or 0.0), float(p.get("marketValue") or 0.0), float(p.get("pnl") or 0.0),
+                 float(p.get("pnlPct") or 0.0), float(p.get("highest") or 0.0), float(p.get("trailStartPrice") or 0.0),
+                 float(p.get("trailFloor") or 0.0), float(p.get("stopPrice") or 0.0),
+                 float(p.get("emergencyStopPrice") or 0.0), 1 if p.get("trailingActive") else 0,
+                 1 if market_open else 0, "live-position"),
+            )
+            conn.execute("UPDATE trade_replay_sessions SET updated_at=? WHERE id=?", (now_iso, session_id))
+            _trade_replay_last_sample[symbol] = now_mono
+            recorded += 1
+        conn.commit(); conn.close()
+        return {"ok": True, "enabled": True, "recorded": recorded}
+    except Exception as exc:
+        print(f"V17.1 TRADE REPLAY RECORD ERROR: {exc}")
+        return {"ok": False, "enabled": True, "recorded": 0, "error": str(exc)}
+
+
+def _trade_replay_close_for_trade(trade: Dict[str, Any], closed_trade_id: Optional[int] = None) -> None:
+    if not SQLITE_ENABLED or not TRADE_REPLAY_ENABLED:
+        return
+    try:
+        _trade_replay_ensure_tables()
+        symbol = str(trade.get("symbol") or "").upper()
+        if not symbol:
+            return
+        ended_at = str(trade.get("timestamp") or datetime.now(UTC).isoformat())
+        exit_price = float(trade.get("exitPrice") or trade.get("price") or 0.0)
+        conn = db_connect()
+        row = conn.execute(
+            "SELECT id FROM trade_replay_sessions WHERE symbol=? AND status='OPEN' ORDER BY id DESC LIMIT 1",
+            (symbol,),
+        ).fetchone()
+        if row:
+            conn.execute(
+                """UPDATE trade_replay_sessions
+                   SET status='CLOSED',ended_at=?,exit_price=?,closed_trade_id=COALESCE(?,closed_trade_id),updated_at=?
+                   WHERE id=?""",
+                (ended_at, exit_price, closed_trade_id, datetime.now(UTC).isoformat(), int(row["id"])),
+            )
+            conn.commit()
+        conn.close()
+    except Exception as exc:
+        print(f"V17.1 TRADE REPLAY CLOSE ERROR: {exc}")
+
+
+def _trade_replay_points_for_session(session_id: int, limit: int = TRADE_REPLAY_MAX_POINTS) -> List[Dict[str, Any]]:
+    _trade_replay_ensure_tables(); conn = db_connect()
+    rows = conn.execute(
+        "SELECT * FROM trade_replay_points WHERE session_id=? ORDER BY observed_at ASC LIMIT ?",
+        (int(session_id), max(1, min(int(limit), TRADE_REPLAY_MAX_POINTS))),
+    ).fetchall(); conn.close()
+    return [
+        {"id": int(r["id"]), "sessionId": int(r["session_id"]), "symbol": r["symbol"], "time": r["observed_at"],
+         "price": float(r["price"] or 0.0), "entry": float(r["entry_price"] or 0.0), "qty": float(r["qty"] or 0.0),
+         "marketValue": float(r["market_value"] or 0.0), "pnl": float(r["pnl"] or 0.0), "pnlPct": float(r["pnl_pct"] or 0.0),
+         "highest": float(r["highest"] or 0.0), "trailStart": float(r["trail_start_price"] or 0.0),
+         "trailFloor": float(r["trail_floor"] or 0.0), "stop": float(r["stop_price"] or 0.0),
+         "emergencyStop": float(r["emergency_stop_price"] or 0.0), "trailingActive": bool(r["trailing_active"]),
+         "marketOpen": bool(r["market_open"])} for r in rows
+    ]
+
+
+def _trade_replay_payload(session_row, limit: int = TRADE_REPLAY_MAX_POINTS, closed_trade: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if not session_row:
+        return {"ok": True, "recorded": False, "points": [], "message": "No recorded replay is available for this trade yet."}
+    session = dict(session_row); points = _trade_replay_points_for_session(int(session["id"]), limit)
+    prices = [float(p.get("price") or 0.0) for p in points if float(p.get("price") or 0.0) > 0]
+    entry = float(session.get("entry_price") or (points[0].get("entry") if points else 0.0) or 0.0)
+    last_price = float((closed_trade or {}).get("exitPrice") or session.get("exit_price") or (points[-1].get("price") if points else 0.0) or 0.0)
+    peak = max(prices) if prices else 0.0; trough = min(prices) if prices else 0.0
+    return {
+        "ok": True, "recorded": bool(points),
+        "session": {"id": int(session["id"]), "symbol": session.get("symbol"), "entryPrice": entry,
+                    "startedAt": session.get("started_at"), "endedAt": session.get("ended_at"),
+                    "exitPrice": last_price, "status": session.get("status")},
+        "trade": closed_trade or {}, "points": points,
+        "stats": {"pointCount": len(points), "entry": entry, "last": last_price, "peak": peak, "trough": trough,
+                  "maxGainPct": (((peak / entry) - 1.0) * 100.0) if entry > 0 and peak > 0 else 0.0,
+                  "maxDrawdownFromEntryPct": (((trough / entry) - 1.0) * 100.0) if entry > 0 and trough > 0 else 0.0},
+        "sampleSeconds": TRADE_REPLAY_SAMPLE_SECONDS,
+    }
+
+
+def trade_replay_live_payload(symbol: str, limit: int = TRADE_REPLAY_MAX_POINTS) -> Dict[str, Any]:
+    _trade_replay_ensure_tables(); sym = str(symbol).upper().strip(); conn = db_connect()
+    row = conn.execute(
+        "SELECT * FROM trade_replay_sessions WHERE symbol=? AND status='OPEN' ORDER BY id DESC LIMIT 1", (sym,)
+    ).fetchone(); conn.close()
+    return _trade_replay_payload(row, limit)
+
+
+def trade_replay_closed_payload(trade_id: int, limit: int = TRADE_REPLAY_MAX_POINTS) -> Dict[str, Any]:
+    _trade_replay_ensure_tables(); conn = db_connect()
+    trade_row = conn.execute("SELECT * FROM closed_trades WHERE id=?", (int(trade_id),)).fetchone()
+    if not trade_row:
+        conn.close(); return {"ok": False, "message": "Closed trade not found", "points": []}
+    tr = dict(trade_row); symbol = str(tr.get("symbol") or "").upper(); exit_ts = str(tr.get("timestamp") or "")
+    row = conn.execute(
+        "SELECT * FROM trade_replay_sessions WHERE closed_trade_id=? ORDER BY id DESC LIMIT 1", (int(trade_id),)
+    ).fetchone()
+    if not row:
+        # Historical matcher rows may have been written before the replay session
+        # was linked. Prefer the most recent session for this symbol that began
+        # before the trade closed.
+        row = conn.execute(
+            """SELECT * FROM trade_replay_sessions
+               WHERE symbol=? AND started_at<=?
+               ORDER BY CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END, ABS(strftime('%s', COALESCE(ended_at,updated_at))-strftime('%s',?)) ASC
+               LIMIT 1""",
+            (symbol, exit_ts, exit_ts),
+        ).fetchone()
+    conn.close()
+    trade = {"id": int(tr["id"]), "timestamp": tr.get("timestamp"), "symbol": symbol,
+             "qty": float(tr.get("qty") or 0.0), "entryPrice": float(tr.get("entry_price") or 0.0),
+             "exitPrice": float(tr.get("exit_price") or 0.0), "pnl": float(tr.get("pnl") or 0.0),
+             "pnlGbp": float(tr.get("pnl_gbp") or 0.0), "pnlPct": float(tr.get("pnl_pct") or 0.0),
+             "reason": tr.get("reason") or ""}
+    return _trade_replay_payload(row, limit, trade)
+
+
 def run_bot_loop():
     print("Rebuilt Sniper Profit Bot started...")
     init_db()
@@ -8495,6 +8779,10 @@ def run_bot_loop():
                 except Exception as e:
                     print(f"AUTO REPORT LOOP SYNC ERROR: {e}")
                 clock = trading_client.get_clock()
+                try:
+                    record_trade_replay_snapshot(bool(clock.is_open))
+                except Exception as e:
+                    print(f"V17.1 TRADE REPLAY LOOP ERROR: {e}")
 
                 if not clock.is_open:
                     print("Market closed. Waiting...")
@@ -8859,6 +9147,29 @@ def _build_reports_payload() -> Dict[str, Any]:
         "equityHistory": equity_history[-500:], "winRate": _safe_num(db.get("winRate")) * 100.0,
         "totalTrades": int(_safe_num(db.get("totalTrades"))),
     }
+
+
+@app.get("/trade-replay/live/{symbol}")
+def api_trade_replay_live(symbol: str, limit: int = TRADE_REPLAY_MAX_POINTS):
+    return trade_replay_live_payload(symbol, limit)
+
+
+@app.get("/trade-replay/closed/{trade_id}")
+def api_trade_replay_closed(trade_id: int, limit: int = TRADE_REPLAY_MAX_POINTS):
+    return trade_replay_closed_payload(trade_id, limit)
+
+
+@app.get("/trade-replay/status")
+def api_trade_replay_status():
+    try:
+        _trade_replay_ensure_tables(); conn = db_connect()
+        sessions = int(conn.execute("SELECT COUNT(*) FROM trade_replay_sessions").fetchone()[0])
+        points = int(conn.execute("SELECT COUNT(*) FROM trade_replay_points").fetchone()[0])
+        conn.close()
+        return {"ok": True, "enabled": TRADE_REPLAY_ENABLED, "sampleSeconds": TRADE_REPLAY_SAMPLE_SECONDS,
+                "sessions": sessions, "points": points}
+    except Exception as exc:
+        return {"ok": False, "enabled": TRADE_REPLAY_ENABLED, "error": str(exc)}
 
 
 @app.get("/reports")

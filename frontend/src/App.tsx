@@ -52,10 +52,10 @@ export default function App() {
     <Nav tab={tab} setTab={setTab} />
 
     {tab === "overview" && <OverviewPage {...bot} positionGlowStyle={positionGlowStyle} />}
-    {tab === "positions" && <PositionsPage positions={bot.positions} rate={bot.rate} action={bot.action} positionGlowStyle={positionGlowStyle} />}
+    {tab === "positions" && <PositionsPage positions={bot.positions} rate={bot.rate} action={bot.action} positionGlowStyle={positionGlowStyle} authToken={bot.authToken} />}
     <Suspense fallback={<PageLoading />}>
       {tab === "portfolio" && <PortfolioPage authToken={bot.authToken} />}
-      {tab === "reports" && <ReportsPage reports={bot.reports} data={bot.data} rate={bot.rate} closedTrades={bot.closedTrades} chartCurrency={bot.chartCurrency} setChartCurrency={bot.setChartCurrency} reportsLoading={bot.reportsLoading} reportsError={bot.reportsError} reportsUpdatedAt={bot.reportsUpdatedAt} loadReports={bot.loadReports} />}
+      {tab === "reports" && <ReportsPage reports={bot.reports} data={bot.data} rate={bot.rate} closedTrades={bot.closedTrades} chartCurrency={bot.chartCurrency} setChartCurrency={bot.setChartCurrency} reportsLoading={bot.reportsLoading} reportsError={bot.reportsError} reportsUpdatedAt={bot.reportsUpdatedAt} loadReports={bot.loadReports} authToken={bot.authToken} />}
       {tab === "intelligence" && <IntelligencePage authToken={bot.authToken} marketRegime={bot.marketRegime} botHealth={bot.botHealth} aiConfidence={bot.aiConfidence} fetchData={bot.fetchData} />}
       {tab === "explorer" && <ExplorerPage stockQuery={bot.stockQuery} setStockQuery={bot.setStockQuery} stockResults={bot.stockResults} setStockResults={bot.setStockResults} stockSearchLoading={bot.stockSearchLoading} searchStocks={bot.searchStocks} action={bot.action} />}
       {tab === "admin" && <AdminPage {...bot} />}
