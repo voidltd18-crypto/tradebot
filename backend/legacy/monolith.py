@@ -451,7 +451,7 @@ LOCKED_UNIVERSE_FALLBACK_POOL = [
     "AAPL", "ABBV", "ADBE", "AMD", "AMAT", "AMGN", "AMZN", "AVGO",
     "BAC", "CAT", "CMG", "COIN", "COST", "CRM", "CRWD", "CSCO",
     "CVX", "DDOG", "DIS", "GE", "GM", "GOOG", "GOOGL", "GS",
-    "HD", "HOOD", "IBM", "INTC", "JNJ", "JPM", "KO", "MARA",
+    "HD", "HOOD", "IBM", "INTC", "JNJ", "JPM", "KO", "LLY",
     "MA", "META", "MSFT", "MU", "NFLX", "NOW", "NVDA", "ORCL",
     "PANW", "PEP", "PFE", "QCOM", "QQQ", "ROKU", "SHOP", "SMH",
     "SNOW", "SPY", "TGT", "TJX", "TSLA", "TXN", "UBER", "UNH",
@@ -1361,10 +1361,9 @@ def ai_position_capacity_payload() -> Dict[str, Any]:
             account = get_account()
             equity = float(account.equity)
             buying_power = max(0.0, float(account.buying_power))
-            # V17.0.5: explicit single-position FULL BUY means use live buying power,
-            # not the saved profit-banking/trading-cap value. The cap remains active
-            # for every non-full-buy mode.
-            cap_usd = equity
+            # V17.6: explicit single-position FULL BUY uses the whole WORKING pot,
+            # while realised Profit Vault cash remains reserved and cannot be reused.
+            cap_usd = profit_vault_deployable_usd(equity, buying_power) if "profit_vault_deployable_usd" in globals() else equity
             open_count = len(get_all_positions())
         except Exception:
             buying_power = None
@@ -1384,12 +1383,12 @@ def ai_position_capacity_payload() -> Dict[str, Any]:
             "maxPositionValuePct": 1.0,
             "capitalUsd": round(float(cap_usd), 2) if cap_usd is not None else None,
             "buyingPowerUsd": round(float(buying_power), 2) if buying_power is not None else None,
-            "targetPositionNotionalUsd": round(max(0.0, float(buying_power or 0.0) - float(globals().get("FULL_BUY_CASH_BUFFER", 2.0))), 2) if buying_power is not None else None,
+            "targetPositionNotionalUsd": round(max(0.0, min(float(buying_power or 0.0), float(cap_usd or 0.0)) - float(globals().get("FULL_BUY_CASH_BUFFER", 2.0))), 2) if buying_power is not None else None,
             "openPositions": int(open_count),
             "structuralAvailableSlots": int(structural_slots),
             "affordableNewPositions": int(affordable),
             "availableSlots": int(min(structural_slots, affordable)),
-            "reason": "V17.0.5 single-position full-buy mode: live buying power is authoritative and the trading-cap reserve is bypassed only for this mode.",
+            "reason": "V17.6 single-position full-buy mode: the full working pot is authoritative, while realised Profit Vault cash is reserved from new orders.",
         }
 
     if not bool(globals().get("AI_POSITION_CAPACITY_ENABLED", True)):
@@ -1487,11 +1486,9 @@ def calculate_new_position_notional():
     # Full-buy mode for one-position trading.
     # Uses nearly all available capped trading capital/buying power, leaving a small buffer.
     if V17_SINGLE_FULL_BUY_MODE or (FULL_BUY_WHEN_ONE_POSITION and effective_max_positions() <= 1):
-        # V17.0.6: authoritative one-position full-buy mode.
-        # V17.0.5: in explicit full-buy mode the user wants the actual available
-        # buying power deployed into the single #1 position. Do not constrain this
-        # branch with effective_trading_equity()/profit-banking cap.
-        usable_cash = max(0.0, buying_power - FULL_BUY_CASH_BUFFER)
+        # V17.6: full-buy means the whole WORKING pot, not the Profit Vault.
+        working_cash = profit_vault_deployable_usd(equity, buying_power) if "profit_vault_deployable_usd" in globals() else buying_power
+        usable_cash = max(0.0, min(buying_power, working_cash) - FULL_BUY_CASH_BUFFER)
         return round(usable_cash, 2)
 
     target_value = sizing_equity * TARGET_POSITION_VALUE_PCT
@@ -1654,6 +1651,11 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     trade_events.append(event)
     add_trade_history_event(event)
     update_stock_memory_from_sell(symbol, pnl, pnl_pct)
+    if pnl > 0 and "profit_vault_bank_realised_profit" in globals():
+        try:
+            profit_vault_bank_realised_profit(pnl, symbol=symbol, reason=reason)
+        except Exception as vault_exc:
+            print(f"V17.6 PROFIT VAULT BANK ERROR | symbol={symbol} error={vault_exc}")
     lock_symbol_until_tomorrow(symbol)
     notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
 
@@ -4222,10 +4224,10 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         # Use all currently available deployable cash for the #1 qualified candidate,
         # leaving only the explicit full-buy cash buffer. Do not apply the legacy
         # 45% portfolio weight or V10 per-position cap to this user-selected mode.
-        # V17.0.5: actual full-buy amount is based on LIVE BUYING POWER.
-        # managed_capital may be intentionally capped for profit banking, but that
-        # must not silently turn explicit full-buy mode into a partial buy.
-        deployable = round(max(0.0, buying_power - FULL_BUY_CASH_BUFFER), 2)
+        # V17.6: commit the whole WORKING pot to #1, excluding the persistent
+        # realised-profit vault from deployable buying power.
+        vault_working_capital = profit_vault_deployable_usd(equity, buying_power) if "profit_vault_deployable_usd" in globals() else buying_power
+        deployable = round(max(0.0, min(buying_power, vault_working_capital) - FULL_BUY_CASH_BUFFER), 2)
         actionable_ranked = actionable_ranked[:1]
     else:
         deployable = round(max(0.0, usable_cash * (1.0 - reserve_pct)), 2)
@@ -4258,7 +4260,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 "confidenceLabel": item["confidenceLabel"],
                 "quality": item["quality"],
                 "spread": item["spread"],
-                "weightPct": round((amount / (buying_power if single_full_buy else managed_capital)) * 100.0, 2) if (buying_power if single_full_buy else managed_capital) else 0.0,
+                "weightPct": round((amount / (vault_working_capital if single_full_buy else managed_capital)) * 100.0, 2) if (vault_working_capital if single_full_buy else managed_capital) else 0.0,
                 "shareOfDeployedPct": round((amount / deployable) * 100.0, 2) if deployable else 0.0,
                 "notionalUsd": amount,
                 "notionalGbp": round(money_gbp(amount), 2),
@@ -4287,8 +4289,8 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             else "QUALIFIED_BELOW_ORDER_MINIMUM" if qualified_ranked
             else "NO_QUALIFIED_PORTFOLIO"
         ),
-        "managedCapitalUsd": round(buying_power if single_full_buy else managed_capital, 2),
-        "managedCapitalGbp": round(money_gbp(buying_power if single_full_buy else managed_capital), 2),
+        "managedCapitalUsd": round((vault_working_capital if single_full_buy else managed_capital), 2),
+        "managedCapitalGbp": round(money_gbp((vault_working_capital if single_full_buy else managed_capital)), 2),
         "buyingPowerUsd": round(buying_power, 2),
         "candidateCount": len(picks),
         "qualifiedCount": len(qualified_ranked),
@@ -4496,13 +4498,17 @@ def money_mode_buy(scans, manual=False):
         ):
             try:
                 live_account = get_account()
+                live_equity = max(0.0, float(live_account.equity))
                 live_buying_power = max(0.0, float(live_account.buying_power))
                 full_buffer = float(globals().get("FULL_BUY_CASH_BUFFER", 2.0))
-                notional = round(max(0.0, live_buying_power - full_buffer), 2)
+                working_capital = profit_vault_deployable_usd(live_equity, live_buying_power) if "profit_vault_deployable_usd" in globals() else live_buying_power
+                notional = round(max(0.0, min(live_buying_power, working_capital) - full_buffer), 2)
                 allocation["notionalUsd"] = notional
+                vault_reserved = profit_vault_reserved_usd() if "profit_vault_reserved_usd" in globals() else 0.0
                 print(
-                    f"V17.0.7 FULL BUY EXECUTION LOCK | symbol={symbol} "
+                    f"V17.6 FULL BUY EXECUTION LOCK | symbol={symbol} "
                     f"planned=${planned_notional:.2f} live_buying_power=${live_buying_power:.2f} "
+                    f"working_capital=${working_capital:.2f} vault_reserved=${vault_reserved:.2f} "
                     f"buffer=${full_buffer:.2f} final=${notional:.2f}"
                 )
                 v174_final_gate_last_event.clear()
@@ -10919,6 +10925,173 @@ def refresh_universe_preview():
 
 
 # ============================================================
+# V17.6.0 — REALISED PROFIT VAULT
+# ============================================================
+# The vault is deliberately separate from the legacy trading cap.
+# Full-buy mode still commits the whole WORKING pot, but realised positive
+# PnL is reserved in software and excluded from all future buy sizing.
+# Losses never consume the recorded vault balance.
+PROFIT_VAULT_VERSION = "V17.6.0"
+PROFIT_VAULT_ENABLED = os.getenv("PROFIT_VAULT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+PROFIT_VAULT_DEFAULT_BASELINE_GBP = float(os.getenv("PROFIT_VAULT_BASELINE_GBP", "982.84") or 982.84)
+PROFIT_VAULT_BANK_PCT = max(0.0, min(1.0, float(os.getenv("PROFIT_VAULT_BANK_PCT", "1.0") or 1.0)))
+_PROFIT_VAULT_LOCK = threading.RLock()
+
+def profit_vault_file_path() -> str:
+    env_path = os.getenv("PROFIT_VAULT_FILE", "").strip()
+    if env_path:
+        return env_path
+    if os.path.isdir("/var/data"):
+        return "/var/data/profit_vault.json"
+    base = os.getenv("RENDER_DISK_PATH", "backend/state")
+    return os.path.join(base, "profit_vault.json")
+
+def _profit_vault_default_state() -> Dict[str, Any]:
+    now = datetime.now(UTC).isoformat()
+    return {
+        "version": PROFIT_VAULT_VERSION,
+        "enabled": bool(PROFIT_VAULT_ENABLED),
+        "baselineGbp": round(float(PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2),
+        "bankPct": round(float(PROFIT_VAULT_BANK_PCT), 4),
+        "bankedProfitGbp": 0.0,
+        "lifetimeBankedGbp": 0.0,
+        "createdAt": now,
+        "updatedAt": now,
+        "lastBankedAt": "",
+        "lastBankedSymbol": "",
+        "lastBankedReason": "",
+        "lastBankedAmountGbp": 0.0,
+    }
+
+def load_profit_vault_state() -> Dict[str, Any]:
+    path = profit_vault_file_path()
+    with _PROFIT_VAULT_LOCK:
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                default = _profit_vault_default_state()
+                default.update(data if isinstance(data, dict) else {})
+                default["enabled"] = bool(default.get("enabled", PROFIT_VAULT_ENABLED))
+                default["baselineGbp"] = round(float(default.get("baselineGbp") or PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2)
+                default["bankPct"] = max(0.0, min(1.0, float(default.get("bankPct") if default.get("bankPct") is not None else PROFIT_VAULT_BANK_PCT)))
+                default["bankedProfitGbp"] = max(0.0, float(default.get("bankedProfitGbp") or 0.0))
+                default["lifetimeBankedGbp"] = max(default["bankedProfitGbp"], float(default.get("lifetimeBankedGbp") or 0.0))
+                return default
+        except Exception as exc:
+            print(f"V17.6 PROFIT VAULT LOAD ERROR | {exc}")
+
+        state = _profit_vault_default_state()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except Exception as exc:
+            print(f"V17.6 PROFIT VAULT INIT ERROR | {exc}")
+        return state
+
+def save_profit_vault_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    path = profit_vault_file_path()
+    with _PROFIT_VAULT_LOCK:
+        data = _profit_vault_default_state()
+        data.update(state or {})
+        data["version"] = PROFIT_VAULT_VERSION
+        data["updatedAt"] = datetime.now(UTC).isoformat()
+        data["bankedProfitGbp"] = round(max(0.0, float(data.get("bankedProfitGbp") or 0.0)), 4)
+        data["lifetimeBankedGbp"] = round(max(data["bankedProfitGbp"], float(data.get("lifetimeBankedGbp") or 0.0)), 4)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+        return data
+
+def profit_vault_reserved_usd() -> float:
+    state = load_profit_vault_state()
+    if not state.get("enabled"):
+        return 0.0
+    banked_gbp = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
+    rate = get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP
+    return max(0.0, banked_gbp / max(float(rate), 0.0001))
+
+def profit_vault_deployable_usd(account_equity: float, buying_power: Optional[float] = None) -> float:
+    try:
+        equity = max(0.0, float(account_equity or 0.0))
+    except Exception:
+        equity = 0.0
+    reserved = profit_vault_reserved_usd()
+    working = max(0.0, equity - reserved)
+    if buying_power is not None:
+        try:
+            working = min(working, max(0.0, float(buying_power)))
+        except Exception:
+            pass
+    return max(0.0, working)
+
+def profit_vault_bank_realised_profit(pnl_usd: float, symbol: str = "", reason: str = "") -> Dict[str, Any]:
+    state = load_profit_vault_state()
+    if not state.get("enabled"):
+        return state
+    try:
+        pnl_usd = float(pnl_usd or 0.0)
+    except Exception:
+        pnl_usd = 0.0
+    if pnl_usd <= 0:
+        return state
+    pnl_gbp = max(0.0, float(money_gbp(pnl_usd)))
+    bank_amount = round(pnl_gbp * max(0.0, min(1.0, float(state.get("bankPct") or PROFIT_VAULT_BANK_PCT))), 4)
+    if bank_amount <= 0:
+        return state
+    state["bankedProfitGbp"] = round(float(state.get("bankedProfitGbp") or 0.0) + bank_amount, 4)
+    state["lifetimeBankedGbp"] = round(float(state.get("lifetimeBankedGbp") or 0.0) + bank_amount, 4)
+    state["lastBankedAt"] = datetime.now(UTC).isoformat()
+    state["lastBankedSymbol"] = str(symbol or "").upper()
+    state["lastBankedReason"] = str(reason or "")
+    state["lastBankedAmountGbp"] = bank_amount
+    state = save_profit_vault_state(state)
+    print(
+        f"V17.6 PROFIT VAULT BANK | symbol={str(symbol or '').upper()} "
+        f"realised_pnl=£{pnl_gbp:.2f} banked=£{bank_amount:.2f} "
+        f"vault=£{float(state.get('bankedProfitGbp') or 0.0):.2f}"
+    )
+    return state
+
+def profit_vault_payload(account: Any = None) -> Dict[str, Any]:
+    state = load_profit_vault_state()
+    try:
+        account = account or get_account()
+        equity_usd = max(0.0, float(account.equity))
+        buying_power_usd = max(0.0, float(account.buying_power))
+    except Exception:
+        equity_usd = 0.0
+        buying_power_usd = 0.0
+    rate = get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP
+    equity_gbp = equity_usd * float(rate)
+    banked_gbp = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
+    reserved_usd = banked_gbp / max(float(rate), 0.0001)
+    working_usd = profit_vault_deployable_usd(equity_usd, buying_power_usd)
+    return {
+        "version": PROFIT_VAULT_VERSION,
+        "enabled": bool(state.get("enabled")),
+        "baselineGbp": round(float(state.get("baselineGbp") or PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2),
+        "bankPct": round(float(state.get("bankPct") or 0.0), 4),
+        "bankedProfitGbp": round(banked_gbp, 2),
+        "bankedProfitUsd": round(reserved_usd, 2),
+        "lifetimeBankedGbp": round(float(state.get("lifetimeBankedGbp") or 0.0), 2),
+        "accountEquityGbp": round(equity_gbp, 2),
+        "accountEquityUsd": round(equity_usd, 2),
+        "workingCapitalGbp": round(working_usd * float(rate), 2),
+        "workingCapitalUsd": round(working_usd, 2),
+        "buyingPowerUsd": round(buying_power_usd, 2),
+        "lastBankedAt": state.get("lastBankedAt", ""),
+        "lastBankedSymbol": state.get("lastBankedSymbol", ""),
+        "lastBankedReason": state.get("lastBankedReason", ""),
+        "lastBankedAmountGbp": round(float(state.get("lastBankedAmountGbp") or 0.0), 2),
+        "growthSinceBaselineGbp": round(equity_gbp - float(state.get("baselineGbp") or PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2),
+        "message": "100% of positive realised PnL is reserved and excluded from future buys." if float(state.get("bankPct") or 0.0) >= 0.999 else "A configured share of positive realised PnL is reserved from future buys.",
+    }
+
+# ============================================================
 # PROFIT BANKING / PERSISTENT TRADING CAP OVERRIDE
 # ============================================================
 
@@ -11039,6 +11212,7 @@ def banking_payload():
 
     effective = max(0.0, min(equity, cap_usd)) if cap_usd > 0 else max(0.0, equity)
     banked = max(0.0, equity - effective) if cap_usd > 0 else 0.0
+    vault = profit_vault_payload(account) if "profit_vault_payload" in globals() else {}
 
     return {
         "ok": True,
@@ -11056,7 +11230,13 @@ def banking_payload():
         "effectiveTradingEquityGbp": money_gbp(effective),
         "bankedProfitCashBuffer": banked,
         "bankedProfitCashBufferGbp": money_gbp(banked),
-        "message": "Profit banking active" if cap_usd > 0 else "Profit banking disabled",
+        "profitVault": vault,
+        "profitVaultEnabled": bool(vault.get("enabled")),
+        "profitVaultBaselineGbp": vault.get("baselineGbp", 0.0),
+        "profitVaultBankedGbp": vault.get("bankedProfitGbp", 0.0),
+        "profitVaultWorkingCapitalGbp": vault.get("workingCapitalGbp", 0.0),
+        "profitVaultLifetimeBankedGbp": vault.get("lifetimeBankedGbp", 0.0),
+        "message": "Profit Vault active" if vault.get("enabled") else ("Profit banking active" if cap_usd > 0 else "Profit banking disabled"),
     }
 
 
@@ -11353,7 +11533,8 @@ def _compat_buy_preview():
 
     partial_usd = max(0.0, min(capped_equity / max(1, max_positions), max(0.0, buying_power - cash_buffer)))
     if bool(globals().get("V17_SINGLE_FULL_BUY_MODE", False)):
-        full_usd = max(0.0, buying_power - full_buffer)
+        working = profit_vault_deployable_usd(equity, buying_power) if "profit_vault_deployable_usd" in globals() else buying_power
+        full_usd = max(0.0, min(buying_power, working) - full_buffer)
     else:
         full_usd = max(0.0, min(capped_equity, max(0.0, buying_power - full_buffer)))
     mode = _compat_load_buy_mode()
@@ -15887,8 +16068,10 @@ def ai_risk_notional(scan: Dict[str, Any]) -> float:
     ):
         try:
             account = get_account()
+            live_equity = max(0.0, float(account.equity))
             live_bp = max(0.0, float(account.buying_power))
-            return round(max(0.0, live_bp - float(globals().get("FULL_BUY_CASH_BUFFER", 2.0))), 2)
+            working = profit_vault_deployable_usd(live_equity, live_bp) if "profit_vault_deployable_usd" in globals() else live_bp
+            return round(max(0.0, min(live_bp, working) - float(globals().get("FULL_BUY_CASH_BUFFER", 2.0))), 2)
         except Exception:
             return base
 
