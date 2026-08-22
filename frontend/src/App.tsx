@@ -39,13 +39,19 @@ export default function App() {
 
   const totalDeposited = Number(bot.reports?.totalDeposited || 0);
   const totalGainLoss = Number(bot.reports?.totalGainLoss || 0);
+  const profitVault = bot.banking?.profitVault || bot.data?.banking?.profitVault || {};
+  const vaultWorkingCapitalGbp = Number(profitVault?.workingCapitalGbp || 0);
+  const brokerBuyingPowerUsd = Number(bot.data?.account?.buyingPower || 0);
+  const displayedWorkingCapitalGbp = vaultWorkingCapitalGbp > 0
+    ? vaultWorkingCapitalGbp
+    : brokerBuyingPowerUsd * bot.rate;
 
   return <div className="app ai-dashboard">
     <DashboardStyles />
     <Header status={bot.status} data={bot.data} marketLabel={bot.marketLabel} onLogout={bot.secureLogout} />
     <section className="stats">
       <Stat label="Equity" value={gbp(Number(bot.data?.account?.equity || 0) * bot.rate)} sub={usd(bot.data?.account?.equity)} />
-      <Stat label="Buying Power" value={gbp(Number(bot.data?.account?.buyingPower || 0) * bot.rate)} sub={usd(bot.data?.account?.buyingPower)} />
+      <Stat label="Working Capital" value={gbp(displayedWorkingCapitalGbp)} sub={profitVault?.enabled ? "Profit Vault adjusted" : usd(brokerBuyingPowerUsd)} />
       <Stat label="Today" value={gbp(Number(bot.data?.account?.pnlDay || 0) * bot.rate)} sub={usd(bot.data?.account?.pnlDay)} className={tone(bot.data?.account?.pnlDay)} />
       <Stat label="Total Gain/Loss" value={gbp(totalGainLoss * bot.rate)} sub={`Deposited ${gbp(totalDeposited * bot.rate)}`} className={tone(totalGainLoss)} />
     </section>
