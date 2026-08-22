@@ -451,7 +451,7 @@ LOCKED_UNIVERSE_FALLBACK_POOL = [
     "AAPL", "ABBV", "ADBE", "AMD", "AMAT", "AMGN", "AMZN", "AVGO",
     "BAC", "CAT", "CMG", "COIN", "COST", "CRM", "CRWD", "CSCO",
     "CVX", "DDOG", "DIS", "GE", "GM", "GOOG", "GOOGL", "GS",
-    "HD", "HOOD", "IBM", "INTC", "JNJ", "JPM", "KO", "LLY",
+    "HD", "HOOD", "IBM", "INTC", "JNJ", "JPM", "KO", "MARA",
     "MA", "META", "MSFT", "MU", "NFLX", "NOW", "NVDA", "ORCL",
     "PANW", "PEP", "PFE", "QCOM", "QQQ", "ROKU", "SHOP", "SMH",
     "SNOW", "SPY", "TGT", "TJX", "TSLA", "TXN", "UBER", "UNH",
@@ -483,6 +483,7 @@ locked_today: Dict[str, str] = {}
 custom_symbols: Dict[str, bool] = {}
 last_universe_refresh_ts = 0
 locked_universe_runtime_cache: Dict[str, Any] = {"day": "", "symbols": [], "rows": [], "lastDiscoveryTs": 0.0}
+adaptive_universe_runtime_cache: Dict[str, Any] = {"updatedAt": "", "symbols": [], "rows": [], "lastRefreshTs": 0.0, "changes": 0}
 
 latest_status: Dict[str, Any] = {}
 latest_scans: List[Dict[str, Any]] = []
@@ -6976,6 +6977,7 @@ def build_status_payload(bot_name, scans):
         "fx": fx_payload(),
         "autoUniverse": auto_universe_payload(),
         "dynamicMarketScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
+        "adaptiveUniverse": adaptive_universe_payload() if "adaptive_universe_payload" in globals() else {},
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
         "strictOneCyclePerStockPerDay": STRICT_ONE_CYCLE_PER_STOCK_PER_DAY,
@@ -9250,6 +9252,10 @@ def run_bot_loop():
                     print(f"DYNAMIC SCANNER LOOP ERROR: {e}")
                 refresh_universe_if_needed()
                 try:
+                    refresh_adaptive_universe_if_needed()
+                except Exception as e:
+                    print(f"V17.5 ADAPTIVE UNIVERSE LOOP ERROR: {e}")
+                try:
                     sync_recent_filled_orders_to_reports()
                 except Exception as e:
                     print(f"AUTO REPORT LOOP SYNC ERROR: {e}")
@@ -10110,8 +10116,8 @@ def api_clear_loser_cooldown(request: Request):
 # DYNAMIC MARKET SCANNER v1.0
 # =========================
 DYNAMIC_MARKET_SCANNER_ENABLED = os.getenv("DYNAMIC_MARKET_SCANNER_ENABLED", "true").lower() == "true"
-DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS = int(os.getenv("DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS", "12"))
-DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS = int(os.getenv("DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS", str(60 * 60 * 4)))
+DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS = int(os.getenv("DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS", "24"))
+DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS = int(os.getenv("DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS", str(60 * 30)))
 DYNAMIC_MARKET_SCANNER_FILE = os.path.join("backend", "state", "dynamic_market_scanner.json")
 DYNAMIC_MARKET_MIN_PRICE = float(os.getenv("DYNAMIC_MARKET_MIN_PRICE", "3"))
 DYNAMIC_MARKET_MAX_PRICE = float(os.getenv("DYNAMIC_MARKET_MAX_PRICE", "800"))
@@ -10338,6 +10344,264 @@ def api_dynamic_market_scanner_refresh(request: Request):
         print(f"DYNAMIC SCANNER STATUS UPDATE ERROR: {e}")
     return {"ok": True, "message": "Dynamic market scanner refreshed", "dynamicMarketScanner": payload, **payload}
 
+
+
+# =========================
+# V17.5 — HYBRID ADAPTIVE OPEN-MARKET UNIVERSE
+# =========================
+# The old weekly/core pool remains as a safety anchor, but it no longer owns the
+# whole scanner. Fresh broad-market discoveries compete for most runtime slots.
+# No entry, sizing, daily-lock or exit gate is bypassed by this layer.
+ADAPTIVE_UNIVERSE_ENABLED = os.getenv("ADAPTIVE_UNIVERSE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+ADAPTIVE_UNIVERSE_TARGET_SIZE = max(6, int(os.getenv("ADAPTIVE_UNIVERSE_TARGET_SIZE", str(AUTO_UNIVERSE_SIZE)) or AUTO_UNIVERSE_SIZE))
+ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS = max(1, min(ADAPTIVE_UNIVERSE_TARGET_SIZE, int(os.getenv("ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS", "8") or 8)))
+ADAPTIVE_UNIVERSE_CORE_SLOTS = max(0, min(ADAPTIVE_UNIVERSE_TARGET_SIZE, int(os.getenv("ADAPTIVE_UNIVERSE_CORE_SLOTS", "4") or 4)))
+ADAPTIVE_UNIVERSE_REFRESH_SECONDS = max(300, int(os.getenv("ADAPTIVE_UNIVERSE_REFRESH_SECONDS", "1800") or 1800))
+ADAPTIVE_UNIVERSE_FILE = os.path.join("backend", "state", "adaptive_universe.json")
+
+
+def _adaptive_symbol_buy_allowed(symbol: str) -> bool:
+    sym = str(symbol or "").upper().strip()
+    if not sym or sym in globals().get("BLOCKED_WEAK_TICKERS", set()):
+        return False
+    try:
+        if is_locked_today(sym):
+            return False
+    except Exception:
+        pass
+    try:
+        decision = auto_improve_decision(sym)
+        if str(decision.get("action") or "NORMAL").upper() == "BLACKLIST":
+            qty, _ = get_position(sym)
+            return float(qty or 0.0) > DUST_THRESHOLD
+    except Exception:
+        pass
+    return True
+
+
+def _adaptive_core_rows() -> List[Dict[str, Any]]:
+    """Rank stable anchors by the bot's own realised symbol evidence."""
+    pool = [str(x).upper() for x in globals().get("QUALITY_ONLY_UNIVERSE", AUTO_UNIVERSE_CANDIDATE_POOL)]
+    memory = {}
+    try:
+        memory = {str(r.get("symbol") or "").upper(): dict(r) for r in universe_rows_from_stock_memory()}
+    except Exception:
+        memory = {}
+
+    rows: List[Dict[str, Any]] = []
+    for i, sym in enumerate(pool):
+        if not _adaptive_symbol_buy_allowed(sym):
+            continue
+        row = dict(memory.get(sym) or score_candidate_symbol(sym))
+        # Keep scores useful for display without pretending dynamic/core scores
+        # are identical statistical quantities.
+        row.update({"symbol": sym, "adaptiveSource": "CORE", "coreAnchor": True, "dynamicPick": False})
+        row.setdefault("reason", "adaptive core anchor")
+        row["anchorRank"] = i + 1
+        rows.append(row)
+    rows.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
+    return rows
+
+
+def _adaptive_discovery_rows() -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for raw in dynamic_market_rows():
+        sym = str(raw.get("symbol") or "").upper().strip()
+        if not _adaptive_symbol_buy_allowed(sym):
+            continue
+        row = dict(raw)
+        row.update({"symbol": sym, "adaptiveSource": "DISCOVERY", "coreAnchor": False, "dynamicPick": True})
+        rows.append(row)
+    rows.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
+    return rows
+
+
+def _save_adaptive_universe_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    global adaptive_universe_runtime_cache
+    adaptive_universe_runtime_cache = {**adaptive_universe_runtime_cache, **payload}
+    try:
+        os.makedirs(os.path.dirname(ADAPTIVE_UNIVERSE_FILE), exist_ok=True)
+        with open(ADAPTIVE_UNIVERSE_FILE, "w", encoding="utf-8") as f:
+            json.dump(adaptive_universe_runtime_cache, f, indent=2)
+    except Exception as exc:
+        print(f"V17.5 ADAPTIVE UNIVERSE SAVE ERROR: {exc}")
+    return dict(adaptive_universe_runtime_cache)
+
+
+def adaptive_universe_payload() -> Dict[str, Any]:
+    payload = dict(adaptive_universe_runtime_cache)
+    if not payload.get("rows"):
+        try:
+            if os.path.exists(ADAPTIVE_UNIVERSE_FILE):
+                with open(ADAPTIVE_UNIVERSE_FILE, "r", encoding="utf-8") as f:
+                    saved = json.load(f)
+                if isinstance(saved, dict):
+                    payload.update(saved)
+        except Exception:
+            pass
+    payload.setdefault("enabled", ADAPTIVE_UNIVERSE_ENABLED)
+    payload.setdefault("mode", "hybrid-open-market")
+    payload.setdefault("targetSize", ADAPTIVE_UNIVERSE_TARGET_SIZE)
+    payload.setdefault("discoverySlots", ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS)
+    payload.setdefault("coreSlots", ADAPTIVE_UNIVERSE_CORE_SLOTS)
+    payload.setdefault("refreshSeconds", ADAPTIVE_UNIVERSE_REFRESH_SECONDS)
+    payload["activeSymbols"] = list(current_universe)
+    return payload
+
+
+def refresh_adaptive_universe(force: bool = False) -> Dict[str, Any]:
+    """Build a runtime universe with fresh discoveries owning most slots.
+
+    Priority is: held positions -> manual pins -> broad-market discoveries ->
+    evidence-ranked core anchors -> safe refill. Every candidate still has to
+    pass the normal V17 live gates and final execution lock before buying.
+    """
+    global current_universe, adaptive_universe_runtime_cache
+    if not ADAPTIVE_UNIVERSE_ENABLED:
+        return adaptive_universe_payload()
+
+    now_ts = time.time()
+    last_ts = float(adaptive_universe_runtime_cache.get("lastRefreshTs") or 0.0)
+    if not force and adaptive_universe_runtime_cache.get("rows") and (now_ts - last_ts) < ADAPTIVE_UNIVERSE_REFRESH_SECONDS:
+        return adaptive_universe_payload()
+
+    try:
+        refresh_dynamic_market_candidates(force=force)
+    except Exception as exc:
+        print(f"V17.5 DISCOVERY REFRESH ERROR: {exc}")
+
+    held: List[str] = []
+    try:
+        held = [str(p.get("symbol") or "").upper().strip() for p in get_all_positions() if str(p.get("symbol") or "").strip()]
+    except Exception:
+        held = []
+
+    manual: List[str] = []
+    try:
+        manual = [str(x).upper().strip() for x in load_manual_universe_picks() if str(x).strip()]
+    except Exception:
+        manual = []
+
+    discoveries = _adaptive_discovery_rows()
+    cores = _adaptive_core_rows()
+    selected: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add_row(row: Dict[str, Any], source: str) -> None:
+        if len(selected) >= ADAPTIVE_UNIVERSE_TARGET_SIZE:
+            return
+        sym = str(row.get("symbol") or "").upper().strip()
+        if not sym or sym in seen:
+            return
+        item = dict(row)
+        item["symbol"] = sym
+        item["adaptiveSource"] = source
+        item["status"] = "active"
+        selected.append(item)
+        seen.add(sym)
+
+    # Held symbols are management-critical even if a buy lock/blacklist exists.
+    for sym in held:
+        add_row({"symbol": sym, "score": 999.0, "reason": "currently held position"}, "HELD")
+
+    for sym in manual:
+        if sym not in seen and sym not in globals().get("BLOCKED_WEAK_TICKERS", set()):
+            add_row({"symbol": sym, "score": 998.0, "reason": "manual pin | retained in adaptive universe", "manualPick": True}, "PIN")
+
+    discovery_added = 0
+    for row in discoveries:
+        if len(selected) >= ADAPTIVE_UNIVERSE_TARGET_SIZE or discovery_added >= ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS:
+            break
+        if str(row.get("symbol") or "").upper() in seen:
+            continue
+        add_row(row, "DISCOVERY")
+        discovery_added += 1
+
+    core_added = 0
+    for row in cores:
+        if len(selected) >= ADAPTIVE_UNIVERSE_TARGET_SIZE or core_added >= ADAPTIVE_UNIVERSE_CORE_SLOTS:
+            break
+        if str(row.get("symbol") or "").upper() in seen:
+            continue
+        add_row(row, "CORE")
+        core_added += 1
+
+    # If discovery/core quotas left gaps, fill from whichever side still has
+    # viable names rather than returning to a fixed dedicated pool.
+    for row in discoveries + cores:
+        if len(selected) >= ADAPTIVE_UNIVERSE_TARGET_SIZE:
+            break
+        add_row(row, str(row.get("adaptiveSource") or "DISCOVERY"))
+
+    # Last-resort safe refill only if external discovery is unavailable.
+    for sym in AUTO_UNIVERSE_CANDIDATE_POOL:
+        if len(selected) >= ADAPTIVE_UNIVERSE_TARGET_SIZE:
+            break
+        if sym in seen or not _adaptive_symbol_buy_allowed(sym):
+            continue
+        add_row(score_candidate_symbol(sym), "FALLBACK")
+
+    previous = list(current_universe)
+    current_universe = [r["symbol"] for r in selected]
+    for sym in current_universe:
+        ensure_symbol_state(sym, custom=sym in custom_symbols)
+
+    changed = previous != current_universe
+    changes = int(adaptive_universe_runtime_cache.get("changes") or 0) + (1 if changed else 0)
+    payload = {
+        "enabled": True,
+        "mode": "hybrid-open-market",
+        "updatedAt": datetime.now(UTC).isoformat(),
+        "lastRefreshTs": now_ts,
+        "refreshSeconds": ADAPTIVE_UNIVERSE_REFRESH_SECONDS,
+        "targetSize": ADAPTIVE_UNIVERSE_TARGET_SIZE,
+        "discoverySlots": ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS,
+        "coreSlots": ADAPTIVE_UNIVERSE_CORE_SLOTS,
+        "discoveryCount": len([r for r in selected if r.get("adaptiveSource") == "DISCOVERY"]),
+        "coreCount": len([r for r in selected if r.get("adaptiveSource") == "CORE"]),
+        "heldCount": len([r for r in selected if r.get("adaptiveSource") == "HELD"]),
+        "pinCount": len([r for r in selected if r.get("adaptiveSource") == "PIN"]),
+        "symbols": list(current_universe),
+        "activeSymbols": list(current_universe),
+        "rows": selected,
+        "changed": changed,
+        "changes": changes,
+        "previousSymbols": previous,
+    }
+    _save_adaptive_universe_payload(payload)
+    try:
+        latest_status["adaptiveUniverse"] = payload
+        latest_status["autoUniverse"] = {**latest_status.get("autoUniverse", {}), "mode": "hybrid-open-market", "activeSymbols": list(current_universe), "rows": selected, "size": len(current_universe)}
+    except Exception:
+        pass
+
+    if changed:
+        removed = [x for x in previous if x not in current_universe]
+        added = [x for x in current_universe if x not in previous]
+        print(
+            "V17.5 ADAPTIVE UNIVERSE ROTATION | "
+            f"discovery={payload['discoveryCount']} core={payload['coreCount']} held={payload['heldCount']} pins={payload['pinCount']} "
+            f"removed={','.join(removed) or '-'} added={','.join(added) or '-'} universe={','.join(current_universe)}"
+        )
+    return payload
+
+
+def refresh_adaptive_universe_if_needed() -> Dict[str, Any]:
+    return refresh_adaptive_universe(force=False)
+
+
+@app.get("/adaptive-universe")
+def api_adaptive_universe():
+    payload = adaptive_universe_payload()
+    return {"ok": True, "adaptiveUniverse": payload, **payload}
+
+
+@app.post("/adaptive-universe/refresh")
+def api_refresh_adaptive_universe(request: Request):
+    verify_api_key(request)
+    payload = refresh_adaptive_universe(force=True)
+    update_status(BOT_NAME, latest_scans)
+    return {"ok": True, "message": "Adaptive open-market universe refreshed", "adaptiveUniverse": payload, **payload}
 
 # =========================
 # QUALITY-ONLY UNIVERSE LOCK v1.3
