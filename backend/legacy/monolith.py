@@ -10933,7 +10933,7 @@ def refresh_universe_preview():
 # Losses never consume the recorded vault balance.
 PROFIT_VAULT_VERSION = "V17.6.0"
 PROFIT_VAULT_ENABLED = os.getenv("PROFIT_VAULT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-PROFIT_VAULT_DEFAULT_BASELINE_GBP = float(os.getenv("PROFIT_VAULT_BASELINE_GBP", "900.00") or 900.00)
+PROFIT_VAULT_DEFAULT_BASELINE_GBP = 900.00  # HARD-CODED: persisted state must not override this
 PROFIT_VAULT_BANK_PCT = max(0.0, min(1.0, float(os.getenv("PROFIT_VAULT_BANK_PCT", "1.0") or 1.0)))
 _PROFIT_VAULT_LOCK = threading.RLock()
 
@@ -10973,7 +10973,7 @@ def load_profit_vault_state() -> Dict[str, Any]:
                 default = _profit_vault_default_state()
                 default.update(data if isinstance(data, dict) else {})
                 default["enabled"] = bool(default.get("enabled", PROFIT_VAULT_ENABLED))
-                default["baselineGbp"] = round(float(default.get("baselineGbp") or PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2)
+                default["baselineGbp"] = round(float(PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2)  # hard-coded baseline wins
                 default["bankPct"] = max(0.0, min(1.0, float(default.get("bankPct") if default.get("bankPct") is not None else PROFIT_VAULT_BANK_PCT)))
                 default["bankedProfitGbp"] = max(0.0, float(default.get("bankedProfitGbp") or 0.0))
                 default["lifetimeBankedGbp"] = max(default["bankedProfitGbp"], float(default.get("lifetimeBankedGbp") or 0.0))
@@ -10996,6 +10996,7 @@ def save_profit_vault_state(state: Dict[str, Any]) -> Dict[str, Any]:
         data = _profit_vault_default_state()
         data.update(state or {})
         data["version"] = PROFIT_VAULT_VERSION
+        data["baselineGbp"] = round(float(PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2)  # never persist a different baseline
         data["updatedAt"] = datetime.now(UTC).isoformat()
         data["bankedProfitGbp"] = round(max(0.0, float(data.get("bankedProfitGbp") or 0.0)), 4)
         data["lifetimeBankedGbp"] = round(max(data["bankedProfitGbp"], float(data.get("lifetimeBankedGbp") or 0.0)), 4)
