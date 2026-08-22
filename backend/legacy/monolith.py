@@ -9245,6 +9245,11 @@ def run_bot_loop():
         restore_today_sell_locks_from_db()
     except Exception as e:
         print(f"AUTO REPORT STARTUP SYNC ERROR: {e}")
+    try:
+        if "profit_vault_seed_existing_surplus" in globals():
+            profit_vault_seed_existing_surplus()
+    except Exception as e:
+        print(f"V17.6.2 PROFIT VAULT STARTUP SEED ERROR: {e}")
     update_status(BOT_NAME, [])
 
     while True:
@@ -10931,7 +10936,7 @@ def refresh_universe_preview():
 # Full-buy mode still commits the whole WORKING pot, but realised positive
 # PnL is reserved in software and excluded from all future buy sizing.
 # Losses never consume the recorded vault balance.
-PROFIT_VAULT_VERSION = "V17.6.0"
+PROFIT_VAULT_VERSION = "V17.6.2"
 PROFIT_VAULT_ENABLED = os.getenv("PROFIT_VAULT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 PROFIT_VAULT_DEFAULT_BASELINE_GBP = 900.00  # HARD-CODED: persisted state must not override this
 PROFIT_VAULT_BANK_PCT = max(0.0, min(1.0, float(os.getenv("PROFIT_VAULT_BANK_PCT", "1.0") or 1.0)))
@@ -10961,6 +10966,9 @@ def _profit_vault_default_state() -> Dict[str, Any]:
         "lastBankedSymbol": "",
         "lastBankedReason": "",
         "lastBankedAmountGbp": 0.0,
+        "baselineSeeded": False,
+        "baselineSeededAt": "",
+        "baselineSeedAmountGbp": 0.0,
     }
 
 def load_profit_vault_state() -> Dict[str, Any]:
@@ -11006,6 +11014,49 @@ def save_profit_vault_state(state: Dict[str, Any]) -> Dict[str, Any]:
             json.dump(data, f, indent=2)
         os.replace(tmp, path)
         return data
+
+def profit_vault_seed_existing_surplus(account: Any = None) -> Dict[str, Any]:
+    """One-time migration: reserve existing account equity above the hard-coded baseline.
+
+    This only runs when there are no open positions. Once seeded, future vault growth
+    comes only from realised profitable sells via profit_vault_bank_realised_profit().
+    """
+    state = load_profit_vault_state()
+    if not state.get("enabled") or bool(state.get("baselineSeeded")):
+        return state
+    try:
+        if len(get_all_positions()) > 0:
+            return state
+    except Exception as exc:
+        print(f"V17.6.2 PROFIT VAULT SEED WAIT | positions unavailable: {exc}")
+        return state
+    try:
+        account = account or get_account()
+        equity_usd = max(0.0, float(account.equity))
+    except Exception as exc:
+        print(f"V17.6.2 PROFIT VAULT SEED WAIT | account unavailable: {exc}")
+        return state
+    rate = get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP
+    equity_gbp = equity_usd * float(rate)
+    baseline_gbp = float(PROFIT_VAULT_DEFAULT_BASELINE_GBP)
+    target_banked = round(max(0.0, equity_gbp - baseline_gbp), 4)
+    existing_banked = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
+    seeded_delta = round(max(0.0, target_banked - existing_banked), 4)
+    state["bankedProfitGbp"] = round(max(existing_banked, target_banked), 4)
+    state["lifetimeBankedGbp"] = round(max(
+        float(state.get("lifetimeBankedGbp") or 0.0) + seeded_delta,
+        float(state["bankedProfitGbp"]),
+    ), 4)
+    state["baselineSeeded"] = True
+    state["baselineSeededAt"] = datetime.now(UTC).isoformat()
+    state["baselineSeedAmountGbp"] = seeded_delta
+    state = save_profit_vault_state(state)
+    print(
+        f"V17.6.2 PROFIT VAULT BASELINE SEED | baseline=£{baseline_gbp:.2f} "
+        f"equity=£{equity_gbp:.2f} banked=£{float(state.get('bankedProfitGbp') or 0.0):.2f} "
+        f"working=£{max(0.0, equity_gbp-float(state.get('bankedProfitGbp') or 0.0)):.2f}"
+    )
+    return state
 
 def profit_vault_reserved_usd() -> float:
     state = load_profit_vault_state()
@@ -11058,7 +11109,9 @@ def profit_vault_bank_realised_profit(pnl_usd: float, symbol: str = "", reason: 
     return state
 
 def profit_vault_payload(account: Any = None) -> Dict[str, Any]:
-    state = load_profit_vault_state()
+    state = profit_vault_seed_existing_surplus(account)
+    if not state.get("baselineSeeded"):
+        state = load_profit_vault_state()
     try:
         account = account or get_account()
         equity_usd = max(0.0, float(account.equity))
@@ -11088,6 +11141,9 @@ def profit_vault_payload(account: Any = None) -> Dict[str, Any]:
         "lastBankedSymbol": state.get("lastBankedSymbol", ""),
         "lastBankedReason": state.get("lastBankedReason", ""),
         "lastBankedAmountGbp": round(float(state.get("lastBankedAmountGbp") or 0.0), 2),
+        "baselineSeeded": bool(state.get("baselineSeeded")),
+        "baselineSeededAt": state.get("baselineSeededAt", ""),
+        "baselineSeedAmountGbp": round(float(state.get("baselineSeedAmountGbp") or 0.0), 2),
         "growthSinceBaselineGbp": round(equity_gbp - float(state.get("baselineGbp") or PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2),
         "message": "100% of positive realised PnL is reserved and excluded from future buys." if float(state.get("bankPct") or 0.0) >= 0.999 else "A configured share of positive realised PnL is reserved from future buys.",
     }
