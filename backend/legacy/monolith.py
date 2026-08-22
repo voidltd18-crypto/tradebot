@@ -10933,7 +10933,7 @@ def refresh_universe_preview():
 # Losses never consume the recorded vault balance.
 PROFIT_VAULT_VERSION = "V17.6.0"
 PROFIT_VAULT_ENABLED = os.getenv("PROFIT_VAULT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-PROFIT_VAULT_DEFAULT_BASELINE_GBP = float(os.getenv("PROFIT_VAULT_BASELINE_GBP", "982.84") or 982.84)
+PROFIT_VAULT_DEFAULT_BASELINE_GBP = float(os.getenv("PROFIT_VAULT_BASELINE_GBP", "900.00") or 900.00)
 PROFIT_VAULT_BANK_PCT = max(0.0, min(1.0, float(os.getenv("PROFIT_VAULT_BANK_PCT", "1.0") or 1.0)))
 _PROFIT_VAULT_LOCK = threading.RLock()
 
