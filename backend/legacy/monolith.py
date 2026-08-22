@@ -9590,17 +9590,101 @@ _reports_payload_lock = threading.RLock()
 REPORTS_CACHE_SECONDS = max(15, int(os.getenv("REPORTS_CACHE_SECONDS", "45")))
 
 
+def _reports_fast_performance_snapshot(status: Dict[str, Any]) -> Dict[str, Any]:
+    """Build report statistics with short read-only SQLite queries.
+
+    V17.4.1: Reports must never rebuild the performance engine, write to SQLite,
+    or call the broker on the HTTP request path. Those operations can contend
+    with the 10-second Trade Replay writer and made /reports appear to hang.
+    """
+    baseline = 0.0
+    total_withdrawn = _safe_num(os.getenv("TOTAL_WITHDRAWN_USD", 0))
+    stats = {
+        "lifetimeRealisedPnl": 0.0, "wins": 0, "losses": 0, "breakevens": 0,
+        "totalClosedTrades": 0, "bestTrade": 0.0, "worstTrade": 0.0,
+        "averageWin": 0.0, "averageLoss": 0.0, "profitFactor": 0.0,
+        "winRate": 0.0, "updatedAt": datetime.now(UTC).isoformat(),
+    }
+    try:
+        conn = db_connect()
+        # A single aggregate query is much cheaper than loading/rebuilding the
+        # entire historical performance state on every Reports page open.
+        row = conn.execute("""
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(pnl), 0) AS realised,
+                COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                COALESCE(SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END), 0) AS losses,
+                COALESCE(SUM(CASE WHEN pnl = 0 THEN 1 ELSE 0 END), 0) AS breakevens,
+                COALESCE(MAX(pnl), 0) AS best_trade,
+                COALESCE(MIN(pnl), 0) AS worst_trade,
+                COALESCE(AVG(CASE WHEN pnl > 0 THEN pnl END), 0) AS average_win,
+                COALESCE(AVG(CASE WHEN pnl < 0 THEN pnl END), 0) AS average_loss,
+                COALESCE(SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END), 0) AS gross_profit,
+                COALESCE(ABS(SUM(CASE WHEN pnl < 0 THEN pnl ELSE 0 END)), 0) AS gross_loss
+            FROM closed_trades
+        """).fetchone()
+        try:
+            state = conn.execute("SELECT baseline_equity, total_withdrawn, updated_at FROM performance_state WHERE id=1").fetchone()
+        except Exception:
+            state = None
+        conn.close()
+
+        if row is not None:
+            wins = int(row["wins"] or 0); losses = int(row["losses"] or 0)
+            gross_profit = float(row["gross_profit"] or 0.0); gross_loss = float(row["gross_loss"] or 0.0)
+            stats.update({
+                "lifetimeRealisedPnl": float(row["realised"] or 0.0),
+                "wins": wins, "losses": losses, "breakevens": int(row["breakevens"] or 0),
+                "totalClosedTrades": int(row["total"] or 0),
+                "bestTrade": float(row["best_trade"] or 0.0), "worstTrade": float(row["worst_trade"] or 0.0),
+                "averageWin": float(row["average_win"] or 0.0), "averageLoss": float(row["average_loss"] or 0.0),
+                "profitFactor": gross_profit / gross_loss if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0),
+                "winRate": wins / max(1, wins + losses),
+            })
+        if state is not None:
+            baseline = _safe_num(state["baseline_equity"])
+            total_withdrawn = _safe_num(state["total_withdrawn"], total_withdrawn)
+            stats["updatedAt"] = state["updated_at"] or stats["updatedAt"]
+    except Exception as exc:
+        print(f"V17.4.1 FAST REPORT SNAPSHOT ERROR: {exc}")
+        # Fall back to already-computed status values instead of blocking the UI.
+        db = status.get("dbSummary") or {}
+        stats["lifetimeRealisedPnl"] = _safe_num(db.get("totalPnl"))
+        stats["winRate"] = _safe_num(db.get("winRate"))
+        stats["totalClosedTrades"] = int(_safe_num(db.get("totalTrades")))
+
+    account = status.get("account") or {}
+    equity = _safe_num(account.get("equity"))
+    if baseline <= 0:
+        baseline = _safe_num(os.getenv("TOTAL_DEPOSITED_USD", 0)) or equity
+    total_gain_loss = equity + total_withdrawn - baseline
+    return {
+        "ok": True,
+        "persistent": os.path.abspath(SQLITE_DB_FILE).startswith("/var/data") or bool(os.getenv("PERSISTENT_DATA_DIR")),
+        "databaseFile": SQLITE_DB_FILE,
+        "baselineFile": BASELINE_FILE,
+        "baselineEquity": baseline,
+        "totalDeposited": baseline,
+        "totalWithdrawn": total_withdrawn,
+        "currentEquity": equity,
+        "totalGainLoss": total_gain_loss,
+        "totalGainLossGbp": money_gbp(total_gain_loss),
+        **stats,
+    }
+
+
 def _build_reports_payload() -> Dict[str, Any]:
     status = latest_status if isinstance(latest_status, dict) else {}
     account = status.get("account") or {}
     db = status.get("dbSummary") or {}
     equity = _safe_num(account.get("equity"))
     equity_gbp = _safe_num(account.get("equityGbp"))
-    performance = performance_engine_payload()
+    performance = _reports_fast_performance_snapshot(status)
     total_withdrawn = _safe_num(performance.get("totalWithdrawn"))
     total_deposited = _safe_num(performance.get("totalDeposited"))
     total_gain_loss = _safe_num(performance.get("totalGainLoss"))
-    closed = closed_trades_from_db(500) if "closed_trades_from_db" in globals() else (status.get("closedTrades") or [])
+    closed = closed_trades_from_db(200) if "closed_trades_from_db" in globals() else (status.get("closedTrades") or [])
     timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
     equity_history = []
     for i, e in enumerate(timeline if isinstance(timeline, list) else []):
@@ -9615,15 +9699,15 @@ def _build_reports_payload() -> Dict[str, Any]:
             "pnlPct": _safe_num(e.get("pnlPct")), "reason": e.get("reason") or "",
         })
     return {
-        "ok": True, "depositSource": "persistent-performance-engine",
+        "ok": True, "depositSource": "persistent-performance-engine-fast-read",
         "totalDeposited": total_deposited, "totalWithdrawn": total_withdrawn,
         "currentEquity": equity, "currentEquityGbp": equity_gbp,
         "totalGainLoss": total_gain_loss, "earnedSinceDeposit": max(total_gain_loss, 0.0),
         "lostSinceDeposit": abs(min(total_gain_loss, 0.0)), "dayPnl": _safe_num(account.get("pnlDay")),
         "realisedNet": _safe_num(performance.get("lifetimeRealisedPnl", db.get("totalPnl"))),
         "performanceEngine": performance, "closedTrades": closed[:200] if isinstance(closed, list) else [],
-        "equityHistory": equity_history[-500:], "winRate": _safe_num(db.get("winRate")) * 100.0,
-        "totalTrades": int(_safe_num(db.get("totalTrades"))),
+        "equityHistory": equity_history[-500:], "winRate": _safe_num(performance.get("winRate", db.get("winRate"))) * 100.0,
+        "totalTrades": int(_safe_num(performance.get("totalClosedTrades", db.get("totalTrades")))),
     }
 
 
