@@ -905,18 +905,184 @@ def get_equity():
     return float(get_account().equity)
 
 
-def get_market_status_payload():
+# V17.6.4: Alpaca remains the primary market clock, but a deterministic
+# NYSE regular-session sanity check prevents a stale false `is_open` value
+# from putting the entire live trader to sleep during obvious core hours.
+_market_clock_last_override_log = 0.0
+_market_clock_last_error_log = 0.0
+MARKET_CLOCK_FALLBACK_LOG_SECONDS = 300.0
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int):
+    d = datetime(year, month, 1).date()
+    shift = (weekday - d.weekday()) % 7
+    return d + timedelta(days=shift + 7 * (n - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int):
+    if month == 12:
+        d = datetime(year + 1, 1, 1).date() - timedelta(days=1)
+    else:
+        d = datetime(year, month + 1, 1).date() - timedelta(days=1)
+    return d - timedelta(days=(d.weekday() - weekday) % 7)
+
+
+def _observed_fixed_holiday(year: int, month: int, day: int):
+    d = datetime(year, month, day).date()
+    if d.weekday() == 5:  # Saturday -> Friday
+        return d - timedelta(days=1)
+    if d.weekday() == 6:  # Sunday -> Monday
+        return d + timedelta(days=1)
+    return d
+
+
+def _easter_sunday(year: int):
+    # Anonymous Gregorian algorithm; used only to derive Good Friday.
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return datetime(year, month, day).date()
+
+
+def _nyse_regular_holidays(year: int):
+    holidays = {
+        _observed_fixed_holiday(year, 1, 1),
+        _nth_weekday(year, 1, 0, 3),   # Martin Luther King Jr. Day
+        _nth_weekday(year, 2, 0, 3),   # Washington's Birthday
+        _easter_sunday(year) - timedelta(days=2),  # Good Friday
+        _last_weekday(year, 5, 0),     # Memorial Day
+        _observed_fixed_holiday(year, 6, 19),  # Juneteenth
+        _observed_fixed_holiday(year, 7, 4),   # Independence Day
+        _nth_weekday(year, 9, 0, 1),   # Labor Day
+        _nth_weekday(year, 11, 3, 4),  # Thanksgiving
+        _observed_fixed_holiday(year, 12, 25), # Christmas
+    }
+    # New Year's Day can be observed on Dec 31 of the previous year.
+    holidays.add(_observed_fixed_holiday(year + 1, 1, 1))
+    return holidays
+
+
+def _nyse_early_close_dates(year: int):
+    dates = set()
+    # Friday after Thanksgiving.
+    dates.add(_nth_weekday(year, 11, 3, 4) + timedelta(days=1))
+    # Christmas Eve when it is a weekday and not itself a full holiday.
+    xmas_eve = datetime(year, 12, 24).date()
+    if xmas_eve.weekday() < 5 and xmas_eve not in _nyse_regular_holidays(year):
+        dates.add(xmas_eve)
+    # Common Independence Day early close: July 3 when it is a weekday and
+    # not the observed full holiday. If July 4 is Monday, July 1 is commonly
+    # the preceding early-close session.
+    july4 = datetime(year, 7, 4).date()
+    candidate = datetime(year, 7, 3).date()
+    if candidate.weekday() < 5 and candidate not in _nyse_regular_holidays(year):
+        dates.add(candidate)
+    elif july4.weekday() == 0:
+        july1 = datetime(year, 7, 1).date()
+        if july1.weekday() < 5 and july1 not in _nyse_regular_holidays(year):
+            dates.add(july1)
+    return dates
+
+
+def _nyse_schedule_state(now_utc=None) -> Dict[str, Any]:
+    now_utc = now_utc or datetime.now(UTC)
+    ny = now_utc.astimezone(ZoneInfo("America/New_York"))
+    day = ny.date()
+    holidays = _nyse_regular_holidays(day.year)
+    regular_day = ny.weekday() < 5 and day not in holidays
+    close_hour = 13 if day in _nyse_early_close_dates(day.year) else 16
+    open_dt = ny.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_dt = ny.replace(hour=close_hour, minute=0, second=0, microsecond=0)
+    is_open = bool(regular_day and open_dt <= ny < close_dt)
+    return {
+        "isOpen": is_open,
+        "timestamp": ny.isoformat(),
+        "sessionOpen": open_dt.isoformat(),
+        "sessionClose": close_dt.isoformat(),
+        "regularDay": regular_day,
+        "earlyClose": bool(day in _nyse_early_close_dates(day.year)),
+        "date": day.isoformat(),
+    }
+
+
+def get_effective_market_status_payload() -> Dict[str, Any]:
+    global _market_clock_last_override_log, _market_clock_last_error_log
+    schedule = _nyse_schedule_state()
     try:
         clock = trading_client.get_clock()
+        alpaca_open = bool(clock.is_open)
+        effective_open = alpaca_open
+        source = "alpaca"
+        overridden = False
+
+        # We only override a suspicious CLOSED result. Alpaca remains trusted
+        # when it reports OPEN, preserving broker-side special-session handling.
+        if not alpaca_open and schedule["isOpen"]:
+            effective_open = True
+            source = "nyse_schedule_fallback"
+            overridden = True
+            now_mono = time.monotonic()
+            if now_mono - _market_clock_last_override_log >= MARKET_CLOCK_FALLBACK_LOG_SECONDS:
+                print(
+                    "V17.6.4 MARKET CLOCK MISMATCH | "
+                    f"alpaca_open={alpaca_open} schedule_open={schedule['isOpen']} "
+                    f"ny_time={schedule['timestamp']} -> USING NYSE SCHEDULE FALLBACK"
+                )
+                _market_clock_last_override_log = now_mono
+
         return {
-            "isOpen": bool(clock.is_open),
+            "isOpen": effective_open,
+            "alpacaOpen": alpaca_open,
+            "scheduleOpen": bool(schedule["isOpen"]),
+            "fallbackActive": overridden,
+            "source": source,
             "timestamp": str(clock.timestamp),
             "nextOpen": str(clock.next_open),
             "nextClose": str(clock.next_close),
-            "label": "OPEN" if clock.is_open else "CLOSED",
+            "schedule": schedule,
+            "label": "OPEN" if effective_open else "CLOSED",
         }
-    except Exception as e:
-        return {"isOpen": False, "label": "UNKNOWN", "error": str(e), "timestamp": "", "nextOpen": "", "nextClose": ""}
+    except Exception as exc:
+        # If the broker clock itself errors, a known regular NYSE session is a
+        # safer fallback than forcing the bot closed. Outside the session we
+        # remain closed.
+        effective_open = bool(schedule["isOpen"])
+        now_mono = time.monotonic()
+        if now_mono - _market_clock_last_error_log >= MARKET_CLOCK_FALLBACK_LOG_SECONDS:
+            print(
+                "V17.6.4 MARKET CLOCK ERROR | "
+                f"error={exc} schedule_open={effective_open} ny_time={schedule['timestamp']} "
+                "-> USING NYSE SCHEDULE FALLBACK"
+            )
+            _market_clock_last_error_log = now_mono
+        return {
+            "isOpen": effective_open,
+            "alpacaOpen": None,
+            "scheduleOpen": effective_open,
+            "fallbackActive": True,
+            "source": "nyse_schedule_fallback_error",
+            "error": str(exc),
+            "timestamp": schedule["timestamp"],
+            "nextOpen": "",
+            "nextClose": "",
+            "schedule": schedule,
+            "label": "OPEN" if effective_open else "CLOSED",
+        }
+
+
+def get_market_status_payload():
+    return get_effective_market_status_payload()
 
 
 def get_quote(symbol: str):
@@ -4557,7 +4723,7 @@ def buy_custom_symbol(symbol: str):
     symbol = symbol.upper().strip()
     if not symbol or not symbol.replace(".", "").replace("-", "").isalnum():
         return {"ok": False, "message": "Invalid ticker"}
-    if CUSTOM_BUY_REQUIRES_MARKET_OPEN and not trading_client.get_clock().is_open:
+    if CUSTOM_BUY_REQUIRES_MARKET_OPEN and not get_effective_market_status_payload().get("isOpen", False):
         return {"ok": False, "message": "Market closed"}
     can_buy, reason = can_buy_symbol(symbol)
     if not can_buy:
@@ -4853,7 +5019,7 @@ def _db_safe_housekeeping(force: bool = False) -> Dict[str, Any]:
     # because it only touches audit/event history and takes the serial SQLite writer lock.
     if not force:
         try:
-            if bool(trading_client.get_clock().is_open):
+            if bool(get_effective_market_status_payload().get("isOpen", False)):
                 return {"ok": True, "skipped": True, "reason": "Market open"}
         except Exception:
             pass
@@ -8314,7 +8480,7 @@ def v2_adaptive_threshold_recommendations(horizon_hours: int = 24, min_samples: 
         market_closed = True
         if AI_THRESHOLD_CLOSED_MARKET_ONLY:
             try:
-                market_closed = not bool(trading_client.get_clock().is_open)
+                market_closed = not bool(get_effective_market_status_payload().get("isOpen", False))
             except Exception:
                 market_closed = False
         result["marketClosed"] = market_closed
@@ -8603,7 +8769,7 @@ def manual_override_off(request: Request):
 def manual_buy(request: Request):
     verify_api_key(request)
     with bot_lock:
-        if not trading_client.get_clock().is_open:
+        if not get_effective_market_status_payload().get("isOpen", False):
             return {"ok": False, "message": "Market closed"}
         result = money_mode_buy(latest_scans, manual=True)
         update_status(BOT_NAME, latest_scans)
@@ -8696,7 +8862,7 @@ def backfill_trades(request: Request):
 def _ai_research_market_open() -> Optional[bool]:
     """Return Alpaca market state, or None when the clock cannot be read safely."""
     try:
-        return bool(trading_client.get_clock().is_open)
+        return bool(get_effective_market_status_payload().get("isOpen", False))
     except Exception as exc:
         print(f"AI RESEARCH CLOCK ERROR: {exc}")
         return None
@@ -9067,7 +9233,7 @@ def record_trade_replay_snapshot(market_open: Optional[bool] = None) -> Dict[str
             return {"ok": True, "enabled": True, "recorded": 0}
         if market_open is None:
             try:
-                market_open = bool(trading_client.get_clock().is_open)
+                market_open = bool(get_effective_market_status_payload().get("isOpen", False))
             except Exception:
                 market_open = False
         conn = db_connect(); recorded = 0
@@ -9108,7 +9274,7 @@ def trade_replay_recorder_worker() -> None:
             # get_all_positions already reads live position data; market-open is
             # informational for the saved point and does not control recording.
             try:
-                is_open = bool(trading_client.get_clock().is_open)
+                is_open = bool(get_effective_market_status_payload().get("isOpen", False))
             except Exception:
                 is_open = False
             record_trade_replay_snapshot(is_open)
@@ -9270,13 +9436,13 @@ def run_bot_loop():
                     sync_recent_filled_orders_to_reports()
                 except Exception as e:
                     print(f"AUTO REPORT LOOP SYNC ERROR: {e}")
-                clock = trading_client.get_clock()
+                market_state = get_effective_market_status_payload()
                 try:
-                    record_trade_replay_snapshot(bool(clock.is_open))
+                    record_trade_replay_snapshot(bool(market_state.get("isOpen")))
                 except Exception as e:
                     print(f"V17.1 TRADE REPLAY LOOP ERROR: {e}")
 
-                if not clock.is_open:
+                if not market_state.get("isOpen"):
                     print("Market closed. Waiting...")
                     update_status(BOT_NAME, latest_scans)
                     time.sleep(CHECK_INTERVAL)
@@ -14703,8 +14869,8 @@ def api_outcomes_backlog(request: Request):
 def api_outcomes_drain(request: Request, payload: Dict[str, Any] = Body(default={})):
     verify_api_key(request)
     try:
-        clock = trading_client.get_clock()
-        if clock.is_open and AI_RESEARCH_CLOSED_MARKET_ONLY:
+        market_state = get_effective_market_status_payload()
+        if market_state.get("isOpen") and AI_RESEARCH_CLOSED_MARKET_ONLY:
             return {"ok": False, "blocked": True, "reason": "market_open_live_trader_has_priority"}
     except Exception:
         pass
@@ -18929,7 +19095,7 @@ def ai_threshold_learning_cycle(trigger: str = "automatic", force: bool = False)
     if not AI_THRESHOLD_LEARNING_ENABLED:
         return {"ok": False, "version": "V15.12", "message": "Autonomous threshold learning is disabled."}
     try:
-        market_open = bool(trading_client.get_clock().is_open)
+        market_open = bool(get_effective_market_status_payload().get("isOpen", False))
     except Exception as exc:
         result = {"ok": False, "version": "V15.12", "trigger": trigger, "error": f"Market clock unavailable: {exc}"}
         _ai_threshold_last_result = result
