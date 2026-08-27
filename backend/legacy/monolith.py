@@ -7431,20 +7431,56 @@ def apply_custom_a_plus_thresholds(confidence: float, quality: float, reason: st
     })
     if save:
         _save_strategy_settings(payload)
-    try:
-        init_db()
-        conn = db_connect()
-        count = conn.execute("SELECT COUNT(*) FROM v2_strategy_versions").fetchone()[0]
-        conn.execute(
-            """INSERT INTO v2_strategy_versions
-               (created_at, version_label, action, confidence, quality, previous_confidence, previous_quality, reason, metrics_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (datetime.now(UTC).isoformat(), f"V2.{count+1}", "APPLY", confidence, quality,
-             previous_conf, previous_quality, reason, json.dumps({})),
-        )
-        conn.commit(); conn.close()
-    except Exception as e:
-        print(f"STRATEGY VERSION SAVE ERROR: {e}")
+    # V17.7.1 — write the strategy-version audit row as one serialized
+    # transaction.  The old SELECT-then-INSERT sequence could start as a WAL
+    # reader and then fail while upgrading to a writer if another autonomous
+    # worker committed in between.  BEGIN IMMEDIATE + whole-transaction retry
+    # removes that read->write upgrade race without changing any strategy rule.
+    strategy_save_error = None
+    for strategy_save_attempt in range(_DB_LOCK_RETRIES):
+        conn = None
+        try:
+            init_db()
+            with _DB_SERIAL_WRITE_LOCK:
+                conn = db_connect()
+                conn.execute("BEGIN IMMEDIATE")
+                count = conn.execute("SELECT COUNT(*) FROM v2_strategy_versions").fetchone()[0]
+                conn.execute(
+                    """INSERT INTO v2_strategy_versions
+                       (created_at, version_label, action, confidence, quality, previous_confidence, previous_quality, reason, metrics_json)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (datetime.now(UTC).isoformat(), f"V2.{count+1}", "APPLY", confidence, quality,
+                     previous_conf, previous_quality, reason, json.dumps({})),
+                )
+                conn.commit()
+            strategy_save_error = None
+            break
+        except sqlite3.OperationalError as e:
+            strategy_save_error = e
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            if not _db_is_lock_error(e) or strategy_save_attempt >= _DB_LOCK_RETRIES - 1:
+                break
+            time.sleep(_db_retry_delay(strategy_save_attempt))
+        except Exception as e:
+            strategy_save_error = e
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            break
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    if strategy_save_error is not None:
+        print(f"V17.7.1 STRATEGY VERSION SAVE ERROR | attempts={_DB_LOCK_RETRIES} error={strategy_save_error}")
     return payload
 
 
@@ -16129,6 +16165,23 @@ AI_RISK_ENGINE_ENABLED = os.getenv("AI_RISK_ENGINE_ENABLED", "true").lower() in 
 AI_RISK_EMERGENCY_STOP_PCT = max(6.0, min(15.0, float(os.getenv("AI_RISK_EMERGENCY_STOP_PCT", "10.0") or 10.0)))
 AI_RISK_MIN_POSITION_MULTIPLIER = max(0.25, min(1.0, float(os.getenv("AI_RISK_MIN_POSITION_MULTIPLIER", "0.60") or 0.60)))
 AI_RISK_MAX_POSITION_MULTIPLIER = max(1.0, min(1.50, float(os.getenv("AI_RISK_MAX_POSITION_MULTIPLIER", "1.25") or 1.25)))
+
+# V17.7 — Volatility-aware trailing-profit activation.
+# The saved AI risk profile remains the maximum breathing room selected at entry.
+# While a position is live, sufficiently mature recent price behaviour may arm
+# the profit trail earlier for slow/steady names. Fast movers keep their wider
+# entry-selected activation threshold. This changes profit protection only; it
+# never loosens stop-loss/emergency protection and never raises trail-start
+# above the profile that was approved at entry.
+V17_ADAPTIVE_TRAIL_START_ENABLED = os.getenv("V17_ADAPTIVE_TRAIL_START_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+V17_ADAPTIVE_TRAIL_MIN_SAMPLES = max(12, int(os.getenv("V17_ADAPTIVE_TRAIL_MIN_SAMPLES", "20") or 20))
+V17_ADAPTIVE_TRAIL_LOW_VOL_PCT = max(0.01, float(os.getenv("V17_ADAPTIVE_TRAIL_LOW_VOL_PCT", "0.08") or 0.08))
+V17_ADAPTIVE_TRAIL_MED_VOL_PCT = max(V17_ADAPTIVE_TRAIL_LOW_VOL_PCT, float(os.getenv("V17_ADAPTIVE_TRAIL_MED_VOL_PCT", "0.18") or 0.18))
+V17_ADAPTIVE_TRAIL_LOW_START_PCT = max(1.0, float(os.getenv("V17_ADAPTIVE_TRAIL_LOW_START_PCT", "1.75") or 1.75))
+V17_ADAPTIVE_TRAIL_MED_START_PCT = max(V17_ADAPTIVE_TRAIL_LOW_START_PCT, float(os.getenv("V17_ADAPTIVE_TRAIL_MED_START_PCT", "2.50") or 2.50))
+V17_ADAPTIVE_TRAIL_HIGH_START_PCT = max(V17_ADAPTIVE_TRAIL_MED_START_PCT, float(os.getenv("V17_ADAPTIVE_TRAIL_HIGH_START_PCT", "4.00") or 4.00))
+V17_ADAPTIVE_TRAIL_LOG_SECONDS = max(60.0, float(os.getenv("V17_ADAPTIVE_TRAIL_LOG_SECONDS", "300") or 300))
+_ai_risk_adaptive_trail_log: Dict[str, Dict[str, Any]] = {}
 _ai_risk_symbol_cache: Dict[str, Any] = {"ts": 0.0, "rows": {}}
 
 
@@ -16311,20 +16364,91 @@ def ai_risk_notional(scan: Dict[str, Any]) -> float:
         return round(max(0.0, base * profile["positionMultiplier"]), 2)
 
 
+def _v17_adaptive_trail_start(symbol: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of the risk profile with a volatility-aware trail start.
+
+    Recent realised volatility is taken from the bot's live price curve. We only
+    tighten the entry-selected trail activation; we never widen it. If there is
+    not enough live evidence yet, the original profile is returned unchanged.
+    """
+    result = dict(profile or {})
+    base_start = abs(float(result.get("trailStartPct") or ((float(TRAIL_START) - 1.0) * 100.0)))
+    result["trailStartPctBase"] = round(base_start, 4)
+    result["adaptiveTrailEnabled"] = bool(V17_ADAPTIVE_TRAIL_START_ENABLED)
+    result["adaptiveTrailMode"] = "BASE"
+
+    if not V17_ADAPTIVE_TRAIL_START_ENABLED:
+        return result
+
+    try:
+        ensure_symbol_state(symbol)
+        metrics = _v16_curve_metrics({"symbol": symbol, "price_curve": (state.get(symbol) or {}).get("price_curve") or []})
+        samples = int(metrics.get("samples") or 0)
+        # _v16_curve_metrics volatility is a decimal return; convert to percent.
+        realised_vol_pct = abs(float(metrics.get("volatility") or 0.0)) * 100.0
+        result["adaptiveTrailSamples"] = samples
+        result["adaptiveTrailVolatilityPct"] = round(realised_vol_pct, 4)
+
+        if samples < V17_ADAPTIVE_TRAIL_MIN_SAMPLES:
+            result["adaptiveTrailMode"] = "LEARNING"
+            return result
+
+        if realised_vol_pct <= V17_ADAPTIVE_TRAIL_LOW_VOL_PCT:
+            target = V17_ADAPTIVE_TRAIL_LOW_START_PCT
+            mode = "STEADY_EARLY_PROTECTION"
+        elif realised_vol_pct <= V17_ADAPTIVE_TRAIL_MED_VOL_PCT:
+            target = V17_ADAPTIVE_TRAIL_MED_START_PCT
+            mode = "NORMAL_PROTECTION"
+        else:
+            target = V17_ADAPTIVE_TRAIL_HIGH_START_PCT
+            mode = "VOLATILE_BREATHING_ROOM"
+
+        # Never loosen the entry-approved profile. This feature can only bank
+        # protection earlier when the stock proves it is behaving steadily.
+        effective = min(base_start, target)
+        effective = _v10_clamp(
+            effective,
+            float(V10_CONSTITUTION["trailStartPct"]["min"]),
+            float(V10_CONSTITUTION["trailStartPct"]["max"]),
+        )
+        result["trailStartPct"] = round(effective, 4)
+        result["adaptiveTrailTargetPct"] = round(target, 4)
+        result["adaptiveTrailMode"] = mode if effective < base_start - 0.001 else "BASE_VOLATILITY_OK"
+
+        # Bounded, deduped observability so Render makes it obvious why a trail
+        # activation moved without flooding the log every status refresh.
+        now_mono = time.monotonic()
+        cached = _ai_risk_adaptive_trail_log.get(symbol) or {}
+        changed = abs(float(cached.get("effective") or -999.0) - effective) >= 0.05 or str(cached.get("mode") or "") != result["adaptiveTrailMode"]
+        if changed or now_mono - float(cached.get("ts") or 0.0) >= V17_ADAPTIVE_TRAIL_LOG_SECONDS:
+            if effective < base_start - 0.001:
+                print(
+                    f"V17.7 ADAPTIVE TRAIL | {symbol} mode={result['adaptiveTrailMode']} "
+                    f"samples={samples} vol={realised_vol_pct:.3f}% "
+                    f"base={base_start:.2f}% effective={effective:.2f}%"
+                )
+            _ai_risk_adaptive_trail_log[symbol] = {"ts": now_mono, "effective": effective, "mode": result["adaptiveTrailMode"]}
+        return result
+    except Exception as exc:
+        result["adaptiveTrailMode"] = "BASE_ERROR_FALLBACK"
+        result["adaptiveTrailError"] = str(exc)[:300]
+        return result
+
+
 def _ai_risk_effective_profile(symbol: str) -> Dict[str, Any]:
     profile = _ai_risk_latest_profile(symbol)
-    if profile:
-        return profile
-    return {
-        "symbol": symbol,
-        "stopLossPct": round((1.0 - float(STOP_LOSS)) * 100.0, 4),
-        "fastStopLossPct": abs(float(FAST_STOP_LOSS_PCT)),
-        "trailStartPct": round((float(TRAIL_START) - 1.0) * 100.0, 4),
-        "trailGivebackPct": round((1.0 - float(TRAIL_GIVEBACK)) * 100.0, 4),
-        "emergencyStopPct": AI_RISK_EMERGENCY_STOP_PCT,
-        "positionMultiplier": 1.0,
-        "rationale": "Fallback to current promoted live configuration."
-    }
+    if not profile:
+        profile = {
+            "symbol": symbol,
+            "stopLossPct": round((1.0 - float(STOP_LOSS)) * 100.0, 4),
+            "fastStopLossPct": abs(float(FAST_STOP_LOSS_PCT)),
+            "trailStartPct": round((float(TRAIL_START) - 1.0) * 100.0, 4),
+            "trailGivebackPct": round((1.0 - float(TRAIL_GIVEBACK)) * 100.0, 4),
+            "emergencyStopPct": AI_RISK_EMERGENCY_STOP_PCT,
+            "positionMultiplier": 1.0,
+            "rationale": "Fallback to current promoted live configuration."
+        }
+    return _v17_adaptive_trail_start(str(symbol or "").upper(), profile)
 
 
 def ai_risk_engine_status() -> Dict[str, Any]:
@@ -19063,6 +19187,12 @@ def api_v15_operations_constitution(request: Request):
 # ============================================================
 _ai_threshold_last_result: Dict[str, Any] = {}
 _ai_threshold_worker_started = False
+# V17.7.1 — only one evidence-calibration cycle may run at once, whether it
+# comes from the autonomous worker or the authenticated review endpoint.
+_AI_THRESHOLD_CYCLE_LOCK = threading.Lock()
+_ai_threshold_last_log_signature = None
+_ai_threshold_last_log_ts = 0.0
+AI_THRESHOLD_LOG_DEDUPE_SECONDS = max(5.0, float(os.getenv("AI_THRESHOLD_LOG_DEDUPE_SECONDS", "60") or 60))
 
 
 def ai_threshold_learning_status() -> Dict[str, Any]:
@@ -19090,7 +19220,7 @@ def ai_threshold_learning_status() -> Dict[str, Any]:
     }
 
 
-def ai_threshold_learning_cycle(trigger: str = "automatic", force: bool = False) -> Dict[str, Any]:
+def _ai_threshold_learning_cycle_unlocked(trigger: str = "automatic", force: bool = False) -> Dict[str, Any]:
     global _ai_threshold_last_result
     if not AI_THRESHOLD_LEARNING_ENABLED:
         return {"ok": False, "version": "V15.12", "message": "Autonomous threshold learning is disabled."}
@@ -19120,16 +19250,47 @@ def ai_threshold_learning_cycle(trigger: str = "automatic", force: bool = False)
     })
     _ai_threshold_last_result = result
     try:
-        print(
-            "V15.12 THRESHOLD LEARNER | "
-            f"recommendation={result.get('recommendation')} observations={result.get('observations',0)} "
-            f"stable={((result.get('stability') or {}).get('matchingRuns',0))}/"
-            f"{((result.get('stability') or {}).get('requiredRuns',V2_OPTIMIZER_REQUIRED_STABLE_RUNS))} "
-            f"applied={result.get('applied',False)}"
+        global _ai_threshold_last_log_signature, _ai_threshold_last_log_ts
+        stability = result.get('stability') or {}
+        signature = (
+            str(result.get('recommendation') or ''),
+            int(result.get('observations') or 0),
+            int(stability.get('matchingRuns') or 0),
+            int(stability.get('requiredRuns') or V2_OPTIMIZER_REQUIRED_STABLE_RUNS),
+            bool(result.get('applied', False)),
         )
+        now_mono = time.monotonic()
+        if signature != _ai_threshold_last_log_signature or (now_mono - _ai_threshold_last_log_ts) >= AI_THRESHOLD_LOG_DEDUPE_SECONDS:
+            print(
+                "V15.12 THRESHOLD LEARNER | "
+                f"recommendation={result.get('recommendation')} observations={result.get('observations',0)} "
+                f"stable={stability.get('matchingRuns',0)}/"
+                f"{stability.get('requiredRuns',V2_OPTIMIZER_REQUIRED_STABLE_RUNS)} "
+                f"applied={result.get('applied',False)}"
+            )
+            _ai_threshold_last_log_signature = signature
+            _ai_threshold_last_log_ts = now_mono
     except Exception:
         pass
     return result
+
+
+def ai_threshold_learning_cycle(trigger: str = "automatic", force: bool = False) -> Dict[str, Any]:
+    # Never allow the scheduler, a manual review, or another caller to run the
+    # expensive evidence-calibration transaction concurrently.  A busy cycle is
+    # skipped rather than queued so /status and the live trader keep priority.
+    acquired = _AI_THRESHOLD_CYCLE_LOCK.acquire(blocking=False)
+    if not acquired:
+        return {
+            "ok": True, "version": "V17.7.1", "trigger": trigger,
+            "ran": False, "skipped": True, "reason": "threshold_cycle_already_running",
+            "message": "Another threshold-learning cycle is already running; this duplicate request was skipped.",
+            "currentSettings": current_strategy_settings_payload(),
+        }
+    try:
+        return _ai_threshold_learning_cycle_unlocked(trigger=trigger, force=force)
+    finally:
+        _AI_THRESHOLD_CYCLE_LOCK.release()
 
 
 def ai_threshold_learning_worker() -> None:
@@ -19167,4 +19328,3 @@ if AI_THRESHOLD_LEARNING_ENABLED and not _ai_threshold_worker_started:
         _ai_threshold_worker_started = True
     except Exception as exc:
         print(f"V15.12 THRESHOLD WORKER START ERROR: {exc}")
-
