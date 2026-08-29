@@ -25,6 +25,7 @@ function PageLoading() {
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
+  const [exportRequested, setExportRequested] = useState(false);
   const bot = useTradeBot(tab);
 
   function positionGlowStyle(position: AnyObj): React.CSSProperties {
@@ -45,32 +46,39 @@ export default function App() {
   const profitVault = bot.banking?.profitVault || bot.data?.banking?.profitVault || {};
   const vaultWorkingCapitalGbp = Number(profitVault?.workingCapitalGbp || 0);
   const brokerBuyingPowerUsd = Number(bot.data?.account?.buyingPower || 0);
-  const displayedWorkingCapitalGbp = vaultWorkingCapitalGbp > 0
-    ? vaultWorkingCapitalGbp
-    : brokerBuyingPowerUsd * bot.rate;
+  const displayedWorkingCapitalGbp = vaultWorkingCapitalGbp > 0 ? vaultWorkingCapitalGbp : brokerBuyingPowerUsd * bot.rate;
+  const bankedProfitGbp = Number(profitVault?.bankedProfitGbp || 0);
+  const maxPositions = Number(bot.data?.maxPositions || bot.positionSettings?.maxPositions || 0);
 
-  return <div className="app ai-dashboard">
+  return <div className="app ai-dashboard command-dashboard">
     <DashboardStyles />
-    <Header status={bot.status} data={bot.data} marketLabel={bot.marketLabel} onLogout={bot.secureLogout} />
-    <section className="stats">
-      <Stat label="Equity" value={gbp(Number(bot.data?.account?.equity || 0) * bot.rate)} sub={usd(bot.data?.account?.equity)} />
-      <Stat label="Working Capital" value={gbp(displayedWorkingCapitalGbp)} sub={profitVault?.enabled ? "Profit Vault adjusted" : usd(brokerBuyingPowerUsd)} />
-      <Stat label="Today" value={gbp(Number(bot.data?.account?.pnlDay || 0) * bot.rate)} sub={usd(bot.data?.account?.pnlDay)} className={tone(bot.data?.account?.pnlDay)} />
-      <Stat label="Total Gain/Loss" value={gbp(totalGainLoss * bot.rate)} sub={`Deposited ${gbp(totalDeposited * bot.rate)}`} className={tone(totalGainLoss)} />
-    </section>
-    <Nav tab={tab} setTab={setTab} />
+    <div className="dashboard-shell">
+      <Nav tab={tab} setTab={setTab} />
+      <div className="dashboard-content">
+        <Header status={bot.status} data={bot.data} marketLabel={bot.marketLabel} onLogout={bot.secureLogout} />
 
-    {tab === "overview" && <OverviewPage {...bot} positionGlowStyle={positionGlowStyle} />}
-    {tab === "positions" && <PositionsPage positions={bot.positions} rate={bot.rate} action={bot.action} positionGlowStyle={positionGlowStyle} authToken={bot.authToken} />}
-    <Suspense fallback={<PageLoading />}>
-      {tab === "portfolio" && <PortfolioPage authToken={bot.authToken} />}
-      {tab === "reports" && <ReportsPage reports={bot.reports} data={bot.data} rate={bot.rate} closedTrades={bot.closedTrades} chartCurrency={bot.chartCurrency} setChartCurrency={bot.setChartCurrency} reportsLoading={bot.reportsLoading} reportsError={bot.reportsError} reportsUpdatedAt={bot.reportsUpdatedAt} loadReports={bot.loadReports} authToken={bot.authToken} />}
-      {tab === "intelligence" && <IntelligencePage authToken={bot.authToken} marketRegime={bot.marketRegime} botHealth={bot.botHealth} aiConfidence={bot.aiConfidence} fetchData={bot.fetchData} />}
-      {tab === "explorer" && <ExplorerPage data={bot.data} stockQuery={bot.stockQuery} setStockQuery={bot.setStockQuery} stockResults={bot.stockResults} setStockResults={bot.setStockResults} stockSearchLoading={bot.stockSearchLoading} searchStocks={bot.searchStocks} action={bot.action} />}
-      {tab === "audit" && <AuditPage authToken={bot.authToken} />}
-      {tab === "weekly" && <WeeklyReviewPage authToken={bot.authToken} />}
-      {tab === "observatory" && <ObservatoryPage authToken={bot.authToken} />}
-      {tab === "admin" && <AdminPage {...bot} />}
-    </Suspense>
+        <section className="stats command-stats">
+          <Stat label="Equity" value={gbp(Number(bot.data?.account?.equity || 0) * bot.rate)} sub={usd(bot.data?.account?.equity)} />
+          <Stat label="Today P&L" value={gbp(Number(bot.data?.account?.pnlDay || 0) * bot.rate)} sub="Since midnight" className={tone(bot.data?.account?.pnlDay)} />
+          <Stat label="Positions" value={`${bot.positions.length} / ${maxPositions || "—"}`} sub="Open / Max" />
+          <Stat label="Profit Vault" value={gbp(bankedProfitGbp)} sub={`Working ${gbp(displayedWorkingCapitalGbp)}`} className={bankedProfitGbp > 0 ? "gain" : ""} />
+          <Stat label="AI Readiness" value={bot.data?.botEnabled ? "ACTIVE" : "PAUSED"} sub={`${bot.botHealth}% system health`} className={bot.data?.botEnabled ? "gain" : "loss"} />
+        </section>
+
+        {tab === "overview" && <OverviewPage {...bot} positionGlowStyle={positionGlowStyle} onExportFullBot={() => setExportRequested(true)} exportBusy={exportRequested} />}
+        {tab === "positions" && <PositionsPage positions={bot.positions} rate={bot.rate} action={bot.action} positionGlowStyle={positionGlowStyle} authToken={bot.authToken} />}
+        <Suspense fallback={<PageLoading />}>
+          {tab === "portfolio" && <PortfolioPage authToken={bot.authToken} />}
+          {tab === "reports" && <ReportsPage reports={bot.reports} data={bot.data} rate={bot.rate} closedTrades={bot.closedTrades} chartCurrency={bot.chartCurrency} setChartCurrency={bot.setChartCurrency} reportsLoading={bot.reportsLoading} reportsError={bot.reportsError} reportsUpdatedAt={bot.reportsUpdatedAt} loadReports={bot.loadReports} authToken={bot.authToken} />}
+          {tab === "intelligence" && <IntelligencePage authToken={bot.authToken} marketRegime={bot.marketRegime} botHealth={bot.botHealth} aiConfidence={bot.aiConfidence} fetchData={bot.fetchData} />}
+          {tab === "explorer" && <ExplorerPage data={bot.data} stockQuery={bot.stockQuery} setStockQuery={bot.setStockQuery} stockResults={bot.stockResults} setStockResults={bot.setStockResults} stockSearchLoading={bot.stockSearchLoading} searchStocks={bot.searchStocks} action={bot.action} />}
+          {tab === "audit" && <AuditPage authToken={bot.authToken} />}
+          {tab === "weekly" && <WeeklyReviewPage authToken={bot.authToken} />}
+          {tab === "observatory" && <ObservatoryPage authToken={bot.authToken} />}
+          {tab === "admin" && <AdminPage {...bot} />}
+          {exportRequested && tab !== "intelligence" && <div className="home-export-host" aria-hidden="true"><IntelligencePage authToken={bot.authToken} marketRegime={bot.marketRegime} botHealth={bot.botHealth} aiConfidence={bot.aiConfidence} fetchData={bot.fetchData} autoExport onExportComplete={() => setExportRequested(false)} /></div>}
+        </Suspense>
+      </div>
+    </div>
   </div>;
 }

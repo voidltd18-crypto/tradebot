@@ -86,12 +86,14 @@ function DataTable({ rows, columns }: { rows: AnyObj[]; columns: { key: string; 
   return <div className="table-wrap"><table className="compact-table"><thead><tr>{columns.map((column) => <th key={column.key}>{column.label}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={String(row.id ?? row.key ?? row.symbol ?? index)}>{columns.map((column) => <td key={column.key}>{column.render ? column.render(row) : text(row[column.key], "—")}</td>)}</tr>)}</tbody></table></div>;
 }
 
-export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfidence, fetchData }: {
+export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfidence, fetchData, autoExport = false, onExportComplete }: {
   authToken: string;
   marketRegime: string;
   botHealth: number;
   aiConfidence: number;
   fetchData: (force?: boolean) => Promise<void>;
+  autoExport?: boolean;
+  onExportComplete?: (success: boolean) => void;
 }) {
   const [section, setSection] = useState<IntelligenceSection>("ceo");
   const [lastUpdated, setLastUpdated] = useState("");
@@ -101,6 +103,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const [exportBusy, setExportBusy] = useState(false);
   const [exportingPdf, setExportingPdf] = useState(false);
   const reportRef = useRef<HTMLDivElement | null>(null);
+  const autoExportStartedRef = useRef(false);
   const [sources, setSources] = useState<Record<string, EndpointState>>({
     advisor: EMPTY_ENDPOINT,
     shadow: EMPTY_ENDPOINT,
@@ -148,6 +151,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     operationsDoctor: EMPTY_ENDPOINT,
     operationsEngineHealth: EMPTY_ENDPOINT,
     portfolio: EMPTY_ENDPOINT,
+    audit: EMPTY_ENDPOINT,
+    weeklyReview: EMPTY_ENDPOINT,
+    observatory: EMPTY_ENDPOINT,
   });
 
   const endpoints = useMemo(() => ({
@@ -197,6 +203,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     operationsDoctor: "/v15/operations/doctor",
     operationsEngineHealth: "/v15/operations/engine-health",
     portfolio: "/v16/portfolio/status",
+    audit: "/v17/decision-audit?days=7",
+    weeklyReview: "/v18/weekly-review?days=7",
+    observatory: "/v18/performance-observatory?days=7",
   }), []);
 
   const sectionKeys = useMemo<Record<IntelligenceSection, string[]>>(() => ({
@@ -322,6 +331,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const operationsDoctor = sources.operationsDoctor.data || {};
   const operationsEngineHealth = sources.operationsEngineHealth.data || {};
   const portfolioData = sources.portfolio.data || {};
+  const auditData = sources.audit.data || {};
+  const weeklyReviewData = sources.weeklyReview.data || {};
+  const observatoryData = sources.observatory.data || {};
   const portfolioAllocations = firstArray(portfolioData.allocations, portfolioData.plan?.allocations);
   const portfolioCapacity = firstObject(portfolioData.capacity);
   const operationsComponents = firstArray(
@@ -571,6 +583,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
 
   const exportFullBotReport = async () => {
     if (!authToken || exportBusy) return;
+    let exportSucceeded = false;
     setExportBusy(true);
     const headers = { "X-Auth-Token": authToken, "x-api-key": authToken };
 
@@ -610,14 +623,14 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       setLastUpdated(new Date().toLocaleTimeString("en-GB"));
       setExportingPdf(true);
 
-      // Wait until React has mounted the six whole-bot sections plus all twelve Intelligence sections.
+      // Wait until React has mounted the nine whole-bot sections plus all twelve Intelligence sections.
       const waitForReport = async () => {
         const started = Date.now();
         while (Date.now() - started < 5000) {
           await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
           const root = reportRef.current;
           const count = root?.querySelectorAll(".pdf-section").length ?? 0;
-          if (root && count >= 18 && root.scrollHeight > 1000) return root;
+          if (root && count >= 21 && root.scrollHeight > 1000) return root;
         }
         throw new Error("The full bot report did not finish rendering in time.");
       };
@@ -686,13 +699,22 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       ].join("-") + "_" + [String(now.getHours()).padStart(2, "0"), String(now.getMinutes()).padStart(2, "0")].join("-");
 
       pdf.save(`TradeBot_FULL_BOT_REPORT_${stamp}.pdf`);
+      exportSucceeded = true;
     } catch (error: any) {
       window.alert(`Full bot PDF export failed: ${error?.message || "Unknown error"}`);
     } finally {
       setExportingPdf(false);
       setExportBusy(false);
+      onExportComplete?.(exportSucceeded);
     }
   };
+
+  useEffect(() => {
+    if (!autoExport || autoExportStartedRef.current) return;
+    autoExportStartedRef.current = true;
+    const timer = window.setTimeout(() => { void exportFullBotReport(); }, 120);
+    return () => window.clearTimeout(timer);
+  }, [autoExport]);
 
   const promotionPost = async (endpoint: string, body: AnyObj) => {
     if (!authToken) return;
@@ -899,6 +921,90 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
       <Card title="Recent Runtime Logs" wide>
         {fullBotLogs.length ? <div className="log-list full-bot-log-list">{fullBotLogs.map((row:any,index:number) => <div key={index}>{typeof row === "string" ? row : text(row.message ?? row.text ?? row.detail, JSON.stringify(row))}</div>)}</div> : <EmptyState endpoint="runtime logs" />}
+      </Card>
+    </div>}
+
+    {exportingPdf && <div className="pdf-section grid two full-bot-report-section" data-pdf-title="DECISION AUDIT · V17.9">
+      <Card title="Decision Audit Summary">
+        <div className="summary">
+          <div><span>Window</span><b>7 days</b></div>
+          <div><span>Pending checkpoints</span><b>{num(auditData.pendingCheckpoints)}</b></div>
+          <div><span>Missed-winner threshold</span><b>+{num(auditData.thresholds?.missedWinnerPct,1).toFixed(2)}%</b></div>
+          <div><span>Good-block threshold</span><b>{num(auditData.thresholds?.goodBlockPct,-0.5).toFixed(2)}%</b></div>
+        </div>
+      </Card>
+      <Card title="Gate Effectiveness">
+        {firstArray(auditData.gates).length ? <DataTable rows={firstArray(auditData.gates)} columns={[
+          { key: "stage", label: "Gate" }, { key: "blocked", label: "Blocked" }, { key: "good_blocks", label: "Good blocks" },
+          { key: "missed_winners", label: "Missed winners" }, { key: "neutral", label: "Neutral" },
+          { key: "effectivenessPct", label: "Effectiveness", render: (row) => `${num(row.effectivenessPct).toFixed(1)}%` },
+        ]} /> : <EmptyState endpoint="V17.9 decision audit" />}
+      </Card>
+      <Card title="Recent Rejected Opportunities" wide>
+        {firstArray(auditData.recent).length ? <DataTable rows={firstArray(auditData.recent).slice(0,30)} columns={[
+          { key: "decision_at", label: "Time", render: (row) => text(row.decision_at ? new Date(String(row.decision_at)).toLocaleString("en-GB") : "—") },
+          { key: "symbol", label: "Symbol" }, { key: "stage", label: "Gate" },
+          { key: "return_15m", label: "15m", render: (row) => row.return_15m == null ? "—" : `${num(row.return_15m).toFixed(2)}%` },
+          { key: "return_30m", label: "30m", render: (row) => row.return_30m == null ? "—" : `${num(row.return_30m).toFixed(2)}%` },
+          { key: "return_1h", label: "1h", render: (row) => row.return_1h == null ? "—" : `${num(row.return_1h).toFixed(2)}%` },
+          { key: "return_2h", label: "2h", render: (row) => row.return_2h == null ? "—" : `${num(row.return_2h).toFixed(2)}%` },
+          { key: "classification", label: "Verdict" }, { key: "reason", label: "Reason" },
+        ]} /> : <EmptyState endpoint="audited rejection history" />}
+      </Card>
+    </div>}
+
+    {exportingPdf && <div className="pdf-section grid two full-bot-report-section" data-pdf-title="AUTONOMOUS WEEKLY REVIEW · V18">
+      <Card title="V18 Weekly Governance">
+        <div className="summary">
+          <div><span>Verdict</span><b>{text(weeklyReviewData.verdict,"—")}</b></div>
+          <div><span>Evidence strength</span><b>{text(weeklyReviewData.evidenceStrength,"—")}</b></div>
+          <div><span>Audited decisions</span><b>{num(weeklyReviewData.evidence?.auditedDecisions)} / {num(weeklyReviewData.evidence?.minimumAuditedDecisions,20)}</b></div>
+          <div><span>Pending checkpoints</span><b>{num(weeklyReviewData.evidence?.pendingCheckpoints)}</b></div>
+          <div><span>Proposal</span><b>{text(weeklyReviewData.proposal?.action,"OBSERVE")}</b></div>
+          <div><span>Stability</span><b>{num(weeklyReviewData.proposal?.stabilityCount)} / {num(weeklyReviewData.proposal?.stabilityRequired,5)}</b></div>
+          <div><span>Board eligible</span><b>{weeklyReviewData.proposal?.promotionEligible ? "YES" : "NO"}</b></div>
+        </div>
+        <p className="notice">{text(weeklyReviewData.proposal?.text,"Collecting evidence.")}</p>
+      </Card>
+      <Card title="Constitutional Locks">
+        <div className="tags">{(Array.isArray(weeklyReviewData.constitutionalLocks) ? weeklyReviewData.constitutionalLocks : []).map((lock:string) => <span className="tag" key={lock}>{lock.replaceAll("_"," ")}</span>)}</div>
+      </Card>
+      <Card title="Weekly Gate Review" wide>
+        {firstArray(weeklyReviewData.gates).length ? <DataTable rows={firstArray(weeklyReviewData.gates)} columns={[
+          { key: "stage", label: "Gate" }, { key: "classified", label: "Evidence" }, { key: "good_blocks", label: "Good blocks" },
+          { key: "missed_winners", label: "Missed winners" }, { key: "neutral", label: "Neutral" },
+          { key: "effectivenessPct", label: "Effectiveness", render: (row) => `${num(row.effectivenessPct).toFixed(1)}%` }, { key: "action", label: "Action" },
+        ]} /> : <EmptyState endpoint="V18 weekly review" />}
+      </Card>
+    </div>}
+
+    {exportingPdf && <div className="pdf-section grid two full-bot-report-section" data-pdf-title="PERFORMANCE OBSERVATORY · V18.1">
+      <Card title="Trading Performance">
+        <div className="summary">
+          <div><span>Realised P&L · 7d</span><b>{directGbp(observatoryData.trading?.realisedPnlGbp)}</b></div>
+          <div><span>Closed trades</span><b>{num(observatoryData.trading?.closedTrades)}</b></div>
+          <div><span>Win rate</span><b>{num(observatoryData.trading?.winRatePct).toFixed(1)}%</b></div>
+          <div><span>Max realised drawdown</span><b>{directGbp(observatoryData.trading?.maxRealisedDrawdownGbp)}</b></div>
+          <div><span>Avg winner</span><b>{directGbp(observatoryData.trading?.avgWinnerGbp)}</b></div>
+          <div><span>Avg loser</span><b>{directGbp(observatoryData.trading?.avgLoserGbp)}</b></div>
+        </div>
+      </Card>
+      <Card title="Profit Protection & Capture">
+        <div className="summary">
+          <div><span>Banked profit</span><b>{directGbp(observatoryData.profitProtection?.bankedProfitGbp)}</b></div>
+          <div><span>Lifetime banked</span><b>{directGbp(observatoryData.profitProtection?.lifetimeBankedGbp)}</b></div>
+          <div><span>Working capital</span><b>{directGbp(observatoryData.profitProtection?.workingCapitalGbp)}</b></div>
+          <div><span>Protected baseline</span><b>{directGbp(observatoryData.profitProtection?.protectedBaselineGbp)}</b></div>
+          <div><span>Replay trades measured</span><b>{num(observatoryData.profitCapture?.replayTradesMeasured)}</b></div>
+          <div><span>Average peak capture</span><b>{observatoryData.profitCapture?.averagePeakCapturePct == null ? "COLLECTING" : `${num(observatoryData.profitCapture?.averagePeakCapturePct).toFixed(1)}%`}</b></div>
+        </div>
+      </Card>
+      <Card title="Exit Performance" wide>
+        {firstArray(observatoryData.exits).length ? <DataTable rows={firstArray(observatoryData.exits)} columns={[
+          { key: "reason", label: "Exit reason" }, { key: "trades", label: "Trades" },
+          { key: "winRatePct", label: "Win rate", render: (row) => `${num(row.winRatePct).toFixed(1)}%` },
+          { key: "pnlGbp", label: "Realised P&L", render: (row) => directGbp(row.pnlGbp) },
+        ]} /> : <EmptyState endpoint="V18.1 exit performance" />}
       </Card>
     </div>}
 
