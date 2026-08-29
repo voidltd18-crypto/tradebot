@@ -2641,45 +2641,76 @@ def _v6_parse_utc(value: Any) -> datetime:
 def _v6_historical_checkpoint_price(symbol: str, due_at: Any) -> Dict[str, Any]:
     """Return the first valid one-minute bar at/after the intended checkpoint.
 
-    The original V6.4 lookup only searched 45 minutes forward. That creates
-    repeated errors when a checkpoint lands after-hours, on a market holiday,
-    or when Alpaca has a small data gap. This research-only lookup progressively
-    expands forward to the next available trading session. Live order logic is
-    not involved.
+    V17.8.1 research-data fallback: Alpaca accounts without recent SIP history
+    can still evaluate V6 outcomes by retrying the historical request on the IEX
+    feed. This path is research/outcome evaluation only and never participates
+    in live entry, exit, sizing, quotes, or order submission.
     """
     due = _v6_parse_utc(due_at)
     symbol = str(symbol or "").strip().upper()
     if not symbol:
         raise RuntimeError("missing_symbol")
 
-    # First keep the tight original window. If no checkpoint bar exists, widen
-    # across later sessions so weekends/holidays do not poison the learning set.
     forward_windows_minutes = [
         V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES,
-        180,       # remainder of a normal session
-        24 * 60,   # next calendar day
+        180,
+        24 * 60,
         3 * 24 * 60,
         7 * 24 * 60,
     ]
     last_error = None
     before_candidates = []
+    use_iex = False
+    fallback_logged = False
+
+    def _bars_for_window(start: datetime, end: datetime):
+        nonlocal use_iex, fallback_logged
+
+        def _request(feed=None):
+            kwargs = {
+                "symbol_or_symbols": [symbol],
+                "timeframe": TimeFrame.Minute,
+                "start": start,
+                "end": end,
+            }
+            if feed is not None:
+                kwargs["feed"] = feed
+            request = StockBarsRequest(**kwargs)
+            response = data_client.get_stock_bars(request)
+            try:
+                return list(response[symbol])
+            except Exception:
+                data = getattr(response, "data", {}) or {}
+                return list(data.get(symbol, []))
+
+        if use_iex:
+            return _request(DataFeed.IEX), "alpaca_iex_historical_1min_close"
+
+        try:
+            return _request(), "alpaca_historical_1min_close"
+        except Exception as exc:
+            text = str(exc).lower()
+            entitlement_error = (
+                "subscription does not permit" in text
+                or "recent sip data" in text
+                or ("sip" in text and "subscription" in text)
+                or ("sip" in text and "not permit" in text)
+            )
+            if not entitlement_error:
+                raise
+            use_iex = True
+            if not fallback_logged:
+                print(
+                    f"V17.8.1 V6 DATA FALLBACK | {symbol} SIP historical unavailable -> IEX historical feed"
+                )
+                fallback_logged = True
+            return _request(DataFeed.IEX), "alpaca_iex_historical_1min_close"
 
     for forward_minutes in sorted(set(max(5, int(v)) for v in forward_windows_minutes)):
         start = due - timedelta(minutes=V6_HISTORICAL_BAR_LOOKBACK_MINUTES)
         end = due + timedelta(minutes=forward_minutes)
         try:
-            request = StockBarsRequest(
-                symbol_or_symbols=[symbol],
-                timeframe=TimeFrame.Minute,
-                start=start,
-                end=end,
-            )
-            response = data_client.get_stock_bars(request)
-            try:
-                bars = list(response[symbol])
-            except Exception:
-                data = getattr(response, "data", {}) or {}
-                bars = list(data.get(symbol, []))
+            bars, source_name = _bars_for_window(start, end)
 
             candidates = []
             for bar in bars:
@@ -2692,7 +2723,7 @@ def _v6_historical_checkpoint_price(symbol: str, due_at: Any) -> Dict[str, Any]:
                     if price <= 0 or not math.isfinite(price):
                         continue
                     bar_at = _v6_parse_utc(ts)
-                    candidates.append((bar_at, price))
+                    candidates.append((bar_at, price, source_name))
                 except Exception:
                     continue
 
@@ -2702,14 +2733,15 @@ def _v6_historical_checkpoint_price(symbol: str, due_at: Any) -> Dict[str, Any]:
 
             after = [item for item in candidates if item[0] >= due]
             if after:
-                bar_at, price = min(after, key=lambda item: item[0])
+                bar_at, price, source_name = min(after, key=lambda item: item[0])
                 delay_minutes = (bar_at - due).total_seconds() / 60.0
                 return {
                     "price": price,
                     "barAt": bar_at.isoformat(),
                     "delayMinutes": delay_minutes,
-                    "source": "alpaca_historical_1min_close",
+                    "source": source_name,
                     "lookupWindowMinutes": forward_minutes,
+                    "feedFallback": bool(source_name == "alpaca_iex_historical_1min_close"),
                 }
 
             before_candidates.extend(item for item in candidates if item[0] < due)
@@ -2717,22 +2749,20 @@ def _v6_historical_checkpoint_price(symbol: str, due_at: Any) -> Dict[str, Any]:
         except Exception as exc:
             last_error = str(exc) or exc.__class__.__name__
 
-    # A pre-checkpoint bar is acceptable only inside the explicitly permitted
-    # look-back. Never substitute a distant stale quote for an outcome.
     if before_candidates:
-        bar_at, price = max(before_candidates, key=lambda item: item[0])
+        bar_at, price, source_name = max(before_candidates, key=lambda item: item[0])
         delay_minutes = (bar_at - due).total_seconds() / 60.0
         if delay_minutes >= -float(V6_HISTORICAL_BAR_LOOKBACK_MINUTES):
             return {
                 "price": price,
                 "barAt": bar_at.isoformat(),
                 "delayMinutes": delay_minutes,
-                "source": "alpaca_historical_1min_close",
+                "source": source_name,
                 "lookupWindowMinutes": max(forward_windows_minutes),
+                "feedFallback": bool(source_name == "alpaca_iex_historical_1min_close"),
             }
 
     raise RuntimeError(f"historical_bar_unavailable:{last_error or 'unknown'}")
-
 
 def _v6_write_historical_outcome(conn: sqlite3.Connection, row: Any) -> Dict[str, Any]:
     symbol=str(row["symbol"]).upper()
@@ -2786,7 +2816,7 @@ def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
                 print("V6.5 OUTCOME SAMPLES | " + " | ".join(error_samples))
         return {"ok":True,"version":"V6.5","evaluated":evaluated,"errors":errors,"due":len(rows),
                 "errorReasons":error_reasons,"errorSamples":error_samples,
-                "outcomeSource":"alpaca_historical_1min_close"}
+                "outcomeSource":"alpaca_historical_1min_close_or_iex_fallback"}
     except Exception as e:
         try: conn.close()
         except Exception: pass
@@ -2853,7 +2883,7 @@ def v6_repair_outcome_times(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit
         init_db(); conn=db_connect()
         rows=conn.execute("""SELECT * FROM v2_observation_outcomes
             WHERE horizon_hours=? AND status='COMPLETE'
-              AND (outcome_source IS NULL OR outcome_source!='alpaca_historical_1min_close' OR outcome_bar_at IS NULL)
+              AND (outcome_source IS NULL OR outcome_source NOT IN ('alpaca_historical_1min_close','alpaca_iex_historical_1min_close') OR outcome_bar_at IS NULL)
             ORDER BY due_at ASC LIMIT ?""",(horizon,batch)).fetchall()
         for row in rows:
             try:
@@ -2865,7 +2895,7 @@ def v6_repair_outcome_times(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit
         conn.commit()
         remaining=int(conn.execute("""SELECT COUNT(*) FROM v2_observation_outcomes
             WHERE horizon_hours=? AND status='COMPLETE'
-              AND (outcome_source IS NULL OR outcome_source!='alpaca_historical_1min_close' OR outcome_bar_at IS NULL)""",(horizon,)).fetchone()[0])
+              AND (outcome_source IS NULL OR outcome_source NOT IN ('alpaca_historical_1min_close','alpaca_iex_historical_1min_close') OR outcome_bar_at IS NULL)""",(horizon,)).fetchone()[0])
         conn.close()
         return {"ok":True,"version":"V6.4","advisoryOnly":True,"horizonHours":horizon,"processed":len(rows),
                 "repaired":repaired,"errors":errors,"remaining":remaining,"samples":samples,
@@ -12093,7 +12123,7 @@ def _v6_validate_source_row(row: Dict[str, Any]) -> Dict[str, Any]:
     if outcome <= 0: reasons.append("missing_or_invalid_outcome_price")
     if not bool(int(row.get("ready_to_buy") or 0)): reasons.append("entry_trigger_not_ready")
     due_at=row.get("due_at"); bar_at=row.get("outcome_bar_at"); source=str(row.get("outcome_source") or "")
-    if source != "alpaca_historical_1min_close": reasons.append("outcome_not_historical_checkpoint")
+    if source not in ("alpaca_historical_1min_close", "alpaca_iex_historical_1min_close"): reasons.append("outcome_not_historical_checkpoint")
     if not bar_at: reasons.append("outcome_timestamp_missing")
     if due_at and bar_at:
         try:
