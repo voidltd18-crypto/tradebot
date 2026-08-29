@@ -11746,6 +11746,10 @@ def effective_trading_equity(account_equity: float) -> float:
 
 
 def banking_payload():
+    # V18.2.2: keep account defined even when the broker account lookup fails.
+    # This lets /banking-status and the Command Center degrade gracefully instead
+    # of raising UnboundLocalError during a temporary broker/API failure.
+    account = None
     try:
         account = get_account()
         equity = float(account.equity)
