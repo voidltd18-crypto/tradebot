@@ -2902,7 +2902,7 @@ def v181_performance_observatory(days: int = 7) -> Dict[str, Any]:
             role=str((r or {}).get('role') or (r or {}).get('type') or 'OTHER').upper(); counts[role]=counts.get(role,0)+1
         return {'ok':True,'version':'V18.1','days':days,'readOnly':True,
           'trading':{'closedTrades':len(trades),'realisedPnlGbp':round(sum(pnls),2),'wins':len(wins),'losses':len(losses),'winRatePct':round(100*len(wins)/max(1,len(pnls)),1),'avgWinnerGbp':round(sum(wins)/max(1,len(wins)),2),'avgLoserGbp':round(sum(losses)/max(1,len(losses)),2),'maxRealisedDrawdownGbp':round(max_dd,2)},
-          'profitProtection':{'bankedProfitGbp':vault.get('bankedProfitGbp',0),'lifetimeBankedGbp':vault.get('lifetimeBankedGbp',0),'workingCapitalGbp':vault.get('workingCapitalGbp',0),'protectedBaselineGbp':vault.get('baselineGbp',0),'growthSinceBaselineGbp':vault.get('growthSinceBaselineGbp',0)},
+          'profitProtection':{'bankedProfitGbp':vault.get('bankedProfitGbp',0),'lifetimeBankedGbp':vault.get('lifetimeBankedGbp',0),'workingCapitalGbp':vault.get('workingCapitalGbp',0),'freeCashGbp':vault.get('freeCashGbp',vault.get('workingCapitalGbp',0)),'tradingCapitalGbp':vault.get('tradingCapitalGbp',max(0.0,float(vault.get('accountEquityGbp',0) or 0)-float(vault.get('bankedProfitGbp',0) or 0))),'protectedBaselineGbp':vault.get('baselineGbp',0),'growthSinceBaselineGbp':vault.get('growthSinceBaselineGbp',0)},
           'profitCapture':{'replayTradesMeasured':len(capture),'averagePeakCapturePct':round(sum(capture)/len(capture),1) if capture else None},
           'decisionAudit':{'pendingCheckpoints':audit.get('pendingCheckpoints',0),'gates':audit.get('gates',[])},
           'exits':exit_rows[:12], 'universe':{'activeSymbols':len(universe.get('activeSymbols',[]) if isinstance(universe,dict) else []),'roles':counts},
@@ -11623,8 +11623,14 @@ def profit_vault_payload(account: Any = None) -> Dict[str, Any]:
         "lifetimeBankedGbp": round(float(state.get("lifetimeBankedGbp") or 0.0), 2),
         "accountEquityGbp": round(equity_gbp, 2),
         "accountEquityUsd": round(equity_usd, 2),
+        # V18.2.4 capital clarity: workingCapital remains the legacy free-cash/deployable field.
+        # Explicit semantic fields prevent dashboards/reports from mistaking free cash for the whole trading pot.
         "workingCapitalGbp": round(working_usd * float(rate), 2),
         "workingCapitalUsd": round(working_usd, 2),
+        "freeCashGbp": round(working_usd * float(rate), 2),
+        "freeCashUsd": round(working_usd, 2),
+        "tradingCapitalGbp": round(max(0.0, equity_gbp - banked_gbp), 2),
+        "tradingCapitalUsd": round(max(0.0, equity_usd - reserved_usd), 2),
         "buyingPowerUsd": round(buying_power_usd, 2),
         "lastBankedAt": state.get("lastBankedAt", ""),
         "lastBankedSymbol": state.get("lastBankedSymbol", ""),

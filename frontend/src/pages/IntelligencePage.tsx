@@ -526,6 +526,15 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       ? fullBotAdaptive.activeSymbols.map((symbol: unknown) => typeof symbol === "string" ? { symbol } : symbol).filter((item: unknown) => item && typeof item === "object") as AnyObj[]
       : [];
   const fullBotVault = firstObject(bankingData.profitVault, liveStatus.banking?.profitVault, liveStatus.data?.banking?.profitVault);
+  // V18.2.4 Capital Clarity — keep the PDF on the same definitions as Home.
+  // Legacy workingCapitalGbp is FREE CASH, not the whole trading pot.
+  const fullBotFreeCashGbp = num(fullBotVault.freeCashGbp ?? fullBotVault.workingCapitalGbp);
+  const fullBotTradingCapitalGbp = num(fullBotVault.tradingCapitalGbp, Math.max(0, num(fullBotVault.accountEquityGbp) - num(fullBotVault.bankedProfitGbp)));
+  const fullBotInvestedCapitalGbp = Math.max(0, fullBotTradingCapitalGbp - fullBotFreeCashGbp);
+  const observatoryProtection = observatoryData.profitProtection || {};
+  const observatoryFreeCashGbp = num(observatoryProtection.freeCashGbp ?? observatoryProtection.workingCapitalGbp);
+  const observatoryTradingCapitalGbp = num(observatoryProtection.tradingCapitalGbp, fullBotTradingCapitalGbp);
+  const observatoryInvestedCapitalGbp = Math.max(0, observatoryTradingCapitalGbp - observatoryFreeCashGbp);
   const fullBotMarket = firstObject(liveStatus.market, liveStatus.data?.market);
   const fullBotStrategy = firstObject(liveStatus.strategySettings, liveStatus.data?.strategySettings);
   const fullBotPositionSettings = firstObject(liveStatus.positionSettings, liveStatus.data?.positionSettings);
@@ -790,7 +799,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="Account & Runtime">
         <div className="intelligence-stat-grid full-bot-stat-grid">
           <StatTile label="Equity" value={reportGbp(account.equity)} sub={`$${num(account.equity).toFixed(2)}`} />
-          <StatTile label="Working Capital" value={directGbp(fullBotVault.workingCapitalGbp)} sub="Profit Vault adjusted" />
+          <StatTile label="Trading Capital" value={directGbp(fullBotTradingCapitalGbp)} sub="Invested + free cash · vault excluded" />
           <StatTile label="Today" value={reportGbp(account.pnlDay ?? account.dayPnl)} sub={`$${num(account.pnlDay ?? account.dayPnl).toFixed(2)}`} tone={num(account.pnlDay ?? account.dayPnl) >= 0 ? "positive" : "negative"} />
           <StatTile label="Total Gain/Loss" value={reportGbp(reportSummary.totalGainLoss ?? reportSummary.totalPnl ?? reportSummary.netPnl)} tone={num(reportSummary.totalGainLoss ?? reportSummary.totalPnl ?? reportSummary.netPnl) >= 0 ? "positive" : "negative"} />
         </div>
@@ -807,7 +816,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         <div className="summary">
           <div><span>Status</span><b>{fullBotVault.enabled === false ? "OFF" : "ACTIVE"}</b></div>
           <div><span>Protected baseline</span><b>{directGbp(fullBotVault.baselineGbp)}</b></div>
-          <div><span>Working capital</span><b>{directGbp(fullBotVault.workingCapitalGbp)}</b></div>
+          <div><span>Trading capital</span><b>{directGbp(fullBotTradingCapitalGbp)}</b></div>
+          <div><span>Invested capital</span><b>{directGbp(fullBotInvestedCapitalGbp)}</b></div>
+          <div><span>Free cash</span><b>{directGbp(fullBotFreeCashGbp)}</b></div>
           <div><span>Banked profit</span><b>{directGbp(fullBotVault.bankedProfitGbp)}</b></div>
           <div><span>Lifetime banked</span><b>{directGbp(fullBotVault.lifetimeBankedGbp)}</b></div>
           <div><span>Last banked symbol</span><b>{text(fullBotVault.lastBankedSymbol, "—")}</b></div>
@@ -993,7 +1004,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         <div className="summary">
           <div><span>Banked profit</span><b>{directGbp(observatoryData.profitProtection?.bankedProfitGbp)}</b></div>
           <div><span>Lifetime banked</span><b>{directGbp(observatoryData.profitProtection?.lifetimeBankedGbp)}</b></div>
-          <div><span>Working capital</span><b>{directGbp(observatoryData.profitProtection?.workingCapitalGbp)}</b></div>
+          <div><span>Trading capital</span><b>{directGbp(observatoryTradingCapitalGbp)}</b></div>
+          <div><span>Invested capital</span><b>{directGbp(observatoryInvestedCapitalGbp)}</b></div>
+          <div><span>Free cash</span><b>{directGbp(observatoryFreeCashGbp)}</b></div>
           <div><span>Protected baseline</span><b>{directGbp(observatoryData.profitProtection?.protectedBaselineGbp)}</b></div>
           <div><span>Replay trades measured</span><b>{num(observatoryData.profitCapture?.replayTradesMeasured)}</b></div>
           <div><span>Average peak capture</span><b>{observatoryData.profitCapture?.averagePeakCapturePct == null ? "COLLECTING" : `${num(observatoryData.profitCapture?.averagePeakCapturePct).toFixed(1)}%`}</b></div>

@@ -110,3 +110,105 @@
 @media(max-width:1250px){.dashboard-shell{grid-template-columns:210px minmax(0,1fr)}.command-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.command-stats{grid-template-columns:repeat(3,minmax(0,1fr))}.command-actions{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:900px){.command-dashboard{width:min(100% - 14px,900px)}.dashboard-shell{display:block}.sidebar{position:relative;min-height:0;margin-bottom:10px;padding:12px}.brand{padding-bottom:12px}.sidebar-tabs{display:flex!important;overflow-x:auto;flex-wrap:nowrap!important;margin:10px 0!important}.sidebar-tabs button{width:auto;min-width:max-content;display:flex}.sidebar-status{display:none}.dashboard-content{padding:4px}.command-topbar{align-items:flex-start}.command-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.home-hero-row,.command-grid{grid-template-columns:1fr}.command-actions{grid-template-columns:repeat(2,minmax(0,1fr))}.home-hero-row .full-report-button{min-width:0}.command-panel{min-height:0}}
 @media(max-width:560px){.command-stats,.command-actions{grid-template-columns:1fr}.command-pills{justify-content:flex-start}.command-topbar h1{font-size:28px}.full-report-button strong{font-size:13px}.system-banner{align-items:flex-start;flex-wrap:wrap}.system-banner span:last-child{white-space:normal}.dashboard-detail-grid{grid-template-columns:1fr!important}}
+
+/* V18.2.5 Mobile Command Center */
+@media(max-width:720px){
+  html,body,#root{max-width:100%;overflow-x:hidden}
+  body{background:linear-gradient(180deg,#081126 0%,#070b18 42%,#050812 100%)}
+  .command-dashboard{width:100%;padding:0 10px 94px;margin:0}
+  .dashboard-shell{display:block}
+  .dashboard-content{padding:10px 0 24px}
+
+  /* Turn the desktop sidebar into a thumb-friendly bottom dock. */
+  .sidebar{position:fixed;left:0;right:0;bottom:0;top:auto;z-index:80;min-height:0;margin:0;padding:6px 8px calc(6px + env(safe-area-inset-bottom));border-width:1px 0 0;border-radius:18px 18px 0 0;background:rgba(6,15,33,.97);backdrop-filter:blur(18px);box-shadow:0 -14px 38px rgba(0,0,0,.42)}
+  .brand,.sidebar-status{display:none!important}
+  .sidebar-tabs{display:flex!important;gap:5px!important;margin:0!important;overflow-x:auto;overflow-y:hidden;scroll-snap-type:x proximity;scrollbar-width:none;padding:0 1px 2px}
+  .sidebar-tabs::-webkit-scrollbar{display:none}
+  .sidebar-tabs button{flex:0 0 76px;width:76px;min-width:76px;min-height:58px;display:flex!important;flex-direction:column;align-items:center;justify-content:center;gap:3px!important;padding:6px 4px!important;border-radius:12px!important;text-align:center!important;font-size:10px;line-height:1.05;scroll-snap-align:start}
+  .sidebar-tabs button.active{background:linear-gradient(180deg,rgba(37,99,235,.72),rgba(29,78,216,.38))!important;box-shadow:inset 0 0 16px rgba(96,165,250,.12)}
+  .nav-icon{font-size:18px;line-height:1}
+  .sidebar-tabs em{display:none}
+
+  .command-topbar{display:grid;gap:10px;margin:0 0 12px;padding:8px 2px 2px}
+  .command-topbar>div:first-child{min-width:0}
+  .command-topbar h1{font-size:27px;line-height:1.1;margin-top:3px}
+  .topbar-subtitle{font-size:12px;line-height:1.35}
+  .command-pills{display:flex;flex-wrap:nowrap;overflow-x:auto;justify-content:flex-start;gap:6px;padding-bottom:3px;scrollbar-width:none}
+  .command-pills::-webkit-scrollbar{display:none}
+  .command-pills .pill,.logout-button{flex:0 0 auto;white-space:nowrap;font-size:10px;padding:7px 9px;border-radius:999px}
+  .logout-button{border-radius:10px}
+
+  /* Two-column financial snapshot keeps the home screen compact on phones. */
+  .command-stats{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:8px;margin-bottom:10px}
+  .command-stats .card.stat{min-height:102px;margin:0;padding:12px;border-radius:16px}
+  .command-stats .card.stat strong{font-size:21px;margin-top:5px;line-height:1.05}
+  .command-stats .card.stat span{font-size:11px}
+  .command-stats .card.stat small{font-size:10px;line-height:1.25;margin-top:5px}
+
+  .home-command-center{gap:10px}
+  .home-hero-row{display:grid;grid-template-columns:1fr;gap:8px}
+  .system-banner{padding:11px 12px;border-radius:14px;gap:8px;align-items:flex-start}
+  .system-banner b{font-size:11px}
+  .system-banner span:last-child{font-size:11px;white-space:normal;line-height:1.35}
+  .full-report-button{width:100%;min-width:0;padding:12px 14px;border-radius:15px;gap:10px}
+  .full-report-button strong{font-size:12px;line-height:1.15}
+  .full-report-button small{font-size:10px;line-height:1.25}
+  .report-icon{font-size:23px}
+
+  .card{border-radius:17px;padding:13px;margin-bottom:9px;box-shadow:0 10px 28px rgba(0,0,0,.18)}
+  .quick-actions-card{padding:12px}
+  .quick-actions-card h2,.command-panel h2{font-size:14px;margin-bottom:10px}
+  .command-actions{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:7px}
+  .command-actions button{min-height:44px;padding:8px 7px;font-size:10.5px;line-height:1.15;border-radius:11px}
+  .command-actions button.danger:last-child{grid-column:1/-1}
+
+  .command-grid,.dashboard-detail-grid,.grid.two{grid-template-columns:1fr!important;gap:9px}
+  .command-panel{min-height:0!important;margin:0}
+  .market-state{padding:12px;margin-bottom:10px}
+  .compact-summary{font-size:11px}
+  .summary div{gap:12px;align-items:flex-start;padding-bottom:7px}
+  .summary span{font-size:11px}
+  .summary b{font-size:11px;text-align:right;overflow-wrap:anywhere}
+  .panel-count,.research-badge{top:13px;right:13px}
+  .system-list{gap:4px}
+  .system-list>div{grid-template-columns:20px minmax(0,1fr) auto;padding:6px 7px;gap:6px}
+  .system-list>div>span:nth-child(2){font-size:10.5px;overflow-wrap:anywhere}
+  .system-list b{font-size:8px;padding:3px 5px}
+  .research-action{max-width:135px;font-size:10px}
+
+  .position{padding:12px;border-radius:14px;gap:8px}
+  .position h3{font-size:19px;margin-bottom:4px}
+  .position p{font-size:11px}
+  .position-side{align-items:flex-start!important;text-align:left!important}
+  .empty-position{height:auto;min-height:150px;padding:18px}
+  .empty-position>span{font-size:34px}
+
+  .ai-grid,.operator-change-grid,.operator-evidence-grid,.intelligence-stat-grid,.universe-counts{grid-template-columns:1fr!important}
+  .decision-symbol{font-size:26px}
+  .final-gate-head{gap:8px;flex-wrap:wrap}
+  .gate-pill{font-size:9px}
+  .log-list{max-height:320px}
+  .log-list div{font-size:10px;line-height:1.35;padding:9px}
+
+  .table-wrap{margin-left:-2px;margin-right:-2px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  table{min-width:640px;font-size:10px}
+  th,td{padding:7px}
+  .chart{height:240px}.small-chart{height:190px}
+  .search-results{grid-template-columns:1fr!important}
+  .search-card{padding:12px;border-radius:16px}
+  .search-price strong{font-size:23px}
+  .search-actions button{flex:1 1 120px}
+
+  /* PDF capture host must remain desktop-width and unaffected by phone layout. */
+  .home-export-host{width:1500px!important;padding:0!important}
+  .home-export-host .intelligence-page{width:1500px!important}
+}
+
+@media(max-width:390px){
+  .command-dashboard{padding-left:7px;padding-right:7px}
+  .command-stats{grid-template-columns:1fr 1fr!important;gap:6px}
+  .command-stats .card.stat{min-height:96px;padding:10px}
+  .command-stats .card.stat strong{font-size:19px}
+  .command-actions{grid-template-columns:1fr 1fr!important}
+  .sidebar-tabs button{flex-basis:70px;width:70px;min-width:70px}
+}
