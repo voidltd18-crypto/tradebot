@@ -59,10 +59,11 @@ export default function App() {
 
         <section className="stats command-stats">
           <Stat label="Equity" value={gbp(Number(bot.data?.account?.equity || 0) * bot.rate)} sub={usd(bot.data?.account?.equity)} />
+          <Stat label="Working Capital" value={gbp(displayedWorkingCapitalGbp)} sub="Available to deploy" />
           <Stat label="Today P&L" value={gbp(Number(bot.data?.account?.pnlDay || 0) * bot.rate)} sub="Since midnight" className={tone(bot.data?.account?.pnlDay)} />
+          <Stat label="Total Gain/Loss" value={gbp(totalGainLoss)} sub={`Deposited ${gbp(totalDeposited)}`} className={tone(totalGainLoss)} />
+          <Stat label="Profit Vault" value={gbp(bankedProfitGbp)} sub="Protected realised profit" className={bankedProfitGbp > 0 ? "gain" : ""} />
           <Stat label="Positions" value={`${bot.positions.length} / ${maxPositions || "—"}`} sub="Open / Max" />
-          <Stat label="Profit Vault" value={gbp(bankedProfitGbp)} sub={`Working ${gbp(displayedWorkingCapitalGbp)}`} className={bankedProfitGbp > 0 ? "gain" : ""} />
-          <Stat label="AI Readiness" value={bot.data?.botEnabled ? "ACTIVE" : "PAUSED"} sub={`${bot.botHealth}% system health`} className={bot.data?.botEnabled ? "gain" : "loss"} />
         </section>
 
         {tab === "overview" && <OverviewPage {...bot} positionGlowStyle={positionGlowStyle} onExportFullBot={() => setExportRequested(true)} exportBusy={exportRequested} />}
