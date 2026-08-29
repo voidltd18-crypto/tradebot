@@ -284,6 +284,9 @@ V6_HISTORICAL_BAR_LOOKBACK_MINUTES = max(5, int(os.getenv("V6_HISTORICAL_BAR_LOO
 V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES = max(5, int(os.getenv("V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES", "45") or 45))
 V6_REPAIR_BATCH_SIZE = max(1, min(int(os.getenv("V6_REPAIR_BATCH_SIZE", "200") or 200), 1000))
 
+# V17.8.2 — Outcome Recovery / stale-error cleanup.
+V6_OUTCOME_MAX_RETRIES = max(1, min(int(os.getenv("V6_OUTCOME_MAX_RETRIES", "3") or 3), 20))
+
 # Closed-market AI research scheduler. Live trading stays focused while the market is open.
 AI_RESEARCH_CLOSED_MARKET_ONLY = os.getenv("AI_RESEARCH_CLOSED_MARKET_ONLY", "true").lower() == "true"
 AI_RESEARCH_INTERVAL_SECONDS = max(300, int(os.getenv("AI_RESEARCH_INTERVAL_SECONDS", "300") or 300))
@@ -2776,7 +2779,8 @@ def _v6_write_historical_outcome(conn: sqlite3.Connection, row: Any) -> Dict[str
     now=datetime.now(UTC).isoformat()
     conn.execute("""UPDATE v2_observation_outcomes
        SET evaluated_at=?, outcome_price=?, return_pct=?, net_return_pct=?, estimated_cost_pct=?,
-           evaluation_delay_minutes=?, outcome_bar_at=?, outcome_source=?, repaired_at=?, status='COMPLETE', error=NULL
+           evaluation_delay_minutes=?, outcome_bar_at=?, outcome_source=?, repaired_at=?, status='COMPLETE', error=NULL,
+           retry_count=0, last_error_at=NULL
        WHERE id=?""",
        (checkpoint["barAt"],outcome_price,return_pct,net_return_pct,estimated_cost_pct,
         float(checkpoint["delayMinutes"]),checkpoint["barAt"],checkpoint["source"],now,int(row["id"])))
@@ -2784,10 +2788,11 @@ def _v6_write_historical_outcome(conn: sqlite3.Connection, row: Any) -> Dict[str
 
 
 def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
-    """Evaluate due outcomes at their historical checkpoint, never at the worker's current quote."""
+    """Evaluate due outcomes using historical checkpoints with bounded recovery."""
     if not (TRADEBOT_V2_ENABLED and SQLITE_ENABLED):
         return {"ok":False,"evaluated":0,"reason":"V2 or SQLite disabled"}
-    batch=max(1,min(int(limit or V2_OUTCOME_BATCH_SIZE),1000)); evaluated=0; errors=0
+    batch=max(1,min(int(limit or V2_OUTCOME_BATCH_SIZE),1000))
+    evaluated=0; errors=0; recovered=0; abandoned=0; retried=0
     try:
         init_db(); conn=db_connect()
         rows=conn.execute("""SELECT * FROM v2_observation_outcomes
@@ -2796,85 +2801,92 @@ def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
         error_reasons: Dict[str, int] = {}
         error_samples: List[str] = []
         for row in rows:
+            keys = row.keys() if hasattr(row, "keys") else []
+            previous_error = str(row["error"] or "")
+            previous_retry = int(row["retry_count"] or 0) if "retry_count" in keys else 0
+            if previous_error:
+                conn.execute("UPDATE v2_observation_outcomes SET error=NULL WHERE id=?", (int(row["id"]),))
             try:
-                _v6_write_historical_outcome(conn,row); evaluated += 1
+                checkpoint = _v6_write_historical_outcome(conn,row)
+                evaluated += 1
+                if previous_error or previous_retry > 0 or checkpoint.get("feedFallback"):
+                    recovered += 1
             except Exception as row_error:
-                errors += 1
                 reason = str(row_error)[:500] or row_error.__class__.__name__
                 reason_key = reason.split(":", 1)[0]
-                error_reasons[reason_key] = error_reasons.get(reason_key, 0) + 1
-                if len(error_samples) < 5:
-                    error_samples.append(
-                        f"{str(row['symbol']).upper()}@{row['due_at']}={reason}"
-                    )
-                conn.execute("UPDATE v2_observation_outcomes SET error=? WHERE id=?",(reason,int(row["id"])))
+                next_retry = previous_retry + 1
+                now_iso = datetime.now(UTC).isoformat()
+                if next_retry >= V6_OUTCOME_MAX_RETRIES:
+                    abandoned += 1
+                    conn.execute("""UPDATE v2_observation_outcomes
+                        SET status='UNAVAILABLE', error=NULL, retry_count=?, last_error_at=?,
+                            outcome_source='unavailable_after_iex_retries', repaired_at=?
+                        WHERE id=?""",
+                        (next_retry, now_iso, now_iso, int(row["id"])))
+                    print(f"V17.8.2 OUTCOME QUARANTINE | {str(row['symbol']).upper()} checkpoint={row['due_at']} retries={next_retry}/{V6_OUTCOME_MAX_RETRIES} reason={reason_key}")
+                else:
+                    errors += 1; retried += 1
+                    error_reasons[reason_key] = error_reasons.get(reason_key, 0) + 1
+                    if len(error_samples) < 5:
+                        error_samples.append(f"{str(row['symbol']).upper()}@{row['due_at']}={reason} retry={next_retry}/{V6_OUTCOME_MAX_RETRIES}")
+                    conn.execute("""UPDATE v2_observation_outcomes
+                        SET error=?, retry_count=?, last_error_at=? WHERE id=?""",
+                        (reason,next_retry,now_iso,int(row["id"])))
         conn.commit(); conn.close()
-        if evaluated or errors:
+        if evaluated or errors or abandoned:
             reason_text = ",".join(f"{k}:{v}" for k,v in sorted(error_reasons.items())) or "none"
-            print(f"V6.5 OUTCOMES | historical={evaluated} errors={errors} reasons={reason_text}")
+            print(f"V17.8.2 OUTCOME RECOVERY | completed={evaluated} recovered={recovered} retrying={retried} abandoned={abandoned} reasons={reason_text}")
             if error_samples:
-                print("V6.5 OUTCOME SAMPLES | " + " | ".join(error_samples))
-        return {"ok":True,"version":"V6.5","evaluated":evaluated,"errors":errors,"due":len(rows),
+                print("V17.8.2 OUTCOME RETRY SAMPLES | " + " | ".join(error_samples))
+            print(f"V6.5 OUTCOMES | historical={evaluated} errors={errors} reasons={reason_text}")
+        return {"ok":True,"version":"V17.8.2","evaluated":evaluated,"errors":errors,"due":len(rows),
+                "recovered":recovered,"retrying":retried,"abandoned":abandoned,"maxRetries":V6_OUTCOME_MAX_RETRIES,
                 "errorReasons":error_reasons,"errorSamples":error_samples,
                 "outcomeSource":"alpaca_historical_1min_close_or_iex_fallback"}
     except Exception as e:
         try: conn.close()
         except Exception: pass
-        return {"ok":False,"version":"V6.4","evaluated":evaluated,"errors":errors+1,"error":str(e)}
-
+        return {"ok":False,"version":"V17.8.2","evaluated":evaluated,"errors":errors+1,"error":str(e)}
 
 def v2_pending_breakdown() -> Dict[str, Any]:
-    """Explain pending outcomes: immature, ready, and rows carrying an evaluation error."""
+    """Explain active pending outcomes and quarantined unavailable rows."""
     now = datetime.now(UTC).isoformat()
-    result = {"totalPending": 0, "notMatureYet": 0, "readyForProcessing": 0, "withErrors": 0, "completed": 0}
+    result = {"totalPending":0,"notMatureYet":0,"readyForProcessing":0,"withErrors":0,"completed":0,"unavailable":0}
     if not SQLITE_ENABLED:
         return result
     try:
-        init_db(); conn = db_connect()
-        row = conn.execute("""SELECT
+        init_db(); conn=db_connect()
+        row=conn.execute("""SELECT
             SUM(CASE WHEN status='COMPLETE' AND net_return_pct IS NOT NULL THEN 1 ELSE 0 END) AS completed,
-            SUM(CASE WHEN status!='COMPLETE' OR net_return_pct IS NULL THEN 1 ELSE 0 END) AS pending,
-            SUM(CASE WHEN (status!='COMPLETE' OR net_return_pct IS NULL) AND due_at>? THEN 1 ELSE 0 END) AS immature,
-            SUM(CASE WHEN (status!='COMPLETE' OR net_return_pct IS NULL) AND due_at<=? THEN 1 ELSE 0 END) AS ready,
-            SUM(CASE WHEN (status!='COMPLETE' OR net_return_pct IS NULL) AND error IS NOT NULL AND TRIM(error)<>'' THEN 1 ELSE 0 END) AS errors
-            FROM v2_observation_outcomes""", (now, now)).fetchone()
-        conn.close()
-        result = {
-            "completed": int(row["completed"] or 0),
-            "totalPending": int(row["pending"] or 0),
-            "notMatureYet": int(row["immature"] or 0),
-            "readyForProcessing": int(row["ready"] or 0),
-            "withErrors": int(row["errors"] or 0),
-        }
+            SUM(CASE WHEN status='PENDING' THEN 1 ELSE 0 END) AS pending,
+            SUM(CASE WHEN status='PENDING' AND due_at>? THEN 1 ELSE 0 END) AS immature,
+            SUM(CASE WHEN status='PENDING' AND due_at<=? THEN 1 ELSE 0 END) AS ready,
+            SUM(CASE WHEN status='PENDING' AND error IS NOT NULL AND TRIM(error)<>'' THEN 1 ELSE 0 END) AS errors,
+            SUM(CASE WHEN status='UNAVAILABLE' THEN 1 ELSE 0 END) AS unavailable
+            FROM v2_observation_outcomes""",(now,now)).fetchone(); conn.close()
+        result={"completed":int(row["completed"] or 0),"totalPending":int(row["pending"] or 0),
+                "notMatureYet":int(row["immature"] or 0),"readyForProcessing":int(row["ready"] or 0),
+                "withErrors":int(row["errors"] or 0),"unavailable":int(row["unavailable"] or 0)}
     except Exception as exc:
-        result["error"] = str(exc)
+        result["error"]=str(exc)
     return result
 
-
 def v2_drain_due_outcomes(max_total: Optional[int] = None) -> Dict[str, Any]:
-    """Drain eligible outcomes in several bounded batches during closed-market research."""
-    ceiling = max(V2_OUTCOME_BATCH_SIZE, int(max_total or V2_OUTCOME_DRAIN_LIMIT))
-    total_evaluated = total_errors = batches = 0
-    while total_evaluated + total_errors < ceiling:
-        remaining = ceiling - (total_evaluated + total_errors)
-        result = v2_evaluate_due_outcomes(min(V2_OUTCOME_BATCH_SIZE, remaining))
-        batches += 1
-        evaluated = int(result.get("evaluated") or 0)
-        errors = int(result.get("errors") or 0)
-        due = int(result.get("due") or 0)
-        total_evaluated += evaluated
-        total_errors += errors
-        if due == 0 or (evaluated == 0 and errors == 0):
-            break
-        if due < min(V2_OUTCOME_BATCH_SIZE, remaining):
-            break
-        if V2_OUTCOME_DRAIN_PAUSE_SECONDS:
-            time.sleep(V2_OUTCOME_DRAIN_PAUSE_SECONDS)
-    backlog = v2_pending_breakdown()
-    if total_evaluated or total_errors:
-        print(f"V6.6 OUTCOME DRAIN | batches={batches} evaluated={total_evaluated} errors={total_errors} ready_remaining={backlog.get('readyForProcessing',0)} immature={backlog.get('notMatureYet',0)}")
-    return {"ok": True, "version": "V6.6", "batches": batches, "evaluated": total_evaluated, "errors": total_errors, "backlog": backlog}
-
+    """Drain eligible outcomes while counting quarantined rows as resolved work."""
+    ceiling=max(V2_OUTCOME_BATCH_SIZE,int(max_total or V2_OUTCOME_DRAIN_LIMIT))
+    total_evaluated=total_errors=total_abandoned=batches=0
+    while total_evaluated+total_errors+total_abandoned < ceiling:
+        remaining=ceiling-(total_evaluated+total_errors+total_abandoned)
+        result=v2_evaluate_due_outcomes(min(V2_OUTCOME_BATCH_SIZE,remaining)); batches+=1
+        evaluated=int(result.get("evaluated") or 0); errors=int(result.get("errors") or 0); abandoned=int(result.get("abandoned") or 0); due=int(result.get("due") or 0)
+        total_evaluated+=evaluated; total_errors+=errors; total_abandoned+=abandoned
+        if due==0 or (evaluated==0 and errors==0 and abandoned==0): break
+        if due < min(V2_OUTCOME_BATCH_SIZE,remaining): break
+        if V2_OUTCOME_DRAIN_PAUSE_SECONDS: time.sleep(V2_OUTCOME_DRAIN_PAUSE_SECONDS)
+    backlog=v2_pending_breakdown()
+    if total_evaluated or total_errors or total_abandoned:
+        print(f"V6.6 OUTCOME DRAIN | batches={batches} evaluated={total_evaluated} errors={total_errors} abandoned={total_abandoned} ready_remaining={backlog.get('readyForProcessing',0)} immature={backlog.get('notMatureYet',0)} unavailable={backlog.get('unavailable',0)}")
+    return {"ok":True,"version":"V17.8.2","batches":batches,"evaluated":total_evaluated,"errors":total_errors,"abandoned":total_abandoned,"backlog":backlog}
 
 def v6_repair_outcome_times(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = V6_REPAIR_BATCH_SIZE) -> Dict[str, Any]:
     """Repair legacy live-quote outcomes using the intended historical due_at checkpoint."""
@@ -5345,6 +5357,8 @@ def _init_db_impl():
         "ALTER TABLE v2_observation_outcomes ADD COLUMN outcome_bar_at TEXT",
         "ALTER TABLE v2_observation_outcomes ADD COLUMN outcome_source TEXT",
         "ALTER TABLE v2_observation_outcomes ADD COLUMN repaired_at TEXT",
+        "ALTER TABLE v2_observation_outcomes ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE v2_observation_outcomes ADD COLUMN last_error_at TEXT",
     ):
         try:
             cur.execute(column_sql)
@@ -14984,7 +14998,7 @@ def ai_advisor_summary(limit: int = 10) -> Dict[str, Any]:
             "SELECT COUNT(*) FROM v2_observation_outcomes WHERE status='COMPLETE' AND net_return_pct IS NOT NULL"
         ).fetchone()[0])
         pending = int(conn.execute(
-            "SELECT COUNT(*) FROM v2_observation_outcomes WHERE status!='COMPLETE' OR net_return_pct IS NULL"
+            "SELECT COUNT(*) FROM v2_observation_outcomes WHERE status='PENDING'"
         ).fetchone()[0])
         conn.close()
     except Exception:
