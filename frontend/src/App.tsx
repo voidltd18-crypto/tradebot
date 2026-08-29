@@ -14,6 +14,9 @@ const AdminPage = lazy(() => import("./pages/AdminPage").then((module) => ({ def
 const IntelligencePage = lazy(() => import("./pages/IntelligencePage").then((module) => ({ default: module.IntelligencePage })));
 const ExplorerPage = lazy(() => import("./pages/ExplorerPage").then((module) => ({ default: module.ExplorerPage })));
 const PortfolioPage = lazy(() => import("./pages/PortfolioPage").then((module) => ({ default: module.PortfolioPage })));
+const ObservatoryPage = lazy(() => import("./pages/ObservatoryPage").then((module) => ({ default: module.ObservatoryPage })));
+const WeeklyReviewPage = lazy(() => import("./pages/WeeklyReviewPage").then((module) => ({ default: module.WeeklyReviewPage })));
+const AuditPage = lazy(() => import("./pages/AuditPage").then((module) => ({ default: module.AuditPage })));
 const ReportsPage = lazy(() => import("./pages/ReportsPage").then((module) => ({ default: module.ReportsPage })));
 
 function PageLoading() {
@@ -64,6 +67,9 @@ export default function App() {
       {tab === "reports" && <ReportsPage reports={bot.reports} data={bot.data} rate={bot.rate} closedTrades={bot.closedTrades} chartCurrency={bot.chartCurrency} setChartCurrency={bot.setChartCurrency} reportsLoading={bot.reportsLoading} reportsError={bot.reportsError} reportsUpdatedAt={bot.reportsUpdatedAt} loadReports={bot.loadReports} authToken={bot.authToken} />}
       {tab === "intelligence" && <IntelligencePage authToken={bot.authToken} marketRegime={bot.marketRegime} botHealth={bot.botHealth} aiConfidence={bot.aiConfidence} fetchData={bot.fetchData} />}
       {tab === "explorer" && <ExplorerPage data={bot.data} stockQuery={bot.stockQuery} setStockQuery={bot.setStockQuery} stockResults={bot.stockResults} setStockResults={bot.setStockResults} stockSearchLoading={bot.stockSearchLoading} searchStocks={bot.searchStocks} action={bot.action} />}
+      {tab === "audit" && <AuditPage authToken={bot.authToken} />}
+      {tab === "weekly" && <WeeklyReviewPage authToken={bot.authToken} />}
+      {tab === "observatory" && <ObservatoryPage authToken={bot.authToken} />}
       {tab === "admin" && <AdminPage {...bot} />}
     </Suspense>
   </div>;

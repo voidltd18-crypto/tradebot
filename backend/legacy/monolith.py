@@ -2471,6 +2471,19 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
             ),
         )
         decision_id = int(cur.lastrowid)
+        # V17.9 Decision Audit: every rejected live-gate decision gets independent
+        # 15m/30m/1h/2h forward checkpoints. Advisory evidence only.
+        if decision_id > 0 and str(decision).upper() == "REJECTED" and float(scan.get("price") or 0.0) > 0:
+            audit_at = datetime.now(UTC)
+            for audit_minutes in (15, 30, 60, 120):
+                conn.execute(
+                    """INSERT OR IGNORE INTO v179_decision_audit
+                       (decision_id,symbol,decision_at,stage,reason,entry_price,confidence,quality,due_minutes,due_at,status)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,'PENDING')""",
+                    (decision_id,symbol,audit_at.isoformat(),str(stage),str(reason)[:1000],float(scan.get("price") or 0.0),
+                     float(scan.get("confidence") or 0.0),float(scan.get("quality_score") or 0.0),audit_minutes,
+                     (audit_at + timedelta(minutes=audit_minutes)).isoformat()),
+                )
         _v114_trace(trace_id, symbol, writer, "BASE_DECISION_WRITTEN", stage, decision, decision_id=decision_id,
                     success=decision_id > 0, detail="v2_setup_decisions insert completed", conn=conn)
         observed_at = datetime.now(UTC)
@@ -2766,6 +2779,195 @@ def _v6_historical_checkpoint_price(symbol: str, due_at: Any) -> Dict[str, Any]:
             }
 
     raise RuntimeError(f"historical_bar_unavailable:{last_error or 'unknown'}")
+
+# =========================
+# V17.9 — DECISION AUDIT / MISSED OPPORTUNITY TRACKER
+# =========================
+V179_MISSED_WINNER_PCT = 1.0
+V179_GOOD_BLOCK_PCT = -0.50
+
+def _v179_classify(return_pct: float) -> str:
+    if return_pct >= V179_MISSED_WINNER_PCT:
+        return "MISSED_WINNER"
+    if return_pct <= V179_GOOD_BLOCK_PCT:
+        return "GOOD_BLOCK"
+    return "NEUTRAL"
+
+def v179_evaluate_decision_audit(limit: int = 200) -> Dict[str, Any]:
+    if not SQLITE_ENABLED:
+        return {"ok":False,"evaluated":0,"errors":0}
+    evaluated=errors=0
+    try:
+        init_db(); conn=db_connect()
+        rows=conn.execute("SELECT * FROM v179_decision_audit WHERE status='PENDING' AND due_at<=? ORDER BY due_at LIMIT ?",
+                          (datetime.now(UTC).isoformat(),max(1,min(int(limit),1000)))).fetchall()
+        for row in rows:
+            try:
+                cp=_v6_historical_checkpoint_price(str(row["symbol"]),row["due_at"])
+                entry=float(row["entry_price"] or 0); price=float(cp["price"] or 0)
+                if entry <= 0 or price <= 0: raise RuntimeError("invalid_audit_price")
+                ret=((price/entry)-1.0)*100.0
+                conn.execute("""UPDATE v179_decision_audit SET evaluated_at=?,outcome_price=?,return_pct=?,
+                    best_move_pct=?,worst_move_pct=?,classification=?,status='COMPLETE',error=NULL,source=? WHERE id=?""",
+                    (cp.get("barAt"),price,ret,max(0.0,ret),min(0.0,ret),_v179_classify(ret),cp.get("source"),int(row["id"])))
+                evaluated += 1
+            except Exception as exc:
+                errors += 1
+                conn.execute("UPDATE v179_decision_audit SET error=? WHERE id=?",(str(exc)[:500],int(row["id"])))
+        conn.commit(); conn.close()
+        if evaluated or errors: print(f"V17.9 DECISION AUDIT | evaluated={evaluated} errors={errors}")
+        return {"ok":True,"evaluated":evaluated,"errors":errors}
+    except Exception as exc:
+        try: conn.close()
+        except Exception: pass
+        return {"ok":False,"evaluated":evaluated,"errors":errors+1,"error":str(exc)}
+
+def v179_decision_audit_summary(days: int = 7) -> Dict[str, Any]:
+    days=max(1,min(int(days),365)); cutoff=(datetime.now(UTC)-timedelta(days=days)).isoformat()
+    try:
+        init_db(); conn=db_connect()
+        rows=conn.execute("""SELECT stage,COUNT(DISTINCT decision_id) blocked,
+          COUNT(DISTINCT CASE WHEN classification='GOOD_BLOCK' THEN decision_id END) good_blocks,
+          COUNT(DISTINCT CASE WHEN classification='MISSED_WINNER' THEN decision_id END) missed_winners,
+          COUNT(DISTINCT CASE WHEN classification='NEUTRAL' THEN decision_id END) neutral,
+          AVG(CASE WHEN due_minutes=60 AND status='COMPLETE' THEN return_pct END) avg_1h_return_pct
+          FROM v179_decision_audit WHERE decision_at>=? GROUP BY stage ORDER BY blocked DESC""",(cutoff,)).fetchall()
+        recent=conn.execute("""SELECT decision_id,symbol,decision_at,stage,reason,entry_price,confidence,quality,
+          MAX(CASE WHEN due_minutes=15 THEN return_pct END) return_15m,
+          MAX(CASE WHEN due_minutes=30 THEN return_pct END) return_30m,
+          MAX(CASE WHEN due_minutes=60 THEN return_pct END) return_1h,
+          MAX(CASE WHEN due_minutes=120 THEN return_pct END) return_2h,
+          MAX(CASE WHEN classification='MISSED_WINNER' THEN 1 ELSE 0 END) missed,
+          MAX(CASE WHEN classification='GOOD_BLOCK' THEN 1 ELSE 0 END) good
+          FROM v179_decision_audit WHERE decision_at>=? GROUP BY decision_id ORDER BY decision_id DESC LIMIT 100""",(cutoff,)).fetchall()
+        pending=int(conn.execute("SELECT COUNT(*) FROM v179_decision_audit WHERE status='PENDING'").fetchone()[0]); conn.close()
+        gates=[]
+        for r in rows:
+            d=dict(r); denom=max(1,int(d['good_blocks'] or 0)+int(d['missed_winners'] or 0)+int(d['neutral'] or 0))
+            d['effectivenessPct']=round(100.0*int(d['good_blocks'] or 0)/denom,1); gates.append(d)
+        items=[]
+        for r in recent:
+            d=dict(r); d['classification']='MISSED_WINNER' if d.pop('missed') else ('GOOD_BLOCK' if d.pop('good') else 'NEUTRAL'); items.append(d)
+        return {"ok":True,"version":"V17.9","days":days,"advisoryOnly":True,"pendingCheckpoints":pending,
+                "thresholds":{"missedWinnerPct":V179_MISSED_WINNER_PCT,"goodBlockPct":V179_GOOD_BLOCK_PCT},
+                "gates":gates,"recent":items}
+    except Exception as exc:
+        return {"ok":False,"version":"V17.9","error":str(exc),"gates":[],"recent":[]}
+
+@app.get("/v17/decision-audit")
+def api_v179_decision_audit(days: int = 7):
+    return v179_decision_audit_summary(days)
+
+# =========================
+# V18.1 — EVIDENCE & PERFORMANCE OBSERVATORY
+# Read-only evidence aggregation. Never changes live trading.
+# =========================
+def v181_performance_observatory(days: int = 7) -> Dict[str, Any]:
+    days=max(1,min(int(days),90)); cutoff=(datetime.now(UTC)-timedelta(days=days)).isoformat()
+    try:
+        init_db(); conn=db_connect()
+        trades=[dict(r) for r in conn.execute("SELECT * FROM closed_trades WHERE timestamp>=? ORDER BY timestamp ASC",(cutoff,)).fetchall()]
+        pnls=[float(t.get('pnl_gbp') if t.get('pnl_gbp') is not None else (t.get('pnl') or 0.0)) for t in trades]
+        wins=[x for x in pnls if x>0]; losses=[x for x in pnls if x<0]
+        curve=0.0; peak=0.0; max_dd=0.0
+        for x in pnls:
+            curve+=x; peak=max(peak,curve); max_dd=max(max_dd,peak-curve)
+        reasons={}
+        for t in trades:
+            reason=str(t.get('reason') or 'UNKNOWN').strip() or 'UNKNOWN'; d=reasons.setdefault(reason,{'reason':reason,'trades':0,'pnlGbp':0.0,'wins':0})
+            p=float(t.get('pnl_gbp') if t.get('pnl_gbp') is not None else (t.get('pnl') or 0.0)); d['trades']+=1; d['pnlGbp']+=p; d['wins']+=1 if p>0 else 0
+        exit_rows=[]
+        for d in reasons.values():
+            d['pnlGbp']=round(d['pnlGbp'],2); d['winRatePct']=round(100*d['wins']/max(1,d['trades']),1); exit_rows.append(d)
+        exit_rows.sort(key=lambda x:(x['trades'],x['pnlGbp']),reverse=True)
+        capture=[]
+        try:
+            rr=conn.execute("""SELECT s.closed_trade_id,s.symbol,s.entry_price,s.exit_price,MAX(p.price) peak_price
+              FROM trade_replay_sessions s LEFT JOIN trade_replay_points p ON p.session_id=s.id
+              WHERE s.status='CLOSED' AND s.closed_trade_id IS NOT NULL AND s.ended_at>=?
+              GROUP BY s.id ORDER BY s.ended_at DESC LIMIT 200""",(cutoff,)).fetchall()
+            for r in rr:
+                entry=float(r['entry_price'] or 0); exitp=float(r['exit_price'] or 0); peakp=float(r['peak_price'] or 0)
+                available=max(0.0,peakp-entry); captured=max(0.0,exitp-entry)
+                if available>0: capture.append(min(150.0,max(0.0,100.0*captured/available)))
+        except Exception: pass
+        audit=v179_decision_audit_summary(days)
+        weekly=_v18_build_review(days,persist=False) if '_v18_build_review' in globals() else {}
+        conn.close()
+        vault=profit_vault_payload() if 'profit_vault_payload' in globals() else {}
+        universe=adaptive_universe_payload() if 'adaptive_universe_payload' in globals() else {}
+        rows=universe.get('rows') if isinstance(universe,dict) else []
+        counts={}
+        for r in (rows if isinstance(rows,list) else []):
+            role=str((r or {}).get('role') or (r or {}).get('type') or 'OTHER').upper(); counts[role]=counts.get(role,0)+1
+        return {'ok':True,'version':'V18.1','days':days,'readOnly':True,
+          'trading':{'closedTrades':len(trades),'realisedPnlGbp':round(sum(pnls),2),'wins':len(wins),'losses':len(losses),'winRatePct':round(100*len(wins)/max(1,len(pnls)),1),'avgWinnerGbp':round(sum(wins)/max(1,len(wins)),2),'avgLoserGbp':round(sum(losses)/max(1,len(losses)),2),'maxRealisedDrawdownGbp':round(max_dd,2)},
+          'profitProtection':{'bankedProfitGbp':vault.get('bankedProfitGbp',0),'lifetimeBankedGbp':vault.get('lifetimeBankedGbp',0),'workingCapitalGbp':vault.get('workingCapitalGbp',0),'protectedBaselineGbp':vault.get('baselineGbp',0),'growthSinceBaselineGbp':vault.get('growthSinceBaselineGbp',0)},
+          'profitCapture':{'replayTradesMeasured':len(capture),'averagePeakCapturePct':round(sum(capture)/len(capture),1) if capture else None},
+          'decisionAudit':{'pendingCheckpoints':audit.get('pendingCheckpoints',0),'gates':audit.get('gates',[])},
+          'exits':exit_rows[:12], 'universe':{'activeSymbols':len(universe.get('activeSymbols',[]) if isinstance(universe,dict) else []),'roles':counts},
+          'governance':{'verdict':weekly.get('verdict'),'evidenceStrength':weekly.get('evidenceStrength'),'proposal':weekly.get('proposal',{}),'evidence':weekly.get('evidence',{})}}
+    except Exception as exc:
+        try: conn.close()
+        except Exception: pass
+        return {'ok':False,'version':'V18.1','error':str(exc),'readOnly':True}
+
+@app.get('/v18/performance-observatory')
+def api_v181_performance_observatory(days: int = 7):
+    return v181_performance_observatory(days)
+
+# =========================
+# V18 — AUTONOMOUS WEEKLY REVIEW
+# =========================
+V18_WINDOW_DAYS=7
+V18_MIN_AUDITED_DECISIONS=20
+V18_MIN_GATE_CLASSIFIED=8
+V18_PROMOTION_STABILITY_REQUIRED=5
+
+def _v18_week_key(now=None):
+    now=now or datetime.now(UTC); iso=now.isocalendar(); return f"{iso.year}-W{iso.week:02d}"
+
+def _v18_build_review(days=V18_WINDOW_DAYS, persist=True):
+    days=max(1,min(int(days),31)); cutoff=(datetime.now(UTC)-timedelta(days=days)).isoformat(); now=datetime.now(UTC); key=_v18_week_key(now)
+    try:
+        init_db(); conn=db_connect()
+        rows=conn.execute("""SELECT stage,COUNT(DISTINCT decision_id) blocked,
+          COUNT(DISTINCT CASE WHEN classification='GOOD_BLOCK' THEN decision_id END) good_blocks,
+          COUNT(DISTINCT CASE WHEN classification='MISSED_WINNER' THEN decision_id END) missed_winners,
+          COUNT(DISTINCT CASE WHEN classification='NEUTRAL' THEN decision_id END) neutral,
+          AVG(CASE WHEN due_minutes=60 AND status='COMPLETE' THEN return_pct END) avg_1h_return_pct
+          FROM v179_decision_audit WHERE decision_at>=? GROUP BY stage ORDER BY blocked DESC""",(cutoff,)).fetchall()
+        pending=int(conn.execute("SELECT COUNT(*) FROM v179_decision_audit WHERE status='PENDING'").fetchone()[0])
+        audited=int(conn.execute("SELECT COUNT(DISTINCT decision_id) FROM v179_decision_audit WHERE decision_at>=? AND status='COMPLETE'",(cutoff,)).fetchone()[0])
+        gates=[]; weakest=None
+        for r in rows:
+            d=dict(r); classified=int(d.get('good_blocks') or 0)+int(d.get('missed_winners') or 0)+int(d.get('neutral') or 0); good=int(d.get('good_blocks') or 0); missed=int(d.get('missed_winners') or 0); eff=100.0*good/max(1,classified)
+            d['classified']=classified; d['effectivenessPct']=round(eff,1)
+            d['action']='OBSERVE' if classified<V18_MIN_GATE_CLASSIFIED else ('KEEP' if eff>=60 and good>missed else ('REVIEW' if eff<45 and missed>good else 'OBSERVE'))
+            gates.append(d)
+            if d['action']=='REVIEW' and (weakest is None or eff<weakest['effectivenessPct']): weakest=d
+        enough=audited>=V18_MIN_AUDITED_DECISIONS
+        if not enough:
+            verdict='COLLECTING_EVIDENCE'; strength='LOW'; proposal_key=None; proposal=f"Collect at least {V18_MIN_AUDITED_DECISIONS} completed audited rejection decisions before proposing a strategy adjustment."
+        elif weakest:
+            verdict='REVIEW_RECOMMENDED'; strength='STRONG' if weakest['classified']>=20 else 'MODERATE'; proposal_key=f"gate:{str(weakest.get('stage') or 'unknown').lower()}"; proposal=f"Review {str(weakest.get('stage') or 'unknown').upper()} only: effectiveness {weakest['effectivenessPct']:.1f}% across {weakest['classified']} classified decisions. No automatic live change."
+        else:
+            verdict='HEALTHY'; strength='STRONG' if audited>=50 else 'MODERATE'; proposal_key='keep:entry_governance'; proposal='Keep current entry governance. No evidence-backed gate change is justified this week.'
+        prev=conn.execute("SELECT proposal_key,stability_count FROM v18_weekly_reviews WHERE review_key<>? ORDER BY created_at DESC LIMIT 1",(key,)).fetchone(); stability=1 if proposal_key else 0
+        if prev and proposal_key and str(prev['proposal_key'] or '')==proposal_key: stability=int(prev['stability_count'] or 0)+1
+        eligible=bool(proposal_key and stability>=V18_PROMOTION_STABILITY_REQUIRED and enough)
+        payload={'ok':True,'version':'V18','advisoryOnly':True,'automaticLiveChanges':False,'reviewKey':key,'createdAt':now.isoformat(),'windowDays':days,'verdict':verdict,'evidenceStrength':strength,'evidence':{'auditedDecisions':audited,'pendingCheckpoints':pending,'minimumAuditedDecisions':V18_MIN_AUDITED_DECISIONS},'gates':gates,'proposal':{'key':proposal_key,'text':proposal,'stabilityCount':stability,'stabilityRequired':V18_PROMOTION_STABILITY_REQUIRED,'promotionEligible':eligible,'action':'BOARD_REVIEW_ONLY' if eligible else 'OBSERVE'},'constitutionalLocks':['PROFIT_VAULT','PROTECTED_BASELINE','MAX_POSITION_SAFETY','ORDER_EXECUTION_SAFETY','STOP_PROTECTION']}
+        if persist:
+            conn.execute("""INSERT INTO v18_weekly_reviews(review_key,created_at,window_days,verdict,evidence_strength,proposal_key,proposal_text,stability_count,promotion_required,payload_json) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(review_key) DO UPDATE SET created_at=excluded.created_at,window_days=excluded.window_days,verdict=excluded.verdict,evidence_strength=excluded.evidence_strength,proposal_key=excluded.proposal_key,proposal_text=excluded.proposal_text,stability_count=excluded.stability_count,promotion_required=excluded.promotion_required,payload_json=excluded.payload_json""",(key,now.isoformat(),days,verdict,strength,proposal_key,proposal,stability,V18_PROMOTION_STABILITY_REQUIRED,json.dumps(payload,default=str))); conn.commit()
+        conn.close(); return payload
+    except Exception as exc:
+        try: conn.close()
+        except Exception: pass
+        return {'ok':False,'version':'V18','error':str(exc),'advisoryOnly':True,'automaticLiveChanges':False}
+
+@app.get('/v18/weekly-review')
+def api_v18_weekly_review(days: int=V18_WINDOW_DAYS):
+    return _v18_build_review(days,True)
 
 def _v6_write_historical_outcome(conn: sqlite3.Connection, row: Any) -> Dict[str, Any]:
     symbol=str(row["symbol"]).upper()
@@ -5328,6 +5530,43 @@ def _init_db_impl():
         CREATE INDEX IF NOT EXISTS idx_v2_setup_decisions_decision
         ON v2_setup_decisions(decision)
     """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v179_decision_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            decision_at TEXT NOT NULL,
+            stage TEXT,
+            reason TEXT,
+            entry_price REAL NOT NULL,
+            confidence REAL,
+            quality REAL,
+            due_minutes INTEGER NOT NULL,
+            due_at TEXT NOT NULL,
+            evaluated_at TEXT,
+            outcome_price REAL,
+            return_pct REAL,
+            best_move_pct REAL,
+            worst_move_pct REAL,
+            classification TEXT,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            error TEXT,
+            source TEXT,
+            UNIQUE(decision_id, due_minutes)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_v179_audit_due ON v179_decision_audit(status,due_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_v179_audit_stage ON v179_decision_audit(stage,classification)")
+
+    # V18 — advisory weekly governance reviews. Never applies live changes directly.
+    cur.execute("""CREATE TABLE IF NOT EXISTS v18_weekly_reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, review_key TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL, window_days INTEGER NOT NULL, verdict TEXT NOT NULL,
+        evidence_strength TEXT NOT NULL, proposal_key TEXT, proposal_text TEXT,
+        stability_count INTEGER NOT NULL DEFAULT 0, promotion_required INTEGER NOT NULL DEFAULT 5,
+        payload_json TEXT NOT NULL)""")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_v18_weekly_created ON v18_weekly_reviews(created_at)")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS v2_observation_outcomes (
@@ -8982,6 +9221,8 @@ def closed_market_ai_research_worker() -> None:
             started = datetime.now(UTC).isoformat()
             seeded = v2_seed_missing_outcomes()
             outcomes = v2_drain_due_outcomes()
+            v179_audit = v179_evaluate_decision_audit()
+            v18_review = _v18_build_review(V18_WINDOW_DAYS, True)
             v6_result = v6_sync_brains(V6_DEFAULT_HORIZON_HOURS, V6_AUTO_SYNC_LIMIT) if V6_BRAINS_ENABLED else {"ok": True, "skipped": True}
             v11_result = v11_learning_cycle("closed_market", force=False) if V11_AUTO_LEARNING_ENABLED else {"ok": True, "skipped": True}
             last_cycle_at = time.monotonic()
@@ -8990,6 +9231,8 @@ def closed_market_ai_research_worker() -> None:
                 f"started={started} seeded={seeded} "
                 f"outcomes={outcomes.get('evaluated', outcomes.get('historical', 0))} "
                 f"errors={outcomes.get('errors', 0)} "
+                f"audit={v179_audit.get('evaluated', 0)}/{v179_audit.get('errors', 0)} "
+                f"weekly={v18_review.get('verdict', 'UNAVAILABLE')} "
                 f"v6_new={v6_result.get('newShadowRows', 0)} "
                 f"v11_discovery={bool(v11_result.get('ranDiscovery'))} "
                 "live_changes=False"
