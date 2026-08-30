@@ -127,48 +127,62 @@ export function useTradeBot(activeTab: Tab = "overview") {
     fetchInFlight.current = true;
     lastFetchAt.current = now;
     const seq = ++fetchSeq.current;
+    let liveConnected = false;
+
+    // V18.2.8: hydrate independently. Previously Promise.allSettled meant a fast
+    // /banking-status response was held hostage by a slow /status request for up
+    // to 30 seconds. Each panel now paints as soon as its own endpoint returns.
+    const bankingPromise = fetchJsonWithTimeout("/banking-status", 10000)
+      .then((value) => {
+        if (seq !== fetchSeq.current || value?.ok === false) return;
+        setBanking(value || {});
+        liveConnected = true;
+        setStatus("Connected");
+
+        // Give the header a useful equity value immediately while the richer
+        // status snapshot is still arriving. /status will replace this with the
+        // authoritative live account/positions payload a moment later.
+        const eq = Number(value?.accountEquity || 0);
+        if (eq > 0) {
+          setData((previous) => ({
+            ...previous,
+            account: {
+              ...(previous?.account || {}),
+              equity: previous?.account?.equity || eq,
+              equityGbp: previous?.account?.equityGbp || eq * Number(previous?.fx?.usdToGbp || 0.7403),
+            },
+            banking: { ...(previous?.banking || {}), ...(value || {}) },
+          }));
+        }
+      })
+      .catch((error: any) => {
+        if (error?.name !== "AbortError") console.error("Banking status load failed", error);
+      });
+
+    const statusPromise = fetchJsonWithTimeout("/status", 12000)
+      .then((value) => {
+        if (seq !== fetchSeq.current) return;
+        if (value && Object.keys(value).length > 0) {
+          setData((previous) => ({ ...previous, ...value }));
+          const mode = value?.positionSettings?.buySizeMode;
+          if (mode) setBuySizeMode(mode === "partial" ? "partial" : "full");
+          liveConnected = true;
+          setStatus("Connected");
+        }
+      })
+      .catch((error: any) => {
+        if (error?.name !== "AbortError") console.error("Live status load failed", error);
+      });
 
     try {
-      const [statusResult, bankingResult] = await Promise.allSettled([
-        fetchJsonWithTimeout("/status", 30000),
-        fetchJsonWithTimeout("/banking-status", 15000),
-      ]);
-
+      await Promise.allSettled([bankingPromise, statusPromise]);
       if (seq !== fetchSeq.current) return;
-
-      let liveConnected = false;
-
-      if (statusResult.status === "fulfilled" && statusResult.value?.account) {
-        setData((previous) => ({ ...previous, ...statusResult.value }));
-        const mode = statusResult.value?.positionSettings?.buySizeMode;
-        if (mode) setBuySizeMode(mode === "partial" ? "partial" : "full");
-        liveConnected = true;
-      }
-
-      if (bankingResult.status === "fulfilled" && bankingResult.value?.ok !== false) {
-        setBanking(bankingResult.value || {});
-        liveConnected = true;
-      }
-
-      setStatus(liveConnected ? "Connected" : "Connection failed");
-
-      if (!liveConnected) {
-        const reason =
-          statusResult.status === "rejected"
-            ? statusResult.reason
-            : bankingResult.status === "rejected"
-              ? bankingResult.reason
-              : "Live status unavailable";
-
-        if (reason?.name !== "AbortError") console.error(reason);
-      }
-    } catch (error: any) {
-      if (error?.name !== "AbortError") console.error(error);
-      setStatus("Connection failed");
+      if (!liveConnected) setStatus("Connection failed");
     } finally {
       fetchInFlight.current = false;
     }
   }, [authToken, fetchJsonWithTimeout]);
+
 
   useEffect(() => {
     if (!authToken) return;

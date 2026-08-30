@@ -489,6 +489,7 @@ locked_universe_runtime_cache: Dict[str, Any] = {"day": "", "symbols": [], "rows
 adaptive_universe_runtime_cache: Dict[str, Any] = {"updatedAt": "", "symbols": [], "rows": [], "lastRefreshTs": 0.0, "changes": 0}
 
 latest_status: Dict[str, Any] = {}
+_STATUS_LOCK = threading.RLock()
 latest_scans: List[Dict[str, Any]] = []
 v174_final_gate_last_event: Dict[str, Any] = {}
 
@@ -7570,8 +7571,14 @@ def build_status_payload(bot_name, scans):
 
 
 def update_status(bot_name, scans):
-    latest_status.clear()
-    latest_status.update(build_status_payload(bot_name, scans))
+    # V18.2.8: build the expensive payload off to the side, then publish it
+    # atomically.  The previous clear-then-build sequence left latest_status
+    # empty for the entire build, so /status could fall into a second live
+    # broker refresh and hang the dashboard for 15-30 seconds.
+    payload = build_status_payload(bot_name, scans)
+    with _STATUS_LOCK:
+        latest_status.clear()
+        latest_status.update(payload)
 
 
 
@@ -9019,31 +9026,41 @@ def api_final_gate_monitor(request: Request):
 
 @app.get("/status")
 def get_status():
-    # Never return an empty shell while the background loop is still warming up.
-    if not isinstance(latest_status.get("account"), dict):
-        try:
-            latest_status.clear()
-            latest_status.update(_quick_live_status_payload())
-        except Exception as e:
-            print(f"QUICK STATUS BUILD ERROR: {e}")
-    latest_status["botVersion"] = "v1.1-strict-profit-mode"
-    try:
-        if "merge_manual_picks_into_auto_universe" in globals():
-            merge_manual_picks_into_auto_universe(latest_status)
-    except Exception as e:
-        print(f"STATUS MANUAL PICK MERGE ERROR: {e}")
+    # V18.2.8 FAST DASHBOARD LOAD
+    # This endpoint must be cache-only. Never call Alpaca, SQLite-heavy research,
+    # universe rebuilds or filesystem merge helpers from the browser request path.
+    # Background workers already refresh latest_status; the UI should receive the
+    # most recent coherent snapshot immediately rather than waiting for a second
+    # synchronous status rebuild.
+    with _STATUS_LOCK:
+        payload = dict(latest_status)
 
-    # The dashboard fetches reports separately. Do not send thousands of historic
-    # trades and the full symbol-memory database on every 10-second status poll.
-    # A compact copy keeps connection/account/positions/scans responsive and avoids
-    # the browser remaining on "Connecting..." while decoding a multi-megabyte JSON.
-    payload = dict(latest_status)
+    payload["botVersion"] = "v1.1-strict-profit-mode"
     payload.pop("tradeTimeline", None)
     payload.pop("closedTrades", None)
     payload.pop("stockMemory", None)
-    payload["statusPayloadMode"] = "compact-live"
+    payload["statusPayloadMode"] = "compact-live-cache"
     payload["fullHistoryAvailableFrom"] = "/reports"
-    payload["finalGateMonitor"] = _v174_final_gate_monitor_payload()
+    payload["statusCacheReady"] = isinstance(payload.get("account"), dict)
+
+    # Keep final-gate data best-effort and non-fatal. This is local persisted state,
+    # not a broker call, but the dashboard must still return if it is unavailable.
+    try:
+        payload["finalGateMonitor"] = _v174_final_gate_monitor_payload()
+    except Exception:
+        payload["finalGateMonitor"] = {}
+
+    if not payload.get("statusCacheReady"):
+        # Return a truthful warming snapshot immediately. Banking/equity can still
+        # hydrate independently from /banking-status on the frontend.
+        payload.setdefault("botEnabled", bot_enabled)
+        payload.setdefault("manualOverride", manual_override)
+        payload.setdefault("emergencyStop", emergency_stop)
+        payload.setdefault("positions", [])
+        payload.setdefault("scans", list(latest_scans))
+        payload.setdefault("universe", list(current_universe))
+        payload["warmingUp"] = True
+
     return payload
 
 
@@ -9846,8 +9863,10 @@ def startup_event():
     except Exception as exc:
         print(f"V17.0.11 STARTUP EVENT LOCK RESTORE ERROR: {exc}")
     try:
-        latest_status.clear()
-        latest_status.update(_quick_live_status_payload())
+        startup_payload = _quick_live_status_payload()
+        with _STATUS_LOCK:
+            latest_status.clear()
+            latest_status.update(startup_payload)
     except Exception as exc:
         print(f"STARTUP QUICK STATUS ERROR: {exc}")
     if not bot_thread_started:
