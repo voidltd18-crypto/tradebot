@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { DashboardStyles } from "./components/DashboardStyles";
 import { Header } from "./components/Header";
 import { Login } from "./components/Login";
@@ -19,6 +19,31 @@ const WeeklyReviewPage = lazy(() => import("./pages/WeeklyReviewPage").then((mod
 const AuditPage = lazy(() => import("./pages/AuditPage").then((module) => ({ default: module.AuditPage })));
 const ReportsPage = lazy(() => import("./pages/ReportsPage").then((module) => ({ default: module.ReportsPage })));
 
+
+function usePhoneLayout() {
+  const detect = () => {
+    if (typeof window === "undefined") return false;
+    const vv = window.visualViewport?.width ?? Number.POSITIVE_INFINITY;
+    const screenWidth = Math.min(window.screen?.width || Number.POSITIVE_INFINITY, window.screen?.height || Number.POSITIVE_INFINITY);
+    const coarse = window.matchMedia?.("(pointer: coarse)")?.matches ?? false;
+    return window.innerWidth <= 760 || vv <= 760 || screenWidth <= 760 || (coarse && window.innerWidth <= 1100);
+  };
+  const [isPhone, setIsPhone] = useState(detect);
+  useEffect(() => {
+    const refresh = () => setIsPhone(detect());
+    refresh();
+    window.addEventListener("resize", refresh);
+    window.addEventListener("orientationchange", refresh);
+    window.visualViewport?.addEventListener("resize", refresh);
+    return () => {
+      window.removeEventListener("resize", refresh);
+      window.removeEventListener("orientationchange", refresh);
+      window.visualViewport?.removeEventListener("resize", refresh);
+    };
+  }, []);
+  return isPhone;
+}
+
 function PageLoading() {
   return <div className="card"><strong>Loading this page…</strong><div className="muted">Live balances and trading remain connected.</div></div>;
 }
@@ -26,6 +51,7 @@ function PageLoading() {
 export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
   const [exportRequested, setExportRequested] = useState(false);
+  const isPhone = usePhoneLayout();
   const bot = useTradeBot(tab);
 
   function positionGlowStyle(position: AnyObj): React.CSSProperties {
@@ -52,10 +78,10 @@ export default function App() {
   const tradingCapitalGbp = Math.max(0, Number(profitVault?.accountEquityGbp || accountEquityGbp) - bankedProfitGbp);
   const maxPositions = Number(bot.data?.maxPositions || bot.positionSettings?.maxPositions || 0);
 
-  return <div className="app ai-dashboard command-dashboard">
+  return <div className={`app ai-dashboard command-dashboard${isPhone ? " phone-layout" : ""}`}>
     <DashboardStyles />
     <div className="dashboard-shell">
-      <Nav tab={tab} setTab={setTab} />
+      <Nav tab={tab} setTab={setTab} isPhone={isPhone} />
       <div className="dashboard-content">
         <Header status={bot.status} data={bot.data} marketLabel={bot.marketLabel} onLogout={bot.secureLogout} />
 

@@ -314,3 +314,58 @@
   .command-actions button{min-width:122px}
   .mobile-nav-dock{left:5px;right:5px}
 }
+
+/* V18.2.7 Mobile Hard Override
+   JS adds .phone-layout using real device/visual viewport detection, so this works
+   even when mobile Safari reports a desktop-like CSS viewport. */
+.phone-layout{
+  width:100%!important;
+  max-width:none!important;
+  margin:0!important;
+  padding:0 10px calc(92px + env(safe-area-inset-bottom))!important;
+  overflow-x:hidden!important;
+}
+.phone-layout .dashboard-shell{display:block!important;width:100%!important;max-width:100%!important}
+.phone-layout .desktop-sidebar{display:none!important}
+.phone-layout .dashboard-content{display:block!important;width:100%!important;max-width:100%!important;min-width:0!important;padding:8px 0 24px!important;margin:0!important}
+.phone-layout .command-topbar{display:block!important;width:100%!important;margin:0 0 10px!important;padding:7px 2px 0!important}
+.phone-layout .command-topbar .eyebrow{font-size:9px!important;letter-spacing:.12em!important}
+.phone-layout .command-topbar h1{font-size:26px!important;line-height:1.05!important;margin:5px 0 0!important}
+.phone-layout .topbar-subtitle{display:none!important}
+.phone-layout .command-pills{display:flex!important;justify-content:flex-start!important;flex-wrap:nowrap!important;gap:5px!important;overflow-x:auto!important;width:100%!important;margin-top:9px!important;padding:0 0 4px!important;scrollbar-width:none}
+.phone-layout .command-pills::-webkit-scrollbar{display:none}
+.phone-layout .command-pills .pill,.phone-layout .command-pills .logout-button{flex:0 0 auto!important;white-space:nowrap!important;font-size:9px!important;padding:6px 8px!important;min-height:28px!important;border-radius:999px!important}
+.phone-layout .stats.command-stats{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;width:100%!important;gap:8px!important;margin:0 0 10px!important}
+.phone-layout .command-stats .card.stat{width:auto!important;min-width:0!important;min-height:88px!important;margin:0!important;padding:11px 12px!important;border-radius:15px!important}
+.phone-layout .command-stats .card.stat:first-child{grid-column:1/-1!important;min-height:104px!important;padding:15px!important}
+.phone-layout .command-stats .card.stat:first-child strong{font-size:30px!important}
+.phone-layout .command-stats .card.stat:nth-child(7){grid-column:1/-1!important;min-height:72px!important}
+.phone-layout .command-stats .card.stat span{font-size:10px!important}
+.phone-layout .command-stats .card.stat strong{font-size:19px!important;line-height:1.05!important;margin-top:5px!important}
+.phone-layout .command-stats .card.stat small{font-size:9px!important;line-height:1.22!important;margin-top:4px!important}
+.phone-layout .home-command-center,.phone-layout .dashboard-detail-grid{width:100%!important;max-width:100%!important}
+.phone-layout .home-hero-row{display:flex!important;flex-direction:column!important;grid-template-columns:none!important;gap:8px!important;width:100%!important}
+.phone-layout .system-banner,.phone-layout .full-report-button{width:100%!important;min-width:0!important}
+.phone-layout .system-banner{padding:11px 12px!important;border-radius:14px!important;display:grid!important;grid-template-columns:auto auto 1fr!important;gap:7px!important}
+.phone-layout .system-banner span:last-child{grid-column:1/-1!important;white-space:normal!important;font-size:10px!important;line-height:1.35!important}
+.phone-layout .full-report-button{min-height:62px!important;padding:11px 13px!important;border-radius:15px!important;gap:10px!important}
+.phone-layout .quick-actions-card{width:100%!important;padding:12px!important;margin:0!important;border-radius:16px!important;overflow:hidden!important}
+.phone-layout .command-actions{display:flex!important;grid-template-columns:none!important;gap:7px!important;overflow-x:auto!important;width:100%!important;padding-bottom:2px!important;scrollbar-width:none}
+.phone-layout .command-actions::-webkit-scrollbar{display:none}
+.phone-layout .command-actions button{flex:0 0 auto!important;min-width:132px!important;min-height:42px!important;padding:8px 10px!important;font-size:10px!important;border-radius:11px!important}
+.phone-layout .command-grid,.phone-layout .dashboard-detail-grid,.phone-layout .grid.two,.phone-layout .ai-grid,.phone-layout .operator-change-grid,.phone-layout .operator-evidence-grid,.phone-layout .intelligence-stat-grid,.phone-layout .universe-counts{display:grid!important;grid-template-columns:minmax(0,1fr)!important;gap:9px!important;width:100%!important}
+.phone-layout .wide{grid-column:auto!important}
+.phone-layout .card,.phone-layout .command-panel{width:100%!important;max-width:100%!important;min-width:0!important;min-height:0!important;margin-bottom:0!important;border-radius:16px!important;padding:13px!important;overflow:hidden}
+.phone-layout .position{display:grid!important;grid-template-columns:minmax(0,1fr)!important;width:100%!important;max-width:100%!important;padding:12px!important;border-radius:14px!important;gap:8px!important}
+.phone-layout .position-side{align-items:flex-start!important;text-align:left!important;width:100%!important}
+.phone-layout .position-side button{max-width:100%!important}
+.phone-layout .table-wrap{width:100%!important;max-width:100%!important;overflow-x:auto!important;-webkit-overflow-scrolling:touch!important}
+.phone-layout table{min-width:680px!important;font-size:10px!important}
+.phone-layout .search-results{grid-template-columns:minmax(0,1fr)!important;width:100%!important}
+.phone-layout .mobile-nav-dock{position:fixed!important;display:grid!important;grid-template-columns:repeat(5,minmax(0,1fr))!important;left:8px!important;right:8px!important;bottom:calc(7px + env(safe-area-inset-bottom))!important;height:64px!important;z-index:100!important;border:1px solid rgba(71,85,105,.52)!important;border-radius:20px!important;padding:5px!important;background:rgba(7,16,35,.96)!important;backdrop-filter:blur(22px)!important;box-shadow:0 16px 45px rgba(0,0,0,.55)!important}
+.phone-layout .mobile-nav-dock button{background:transparent!important;color:#8191ab!important;border:0!important;padding:5px 2px!important;border-radius:14px!important;display:flex!important;flex-direction:column!important;align-items:center!important;justify-content:center!important;gap:2px!important;min-width:0!important}
+.phone-layout .mobile-nav-dock button.active{color:#fff!important;background:linear-gradient(180deg,rgba(37,99,235,.76),rgba(37,99,235,.30))!important}
+.phone-layout .mobile-more-backdrop{display:flex!important;position:fixed!important;inset:0!important;z-index:120!important;align-items:flex-end!important;background:rgba(2,6,23,.70)!important;backdrop-filter:blur(6px)!important}
+.phone-layout .mobile-more-sheet{width:100%!important;max-width:100%!important;max-height:76vh!important;overflow:auto!important;border-radius:24px 24px 0 0!important}
+.phone-layout .home-export-host{width:1500px!important;max-width:none!important;padding:0!important;overflow:visible!important}
+.phone-layout .home-export-host .intelligence-page{width:1500px!important;max-width:none!important}
