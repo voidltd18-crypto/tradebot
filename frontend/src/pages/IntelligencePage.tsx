@@ -101,6 +101,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const [promotionBusy, setPromotionBusy] = useState(false);
   const [promotionMessage, setPromotionMessage] = useState("");
   const [exportBusy, setExportBusy] = useState(false);
+  const [exportProgress, setExportProgress] = useState("");
   const [exportingPdf, setExportingPdf] = useState(false);
   const reportRef = useRef<HTMLDivElement | null>(null);
   const autoExportStartedRef = useRef(false);
@@ -276,7 +277,11 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     }
   }, [authToken, endpoints, section, sectionKeys]);
 
-  useEffect(() => { load(false); }, [load]);
+  // V18.2.9: hidden auto-export instances must not start the normal tab loader in parallel
+  // with the full report collector. That request storm was the main source of partial PDFs.
+  useEffect(() => {
+    if (!autoExport) void load(false);
+  }, [autoExport, load]);
 
   const advisor = sources.advisor.data;
   const shadow = sources.shadow.data;
@@ -594,59 +599,127 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     if (!authToken || exportBusy) return;
     let exportSucceeded = false;
     setExportBusy(true);
+    setExportProgress("Preparing report snapshot…");
     const headers = { "X-Auth-Token": authToken, "x-api-key": authToken };
 
+    // V18.2.9 Report Snapshot Coordinator
+    // Build a deliberate, low-concurrency snapshot before React is allowed to render the PDF.
+    // A complete report is never generated from endpoint timeouts / placeholder state.
+    const criticalKeys = new Set([
+      "status", "banking", "reports", "advisor", "operator", "promotion",
+      "ceoStatus", "ceoReviews", "boardStatus", "boardHistory",
+      "memoryStatus", "memoryKnowledge", "scientistStatus", "scientistHypotheses", "scientistExperiments",
+      "operationsStatus", "operationsComponents", "operationsEngineHealth",
+      "portfolio", "audit", "weeklyReview", "observatory", "research", "v8Status",
+    ]);
+
+    const timeoutFor = (key: string) => {
+      if (key === "reports") return 90000;
+      if (["operationsDoctor", "operationsEngineHealth", "operator", "ceoStatus", "boardStatus"].includes(key)) return 45000;
+      if (["memoryKnowledge", "scientistHypotheses", "scientistExperiments", "operationsHistory"].includes(key)) return 30000;
+      return 22000;
+    };
+
+    const fetchReportEndpoint = async (key: string, endpoint: string): Promise<EndpointState> => {
+      const maxAttempts = criticalKeys.has(key) ? 3 : 2;
+      let lastMessage = "Failed to load";
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), timeoutFor(key));
+        try {
+          const response = await fetch(`${API_URL}${endpoint}`, {
+            cache: "no-store",
+            headers,
+            signal: controller.signal,
+          });
+          const json = await readJson(response);
+          if (!response.ok) throw new Error(text(json?.detail ?? json?.message, `HTTP ${response.status}`));
+          return { data: firstObject(json), error: "", loading: false };
+        } catch (error: any) {
+          lastMessage = error?.name === "AbortError"
+            ? `Timed out after ${Math.round(timeoutFor(key) / 1000)} seconds`
+            : (error?.message || "Failed to load");
+          if (attempt < maxAttempts) {
+            setExportProgress(`Retrying ${keyLabel(key)} (${attempt + 1}/${maxAttempts})…`);
+            await new Promise((resolve) => window.setTimeout(resolve, 700 * attempt));
+          }
+        } finally {
+          window.clearTimeout(timeout);
+        }
+      }
+      return { data: {}, error: lastMessage, loading: false };
+    };
+
     try {
-      // Fetch every intelligence endpoint plus core bot/account data so the PDF is a complete whole-bot snapshot, not only the open tab.
-      const entries = Object.entries(endpoints);
+      // Put the account/governance truth first, then the heavier evidence/history endpoints.
+      const priority = [
+        "status", "banking", "reports", "advisor", "operator", "promotion",
+        "ceoStatus", "boardStatus", "memoryStatus", "scientistStatus", "operationsStatus",
+        "portfolio", "audit", "weeklyReview", "observatory",
+      ];
+      const allEntries = Object.entries(endpoints);
+      const priorityRank = new Map(priority.map((key, index) => [key, index]));
+      const entries = [...allEntries].sort(([a], [b]) =>
+        (priorityRank.get(a) ?? 999) - (priorityRank.get(b) ?? 999)
+      );
       const results: Record<string, EndpointState> = {};
       let cursor = 0;
+      let completed = 0;
 
+      // Only two concurrent report requests. This avoids starving Render/SQLite while still
+      // collecting the complete report reasonably quickly.
       const worker = async () => {
         while (cursor < entries.length) {
           const index = cursor++;
-          const [key, endpoint] = entries[index];
-          const controller = new AbortController();
-          const timeoutSeconds = key === "reports" ? 90 : ["status", "operator", "operationsDoctor", "operationsEngineHealth"].includes(key) ? 30 : key === "banking" ? 20 : 15;
-          const timeout = window.setTimeout(() => controller.abort(), timeoutSeconds * 1000);
-          try {
-            const response = await fetch(`${API_URL}${endpoint}`, {
-              cache: "no-store",
-              headers,
-              signal: controller.signal,
-            });
-            const json = await readJson(response);
-            if (!response.ok) throw new Error(text(json?.detail ?? json?.message, `HTTP ${response.status}`));
-            results[key] = { data: firstObject(json), error: "", loading: false };
-          } catch (error: any) {
-            const message = error?.name === "AbortError" ? "Timed out while building report" : (error?.message || "Failed to load");
-            results[key] = { data: {}, error: message, loading: false };
-          } finally {
-            window.clearTimeout(timeout);
-          }
+          const item = entries[index];
+          if (!item) return;
+          const [key, endpoint] = item;
+          setExportProgress(`Collecting ${keyLabel(key)} · ${completed}/${entries.length}`);
+          results[key] = await fetchReportEndpoint(key, endpoint);
+          completed += 1;
+          setExportProgress(`Collecting report evidence · ${completed}/${entries.length}`);
         }
       };
 
-      await Promise.all(Array.from({ length: 4 }, () => worker()));
+      await Promise.all(Array.from({ length: 2 }, () => worker()));
+
+      const failedCritical = [...criticalKeys]
+        .filter((key) => results[key]?.error)
+        .map((key) => `${keyLabel(key)}: ${results[key]?.error}`);
+
+      if (failedCritical.length) {
+        throw new Error(`Report snapshot incomplete. Nothing was exported. Missing: ${failedCritical.join("; ")}`);
+      }
+
+      // One atomic state publication means the PDF render cannot mix old and new endpoint data.
       setSources((previous) => ({ ...previous, ...results }));
       setLastUpdated(new Date().toLocaleTimeString("en-GB"));
+      setExportProgress("Rendering complete snapshot…");
       setExportingPdf(true);
 
-      // Wait until React has mounted the nine whole-bot sections plus all twelve Intelligence sections.
+      // Wait until React has mounted every whole-bot + Intelligence section and completed two paint cycles.
       const waitForReport = async () => {
         const started = Date.now();
-        while (Date.now() - started < 5000) {
+        let stableFrames = 0;
+        let previousHeight = 0;
+        while (Date.now() - started < 10000) {
           await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
           const root = reportRef.current;
           const count = root?.querySelectorAll(".pdf-section").length ?? 0;
-          if (root && count >= 21 && root.scrollHeight > 1000) return root;
+          const height = root?.scrollHeight ?? 0;
+          if (root && count >= 21 && height > 1000) {
+            stableFrames = Math.abs(height - previousHeight) < 4 ? stableFrames + 1 : 0;
+            previousHeight = height;
+            if (stableFrames >= 2) return root;
+          }
         }
-        throw new Error("The full bot report did not finish rendering in time.");
+        throw new Error("The complete report snapshot did not finish rendering in time.");
       };
 
       const element = await waitForReport();
       if (document.fonts?.ready) await document.fonts.ready;
-      await new Promise((resolve) => window.setTimeout(resolve, 650));
+      await new Promise((resolve) => window.setTimeout(resolve, 850));
+      setExportProgress("Capturing PDF pages…");
 
       const [{ default: html2canvas }, jsPdfModule] = await Promise.all([
         import("html2canvas"),
@@ -664,9 +737,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       if (!sections.length) throw new Error("No TradeBot report sections were available for export.");
 
       let firstPage = true;
-      for (const sectionElement of sections) {
-        // Capture each subsection separately. Capturing the entire 12-section page as one canvas
-        // exceeds browser canvas limits on large reports and produces blank PDFs.
+      for (let sectionIndex = 0; sectionIndex < sections.length; sectionIndex += 1) {
+        const sectionElement = sections[sectionIndex];
+        setExportProgress(`Capturing section ${sectionIndex + 1}/${sections.length}…`);
         const canvas = await html2canvas(sectionElement, {
           scale: 1.25,
           useCORS: true,
@@ -714,6 +787,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     } finally {
       setExportingPdf(false);
       setExportBusy(false);
+      setExportProgress("");
       onExportComplete?.(exportSucceeded);
     }
   };
@@ -779,7 +853,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         </div>
         <div className="actions">
           <span className={`pill ${endpointHealth === endpointTotal ? "ok" : endpointHealth ? "warn" : "bad"}`}>{endpointHealth}/{endpointTotal} engines online</span>
-          <button className="ghost pdf-export-button" disabled={exportBusy} onClick={exportFullBotReport}>{exportBusy ? "BUILDING PDF..." : "EXPORT FULL BOT REPORT PDF"}</button>
+          <button className="ghost pdf-export-button" disabled={exportBusy} onClick={exportFullBotReport}>{exportBusy ? (exportProgress || "BUILDING PDF...") : "EXPORT FULL BOT REPORT PDF"}</button>
           <button className="ghost" disabled={refreshing || exportBusy} onClick={refreshAll}>{refreshing ? "REFRESHING..." : "REFRESH INTELLIGENCE"}</button>
         </div>
       </div>
