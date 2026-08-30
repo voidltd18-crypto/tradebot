@@ -212,3 +212,105 @@
   .command-actions{grid-template-columns:1fr 1fr!important}
   .sidebar-tabs button{flex-basis:70px;width:70px;min-width:70px}
 }
+
+/* V18.2.6 Phone-first Command Center */
+.mobile-nav-dock,.mobile-more-backdrop{display:none}
+@media(max-width:720px){
+  .desktop-sidebar{display:none!important}
+  .command-dashboard{padding:0 10px calc(92px + env(safe-area-inset-bottom));}
+  .dashboard-content{padding:8px 0 24px}
+
+  /* Header becomes compact and app-like instead of a shrunken desktop header. */
+  .command-topbar{display:block;margin:0 0 10px;padding:7px 2px 0}
+  .command-topbar .eyebrow{font-size:9px;letter-spacing:.12em}
+  .command-topbar h1{font-size:25px;line-height:1.05;margin:5px 0 0}
+  .topbar-subtitle{display:none}
+  .command-pills{margin-top:9px;display:flex;gap:5px;overflow-x:auto;flex-wrap:nowrap;padding:0 0 4px;scrollbar-width:none}
+  .command-pills::-webkit-scrollbar{display:none}
+  .command-pills .pill,.command-pills .logout-button{font-size:9px;padding:6px 8px;min-height:28px;border-radius:999px;white-space:nowrap;flex:0 0 auto}
+
+  /* Money is the first thing seen on a phone. */
+  .command-stats{grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:8px;margin:0 0 10px}
+  .command-stats .card.stat{min-height:88px;padding:11px 12px;margin:0;border-radius:15px}
+  .command-stats .card.stat:first-child{grid-column:1/-1;min-height:105px;padding:15px;background:radial-gradient(circle at 88% 30%,rgba(56,189,248,.16),transparent 34%),linear-gradient(145deg,#10213d,#0a1325)}
+  .command-stats .card.stat:first-child strong{font-size:30px}
+  .command-stats .card.stat:nth-child(2) strong,.command-stats .card.stat:nth-child(3) strong,.command-stats .card.stat:nth-child(6) strong{font-size:22px}
+  .command-stats .card.stat:nth-child(7){grid-column:1/-1;min-height:72px;display:grid;grid-template-columns:1fr auto;align-items:center}
+  .command-stats .card.stat:nth-child(7)>span,.command-stats .card.stat:nth-child(7)>small{grid-column:1}
+  .command-stats .card.stat:nth-child(7)>strong{grid-column:2;grid-row:1/3;font-size:26px;margin:0}
+  .command-stats .card.stat span{font-size:10px;text-transform:uppercase;letter-spacing:.04em}
+  .command-stats .card.stat strong{font-size:19px;line-height:1.05;margin-top:5px}
+  .command-stats .card.stat small{font-size:9px;line-height:1.22;margin-top:4px}
+
+  .home-command-center{gap:9px}
+  .home-hero-row{display:flex;flex-direction:column;gap:8px}
+  .system-banner{padding:11px 12px;border-radius:14px;display:grid;grid-template-columns:auto auto 1fr;gap:7px;align-items:center}
+  .system-banner b{font-size:10px}
+  .system-banner span:last-child{grid-column:1/-1;font-size:10px;line-height:1.35;white-space:normal;margin-top:2px}
+  .full-report-button{min-height:62px;padding:11px 13px;border-radius:15px;gap:10px;box-shadow:0 8px 24px rgba(37,99,235,.22)}
+  .full-report-button .report-icon{font-size:23px}
+  .full-report-button strong{font-size:12px}
+  .full-report-button small{font-size:9px;line-height:1.25}
+
+  .quick-actions-card{padding:12px;margin:0;border-radius:16px}
+  .quick-actions-card h2{font-size:13px;margin-bottom:9px}
+  .command-actions{display:flex!important;gap:7px;overflow-x:auto;padding-bottom:2px;scrollbar-width:none}
+  .command-actions::-webkit-scrollbar{display:none}
+  .command-actions button,.command-actions button.danger:last-child{grid-column:auto;flex:0 0 auto;min-width:132px;min-height:42px;padding:8px 10px;font-size:10px;border-radius:11px}
+
+  .command-grid,.dashboard-detail-grid,.grid.two{grid-template-columns:1fr!important;gap:9px}
+  .card,.command-panel{border-radius:16px;padding:13px;margin-bottom:0;min-height:0!important}
+  .command-panel h2,.decision-card h2{font-size:14px;margin-bottom:10px}
+  .market-state{padding:12px;margin-bottom:10px}
+  .summary div{gap:12px;padding-bottom:7px}
+  .summary span,.summary b{font-size:11px}
+  .compact-summary{font-size:11px}
+  .system-list{grid-template-columns:1fr 1fr;gap:5px}
+  .system-list>div{grid-template-columns:18px 1fr;padding:7px 7px;gap:6px;min-width:0}
+  .system-list>div>span:nth-child(2){font-size:9px;line-height:1.2;overflow:hidden;text-overflow:ellipsis}
+  .system-list b{display:none}
+  .research-badge,.panel-count{top:12px;right:12px}
+  .position{padding:11px!important;border-radius:13px}
+  .position h3{font-size:17px!important}
+  .position p{font-size:10px}
+  .position-side b{font-size:11px}
+  .empty-position{height:150px}
+  .empty-position>span{font-size:34px}
+  .empty-position b{font-size:14px}
+  .dashboard-detail-grid .wide{grid-column:auto}
+
+  /* Tables stay readable instead of compressing into tiny columns. */
+  .table-wrap{margin-left:-13px;margin-right:-13px;padding:0 13px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  table{min-width:720px}
+  th,td{padding:8px;font-size:10px;white-space:nowrap}
+
+  /* Native-feeling five-item bottom dock. */
+  .mobile-nav-dock{position:fixed;display:grid;grid-template-columns:repeat(5,1fr);left:8px;right:8px;bottom:calc(7px + env(safe-area-inset-bottom));height:64px;z-index:100;border:1px solid rgba(71,85,105,.52);border-radius:20px;padding:5px;background:rgba(7,16,35,.94);backdrop-filter:blur(22px);box-shadow:0 16px 45px rgba(0,0,0,.55)}
+  .mobile-nav-dock button{background:transparent!important;color:#8191ab!important;border:0;padding:5px 2px;border-radius:14px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;min-width:0}
+  .mobile-nav-dock button>span{font-size:19px;line-height:1}
+  .mobile-nav-dock button small{font-size:8.5px;color:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+  .mobile-nav-dock button.active{color:#fff!important;background:linear-gradient(180deg,rgba(37,99,235,.76),rgba(37,99,235,.30))!important;box-shadow:inset 0 0 18px rgba(96,165,250,.13)}
+
+  /* "More" is a proper bottom sheet, so all 10 areas remain easy to reach. */
+  .mobile-more-backdrop{display:flex;position:fixed;inset:0;z-index:120;align-items:flex-end;background:rgba(2,6,23,.70);backdrop-filter:blur(6px)}
+  .mobile-more-sheet{width:100%;max-height:76vh;overflow:auto;border-radius:24px 24px 0 0;border:1px solid #2a3855;border-bottom:0;background:linear-gradient(180deg,#101c32,#081126);padding:8px 14px calc(22px + env(safe-area-inset-bottom));box-shadow:0 -20px 60px rgba(0,0,0,.55)}
+  .mobile-sheet-handle{width:42px;height:4px;border-radius:999px;background:#43516b;margin:2px auto 10px}
+  .mobile-sheet-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:2px 1px 13px}
+  .mobile-sheet-head strong{display:block;font-size:16px}
+  .mobile-sheet-head small{display:block;font-size:10px;margin-top:3px;color:#8291a9}
+  .mobile-sheet-head button{width:34px;height:34px;padding:0;border-radius:50%;background:#1e293b!important;color:#fff;font-size:20px}
+  .mobile-more-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .mobile-more-grid button{min-height:62px;background:#0d1729!important;border:1px solid #263651;color:#dbeafe;border-radius:14px;padding:10px;display:grid;grid-template-columns:25px 1fr auto;align-items:center;gap:7px;text-align:left;font-size:11px}
+  .mobile-more-grid button.active{border-color:#60a5fa;background:linear-gradient(135deg,rgba(37,99,235,.45),rgba(15,23,42,.95))!important}
+  .mobile-more-grid .nav-icon{font-size:18px}
+  .mobile-more-grid em{font-style:normal;font-size:8px;padding:3px 5px;border-radius:999px;color:#60a5fa;background:rgba(37,99,235,.18)}
+}
+
+@media(max-width:380px){
+  .command-dashboard{padding-left:7px;padding-right:7px}
+  .command-stats{gap:6px}
+  .command-stats .card.stat{padding:10px;min-height:84px}
+  .command-stats .card.stat:first-child{min-height:98px}
+  .command-actions button{min-width:122px}
+  .mobile-nav-dock{left:5px;right:5px}
+}
