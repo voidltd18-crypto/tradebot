@@ -11865,7 +11865,10 @@ def refresh_universe_preview():
 # Losses never consume the recorded vault balance.
 PROFIT_VAULT_VERSION = "V17.6.2"
 PROFIT_VAULT_ENABLED = os.getenv("PROFIT_VAULT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-PROFIT_VAULT_DEFAULT_BASELINE_GBP = 900.00  # HARD-CODED: persisted state must not override this
+PROFIT_VAULT_DEFAULT_BASELINE_GBP = 900.00  # starting protected baseline
+CAPITAL_MILESTONE_STEP_GBP = 100.00
+CAPITAL_MILESTONE_CUSHION_GBP = 25.00
+CAPITAL_MILESTONE_STABILITY_REQUIRED = 5
 PROFIT_VAULT_BANK_PCT = max(0.0, min(1.0, float(os.getenv("PROFIT_VAULT_BANK_PCT", "1.0") or 1.0)))
 _PROFIT_VAULT_LOCK = threading.RLock()
 
@@ -11908,7 +11911,7 @@ def load_profit_vault_state() -> Dict[str, Any]:
                 default = _profit_vault_default_state()
                 default.update(data if isinstance(data, dict) else {})
                 default["enabled"] = bool(default.get("enabled", PROFIT_VAULT_ENABLED))
-                default["baselineGbp"] = round(float(PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2)  # hard-coded baseline wins
+                default["baselineGbp"] = round(max(float(PROFIT_VAULT_DEFAULT_BASELINE_GBP), float(default.get("baselineGbp") or 0.0)), 2)  # milestones may promote, never demote
                 default["bankPct"] = max(0.0, min(1.0, float(default.get("bankPct") if default.get("bankPct") is not None else PROFIT_VAULT_BANK_PCT)))
                 default["bankedProfitGbp"] = max(0.0, float(default.get("bankedProfitGbp") or 0.0))
                 default["lifetimeBankedGbp"] = max(default["bankedProfitGbp"], float(default.get("lifetimeBankedGbp") or 0.0))
@@ -11931,7 +11934,7 @@ def save_profit_vault_state(state: Dict[str, Any]) -> Dict[str, Any]:
         data = _profit_vault_default_state()
         data.update(state or {})
         data["version"] = PROFIT_VAULT_VERSION
-        data["baselineGbp"] = round(float(PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2)  # never persist a different baseline
+        data["baselineGbp"] = round(max(float(PROFIT_VAULT_DEFAULT_BASELINE_GBP), float(data.get("baselineGbp") or 0.0)), 2)
         data["updatedAt"] = datetime.now(UTC).isoformat()
         data["bankedProfitGbp"] = round(max(0.0, float(data.get("bankedProfitGbp") or 0.0)), 4)
         data["lifetimeBankedGbp"] = round(max(data["bankedProfitGbp"], float(data.get("lifetimeBankedGbp") or 0.0)), 4)
@@ -11985,6 +11988,58 @@ def profit_vault_seed_existing_surplus(account: Any = None) -> Dict[str, Any]:
     )
     return state
 
+
+
+def capital_milestone_status(state: Optional[Dict[str, Any]] = None, account: Any = None) -> Dict[str, Any]:
+    """Evidence-gated £100 protected-capital promotion status. Read-only unless called by promotion routine."""
+    state = state or load_profit_vault_state()
+    baseline = max(float(PROFIT_VAULT_DEFAULT_BASELINE_GBP), float(state.get("baselineGbp") or 0.0))
+    next_baseline = (int(baseline // CAPITAL_MILESTONE_STEP_GBP) + 1) * CAPITAL_MILESTONE_STEP_GBP
+    banked = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
+    equity_gbp = 0.0
+    try:
+        account = account or get_account()
+        equity_gbp = max(0.0, float(account.equity)) * float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
+    except Exception:
+        pass
+    weekly = {}
+    try:
+        init_db(); conn = db_connect()
+        row = conn.execute("SELECT payload_json FROM v18_weekly_reviews ORDER BY created_at DESC LIMIT 1").fetchone(); conn.close()
+        if row and row["payload_json"]: weekly = json.loads(row["payload_json"])
+    except Exception:
+        try: conn.close()
+        except Exception: pass
+    proposal = weekly.get("proposal", {}) if isinstance(weekly, dict) else {}
+    stability = int(proposal.get("stabilityCount") or 0)
+    governance_ok = bool(weekly.get("verdict") == "HEALTHY" and weekly.get("evidenceStrength") == "STRONG" and stability >= CAPITAL_MILESTONE_STABILITY_REQUIRED)
+    equity_ok = equity_gbp >= next_baseline + CAPITAL_MILESTONE_CUSHION_GBP
+    reserve_needed = max(0.0, next_baseline - baseline)
+    reserve_ok = banked >= reserve_needed
+    eligible = bool(governance_ok and equity_ok and reserve_ok)
+    return {"version":"V18.2.19","baselineGbp":round(baseline,2),"nextBaselineGbp":round(next_baseline,2),"cushionRequiredGbp":CAPITAL_MILESTONE_CUSHION_GBP,"equityGbp":round(equity_gbp,2),"bankedProfitGbp":round(banked,2),"stabilityCount":stability,"stabilityRequired":CAPITAL_MILESTONE_STABILITY_REQUIRED,"governanceReady":governance_ok,"equityReady":equity_ok,"reserveReady":reserve_ok,"eligible":eligible}
+
+def capital_milestone_try_promote(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    state = state or load_profit_vault_state()
+    status = capital_milestone_status(state)
+    if not status.get("eligible"):
+        return state
+    try:
+        if len(get_all_positions()) > 0:
+            return state
+    except Exception:
+        return state
+    old = float(status["baselineGbp"]); new = float(status["nextBaselineGbp"]); delta = new-old
+    state["baselineGbp"] = round(new,2)
+    state["bankedProfitGbp"] = round(max(0.0, float(state.get("bankedProfitGbp") or 0.0)-delta),4)
+    state["lastCapitalPromotionAt"] = datetime.now(UTC).isoformat()
+    state["lastCapitalPromotionFromGbp"] = round(old,2)
+    state["lastCapitalPromotionToGbp"] = round(new,2)
+    state["capitalPromotionCount"] = int(state.get("capitalPromotionCount") or 0)+1
+    state = save_profit_vault_state(state)
+    print(f"V18.2.19 CAPITAL MILESTONE PROMOTED | £{old:.2f} -> £{new:.2f} released=£{delta:.2f} vault=£{float(state.get('bankedProfitGbp') or 0):.2f}", flush=True)
+    return state
+
 def profit_vault_reserved_usd() -> float:
     state = load_profit_vault_state()
     if not state.get("enabled"):
@@ -12028,6 +12083,7 @@ def profit_vault_bank_realised_profit(pnl_usd: float, symbol: str = "", reason: 
     state["lastBankedReason"] = str(reason or "")
     state["lastBankedAmountGbp"] = bank_amount
     state = save_profit_vault_state(state)
+    state = capital_milestone_try_promote(state)
     print(
         f"V17.6 PROFIT VAULT BANK | symbol={str(symbol or '').upper()} "
         f"realised_pnl=£{pnl_gbp:.2f} banked=£{bank_amount:.2f} "
@@ -12078,6 +12134,7 @@ def profit_vault_payload(account: Any = None) -> Dict[str, Any]:
         "baselineSeededAt": state.get("baselineSeededAt", ""),
         "baselineSeedAmountGbp": round(float(state.get("baselineSeedAmountGbp") or 0.0), 2),
         "growthSinceBaselineGbp": round(equity_gbp - float(state.get("baselineGbp") or PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2),
+        "capitalMilestone": capital_milestone_status(state, account),
         "message": "100% of positive realised PnL is reserved and excluded from future buys." if float(state.get("bankPct") or 0.0) >= 0.999 else "A configured share of positive realised PnL is reserved from future buys.",
     }
 
