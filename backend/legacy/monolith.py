@@ -5012,6 +5012,27 @@ def _db_retry_delay(attempt: int) -> float:
 
 
 _DB_SERIAL_WRITE_LOCK = threading.RLock()
+_DB_SLOW_WRITE_SECONDS = max(0.25, float(os.getenv("SQLITE_SLOW_WRITE_SECONDS", "1.0") or 1.0))
+_DB_WRITE_SEQ_LOCK = threading.Lock()
+_DB_WRITE_SEQ = 0
+
+def _db_next_write_id() -> int:
+    global _DB_WRITE_SEQ
+    with _DB_WRITE_SEQ_LOCK:
+        _DB_WRITE_SEQ += 1
+        return _DB_WRITE_SEQ
+
+def _db_write_owner() -> str:
+    # Cheap caller identification for diagnostics; only evaluated when a write transaction begins.
+    try:
+        import inspect
+        for frame in inspect.stack()[2:10]:
+            name = str(frame.function or "")
+            if name not in {"execute", "executemany", "_acquire_writer_if_needed"} and not name.startswith("_db_"):
+                return name
+    except Exception:
+        pass
+    return threading.current_thread().name or "UNKNOWN"
 
 
 def _db_sql_is_write(sql: Any) -> bool:
@@ -5024,30 +5045,46 @@ def _db_sql_is_write(sql: Any) -> bool:
 
 class ReliableSQLiteCursor(sqlite3.Cursor):
     def execute(self, sql, parameters=()):
+        # V18.2.11: cursor.execute previously bypassed the connection-level writer
+        # coordinator. Route cursor writes through the exact same transaction lock.
+        conn = self.connection
+        conn._acquire_writer_if_needed(sql)
         last_error = None
-        for attempt in range(_DB_LOCK_RETRIES):
-            try:
-                return super().execute(sql, parameters)
-            except sqlite3.OperationalError as exc:
-                if not _db_is_lock_error(exc) or attempt >= _DB_LOCK_RETRIES - 1:
-                    raise
-                last_error = exc
-                time.sleep(_db_retry_delay(attempt))
-        raise last_error  # pragma: no cover
+        try:
+            for attempt in range(_DB_LOCK_RETRIES):
+                try:
+                    return super().execute(sql, parameters)
+                except sqlite3.OperationalError as exc:
+                    if not _db_is_lock_error(exc) or attempt >= _DB_LOCK_RETRIES - 1:
+                        raise
+                    last_error = exc
+                    time.sleep(_db_retry_delay(attempt))
+            raise last_error  # pragma: no cover
+        except Exception:
+            if not conn.in_transaction:
+                conn._release_writer()
+            raise
 
     def executemany(self, sql, seq_of_parameters):
         # Materialise once because a retry cannot safely reuse an exhausted generator.
         params = list(seq_of_parameters)
+        conn = self.connection
+        conn._acquire_writer_if_needed(sql)
         last_error = None
-        for attempt in range(_DB_LOCK_RETRIES):
-            try:
-                return super().executemany(sql, params)
-            except sqlite3.OperationalError as exc:
-                if not _db_is_lock_error(exc) or attempt >= _DB_LOCK_RETRIES - 1:
-                    raise
-                last_error = exc
-                time.sleep(_db_retry_delay(attempt))
-        raise last_error  # pragma: no cover
+        try:
+            for attempt in range(_DB_LOCK_RETRIES):
+                try:
+                    return super().executemany(sql, params)
+                except sqlite3.OperationalError as exc:
+                    if not _db_is_lock_error(exc) or attempt >= _DB_LOCK_RETRIES - 1:
+                        raise
+                    last_error = exc
+                    time.sleep(_db_retry_delay(attempt))
+            raise last_error  # pragma: no cover
+        except Exception:
+            if not conn.in_transaction:
+                conn._release_writer()
+            raise
 
 
 class ReliableSQLiteConnection(sqlite3.Connection):
@@ -5061,12 +5098,24 @@ class ReliableSQLiteConnection(sqlite3.Connection):
     def _acquire_writer_if_needed(self, sql) -> None:
         if not _db_sql_is_write(sql) or getattr(self, "_tradebot_writer_lock_held", False):
             return
+        wait_started = time.monotonic()
         _DB_SERIAL_WRITE_LOCK.acquire()
+        waited = time.monotonic() - wait_started
         self._tradebot_writer_lock_held = True
+        self._tradebot_writer_started = time.monotonic()
+        self._tradebot_writer_owner = _db_write_owner()
+        self._tradebot_writer_id = _db_next_write_id()
+        if waited >= _DB_SLOW_WRITE_SECONDS:
+            print(f"V18.2.11 DB WRITER WAIT | id={self._tradebot_writer_id} owner={self._tradebot_writer_owner} waited={waited:.3f}s")
 
     def _release_writer(self) -> None:
         if getattr(self, "_tradebot_writer_lock_held", False):
+            duration = max(0.0, time.monotonic() - float(getattr(self, "_tradebot_writer_started", time.monotonic())))
+            owner = str(getattr(self, "_tradebot_writer_owner", "UNKNOWN"))
+            write_id = getattr(self, "_tradebot_writer_id", "?")
             self._tradebot_writer_lock_held = False
+            if duration >= _DB_SLOW_WRITE_SECONDS:
+                print(f"V18.2.11 DB WRITER SLOW | id={write_id} owner={owner} duration={duration:.3f}s")
             try:
                 _DB_SERIAL_WRITE_LOCK.release()
             except RuntimeError:
