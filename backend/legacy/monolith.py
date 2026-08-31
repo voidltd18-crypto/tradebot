@@ -7868,56 +7868,41 @@ def apply_custom_a_plus_thresholds(confidence: float, quality: float, reason: st
     })
     if save:
         _save_strategy_settings(payload)
-    # V17.7.1 — write the strategy-version audit row as one serialized
-    # transaction.  The old SELECT-then-INSERT sequence could start as a WAL
-    # reader and then fail while upgrading to a writer if another autonomous
-    # worker committed in between.  BEGIN IMMEDIATE + whole-transaction retry
-    # removes that read->write upgrade race without changing any strategy rule.
+    # V18.2.20 — strategy-version history is audit-only and must never stall
+    # an autonomous threshold cycle for minutes behind SQLite.  Runtime/file
+    # settings above are already authoritative.  Give the audit insert a short
+    # bounded attempt; if SQLite is busy, skip this audit row and continue.
     strategy_save_error = None
-    for strategy_save_attempt in range(_DB_LOCK_RETRIES):
-        conn = None
-        try:
-            init_db()
-            with _DB_SERIAL_WRITE_LOCK:
-                conn = db_connect()
-                conn.execute("BEGIN IMMEDIATE")
-                count = conn.execute("SELECT COUNT(*) FROM v2_strategy_versions").fetchone()[0]
-                conn.execute(
-                    """INSERT INTO v2_strategy_versions
-                       (created_at, version_label, action, confidence, quality, previous_confidence, previous_quality, reason, metrics_json)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (datetime.now(UTC).isoformat(), f"V2.{count+1}", "APPLY", confidence, quality,
-                     previous_conf, previous_quality, reason, json.dumps({})),
-                )
-                conn.commit()
-            strategy_save_error = None
-            break
-        except sqlite3.OperationalError as e:
-            strategy_save_error = e
-            if conn is not None:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            if not _db_is_lock_error(e) or strategy_save_attempt >= _DB_LOCK_RETRIES - 1:
-                break
-            time.sleep(_db_retry_delay(strategy_save_attempt))
-        except Exception as e:
-            strategy_save_error = e
-            if conn is not None:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            break
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+    conn = None
+    try:
+        init_db()
+        conn = sqlite3.connect(SQLITE_DB_FILE, timeout=1.5, check_same_thread=False)
+        conn.execute("PRAGMA busy_timeout=1500")
+        conn.execute("BEGIN IMMEDIATE")
+        count = conn.execute("SELECT COUNT(*) FROM v2_strategy_versions").fetchone()[0]
+        conn.execute(
+            """INSERT INTO v2_strategy_versions
+               (created_at, version_label, action, confidence, quality, previous_confidence, previous_quality, reason, metrics_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (datetime.now(UTC).isoformat(), f"V2.{count+1}", "APPLY", confidence, quality,
+             previous_conf, previous_quality, reason, json.dumps({})),
+        )
+        conn.commit()
+    except Exception as e:
+        strategy_save_error = e
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
     if strategy_save_error is not None:
-        print(f"V17.7.1 STRATEGY VERSION SAVE ERROR | attempts={_DB_LOCK_RETRIES} error={strategy_save_error}")
+        print(f"V18.2.20 STRATEGY AUDIT DEFERRED | owner=apply_custom_a_plus_thresholds error={strategy_save_error}")
     return payload
 
 
@@ -11024,6 +11009,9 @@ DYNAMIC_MARKET_YAHOO_SCREENS = [
 ]
 
 DYNAMIC_SCANNER_CACHE: Dict[str, Any] = {"updatedAt": "", "symbols": [], "rows": [], "source": "empty", "error": ""}
+DYNAMIC_SCANNER_YAHOO_COOLDOWN_SECONDS = int(os.getenv("DYNAMIC_SCANNER_YAHOO_COOLDOWN_SECONDS", "900"))
+_DYNAMIC_SCANNER_YAHOO_BLOCKED_UNTIL = 0.0
+_DYNAMIC_SCANNER_YAHOO_429_LOGGED_AT = 0.0
 
 
 def _load_dynamic_scanner_cache() -> Dict[str, Any]:
@@ -11069,9 +11057,19 @@ def _clean_dynamic_symbol(symbol: str) -> str:
 
 
 def _yahoo_dynamic_screen(screen_id: str, count: int = 50) -> List[Dict[str, Any]]:
+    global _DYNAMIC_SCANNER_YAHOO_BLOCKED_UNTIL, _DYNAMIC_SCANNER_YAHOO_429_LOGGED_AT
+    now_mono = time.monotonic()
+    if now_mono < _DYNAMIC_SCANNER_YAHOO_BLOCKED_UNTIL:
+        raise RuntimeError(f"Yahoo cooldown active ({int(_DYNAMIC_SCANNER_YAHOO_BLOCKED_UNTIL - now_mono)}s remaining)")
     url = f"https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds={screen_id}&count={count}"
     headers = {"User-Agent": "Mozilla/5.0 TradeBot dynamic scanner"}
     response = requests.get(url, headers=headers, timeout=8)
+    if response.status_code == 429:
+        _DYNAMIC_SCANNER_YAHOO_BLOCKED_UNTIL = time.monotonic() + DYNAMIC_SCANNER_YAHOO_COOLDOWN_SECONDS
+        if time.monotonic() - _DYNAMIC_SCANNER_YAHOO_429_LOGGED_AT >= 60.0:
+            print(f"V18.2.20 DYNAMIC SCANNER | Yahoo 429 -> cooldown={DYNAMIC_SCANNER_YAHOO_COOLDOWN_SECONDS}s; retaining last-good discovery set")
+            _DYNAMIC_SCANNER_YAHOO_429_LOGGED_AT = time.monotonic()
+        response.raise_for_status()
     response.raise_for_status()
     data = response.json()
     quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
@@ -11150,6 +11148,8 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
         return _load_dynamic_scanner_cache()
 
     _scanner_cycle_started = _cycle_monitor_start("scanner")
+    prior_cache = dict(_load_dynamic_scanner_cache() or {})
+    prior_rows = list(prior_cache.get("rows") or [])
     rows_by_symbol: Dict[str, Dict[str, Any]] = {}
     errors = []
 
@@ -11168,8 +11168,16 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
 
     rows = sorted(rows_by_symbol.values(), key=lambda r: float(r.get("score") or 0), reverse=True)[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]
 
-    # Safe fallback keeps the bot tradable if external screener data is unavailable.
+    # V18.2.20 — Yahoo is an optional discovery provider.  A 429 must never
+    # erase a previously useful discovery set.  Prefer last-good rows, then
+    # fall back to the core quality universe only when no prior discovery exists.
+    fallback_mode = ""
+    if not rows and prior_rows:
+        rows = prior_rows[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]
+        fallback_mode = "last-good-cache"
+        print(f"V18.2.20 DYNAMIC SCANNER FALLBACK | mode=last-good-cache symbols={len(rows)}")
     if not rows:
+        fallback_mode = "core-quality-universe"
         for i, sym in enumerate(QUALITY_ONLY_UNIVERSE[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]):
             rows.append({
                 "symbol": sym,
@@ -11186,7 +11194,8 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
         "updatedAt": datetime.now(UTC).isoformat(),
         "refreshSeconds": DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS,
         "maxSymbols": DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS,
-        "source": ",".join(DYNAMIC_MARKET_YAHOO_SCREENS),
+        "source": fallback_mode or ",".join(DYNAMIC_MARKET_YAHOO_SCREENS),
+        "providerCooldown": bool(time.monotonic() < _DYNAMIC_SCANNER_YAHOO_BLOCKED_UNTIL),
         "symbols": [r["symbol"] for r in rows],
         "rows": rows,
         "filters": {
