@@ -2607,43 +2607,61 @@ def v2_intelligence_summary():
 # TRADEBOT V2 STAGE 2 — FORWARD REPLAY / OUTCOMES
 # =========================
 def v2_seed_missing_outcomes(limit: int = 5000) -> int:
-    """Create or repair pending outcomes using session-aware due dates."""
+    """Create/repair pending outcomes using short bounded write batches.
+
+    V18.2.12: the old implementation kept one transaction open while walking up
+    to thousands of decisions.  That made this maintenance task a multi-second
+    SQLite writer.  We now precompute rows outside the write transaction and
+    commit every small batch so other AI workers get regular writer access.
+    """
     if not SQLITE_ENABLED:
         return 0
     created = 0
+    batch_size = max(25, min(int(os.getenv("V2_OUTCOME_SEED_BATCH_SIZE", "100") or 100), 500))
     try:
         init_db()
-        conn = db_connect()
-        rows = conn.execute(
+        read_conn = db_connect()
+        rows = read_conn.execute(
             """SELECT id, timestamp, symbol, price, decision, stage FROM v2_setup_decisions
                WHERE price > 0 ORDER BY id DESC LIMIT ?""",
             (max(1, min(int(limit), 50000)),),
         ).fetchall()
+        read_conn.close()
+
+        pending = []
         for row in rows:
             try:
                 observed_at = datetime.fromisoformat(str(row["timestamp"]).replace("Z", "+00:00"))
                 if observed_at.tzinfo is None:
                     observed_at = observed_at.replace(tzinfo=UTC)
-                key = _v2_sample_key(str(row["symbol"]).upper(), str(row["stage"]), str(row["decision"]), observed_at)
+                symbol = str(row["symbol"]).upper()
+                key = _v2_sample_key(symbol, str(row["stage"]), str(row["decision"]), observed_at)
                 for horizon_hours in V2_OUTCOME_HORIZONS_HOURS:
                     due = _v2_session_due_at(observed_at, int(horizon_hours)).isoformat()
+                    pending.append((int(row["id"]), symbol, observed_at.isoformat(), float(row["price"]), int(horizon_hours), due, key))
+            except Exception as row_error:
+                print(f"V2 OUTCOME SEED ROW ERROR: {row_error}")
+
+        for offset in range(0, len(pending), batch_size):
+            chunk = pending[offset:offset + batch_size]
+            conn = db_connect()
+            try:
+                for decision_id, symbol, observed_at, entry_price, horizon_hours, due, key in chunk:
                     cur = conn.execute(
                         """INSERT OR IGNORE INTO v2_observation_outcomes
                            (decision_id, symbol, observed_at, entry_price, horizon_hours, due_at, status, sample_key)
                            VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)""",
-                        (int(row["id"]), str(row["symbol"]).upper(), observed_at.isoformat(),
-                         float(row["price"]), int(horizon_hours), due, key),
+                        (decision_id, symbol, observed_at, entry_price, horizon_hours, due, key),
                     )
                     created += int(cur.rowcount or 0)
                     conn.execute(
                         """UPDATE v2_observation_outcomes SET due_at=?, sample_key=COALESCE(sample_key, ?)
                            WHERE decision_id=? AND horizon_hours=? AND status='PENDING'""",
-                        (due, key, int(row["id"]), int(horizon_hours)),
+                        (due, key, decision_id, horizon_hours),
                     )
-            except Exception as row_error:
-                print(f"V2 OUTCOME SEED ROW ERROR: {row_error}")
-        conn.commit()
-        conn.close()
+                conn.commit()
+            finally:
+                conn.close()
     except Exception as e:
         print(f"V2 OUTCOME SEED ERROR: {e}")
     return created
@@ -12529,10 +12547,13 @@ def v6_sync_brains(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = 1
     if not SQLITE_ENABLED: return {"ok":False,"message":"SQLite disabled"}
     if not V6_BRAINS_ENABLED: return {"ok":False,"message":"V6 brains disabled"}
     horizon=max(1,int(horizon_hours)); limit=max(1,min(int(limit),50000))
+    batch_size=max(50,min(int(os.getenv("V6_SYNC_BATCH_SIZE", "250") or 250),1000))
+    conn=None
     try:
         rows=_v6_source_rows(horizon,limit)
-        conn=db_connect(); brains=_v6_brains(); inserted=0; accepted=0; valid_rows=0; rejected_invalid=0
-        now=datetime.now(UTC).isoformat()
+        brains=_v6_brains(); inserted=0; accepted=0; valid_rows=0; rejected_invalid=0
+        now=datetime.now(UTC).isoformat(); pending=[]
+        # V18.2.12: validate/calculate outside any write transaction.
         for row in rows:
             validation=_v6_validate_source_row(row)
             if not validation["valid"]:
@@ -12542,25 +12563,30 @@ def v6_sync_brains(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = 1
             for brain in brains:
                 passed=1 if _v6_accepts(row,brain) else 0
                 accepted += passed
-                before=conn.total_changes
-                conn.execute("""INSERT OR IGNORE INTO v6_brain_observations
-                    (brain_key,brain_name,decision_id,symbol,observed_at,market_regime,horizon_hours,accepted,return_pct,confidence,quality,momentum,pullback,spread,config_json,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (brain["key"],brain["name"],int(row["decision_id"]),row.get("symbol") or "",row.get("observed_at") or now,
+                pending.append((brain["key"],brain["name"],int(row["decision_id"]),row.get("symbol") or "",row.get("observed_at") or now,
                      row.get("market_regime") or "unknown",horizon,passed,float(row["net_return_pct"]),
                      float(row.get("confidence") or 0),float(row.get("quality") or 0),float(row.get("momentum") or 0),
                      float(row.get("pullback") or 0),float(row.get("spread") or 0),json.dumps(brain),now))
+        for offset in range(0,len(pending),batch_size):
+            conn=db_connect()
+            try:
+                before=conn.total_changes
+                conn.executemany("""INSERT OR IGNORE INTO v6_brain_observations
+                    (brain_key,brain_name,decision_id,symbol,observed_at,market_regime,horizon_hours,accepted,return_pct,confidence,quality,momentum,pullback,spread,config_json,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", pending[offset:offset+batch_size])
                 inserted += conn.total_changes-before
-        conn.commit(); conn.close()
+                conn.commit()
+            finally:
+                conn.close(); conn=None
         return {"ok":True,"version":"V6.4","advisoryOnly":True,"horizonHours":horizon,
                 "independentSourceObservations":len(rows),"validLearningObservations":valid_rows,
                 "invalidObservationsRejected":rejected_invalid,"brains":len(brains),
                 "newShadowRows":inserted,"acceptedEvaluations":accepted,"liveGateChanged":False}
     except Exception as e:
-        try: conn.close()
+        try:
+            if conn is not None: conn.close()
         except Exception: pass
         return {"ok":False,"version":"V6.4","error":str(e)}
-
 
 def v6_rebuild_validated(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = V6_AUTO_SYNC_LIMIT) -> Dict[str, Any]:
     """Delete legacy V6.2 shadow rows and rebuild only from validated V6.3 evidence."""
@@ -13916,15 +13942,40 @@ def _v10_ensure_tables() -> None:
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_lineage_horizon_status ON v10_evidence_lineage(horizon_hours,outcome_status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_lineage_symbol_time ON v10_evidence_lineage(symbol,observed_at)")
-        # Backfill explicit evidence lineage from the already-stable decision_id relationship.
-        conn.execute("""INSERT OR IGNORE INTO v10_evidence_lineage(
-            schema_version,decision_id,snapshot_id,outcome_id,symbol,observed_at,horizon_hours,outcome_status,net_return_pct,linked_at)
-            SELECT ?,m.decision_id,m.decision_id,o.id,m.symbol,m.observed_at,o.horizon_hours,o.status,o.net_return_pct,?
-            FROM v9_market_memory m JOIN v2_observation_outcomes o ON o.decision_id=m.decision_id""",
-            (V10_SCHEMA_VERSION, datetime.now(UTC).isoformat()))
+        # V18.2.12: schema init stays schema-only. Evidence lineage backfill is
+        # performed by normal research/sync paths instead of holding a startup DDL transaction.
         conn.commit(); conn.close()
         _v10_tables_ready = True
 
+
+
+def _v10_sync_evidence_lineage(batch_size: int = 250, max_batches: int = 20) -> int:
+    """Backfill missing V10 lineage using short transactions (V18.2.12)."""
+    if not SQLITE_ENABLED:
+        return 0
+    total = 0
+    batch_size = max(50, min(int(batch_size), 1000))
+    for _ in range(max(1, int(max_batches))):
+        conn = db_connect()
+        try:
+            before = conn.total_changes
+            conn.execute("""INSERT OR IGNORE INTO v10_evidence_lineage(
+                schema_version,decision_id,snapshot_id,outcome_id,symbol,observed_at,horizon_hours,outcome_status,net_return_pct,linked_at)
+                SELECT ?,m.decision_id,m.decision_id,o.id,m.symbol,m.observed_at,o.horizon_hours,o.status,o.net_return_pct,?
+                FROM v9_market_memory m
+                JOIN v2_observation_outcomes o ON o.decision_id=m.decision_id
+                LEFT JOIN v10_evidence_lineage l ON l.outcome_id=o.id
+                WHERE l.id IS NULL
+                ORDER BY o.id ASC LIMIT ?""",
+                (V10_SCHEMA_VERSION, datetime.now(UTC).isoformat(), batch_size))
+            added = int(conn.total_changes - before)
+            conn.commit()
+            total += added
+        finally:
+            conn.close()
+        if added < batch_size:
+            break
+    return total
 
 def _v10_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -14030,6 +14081,7 @@ def _v10_load_observations(conn, horizon_hours: int) -> List[Dict[str, Any]]:
 def v10_run_research(horizon_hours: int = V10_DEFAULT_HORIZON_HOURS,
                      min_samples: int = V10_MIN_PATTERN_SAMPLES) -> Dict[str, Any]:
     _v10_ensure_tables()
+    _v10_sync_evidence_lineage()
     requested_horizon = max(1, min(int(horizon_hours), 168))
     min_samples = max(3, min(int(min_samples), 500))
     now = datetime.now(UTC).isoformat()
@@ -15921,26 +15973,35 @@ SYMBOL_REPUTATION_BLOCK_SCORE = max(0.0, min(100.0, float(os.getenv("SYMBOL_REPU
 SYMBOL_REPUTATION_COOLDOWN_DAYS = max(1, int(os.getenv("SYMBOL_REPUTATION_COOLDOWN_DAYS", "5") or 5))
 SYMBOL_REPUTATION_CACHE_SECONDS = max(30, int(os.getenv("SYMBOL_REPUTATION_CACHE_SECONDS", "300") or 300))
 _symbol_reputation_cache: Dict[str, Any] = {"at": 0.0, "items": {}}
+_symbol_reputation_table_ready = False
+_symbol_reputation_table_lock = threading.RLock()
 
 
 def _symbol_reputation_ensure_table() -> None:
-    if not SQLITE_ENABLED:
+    global _symbol_reputation_table_ready
+    if _symbol_reputation_table_ready or not SQLITE_ENABLED:
         return
-    init_db()
-    conn = db_connect()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS symbol_reputation_cooldowns (
-            symbol TEXT PRIMARY KEY,
-            started_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            score REAL NOT NULL,
-            reason TEXT,
-            active INTEGER NOT NULL DEFAULT 1,
-            updated_at TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
+    with _symbol_reputation_table_lock:
+        if _symbol_reputation_table_ready:
+            return
+        init_db()
+        conn = db_connect()
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS symbol_reputation_cooldowns (
+                    symbol TEXT PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    reason TEXT,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+            _symbol_reputation_table_ready = True
+        finally:
+            conn.close()
 
 
 def _symbol_reputation_score(item: Dict[str, Any]) -> float:
@@ -16548,33 +16609,43 @@ V17_ADAPTIVE_TRAIL_HIGH_START_PCT = max(V17_ADAPTIVE_TRAIL_MED_START_PCT, float(
 V17_ADAPTIVE_TRAIL_LOG_SECONDS = max(60.0, float(os.getenv("V17_ADAPTIVE_TRAIL_LOG_SECONDS", "300") or 300))
 _ai_risk_adaptive_trail_log: Dict[str, Dict[str, Any]] = {}
 _ai_risk_symbol_cache: Dict[str, Any] = {"ts": 0.0, "rows": {}}
+_ai_risk_tables_ready = False
+_ai_risk_tables_lock = threading.RLock()
 
 
 def _ai_risk_ensure_tables() -> None:
-    if not SQLITE_ENABLED:
+    global _ai_risk_tables_ready
+    if _ai_risk_tables_ready or not SQLITE_ENABLED:
         return
-    conn = db_connect()
-    conn.execute("""CREATE TABLE IF NOT EXISTS v10_position_risk_profiles (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        entry_price REAL,
-        confidence REAL,
-        quality REAL,
-        symbol_status TEXT,
-        symbol_samples INTEGER,
-        symbol_expectancy_pct REAL,
-        position_multiplier REAL NOT NULL,
-        stop_loss_pct REAL NOT NULL,
-        fast_stop_loss_pct REAL NOT NULL,
-        trail_start_pct REAL NOT NULL,
-        trail_giveback_pct REAL NOT NULL,
-        emergency_stop_pct REAL NOT NULL,
-        rationale TEXT,
-        active INTEGER NOT NULL DEFAULT 1
-    )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_risk_symbol_time ON v10_position_risk_profiles(symbol, created_at DESC)")
-    conn.commit(); conn.close()
+    with _ai_risk_tables_lock:
+        if _ai_risk_tables_ready:
+            return
+        conn = db_connect()
+        try:
+            conn.execute("""CREATE TABLE IF NOT EXISTS v10_position_risk_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                entry_price REAL,
+                confidence REAL,
+                quality REAL,
+                symbol_status TEXT,
+                symbol_samples INTEGER,
+                symbol_expectancy_pct REAL,
+                position_multiplier REAL NOT NULL,
+                stop_loss_pct REAL NOT NULL,
+                fast_stop_loss_pct REAL NOT NULL,
+                trail_start_pct REAL NOT NULL,
+                trail_giveback_pct REAL NOT NULL,
+                emergency_stop_pct REAL NOT NULL,
+                rationale TEXT,
+                active INTEGER NOT NULL DEFAULT 1
+            )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_v10_risk_symbol_time ON v10_position_risk_profiles(symbol, created_at DESC)")
+            conn.commit()
+            _ai_risk_tables_ready = True
+        finally:
+            conn.close()
 
 
 def _ai_risk_symbol_evidence(symbol: str) -> Dict[str, Any]:
