@@ -511,6 +511,7 @@ v7_weekend_thread_started = False
 v11_learning_thread_started = False
 ai_research_thread_started = False
 ai_summary_thread_started = False
+v18224_live_audit_thread_started = False
 AI_SUMMARY_LOG_ENABLED = os.getenv("AI_SUMMARY_LOG_ENABLED", "true").lower() in ("1","true","yes","on")
 AI_SUMMARY_LOG_INTERVAL_SECONDS = max(300, int(os.getenv("AI_SUMMARY_LOG_INTERVAL_SECONDS", "3600")))
 AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS = max(30, int(os.getenv("AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS", "120")))
@@ -9483,6 +9484,38 @@ def api_cycle_monitor(request: Request):
 # =========================
 # LOOP
 # =========================
+# =========================
+# V18.2.24 — LIVE DECISION AUDIT
+# Evaluate matured V17.9 checkpoints during the live session. Advisory only.
+# =========================
+V18224_LIVE_AUDIT_ENABLED = os.getenv("TRADEBOT_LIVE_DECISION_AUDIT_ENABLED", "true").lower() == "true"
+V18224_LIVE_AUDIT_INTERVAL_SECONDS = max(30, int(os.getenv("TRADEBOT_LIVE_DECISION_AUDIT_INTERVAL_SECONDS", "60")))
+V18224_LIVE_AUDIT_LIMIT = max(1, min(200, int(os.getenv("TRADEBOT_LIVE_DECISION_AUDIT_LIMIT", "50"))))
+
+def v18224_live_decision_audit_worker() -> None:
+    """Fill due 15m/30m/1h/2h Decision Audit checkpoints while market is open.
+
+    This is deliberately isolated from the trading loop. It only evaluates already
+    persisted REJECTED decisions and never changes gates, thresholds or orders.
+    """
+    time.sleep(15)
+    while True:
+        try:
+            market_open = _ai_research_market_open()
+            if market_open is True:
+                result = v179_evaluate_decision_audit(limit=V18224_LIVE_AUDIT_LIMIT)
+                evaluated = int(result.get("evaluated", 0) or 0)
+                errors = int(result.get("errors", 0) or 0)
+                if evaluated or errors:
+                    print(
+                        "V18.2.24 LIVE DECISION AUDIT | "
+                        f"evaluated={evaluated} errors={errors} advisory_only=True"
+                    )
+        except Exception as exc:
+            print(f"V18.2.24 LIVE DECISION AUDIT ERROR: {exc}")
+        time.sleep(V18224_LIVE_AUDIT_INTERVAL_SECONDS)
+
+
 def _ai_research_market_open() -> Optional[bool]:
     """Return Alpaca market state, or None when the clock cannot be read safely."""
     try:
@@ -10151,7 +10184,7 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started, v18224_live_audit_thread_started
     # Initialise the shared SQLite schema synchronously before any worker threads start.
     # This removes the startup race where multiple workers all tried to create tables.
     init_db()
@@ -10188,6 +10221,10 @@ def startup_event():
     if AI_RESEARCH_CLOSED_MARKET_ONLY and not ai_research_thread_started:
         ai_research_thread_started = True
         threading.Thread(target=closed_market_ai_research_worker, daemon=True).start()
+    if V18224_LIVE_AUDIT_ENABLED and not v18224_live_audit_thread_started:
+        v18224_live_audit_thread_started = True
+        threading.Thread(target=v18224_live_decision_audit_worker, daemon=True, name="v18-live-decision-audit").start()
+        print(f"V18.2.24 LIVE DECISION AUDIT | enabled interval={V18224_LIVE_AUDIT_INTERVAL_SECONDS}s limit={V18224_LIVE_AUDIT_LIMIT} advisory_only=True")
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
