@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { Card } from "../components/Card";
 import { TradeReplayModal, type ReplayTarget } from "../components/TradeReplayModal";
@@ -51,6 +51,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const [toDate, setToDate] = useState("");
   const [chartSelection, setChartSelection] = useState<{ts:number; equity:number} | null>(null);
   const chartHoverRef = useRef<{ts:number; equity:number} | null>(null);
+  const chartShellRef = useRef<HTMLDivElement | null>(null);
   const [momentFilter, setMomentFilter] = useState<{from:number; to:number; label:string} | null>(null);
   const totalDeposited = Number(reports?.totalDeposited || 0);
   const totalGainLoss = Number(reports?.totalGainLoss || 0);
@@ -114,6 +115,61 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
     setChartSelection(point);
   };
 
+  // V18.2.23: Recharts v3 can render the tooltip while omitting activePayload
+  // from chart-level click callbacks. Use the actual pointer X coordinate as the
+  // source of truth and select the nearest plotted report point. This makes the
+  // interaction independent of Recharts' event payload shape.
+  const selectNearestPointFromPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!reportChart.length || !chartShellRef.current) return;
+    const rect = chartShellRef.current.getBoundingClientRect();
+    if (!rect.width) return;
+
+    // Approximate the actual drawable X axis. The chart has a small right margin
+    // and Recharts reserves space on the left for the Y axis/ticks. Clamping
+    // keeps clicks in either gutter pinned to the first/last real observation.
+    const plotLeft = rect.left + 56;
+    const plotRight = rect.right - 20;
+    const x = Math.max(plotLeft, Math.min(plotRight, event.clientX));
+    const ratio = plotRight > plotLeft ? (x - plotLeft) / (plotRight - plotLeft) : 0;
+    const firstTs = reportChart[0].ts;
+    const lastTs = reportChart[reportChart.length - 1].ts;
+    const targetTs = firstTs + (lastTs - firstTs) * ratio;
+
+    let nearest = reportChart[0];
+    let nearestDistance = Math.abs(nearest.ts - targetTs);
+    for (const point of reportChart) {
+      const distance = Math.abs(point.ts - targetTs);
+      if (distance < nearestDistance) {
+        nearest = point;
+        nearestDistance = distance;
+      }
+    }
+
+    const selected = { ts: Number(nearest.ts), equity: Number(nearest.equity || 0) };
+    chartHoverRef.current = selected;
+    setChartSelection(selected);
+  };
+
+  const selectionTrades = useMemo(() => {
+    if (!chartSelection) return [] as AnyObj[];
+    const selected = new Date(chartSelection.ts);
+    let from = 0;
+    let to = 0;
+    if (range === "today") {
+      from = chartSelection.ts - 30 * 60 * 1000;
+      to = chartSelection.ts + 30 * 60 * 1000;
+    } else {
+      const start = new Date(selected); start.setHours(0,0,0,0);
+      const end = new Date(selected); end.setHours(23,59,59,999);
+      from = start.getTime();
+      to = end.getTime();
+    }
+    return closedTrades.filter((trade) => {
+      const ts = tradeTimestamp(trade);
+      return ts >= from && ts <= to;
+    }).sort((a,b) => tradeTimestamp(a)-tradeTimestamp(b));
+  }, [chartSelection, closedTrades, range]);
+
   const viewTradesAtSelection = () => {
     if (!chartSelection) return;
     const selected = new Date(chartSelection.ts);
@@ -152,10 +208,11 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
         <div className="range-tabs">{(["today","week","month","year"] as RangeKey[]).map(r => <button key={r} className={range===r?"active":""} onClick={() => setRange(r)}>{r[0].toUpperCase()+r.slice(1)}</button>)}</div>
         <div className="chart-controls"><button className={chartCurrency === "GBP" ? "active" : ""} onClick={() => setChartCurrency("GBP")}>GBP</button><button className={chartCurrency === "USD" ? "active" : ""} onClick={() => setChartCurrency("USD")}>USD</button></div>
       </div>
-      <div className="equity-chart-clean interactive-equity-chart">{reportChart.length ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={reportChart} margin={{top:12,right:18,left:8,bottom:8}} onMouseMove={rememberChartPoint} onClick={selectChartPoint}><defs><linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#38bdf8" stopOpacity={0.28}/><stop offset="100%" stopColor="#38bdf8" stopOpacity={0.02}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke="#1e2b43" vertical={false}/><XAxis dataKey="ts" type="number" domain={["dataMin","dataMax"]} stroke="#94a3b8" tickFormatter={(v) => new Date(v).toLocaleDateString("en-GB", range==="today"?{hour:"2-digit",minute:"2-digit"}:{day:"2-digit",month:"short"})} minTickGap={44}/><YAxis stroke="#94a3b8" domain={["auto","auto"]} tickFormatter={(v) => `${chartCurrency==="GBP"?"£":"$"}${Number(v).toFixed(0)}`}/><Tooltip labelFormatter={(v) => new Date(Number(v)).toLocaleString("en-GB", {dateStyle:"medium",timeStyle:"short"})} formatter={(value:any) => [chartCurrency === "GBP" ? gbp(value) : usd(value), "Account value"]}/>{chartSelection && <ReferenceLine x={chartSelection.ts} strokeDasharray="4 4" label={{ value: "Selected", position: "insideTopRight" }} />}<Area type="monotone" dataKey="equity" stroke="#38bdf8" strokeWidth={2.5} fill="url(#equityFill)" dot={reportChart.length === 1 ? { r: 4 } : false} activeDot={{r:5, onClick: selectAreaPoint, style: { cursor: "pointer" }}} onClick={selectAreaPoint}/></AreaChart></ResponsiveContainer> : <div className="chart-empty"><b>No account-value points in this period</b><span>Choose a wider range or wait for more recorded history.</span></div>}</div>
+      <div ref={chartShellRef} className="equity-chart-clean interactive-equity-chart" onPointerUp={selectNearestPointFromPointer}>{reportChart.length ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={reportChart} margin={{top:12,right:18,left:8,bottom:8}} onMouseMove={rememberChartPoint} onClick={selectChartPoint}><defs><linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#38bdf8" stopOpacity={0.28}/><stop offset="100%" stopColor="#38bdf8" stopOpacity={0.02}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke="#1e2b43" vertical={false}/><XAxis dataKey="ts" type="number" domain={["dataMin","dataMax"]} stroke="#94a3b8" tickFormatter={(v) => new Date(v).toLocaleDateString("en-GB", range==="today"?{hour:"2-digit",minute:"2-digit"}:{day:"2-digit",month:"short"})} minTickGap={44}/><YAxis stroke="#94a3b8" domain={["auto","auto"]} tickFormatter={(v) => `${chartCurrency==="GBP"?"£":"$"}${Number(v).toFixed(0)}`}/><Tooltip labelFormatter={(v) => new Date(Number(v)).toLocaleString("en-GB", {dateStyle:"medium",timeStyle:"short"})} formatter={(value:any) => [chartCurrency === "GBP" ? gbp(value) : usd(value), "Account value"]}/>{chartSelection && <ReferenceLine x={chartSelection.ts} strokeDasharray="4 4" label={{ value: "Selected", position: "insideTopRight" }} />}<Area type="monotone" dataKey="equity" stroke="#38bdf8" strokeWidth={2.5} fill="url(#equityFill)" dot={reportChart.length === 1 ? { r: 4 } : false} activeDot={{r:5, onClick: selectAreaPoint, style: { cursor: "pointer" }}} onClick={selectAreaPoint}/></AreaChart></ResponsiveContainer> : <div className="chart-empty"><b>No account-value points in this period</b><span>Choose a wider range or wait for more recorded history.</span></div>}</div>
       {chartSelection && <div className="chart-trade-selection">
         <div><span>Selected point</span><b>{new Date(chartSelection.ts).toLocaleString("en-GB", { dateStyle:"medium", timeStyle:"short" })}</b></div>
         <div><span>Account value</span><b>{chartCurrency === "GBP" ? gbp(chartSelection.equity) : usd(chartSelection.equity)}</b></div>
+        <div><span>Closed trades in this {range === "today" ? "±30 min window" : "day"}</span><b>{selectionTrades.length}</b>{selectionTrades.length > 0 && <small>{Array.from(new Set(selectionTrades.map(t => String(t?.symbol || "").toUpperCase()).filter(Boolean))).slice(0,6).join(", ")}</small>}</div>
         <button onClick={viewTradesAtSelection}>View trades around this point</button>
         <button className="ghost" onClick={()=>{setChartSelection(null);setMomentFilter(null);}}>Clear selection</button>
       </div>}

@@ -395,3 +395,8 @@
 .interactive-equity-chart .recharts-surface { cursor: crosshair; }
 .interactive-equity-chart .recharts-active-dot { cursor: pointer; }
 .chart-trade-selection { scroll-margin-top: 90px; }
+
+
+/* V18.2.23 Pointer Trade Explorer */
+.interactive-equity-chart { cursor: crosshair; touch-action: manipulation; user-select: none; }
+.chart-trade-selection small { display:block; margin-top:4px; color:#38bdf8; font-size:11px; line-height:1.35; }
