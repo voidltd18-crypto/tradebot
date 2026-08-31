@@ -10515,6 +10515,58 @@ def _reports_fast_performance_snapshot(status: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+def _reports_latest_equity_history(limit: int = 500) -> List[Dict[str, Any]]:
+    """Return the newest trade-backed equity points in chronological order.
+
+    V18.2.18: reports previously reused tradeTimeline, whose shared DB reader is
+    intentionally ordered oldest-first. Once the trade table grew beyond the
+    limit, Today/Week/Month filters could therefore receive only old rows and
+    render an empty chart. Keep this reports-only reader isolated so no trading
+    memory/strategy consumers are changed.
+    """
+    points: List[Dict[str, Any]] = []
+    if SQLITE_ENABLED:
+        conn = None
+        try:
+            init_db()
+            conn = db_connect()
+            rows = conn.execute("""
+                SELECT timestamp, day, time, symbol, side, equity, equity_gbp, pnl, pnl_gbp, pnl_pct, reason
+                FROM trades
+                WHERE COALESCE(equity, 0) > 0
+                ORDER BY datetime(timestamp) DESC, id DESC
+                LIMIT ?
+            """, (max(1, int(limit)),)).fetchall()
+            for r in reversed(rows):
+                timestamp = r["timestamp"] or ""
+                # Backfilled/legacy rows can have day + time even when timestamp is weak.
+                if not timestamp and r["day"]:
+                    timestamp = f"{r['day']}T{r['time'] or '00:00:00'}"
+                points.append({
+                    "time": timestamp,
+                    "day": r["day"] or "",
+                    "clock": r["time"] or "",
+                    "symbol": r["symbol"] or "",
+                    "side": r["side"] or "",
+                    "equity": _safe_num(r["equity"]),
+                    "equityGbp": _safe_num(r["equity_gbp"]),
+                    "pnl": _safe_num(r["pnl"]),
+                    "pnlGbp": _safe_num(r["pnl_gbp"]),
+                    "pnlPct": _safe_num(r["pnl_pct"]),
+                    "reason": r["reason"] or "",
+                    "source": "trade_history",
+                })
+        except Exception as exc:
+            print(f"V18.2.18 REPORT CHART READ ERROR: {exc}")
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return points
+
+
 def _build_reports_payload() -> Dict[str, Any]:
     status = latest_status if isinstance(latest_status, dict) else {}
     account = status.get("account") or {}
@@ -10526,18 +10578,27 @@ def _build_reports_payload() -> Dict[str, Any]:
     total_deposited = _safe_num(performance.get("totalDeposited"))
     total_gain_loss = _safe_num(performance.get("totalGainLoss"))
     closed = closed_trades_from_db(200) if "closed_trades_from_db" in globals() else (status.get("closedTrades") or [])
-    timeline = status.get("tradeTimeline") or status.get("equityCurve") or []
-    equity_history = []
-    for i, e in enumerate(timeline if isinstance(timeline, list) else []):
-        if not isinstance(e, dict):
-            continue
+
+    # V18.2.18: newest historical trade-equity points + a live current-equity point.
+    # This guarantees Today can render even on a no-trade day, while Week/Month/Year
+    # continue to use persisted historical account values where available.
+    equity_history = _reports_latest_equity_history(500)
+    live_equity = equity or _safe_num(performance.get("currentEquity"))
+    if live_equity > 0:
+        live_gbp = equity_gbp or money_gbp(live_equity)
         equity_history.append({
-            "idx": i, "time": e.get("time") or e.get("timestamp") or e.get("t") or "",
-            "symbol": e.get("symbol") or "", "side": e.get("side") or "",
-            "equity": _safe_num(e.get("equity") or e.get("value")),
-            "equityGbp": _safe_num(e.get("equityGbp") or e.get("valueGbp")),
-            "pnl": _safe_num(e.get("pnl")), "pnlGbp": _safe_num(e.get("pnlGbp")),
-            "pnlPct": _safe_num(e.get("pnlPct")), "reason": e.get("reason") or "",
+            "time": datetime.now(UTC).isoformat(),
+            "day": datetime.now(UTC).strftime("%Y-%m-%d"),
+            "clock": datetime.now(UTC).strftime("%H:%M:%S"),
+            "symbol": "ACCOUNT",
+            "side": "SNAPSHOT",
+            "equity": live_equity,
+            "equityGbp": live_gbp,
+            "pnl": 0.0,
+            "pnlGbp": 0.0,
+            "pnlPct": 0.0,
+            "reason": "live account snapshot",
+            "source": "live_snapshot",
         })
     return {
         "ok": True, "depositSource": "persistent-performance-engine-fast-read",

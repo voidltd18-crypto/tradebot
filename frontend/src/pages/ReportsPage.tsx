@@ -8,6 +8,30 @@ import type { AnyObj, Currency } from "../lib/types";
 
 type RangeKey = "today" | "week" | "month" | "year";
 
+function parseReportTimestamp(entry: AnyObj): number {
+  const raw = entry?.timestamp || entry?.time || entry?.t || entry?.date || entry?.closedAt || entry?.exitTime || "";
+  if (raw) {
+    const direct = Date.parse(String(raw));
+    if (Number.isFinite(direct)) return direct;
+  }
+
+  // Legacy report rows sometimes carry YYYY-MM-DD in day and HH:MM:SS in time/clock.
+  const day = String(entry?.day || entry?.date || "").trim();
+  const clock = String(entry?.clock || entry?.timeOfDay || "00:00:00").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    const joined = Date.parse(`${day}T${clock || "00:00:00"}`);
+    if (Number.isFinite(joined)) return joined;
+  }
+
+  // UK legacy dates (DD/MM/YYYY).
+  const uk = day.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (uk) {
+    const joined = Date.parse(`${uk[3]}-${uk[2]}-${uk[1]}T${clock || "00:00:00"}`);
+    if (Number.isFinite(joined)) return joined;
+  }
+  return 0;
+}
+
 function tradeTimestamp(trade: AnyObj): number {
   const raw = trade?.timestamp || trade?.date || trade?.day || trade?.closedAt || trade?.exitTime || "";
   const parsed = Date.parse(String(raw));
@@ -36,11 +60,10 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const reportChart = useMemo(() => {
     const start = rangeStart(range);
     return equityHistory.map((entry: AnyObj, index: number) => {
-      const raw = entry.time || entry.timestamp || entry.t || "";
-      const date = new Date(raw);
-      const ts = Number.isFinite(date.getTime()) ? date.getTime() : 0;
+      const ts = parseReportTimestamp(entry);
+      const date = ts ? new Date(ts) : null;
       const equity = chartCurrency === "GBP" ? Number(entry.equityGbp ?? entry.valueGbp ?? Number(entry.equity || entry.value || 0) * rate) : Number(entry.equity ?? entry.value ?? 0);
-      return { ts, equity, label: ts ? date.toLocaleString("en-GB", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit", hour12:false }) : `#${index + 1}` };
+      return { ts, equity, label: date ? date.toLocaleString("en-GB", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit", hour12:false }) : `#${index + 1}` };
     }).filter((p) => p.ts >= start && p.equity > 0).sort((a,b) => a.ts-b.ts);
   }, [equityHistory, chartCurrency, rate, range]);
 
@@ -73,7 +96,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
         <div className="range-tabs">{(["today","week","month","year"] as RangeKey[]).map(r => <button key={r} className={range===r?"active":""} onClick={() => setRange(r)}>{r[0].toUpperCase()+r.slice(1)}</button>)}</div>
         <div className="chart-controls"><button className={chartCurrency === "GBP" ? "active" : ""} onClick={() => setChartCurrency("GBP")}>GBP</button><button className={chartCurrency === "USD" ? "active" : ""} onClick={() => setChartCurrency("USD")}>USD</button></div>
       </div>
-      <div className="equity-chart-clean">{reportChart.length ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={reportChart} margin={{top:12,right:18,left:8,bottom:8}}><defs><linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#38bdf8" stopOpacity={0.28}/><stop offset="100%" stopColor="#38bdf8" stopOpacity={0.02}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke="#1e2b43" vertical={false}/><XAxis dataKey="ts" type="number" domain={["dataMin","dataMax"]} stroke="#94a3b8" tickFormatter={(v) => new Date(v).toLocaleDateString("en-GB", range==="today"?{hour:"2-digit",minute:"2-digit"}:{day:"2-digit",month:"short"})} minTickGap={44}/><YAxis stroke="#94a3b8" domain={["auto","auto"]} tickFormatter={(v) => `${chartCurrency==="GBP"?"£":"$"}${Number(v).toFixed(0)}`}/><Tooltip labelFormatter={(v) => new Date(Number(v)).toLocaleString("en-GB", {dateStyle:"medium",timeStyle:"short"})} formatter={(value:any) => [chartCurrency === "GBP" ? gbp(value) : usd(value), "Account value"]}/><Area type="monotone" dataKey="equity" stroke="#38bdf8" strokeWidth={2.5} fill="url(#equityFill)" dot={false} activeDot={{r:4}}/></AreaChart></ResponsiveContainer> : <div className="chart-empty"><b>No account-value points in this period</b><span>Choose a wider range or wait for more recorded history.</span></div>}</div>
+      <div className="equity-chart-clean">{reportChart.length ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={reportChart} margin={{top:12,right:18,left:8,bottom:8}}><defs><linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#38bdf8" stopOpacity={0.28}/><stop offset="100%" stopColor="#38bdf8" stopOpacity={0.02}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke="#1e2b43" vertical={false}/><XAxis dataKey="ts" type="number" domain={["dataMin","dataMax"]} stroke="#94a3b8" tickFormatter={(v) => new Date(v).toLocaleDateString("en-GB", range==="today"?{hour:"2-digit",minute:"2-digit"}:{day:"2-digit",month:"short"})} minTickGap={44}/><YAxis stroke="#94a3b8" domain={["auto","auto"]} tickFormatter={(v) => `${chartCurrency==="GBP"?"£":"$"}${Number(v).toFixed(0)}`}/><Tooltip labelFormatter={(v) => new Date(Number(v)).toLocaleString("en-GB", {dateStyle:"medium",timeStyle:"short"})} formatter={(value:any) => [chartCurrency === "GBP" ? gbp(value) : usd(value), "Account value"]}/><Area type="monotone" dataKey="equity" stroke="#38bdf8" strokeWidth={2.5} fill="url(#equityFill)" dot={reportChart.length === 1 ? { r: 4 } : false} activeDot={{r:4}}/></AreaChart></ResponsiveContainer> : <div className="chart-empty"><b>No account-value points in this period</b><span>Choose a wider range or wait for more recorded history.</span></div>}</div>
     </Card>
 
     <Card title="Closed Trade History" wide>
