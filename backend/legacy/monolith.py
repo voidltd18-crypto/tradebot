@@ -2813,6 +2813,212 @@ def _v179_classify(return_pct: float) -> str:
         return "GOOD_BLOCK"
     return "NEUTRAL"
 
+def _v179_reason_bucket(stage: str, reason: str) -> str:
+    """Stable learning key for advisory audit evidence."""
+    raw = str(reason or "").strip().lower()
+    if raw.startswith("confidence"):
+        return "confidence"
+    if raw.startswith("quality"):
+        return "quality"
+    if raw.startswith("spread"):
+        return "spread"
+    if raw.startswith("momentum negative"):
+        return "negative_momentum"
+    if raw.startswith("momentum too weak"):
+        return "weak_momentum"
+    if raw.startswith("win rate"):
+        return "win_rate"
+    if raw.startswith("profit factor"):
+        return "profit_factor"
+    if raw.startswith("expectancy"):
+        return "expectancy"
+    if "already holding" in raw:
+        return "already_holding"
+    if "locked until tomorrow" in raw:
+        return "daily_lock"
+    if "cooldown" in raw:
+        return "symbol_cooldown"
+    return re.sub(r"\s+", "_", raw[:60]) or str(stage or "unknown").lower()
+
+
+def _v179_threshold_near_miss(stage: str, reason: str, confidence: Any, quality: Any) -> Dict[str, Any]:
+    """Detect decisions that missed a numeric gate by a deliberately small margin.
+
+    Advisory only.  It never changes a live threshold.  Where the rejection text
+    contains the threshold used at decision time, that value is preferred so a
+    later configuration change cannot rewrite history.
+    """
+    stage_l = str(stage or "").lower()
+    raw = str(reason or "").strip().lower()
+    metric = None
+    actual = threshold = gap = None
+    tolerance = None
+
+    def nums(pattern: str):
+        m = re.search(pattern, raw)
+        if not m:
+            return None
+        try:
+            return tuple(float(x) for x in m.groups())
+        except Exception:
+            return None
+
+    if raw.startswith("confidence"):
+        parsed = nums(r"confidence(?:\s+too\s+low)?\s+(-?\d+(?:\.\d+)?)\s+below\s+a\+\s+(-?\d+(?:\.\d+)?)")
+        if parsed:
+            actual, threshold = parsed
+        else:
+            m = re.search(r"confidence\s+too\s+low\s+(-?\d+(?:\.\d+)?)", raw)
+            if m:
+                actual = float(m.group(1))
+                threshold = float(SNIPER_MIN_CONFIDENCE) if stage_l == "sniper_gate" else None
+            elif confidence is not None:
+                actual = float(confidence)
+                threshold = float(A_PLUS_MIN_CONFIDENCE) if stage_l == "a_plus_gate" else None
+        metric, tolerance = "confidence", 0.05
+
+    elif raw.startswith("quality"):
+        parsed = nums(r"quality\s+(-?\d+(?:\.\d+)?)\s+below\s+a\+\s+(-?\d+(?:\.\d+)?)")
+        if parsed:
+            actual, threshold = parsed
+        else:
+            m = re.search(r"quality\s+too\s+low\s+(-?\d+(?:\.\d+)?)", raw)
+            if m:
+                actual = float(m.group(1))
+                threshold = float(SNIPER_MIN_QUALITY) if stage_l == "sniper_gate" else None
+            elif quality is not None:
+                actual = float(quality)
+                threshold = float(A_PLUS_MIN_QUALITY) if stage_l == "a_plus_gate" else None
+        metric, tolerance = "quality", 0.0030
+
+    elif raw.startswith("spread"):
+        parsed = nums(r"spread\s+(-?\d+(?:\.\d+)?)\s+above\s+a\+\s+(-?\d+(?:\.\d+)?)")
+        if parsed:
+            actual, threshold = parsed
+        else:
+            m = re.search(r"spread\s+too\s+wide\s+(-?\d+(?:\.\d+)?)", raw)
+            if m:
+                actual = float(m.group(1))
+                threshold = float(SNIPER_MAX_SPREAD) if stage_l == "sniper_gate" else None
+        metric, tolerance = "spread", 0.0050
+
+    elif raw.startswith("win rate"):
+        parsed = nums(r"win\s+rate\s+(-?\d+(?:\.\d+)?)%\s+below\s+(-?\d+(?:\.\d+)?)%")
+        if parsed:
+            actual, threshold = parsed[0] / 100.0, parsed[1] / 100.0
+        metric, tolerance = "win_rate", 0.05
+
+    elif raw.startswith("profit factor"):
+        parsed = nums(r"profit\s+factor\s+(-?\d+(?:\.\d+)?)\s+below\s+(-?\d+(?:\.\d+)?)")
+        if parsed:
+            actual, threshold = parsed
+        metric, tolerance = "profit_factor", 0.10
+
+    elif raw.startswith("expectancy"):
+        parsed = nums(r"expectancy\s+(-?\d+(?:\.\d+)?)%\s+below\s+(-?\d+(?:\.\d+)?)%")
+        if parsed:
+            actual, threshold = parsed
+        metric, tolerance = "expectancy_pct", 0.10
+
+    elif raw.startswith("momentum negative") or raw.startswith("momentum too weak"):
+        m = re.search(r"(-?\d+(?:\.\d+)?)\s*$", raw)
+        if m:
+            actual = float(m.group(1))
+            threshold = 0.0 if raw.startswith("momentum negative") else float(SNIPER_MIN_MOMENTUM)
+        metric, tolerance = "momentum", 0.0015
+
+    if metric is None or actual is None or threshold is None:
+        return {"isNearMiss": False}
+
+    if metric == "spread":
+        gap = actual - threshold
+    else:
+        gap = threshold - actual
+    is_near = gap >= -1e-9 and gap <= float(tolerance or 0.0) + 1e-9
+    return {
+        "isNearMiss": bool(is_near), "metric": metric, "actual": actual,
+        "threshold": threshold, "gap": gap, "tolerance": tolerance,
+    }
+
+
+def _v179_episode_profiles(decisions: List[Dict[str, Any]], episode_gap_minutes: int = 30) -> Dict[str, Any]:
+    """De-duplicate repeated scans into advisory opportunity episodes."""
+    ordered = sorted(decisions, key=lambda x: str(x.get("decision_at") or ""))
+    missed_episodes: List[Dict[str, Any]] = []
+    active_by_symbol: Dict[str, Dict[str, Any]] = {}
+
+    # First: one sustained missed move per symbol, not one mistake per scan.
+    for d in ordered:
+        if str(d.get("classification")) != "MISSED_WINNER":
+            continue
+        sym = str(d.get("symbol") or "").upper()
+        try:
+            dt = datetime.fromisoformat(str(d.get("decision_at")).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        prev = active_by_symbol.get(sym)
+        if prev and (dt - prev["lastDt"]).total_seconds() <= episode_gap_minutes * 60:
+            ep = prev["episode"]
+            ep["endAt"] = d.get("decision_at")
+            ep["scanCount"] += 1
+            ep["decisionIds"].append(int(d.get("decision_id") or 0))
+            ep["gates"] = sorted(set(ep["gates"] + [str(d.get("stage") or "unknown")]))
+            ep["reasons"] = sorted(set(ep["reasons"] + [_v179_reason_bucket(d.get("stage"), d.get("reason"))]))
+            ep["peakReturnPct"] = max(float(ep["peakReturnPct"]), float(d.get("peak_return_pct") or 0.0))
+            prev["lastDt"] = dt
+        else:
+            ep = {
+                "symbol": sym, "startAt": d.get("decision_at"), "endAt": d.get("decision_at"),
+                "scanCount": 1, "decisionIds": [int(d.get("decision_id") or 0)],
+                "gates": [str(d.get("stage") or "unknown")],
+                "reasons": [_v179_reason_bucket(d.get("stage"), d.get("reason"))],
+                "peakReturnPct": float(d.get("peak_return_pct") or 0.0),
+            }
+            missed_episodes.append(ep)
+            active_by_symbol[sym] = {"episode": ep, "lastDt": dt}
+
+    # Second: threshold-near evidence by symbol + gate + reason, also episode de-duplicated.
+    keyed: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
+    for d in ordered:
+        nm = _v179_threshold_near_miss(d.get("stage"), d.get("reason"), d.get("confidence"), d.get("quality"))
+        if not nm.get("isNearMiss"):
+            continue
+        d = dict(d); d["nearMiss"] = nm
+        key = (str(d.get("symbol") or "").upper(), str(d.get("stage") or "unknown"), _v179_reason_bucket(d.get("stage"), d.get("reason")))
+        keyed.setdefault(key, []).append(d)
+
+    profiles=[]
+    for (sym, stage, bucket), arr in keyed.items():
+        episodes=[]; current=None; last_dt=None
+        for d in arr:
+            try: dt=datetime.fromisoformat(str(d.get("decision_at")).replace("Z", "+00:00"))
+            except Exception: continue
+            if current is None or last_dt is None or (dt-last_dt).total_seconds() > episode_gap_minutes*60:
+                current={"startAt":d.get("decision_at"),"endAt":d.get("decision_at"),"scanCount":0,"peakReturnPct":-999.0,"worstReturnPct":999.0,"classifications":set(),"gaps":[]}
+                episodes.append(current)
+            current["endAt"]=d.get("decision_at"); current["scanCount"]+=1
+            current["peakReturnPct"]=max(current["peakReturnPct"],float(d.get("peak_return_pct") or 0.0))
+            current["worstReturnPct"]=min(current["worstReturnPct"],float(d.get("worst_return_pct") or 0.0))
+            current["classifications"].add(str(d.get("classification") or "NEUTRAL"))
+            current["gaps"].append(float(d.get("nearMiss",{}).get("gap") or 0.0)); last_dt=dt
+        missed=sum(1 for e in episodes if "MISSED_WINNER" in e["classifications"])
+        good=sum(1 for e in episodes if "MISSED_WINNER" not in e["classifications"] and "GOOD_BLOCK" in e["classifications"])
+        neutral=max(0,len(episodes)-missed-good)
+        if not episodes: continue
+        sample=arr[-1].get("nearMiss",{})
+        profiles.append({
+            "symbol":sym,"stage":stage,"reasonBucket":bucket,"metric":sample.get("metric"),
+            "episodes":len(episodes),"scanRows":sum(e["scanCount"] for e in episodes),
+            "missedWinnerEpisodes":missed,"goodBlockEpisodes":good,"neutralEpisodes":neutral,
+            "missRatePct":round(100.0*missed/max(1,len(episodes)),1),
+            "avgGap":round(sum(g for e in episodes for g in e["gaps"])/max(1,sum(len(e["gaps"]) for e in episodes)),6),
+            "latestActual":sample.get("actual"),"latestThreshold":sample.get("threshold"),
+            "evidence":"REVIEW" if len(episodes)>=2 and missed>=2 and missed>good else "WATCH",
+        })
+    profiles.sort(key=lambda x:(x["evidence"]!="REVIEW",-x["missedWinnerEpisodes"],-x["episodes"],x["symbol"]))
+    missed_episodes.sort(key=lambda x:(-float(x.get("peakReturnPct") or 0.0),str(x.get("startAt") or "")))
+    return {"episodeGapMinutes":episode_gap_minutes,"missedMoveEpisodes":missed_episodes,"nearMissProfiles":profiles}
+
 def v179_evaluate_decision_audit(limit: int = 200) -> Dict[str, Any]:
     if not SQLITE_ENABLED:
         return {"ok":False,"evaluated":0,"errors":0}
@@ -2864,9 +3070,21 @@ def v179_decision_audit_summary(days: int = 7) -> Dict[str, Any]:
           MAX(CASE WHEN due_minutes=30 THEN return_pct END) return_30m,
           MAX(CASE WHEN due_minutes=60 THEN return_pct END) return_1h,
           MAX(CASE WHEN due_minutes=120 THEN return_pct END) return_2h,
+          MAX(CASE WHEN return_pct IS NOT NULL THEN return_pct END) peak_return_pct,
+          MIN(CASE WHEN return_pct IS NOT NULL THEN return_pct END) worst_return_pct,
           MAX(CASE WHEN classification='MISSED_WINNER' THEN 1 ELSE 0 END) missed,
           MAX(CASE WHEN classification='GOOD_BLOCK' THEN 1 ELSE 0 END) good
           FROM v179_decision_audit WHERE decision_at>=? GROUP BY decision_id ORDER BY decision_id DESC""",(session_start_utc,)).fetchall()
+        learning_rows=conn.execute("""SELECT decision_id,symbol,decision_at,stage,reason,entry_price,confidence,quality,
+          MAX(CASE WHEN due_minutes=15 THEN return_pct END) return_15m,
+          MAX(CASE WHEN due_minutes=30 THEN return_pct END) return_30m,
+          MAX(CASE WHEN due_minutes=60 THEN return_pct END) return_1h,
+          MAX(CASE WHEN due_minutes=120 THEN return_pct END) return_2h,
+          MAX(CASE WHEN return_pct IS NOT NULL THEN return_pct END) peak_return_pct,
+          MIN(CASE WHEN return_pct IS NOT NULL THEN return_pct END) worst_return_pct,
+          MAX(CASE WHEN classification='MISSED_WINNER' THEN 1 ELSE 0 END) missed,
+          MAX(CASE WHEN classification='GOOD_BLOCK' THEN 1 ELSE 0 END) good
+          FROM v179_decision_audit WHERE decision_at>=? GROUP BY decision_id ORDER BY decision_id ASC""",(cutoff,)).fetchall()
         pending=int(conn.execute("SELECT COUNT(*) FROM v179_decision_audit WHERE status='PENDING'").fetchone()[0]); conn.close()
         gates=[]
         for r in rows:
@@ -2874,11 +3092,20 @@ def v179_decision_audit_summary(days: int = 7) -> Dict[str, Any]:
             d['effectivenessPct']=round(100.0*int(d['good_blocks'] or 0)/denom,1); gates.append(d)
         items=[]
         for r in recent:
-            d=dict(r); d['classification']='MISSED_WINNER' if d.pop('missed') else ('GOOD_BLOCK' if d.pop('good') else 'NEUTRAL'); items.append(d)
-        return {"ok":True,"version":"V17.9","days":days,"advisoryOnly":True,"pendingCheckpoints":pending,
+            d=dict(r); d['classification']='MISSED_WINNER' if d.pop('missed') else ('GOOD_BLOCK' if d.pop('good') else 'NEUTRAL')
+            d['reasonBucket']=_v179_reason_bucket(d.get('stage'),d.get('reason'))
+            d['nearMiss']=_v179_threshold_near_miss(d.get('stage'),d.get('reason'),d.get('confidence'),d.get('quality'))
+            items.append(d)
+        learning=[]
+        for r in learning_rows:
+            d=dict(r); d['classification']='MISSED_WINNER' if d.pop('missed') else ('GOOD_BLOCK' if d.pop('good') else 'NEUTRAL')
+            learning.append(d)
+        episode_learning=_v179_episode_profiles(learning, episode_gap_minutes=30)
+        return {"ok":True,"version":"V18.2.26","days":days,"advisoryOnly":True,"pendingCheckpoints":pending,
                 "thresholds":{"missedWinnerPct":V179_MISSED_WINNER_PCT,"goodBlockPct":V179_GOOD_BLOCK_PCT},
                 "recentWindow":"CURRENT_REGULAR_SESSION","recentSessionStart":session_start_utc,
-                "recentCount":len(items),"gates":gates,"recent":items}
+                "recentCount":len(items),"gates":gates,"recent":items,
+                "learning":{"mode":"ADVISORY_ONLY","autoThresholdChanges":False,**episode_learning}}
     except Exception as exc:
         return {"ok":False,"version":"V17.9","error":str(exc),"gates":[],"recent":[]}
 
