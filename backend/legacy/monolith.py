@@ -18422,6 +18422,13 @@ V14_SCIENTIST_STARTUP_DELAY_SECONDS = max(10, int(os.getenv("V14_SCIENTIST_START
 V14_MIN_MEMORY_CONFIDENCE = max(25.0, float(os.getenv("V14_MIN_MEMORY_CONFIDENCE", "55")))
 V14_MIN_RESEARCH_SAMPLES = max(20, int(os.getenv("V14_MIN_RESEARCH_SAMPLES", "100")))
 v14_scientist_thread_started = False
+# V18.2.10: Scientist schema/refresh single-flight guards.  The old code ran
+# CREATE TABLE/INDEX from ordinary read endpoints and allowed overlapping refresh
+# cycles, which created avoidable SQLite writer contention.
+_V14_SCHEMA_LOCK = threading.RLock()
+_V14_SCHEMA_COMPLETE = False
+_V14_REFRESH_LOCK = threading.Lock()
+_V14_LAST_LOCK_LOG_AT = 0.0
 
 
 def _v14_now() -> str:
@@ -18434,66 +18441,70 @@ def _v14_fp(*parts: Any) -> str:
 
 
 def _v14_scientist_ensure_tables() -> None:
-    if not SQLITE_ENABLED:
+    global _V14_SCHEMA_COMPLETE
+    if not SQLITE_ENABLED or _V14_SCHEMA_COMPLETE:
         return
-    conn = db_connect()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS v14_hypotheses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            fingerprint TEXT UNIQUE NOT NULL,
-            title TEXT NOT NULL,
-            hypothesis_type TEXT NOT NULL,
-            subject TEXT NOT NULL,
-            statement TEXT NOT NULL,
-            rationale TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'DISCOVERED',
-            confidence REAL NOT NULL DEFAULT 0,
-            evidence_count INTEGER NOT NULL DEFAULT 0,
-            expected_direction TEXT NOT NULL DEFAULT 'UNKNOWN',
-            source_memory_ids_json TEXT NOT NULL DEFAULT '[]',
-            variables_json TEXT NOT NULL DEFAULT '{}',
-            safeguards_json TEXT NOT NULL DEFAULT '[]',
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS v14_experiments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            experiment_key TEXT UNIQUE NOT NULL,
-            hypothesis_fingerprint TEXT NOT NULL,
-            name TEXT NOT NULL,
-            experiment_type TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'SHADOW_READY',
-            baseline_json TEXT NOT NULL DEFAULT '{}',
-            variant_json TEXT NOT NULL DEFAULT '{}',
-            evidence_json TEXT NOT NULL DEFAULT '{}',
-            sample_size INTEGER NOT NULL DEFAULT 0,
-            win_rate REAL,
-            expectancy_pct REAL,
-            profit_factor REAL,
-            evaluation_score REAL NOT NULL DEFAULT 0,
-            board_eligible INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS v14_scientist_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            title TEXT NOT NULL,
-            detail TEXT NOT NULL,
-            reference_key TEXT,
-            payload_json TEXT NOT NULL DEFAULT '{}'
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_v14_hypotheses_status ON v14_hypotheses(status,confidence)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_v14_experiments_status ON v14_experiments(status,evaluation_score)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_v14_events_created ON v14_scientist_events(created_at)")
-    conn.commit(); conn.close()
-
+    with _V14_SCHEMA_LOCK:
+        if _V14_SCHEMA_COMPLETE:
+            return
+        conn = db_connect()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS v14_hypotheses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                hypothesis_type TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                statement TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'DISCOVERED',
+                confidence REAL NOT NULL DEFAULT 0,
+                evidence_count INTEGER NOT NULL DEFAULT 0,
+                expected_direction TEXT NOT NULL DEFAULT 'UNKNOWN',
+                source_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+                variables_json TEXT NOT NULL DEFAULT '{}',
+                safeguards_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS v14_experiments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                experiment_key TEXT UNIQUE NOT NULL,
+                hypothesis_fingerprint TEXT NOT NULL,
+                name TEXT NOT NULL,
+                experiment_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'SHADOW_READY',
+                baseline_json TEXT NOT NULL DEFAULT '{}',
+                variant_json TEXT NOT NULL DEFAULT '{}',
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                sample_size INTEGER NOT NULL DEFAULT 0,
+                win_rate REAL,
+                expectancy_pct REAL,
+                profit_factor REAL,
+                evaluation_score REAL NOT NULL DEFAULT 0,
+                board_eligible INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS v14_scientist_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                reference_key TEXT,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_v14_hypotheses_status ON v14_hypotheses(status,confidence)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_v14_experiments_status ON v14_experiments(status,evaluation_score)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_v14_events_created ON v14_scientist_events(created_at)")
+        conn.commit(); conn.close()
+        _V14_SCHEMA_COMPLETE = True
 
 def _v14_event(event_type: str, title: str, detail: str, reference_key: str = "", payload: Optional[Dict[str, Any]] = None) -> None:
     if not SQLITE_ENABLED:
@@ -18669,11 +18680,26 @@ def _v14_import_research_validations() -> int:
                            {"status": status, "boardEligible": bool(board_eligible)})
             conn.commit(); conn.close()
     except Exception as exc:
-        print(f"V14 SCIENTIST RESEARCH IMPORT ERROR: {exc}")
+        if _db_is_lock_error(exc):
+            print(f"V18.2.10 DB COORDINATOR | writer=SCIENTIST_IMPORT result=RETRY_EXHAUSTED error={exc}")
+        else:
+            print(f"V14 SCIENTIST RESEARCH IMPORT ERROR: {exc}")
     return created
 
 
 def v14_scientist_refresh() -> Dict[str, Any]:
+    # V18.2.10: only one Scientist cycle may mutate research state at a time.
+    # API/status readers continue to work while a duplicate cycle is skipped.
+    if not _V14_REFRESH_LOCK.acquire(blocking=False):
+        print("V18.2.10 SCIENTIST SINGLE-FLIGHT | duplicate cycle skipped")
+        return v14_scientist_status()
+    try:
+        return _v14_scientist_refresh_impl()
+    finally:
+        _V14_REFRESH_LOCK.release()
+
+
+def _v14_scientist_refresh_impl() -> Dict[str, Any]:
     _v14_scientist_ensure_tables()
     created_hypotheses = 0; created_experiments = 0
     try:
