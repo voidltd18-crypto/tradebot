@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { Card } from "../components/Card";
 import { TradeReplayModal, type ReplayTarget } from "../components/TradeReplayModal";
 import { Stat } from "../components/Stat";
@@ -33,9 +33,7 @@ function parseReportTimestamp(entry: AnyObj): number {
 }
 
 function tradeTimestamp(trade: AnyObj): number {
-  const raw = trade?.timestamp || trade?.date || trade?.day || trade?.closedAt || trade?.exitTime || "";
-  const parsed = Date.parse(String(raw));
-  return Number.isFinite(parsed) ? parsed : 0;
+  return parseReportTimestamp(trade);
 }
 
 function rangeStart(range: RangeKey): number {
@@ -51,6 +49,8 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const [symbolFilter, setSymbolFilter] = useState("ALL");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
+  const [chartSelection, setChartSelection] = useState<{ts:number; equity:number} | null>(null);
+  const [momentFilter, setMomentFilter] = useState<{from:number; to:number; label:string} | null>(null);
   const totalDeposited = Number(reports?.totalDeposited || 0);
   const totalGainLoss = Number(reports?.totalGainLoss || 0);
   const earned = Number(reports?.earnedSinceDeposit || 0);
@@ -74,12 +74,43 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
     return [...closedTrades].filter((trade) => {
       const symbol = String(trade?.symbol || "").toUpperCase();
       const ts = tradeTimestamp(trade);
-      return (symbolFilter === "ALL" || symbol === symbolFilter) && (!from || ts >= from) && (!toDate || ts <= to);
+      const dateMatch = (!from || ts >= from) && (!toDate || ts <= to);
+      const momentMatch = !momentFilter || (ts >= momentFilter.from && ts <= momentFilter.to);
+      return (symbolFilter === "ALL" || symbol === symbolFilter) && dateMatch && momentMatch;
     }).sort((a,b) => tradeTimestamp(b)-tradeTimestamp(a));
-  }, [closedTrades, symbolFilter, fromDate, toDate]);
+  }, [closedTrades, symbolFilter, fromDate, toDate, momentFilter]);
 
   const filteredPnl = filteredClosedTrades.reduce((sum, t) => sum + Number(t?.pnl || 0), 0);
   const filteredWins = filteredClosedTrades.filter(t => Number(t?.pnl || 0) > 0).length;
+
+  const selectChartPoint = (state: any) => {
+    const payload = state?.activePayload?.[0]?.payload;
+    if (!payload?.ts) return;
+    setChartSelection({ ts: Number(payload.ts), equity: Number(payload.equity || 0) });
+  };
+
+  const viewTradesAtSelection = () => {
+    if (!chartSelection) return;
+    const selected = new Date(chartSelection.ts);
+    let from = 0;
+    let to = 0;
+    let label = "";
+    if (range === "today") {
+      from = chartSelection.ts - 30 * 60 * 1000;
+      to = chartSelection.ts + 30 * 60 * 1000;
+      label = `Within 30 minutes of ${selected.toLocaleString("en-GB", { dateStyle:"medium", timeStyle:"short" })}`;
+    } else {
+      const start = new Date(selected); start.setHours(0,0,0,0);
+      const end = new Date(selected); end.setHours(23,59,59,999);
+      from = start.getTime(); to = end.getTime();
+      label = selected.toLocaleDateString("en-GB", { dateStyle:"full" });
+    }
+    setSymbolFilter("ALL");
+    setFromDate("");
+    setToDate("");
+    setMomentFilter({from,to,label});
+    window.setTimeout(() => document.getElementById("closed-trade-history")?.scrollIntoView({ behavior:"smooth", block:"start" }), 50);
+  };
 
   return <main className="grid two reports-page">
     <Card title="Reports Status" wide>
@@ -96,19 +127,26 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
         <div className="range-tabs">{(["today","week","month","year"] as RangeKey[]).map(r => <button key={r} className={range===r?"active":""} onClick={() => setRange(r)}>{r[0].toUpperCase()+r.slice(1)}</button>)}</div>
         <div className="chart-controls"><button className={chartCurrency === "GBP" ? "active" : ""} onClick={() => setChartCurrency("GBP")}>GBP</button><button className={chartCurrency === "USD" ? "active" : ""} onClick={() => setChartCurrency("USD")}>USD</button></div>
       </div>
-      <div className="equity-chart-clean">{reportChart.length ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={reportChart} margin={{top:12,right:18,left:8,bottom:8}}><defs><linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#38bdf8" stopOpacity={0.28}/><stop offset="100%" stopColor="#38bdf8" stopOpacity={0.02}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke="#1e2b43" vertical={false}/><XAxis dataKey="ts" type="number" domain={["dataMin","dataMax"]} stroke="#94a3b8" tickFormatter={(v) => new Date(v).toLocaleDateString("en-GB", range==="today"?{hour:"2-digit",minute:"2-digit"}:{day:"2-digit",month:"short"})} minTickGap={44}/><YAxis stroke="#94a3b8" domain={["auto","auto"]} tickFormatter={(v) => `${chartCurrency==="GBP"?"£":"$"}${Number(v).toFixed(0)}`}/><Tooltip labelFormatter={(v) => new Date(Number(v)).toLocaleString("en-GB", {dateStyle:"medium",timeStyle:"short"})} formatter={(value:any) => [chartCurrency === "GBP" ? gbp(value) : usd(value), "Account value"]}/><Area type="monotone" dataKey="equity" stroke="#38bdf8" strokeWidth={2.5} fill="url(#equityFill)" dot={reportChart.length === 1 ? { r: 4 } : false} activeDot={{r:4}}/></AreaChart></ResponsiveContainer> : <div className="chart-empty"><b>No account-value points in this period</b><span>Choose a wider range or wait for more recorded history.</span></div>}</div>
+      <div className="equity-chart-clean">{reportChart.length ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={reportChart} margin={{top:12,right:18,left:8,bottom:8}} onClick={selectChartPoint}><defs><linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#38bdf8" stopOpacity={0.28}/><stop offset="100%" stopColor="#38bdf8" stopOpacity={0.02}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke="#1e2b43" vertical={false}/><XAxis dataKey="ts" type="number" domain={["dataMin","dataMax"]} stroke="#94a3b8" tickFormatter={(v) => new Date(v).toLocaleDateString("en-GB", range==="today"?{hour:"2-digit",minute:"2-digit"}:{day:"2-digit",month:"short"})} minTickGap={44}/><YAxis stroke="#94a3b8" domain={["auto","auto"]} tickFormatter={(v) => `${chartCurrency==="GBP"?"£":"$"}${Number(v).toFixed(0)}`}/><Tooltip labelFormatter={(v) => new Date(Number(v)).toLocaleString("en-GB", {dateStyle:"medium",timeStyle:"short"})} formatter={(value:any) => [chartCurrency === "GBP" ? gbp(value) : usd(value), "Account value"]}/>{chartSelection && <ReferenceLine x={chartSelection.ts} strokeDasharray="4 4" label={{ value: "Selected", position: "insideTopRight" }} />}<Area type="monotone" dataKey="equity" stroke="#38bdf8" strokeWidth={2.5} fill="url(#equityFill)" dot={reportChart.length === 1 ? { r: 4 } : false} activeDot={{r:5}}/></AreaChart></ResponsiveContainer> : <div className="chart-empty"><b>No account-value points in this period</b><span>Choose a wider range or wait for more recorded history.</span></div>}</div>
+      {chartSelection && <div className="chart-trade-selection">
+        <div><span>Selected point</span><b>{new Date(chartSelection.ts).toLocaleString("en-GB", { dateStyle:"medium", timeStyle:"short" })}</b></div>
+        <div><span>Account value</span><b>{chartCurrency === "GBP" ? gbp(chartSelection.equity) : usd(chartSelection.equity)}</b></div>
+        <button onClick={viewTradesAtSelection}>View trades around this point</button>
+        <button className="ghost" onClick={()=>{setChartSelection(null);setMomentFilter(null);}}>Clear selection</button>
+      </div>}
     </Card>
 
-    <Card title="Closed Trade History" wide>
+    <div id="closed-trade-history" className="report-anchor"><Card title="Closed Trade History" wide>
       <div className="trade-filter-panel">
         <label><span>Stock</span><select value={symbolFilter} onChange={e=>setSymbolFilter(e.target.value)}><option value="ALL">All stocks</option>{symbols.map(s=><option key={s} value={s}>{s}</option>)}</select></label>
         <label><span>From</span><input type="date" value={fromDate} onChange={e=>setFromDate(e.target.value)}/></label>
         <label><span>To</span><input type="date" value={toDate} onChange={e=>setToDate(e.target.value)}/></label>
-        <button className="ghost" onClick={()=>{setSymbolFilter("ALL");setFromDate("");setToDate("");}}>Clear filters</button>
+        <button className="ghost" onClick={()=>{setSymbolFilter("ALL");setFromDate("");setToDate("");setMomentFilter(null);setChartSelection(null);}}>Clear filters</button>
       </div>
+      {momentFilter && <div className="moment-filter-banner"><b>Chart selection:</b> {momentFilter.label}<button className="ghost" onClick={()=>setMomentFilter(null)}>Show all dates</button></div>}
       <div className="filter-summary"><b>{filteredClosedTrades.length}</b> matching rows <span>•</span> PnL <strong className={tone(filteredPnl)}>{gbp(filteredPnl * rate)}</strong> <span>•</span> Winning rows {filteredWins}</div>
       <div className="table-wrap"><table className="compact-table"><thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th><th>Replay</th></tr></thead><tbody>{filteredClosedTrades.map((trade,index)=><tr key={`${trade.id||index}-${index}`}><td>{tradeDate(trade)}</td><td>{tradeTime(trade)}</td><td><b>{trade.symbol}</b></td><td>{usd(trade.entryPrice)}</td><td>{usd(trade.exitPrice)}</td><td>{Number(trade.qty||0).toFixed(4)}</td><td className={tone(trade.pnl)}>{gbp(trade.pnlGbp ?? Number(trade.pnl||0)*rate)} / {usd(trade.pnl)}</td><td className={tone(trade.pnl)}>{pct(trade.pnlPct)}</td><td><button className="table-action" disabled={!trade.id} onClick={()=>trade.id&&setReplay({mode:"closed",symbol:String(trade.symbol),tradeId:Number(trade.id)})}>View Chart</button></td></tr>)}{!filteredClosedTrades.length&&<tr><td colSpan={9}>No trades match these filters.</td></tr>}</tbody></table></div>
-    </Card>
+    </Card></div>
     <TradeReplayModal target={replay} authToken={authToken} onClose={() => setReplay(null)} />
   </main>;
 }

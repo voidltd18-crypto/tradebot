@@ -373,3 +373,18 @@
 /* V18.2.17 Reports Explorer */
 .report-toolbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px}.range-tabs{display:flex;gap:7px;flex-wrap:wrap}.range-tabs button{background:#0b1324;color:#cbd5e1;border:1px solid #263450;padding:9px 14px}.range-tabs button.active{background:#38bdf8;color:#04111f}.equity-chart-clean{height:360px;margin-top:8px}.chart-empty{height:100%;min-height:260px;display:grid;place-content:center;text-align:center;gap:8px;color:#94a3b8}.chart-empty b{color:#dbeafe}.trade-filter-panel{display:grid;grid-template-columns:minmax(150px,1.2fr) minmax(150px,1fr) minmax(150px,1fr) auto;gap:12px;align-items:end;margin-bottom:12px;padding:14px;background:#080f1f;border:1px solid #263450;border-radius:16px}.trade-filter-panel label{display:grid;gap:6px}.trade-filter-panel label span{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#94a3b8;font-weight:800}.trade-filter-panel select,.trade-filter-panel input{width:100%}.filter-summary{display:flex;align-items:center;gap:9px;flex-wrap:wrap;color:#94a3b8;margin:4px 0 12px}.filter-summary b{color:#f8fafc}.compact-table tbody tr:hover{background:rgba(56,189,248,.045)}
 @media(max-width:760px){.trade-filter-panel{grid-template-columns:1fr 1fr}.trade-filter-panel label:first-child,.trade-filter-panel button{grid-column:1/-1}.equity-chart-clean{height:290px}.report-toolbar{align-items:flex-start;flex-direction:column}}
+
+
+/* V18.2.21 Interactive Trade Explorer */
+.equity-chart-clean { cursor: crosshair; }
+.chart-trade-selection { margin-top: 12px; display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:12px 14px; border:1px solid #263957; border-radius:12px; background:#0b1528; }
+.chart-trade-selection > div { display:flex; flex-direction:column; min-width:170px; }
+.chart-trade-selection span { color:#8fa6c5; font-size:12px; }
+.chart-trade-selection b { margin-top:3px; }
+.moment-filter-banner { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:10px 0; padding:10px 12px; border:1px solid #27527a; border-radius:10px; background:#0b1b30; }
+.moment-filter-banner .ghost { margin-left:auto; }
+.report-anchor { grid-column: 1 / -1; scroll-margin-top: 18px; }
+.report-anchor > * { width:100%; }
+.phone-layout .chart-trade-selection > div { min-width:140px; flex:1 1 140px; }
+.phone-layout .chart-trade-selection button { flex:1 1 100%; }
+.phone-layout .moment-filter-banner .ghost { width:100%; margin-left:0; }
