@@ -2844,6 +2844,13 @@ def v179_evaluate_decision_audit(limit: int = 200) -> Dict[str, Any]:
 
 def v179_decision_audit_summary(days: int = 7) -> Dict[str, Any]:
     days=max(1,min(int(days),365)); cutoff=(datetime.now(UTC)-timedelta(days=days)).isoformat()
+    # Keep the 7-day gate-effectiveness window, but show the complete current
+    # US regular-market session in the rejected-opportunities table.  The old
+    # LIMIT 100 caused early-session decisions to disappear as new scans arrived.
+    now_utc=datetime.now(UTC)
+    now_et=now_utc.astimezone(ZoneInfo("America/New_York"))
+    session_start_et=now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    session_start_utc=session_start_et.astimezone(UTC).isoformat()
     try:
         init_db(); conn=db_connect()
         rows=conn.execute("""SELECT stage,COUNT(DISTINCT decision_id) blocked,
@@ -2859,7 +2866,7 @@ def v179_decision_audit_summary(days: int = 7) -> Dict[str, Any]:
           MAX(CASE WHEN due_minutes=120 THEN return_pct END) return_2h,
           MAX(CASE WHEN classification='MISSED_WINNER' THEN 1 ELSE 0 END) missed,
           MAX(CASE WHEN classification='GOOD_BLOCK' THEN 1 ELSE 0 END) good
-          FROM v179_decision_audit WHERE decision_at>=? GROUP BY decision_id ORDER BY decision_id DESC LIMIT 100""",(cutoff,)).fetchall()
+          FROM v179_decision_audit WHERE decision_at>=? GROUP BY decision_id ORDER BY decision_id DESC""",(session_start_utc,)).fetchall()
         pending=int(conn.execute("SELECT COUNT(*) FROM v179_decision_audit WHERE status='PENDING'").fetchone()[0]); conn.close()
         gates=[]
         for r in rows:
@@ -2870,7 +2877,8 @@ def v179_decision_audit_summary(days: int = 7) -> Dict[str, Any]:
             d=dict(r); d['classification']='MISSED_WINNER' if d.pop('missed') else ('GOOD_BLOCK' if d.pop('good') else 'NEUTRAL'); items.append(d)
         return {"ok":True,"version":"V17.9","days":days,"advisoryOnly":True,"pendingCheckpoints":pending,
                 "thresholds":{"missedWinnerPct":V179_MISSED_WINNER_PCT,"goodBlockPct":V179_GOOD_BLOCK_PCT},
-                "gates":gates,"recent":items}
+                "recentWindow":"CURRENT_REGULAR_SESSION","recentSessionStart":session_start_utc,
+                "recentCount":len(items),"gates":gates,"recent":items}
     except Exception as exc:
         return {"ok":False,"version":"V17.9","error":str(exc),"gates":[],"recent":[]}
 
