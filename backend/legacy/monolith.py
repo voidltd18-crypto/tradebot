@@ -7561,6 +7561,7 @@ def build_status_payload(bot_name, scans):
         "fx": fx_payload(),
         "autoUniverse": auto_universe_payload(),
         "dynamicMarketScanner": dynamic_market_scanner_payload() if "dynamic_market_scanner_payload" in globals() else {},
+        "cycleMonitor": cycle_monitor_payload() if "cycle_monitor_payload" in globals() else {},
         "adaptiveUniverse": adaptive_universe_payload() if "adaptive_universe_payload" in globals() else {},
         "analytics": analytics_payload(),
         "optimiser": optimiser_payload(),
@@ -9321,6 +9322,162 @@ def backfill_trades(request: Request):
 
 
 # =========================
+# TRADEBOT V18.2.15 — CYCLE MONITOR
+# Persistent operational counters. Read-only visibility; no trading decisions.
+# =========================
+_CYCLE_MONITOR_LOCK = threading.RLock()
+_CYCLE_MONITOR_STARTED_AT = datetime.now(UTC).isoformat()
+_CYCLE_MONITOR_RUN: Dict[str, Dict[str, Any]] = {}
+_CYCLE_MONITOR_TABLE_READY = False
+_CYCLE_MONITOR_TABLE_LOCK = threading.Lock()
+_CYCLE_MONITOR_TYPES = ("bot", "scientist", "research", "advisor", "scanner")
+
+
+def _cycle_monitor_ensure_table() -> None:
+    global _CYCLE_MONITOR_TABLE_READY
+    if not SQLITE_ENABLED or _CYCLE_MONITOR_TABLE_READY:
+        return
+    with _CYCLE_MONITOR_TABLE_LOCK:
+        if _CYCLE_MONITOR_TABLE_READY:
+            return
+        conn = None
+        try:
+            conn = db_connect()
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS v18215_cycle_monitor (
+                    cycle_name TEXT PRIMARY KEY,
+                    lifetime_completed INTEGER NOT NULL DEFAULT 0,
+                    lifetime_failed INTEGER NOT NULL DEFAULT 0,
+                    last_started_at TEXT,
+                    last_completed_at TEXT,
+                    last_failed_at TEXT,
+                    last_duration_ms REAL NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+            _CYCLE_MONITOR_TABLE_READY = True
+        finally:
+            if conn is not None:
+                conn.close()
+
+
+def _cycle_monitor_start(name: str) -> float:
+    key = str(name or "unknown").lower()
+    started = time.monotonic()
+    with _CYCLE_MONITOR_LOCK:
+        row = _CYCLE_MONITOR_RUN.setdefault(key, {"completed": 0, "failed": 0})
+        row["lastStartedAt"] = datetime.now(UTC).isoformat()
+        row["state"] = "RUNNING"
+    return started
+
+
+def _cycle_monitor_finish(name: str, started: float, ok: bool = True, error: str = "") -> None:
+    key = str(name or "unknown").lower()
+    now = datetime.now(UTC).isoformat()
+    duration_ms = max(0.0, (time.monotonic() - started) * 1000.0)
+    with _CYCLE_MONITOR_LOCK:
+        row = _CYCLE_MONITOR_RUN.setdefault(key, {"completed": 0, "failed": 0})
+        if ok:
+            row["completed"] = int(row.get("completed", 0)) + 1
+            row["lastCompletedAt"] = now
+            row["state"] = "WAITING"
+            row["lastError"] = ""
+        else:
+            row["failed"] = int(row.get("failed", 0)) + 1
+            row["lastFailedAt"] = now
+            row["state"] = "ERROR"
+            row["lastError"] = str(error or "")[:500]
+        row["lastDurationMs"] = round(duration_ms, 1)
+    if not SQLITE_ENABLED:
+        return
+    conn = None
+    try:
+        _cycle_monitor_ensure_table()
+        conn = db_connect()
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("""
+            INSERT INTO v18215_cycle_monitor (
+                cycle_name,lifetime_completed,lifetime_failed,last_started_at,last_completed_at,
+                last_failed_at,last_duration_ms,last_error,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(cycle_name) DO UPDATE SET
+                lifetime_completed=lifetime_completed + excluded.lifetime_completed,
+                lifetime_failed=lifetime_failed + excluded.lifetime_failed,
+                last_started_at=excluded.last_started_at,
+                last_completed_at=CASE WHEN excluded.lifetime_completed > 0 THEN excluded.last_completed_at ELSE last_completed_at END,
+                last_failed_at=CASE WHEN excluded.lifetime_failed > 0 THEN excluded.last_failed_at ELSE last_failed_at END,
+                last_duration_ms=excluded.last_duration_ms,
+                last_error=excluded.last_error,
+                updated_at=excluded.updated_at
+        """, (key, 1 if ok else 0, 0 if ok else 1,
+              _CYCLE_MONITOR_RUN.get(key, {}).get("lastStartedAt"), now if ok else None,
+              None if ok else now, duration_ms, "" if ok else str(error or "")[:500], now))
+        conn.commit()
+    except Exception as exc:
+        # Monitoring must never interfere with the bot or recursively fail a worker.
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:
+            pass
+        print(f"V18.2.15 CYCLE MONITOR SAVE ERROR | cycle={key} error={exc}")
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def cycle_monitor_payload() -> Dict[str, Any]:
+    persistent: Dict[str, Dict[str, Any]] = {}
+    if SQLITE_ENABLED:
+        conn = None
+        try:
+            _cycle_monitor_ensure_table()
+            conn = db_connect()
+            rows = conn.execute("SELECT * FROM v18215_cycle_monitor").fetchall()
+            for raw in rows:
+                d = dict(raw)
+                persistent[str(d.get("cycle_name") or "")] = d
+        except Exception as exc:
+            persistent["_error"] = {"error": str(exc)}
+        finally:
+            if conn is not None:
+                conn.close()
+    with _CYCLE_MONITOR_LOCK:
+        runtime = {k: dict(v) for k, v in _CYCLE_MONITOR_RUN.items()}
+    cycles = {}
+    for name in _CYCLE_MONITOR_TYPES:
+        live = runtime.get(name, {})
+        saved = persistent.get(name, {})
+        cycles[name] = {
+            "thisRunCompleted": int(live.get("completed", 0)),
+            "thisRunFailed": int(live.get("failed", 0)),
+            "lifetimeCompleted": int(saved.get("lifetime_completed", 0) or 0),
+            "lifetimeFailed": int(saved.get("lifetime_failed", 0) or 0),
+            "state": live.get("state", "WAITING"),
+            "lastStartedAt": live.get("lastStartedAt") or saved.get("last_started_at"),
+            "lastCompletedAt": live.get("lastCompletedAt") or saved.get("last_completed_at"),
+            "lastFailedAt": live.get("lastFailedAt") or saved.get("last_failed_at"),
+            "lastDurationMs": float(live.get("lastDurationMs", saved.get("last_duration_ms", 0)) or 0),
+            "lastError": live.get("lastError") or saved.get("last_error") or "",
+        }
+    return {
+        "ok": True,
+        "version": "V18.2.15 Cycle Monitor",
+        "startedAt": _CYCLE_MONITOR_STARTED_AT,
+        "uptimeSeconds": max(0, int((datetime.now(UTC) - datetime.fromisoformat(_CYCLE_MONITOR_STARTED_AT)).total_seconds())),
+        "cycles": cycles,
+    }
+
+
+@app.get("/cycle-monitor")
+def api_cycle_monitor(request: Request):
+    verify_api_key(request)
+    return cycle_monitor_payload()
+
+
+# =========================
 # LOOP
 # =========================
 def _ai_research_market_open() -> Optional[bool]:
@@ -9363,6 +9520,7 @@ def closed_market_ai_research_worker() -> None:
                 time.sleep(min(60, AI_RESEARCH_INTERVAL_SECONDS))
                 continue
 
+            _research_cycle_started = _cycle_monitor_start("research")
             started = datetime.now(UTC).isoformat()
             seeded = v2_seed_missing_outcomes()
             outcomes = v2_drain_due_outcomes()
@@ -9382,7 +9540,10 @@ def closed_market_ai_research_worker() -> None:
                 f"v11_discovery={bool(v11_result.get('ranDiscovery'))} "
                 "live_changes=False"
             )
+            _cycle_monitor_finish("research", _research_cycle_started, True)
         except Exception as exc:
+            if "_research_cycle_started" in locals():
+                _cycle_monitor_finish("research", _research_cycle_started, False, str(exc))
             print(f"AI NIGHT RESEARCH ERROR: {exc}")
         time.sleep(60)
 
@@ -9887,6 +10048,7 @@ def run_bot_loop():
     update_status(BOT_NAME, [])
 
     while True:
+        _cycle_started = _cycle_monitor_start("bot")
         try:
             with bot_lock:
                 reset_daily_flags_if_needed()
@@ -9913,6 +10075,7 @@ def run_bot_loop():
                 if not market_state.get("isOpen"):
                     print("Market closed. Waiting...")
                     update_status(BOT_NAME, latest_scans)
+                    _cycle_monitor_finish("bot", _cycle_started, True)
                     time.sleep(CHECK_INTERVAL)
                     continue
 
@@ -9969,9 +10132,11 @@ def run_bot_loop():
                             print(result)
                 update_status(BOT_NAME, scans)
 
+            _cycle_monitor_finish("bot", _cycle_started, True)
             time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
+            _cycle_monitor_finish("bot", _cycle_started, False, str(e))
             print(f"Main loop error: {e}")
             time.sleep(10)
 
@@ -10900,6 +11065,7 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
     if not force and _dynamic_cache_age_seconds() < DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS:
         return _load_dynamic_scanner_cache()
 
+    _scanner_cycle_started = _cycle_monitor_start("scanner")
     rows_by_symbol: Dict[str, Dict[str, Any]] = {}
     errors = []
 
@@ -10947,7 +11113,9 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
         },
         "error": " | ".join(errors[-3:]),
     }
-    return _save_dynamic_scanner_cache(payload)
+    saved_payload = _save_dynamic_scanner_cache(payload)
+    _cycle_monitor_finish("scanner", _scanner_cycle_started, True)
+    return saved_payload
 
 
 def refresh_dynamic_market_candidates_if_needed() -> Dict[str, Any]:
@@ -16329,6 +16497,7 @@ def ai_periodic_summary_worker() -> None:
     time.sleep(AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS)
     while True:
         try:
+            _advisor_cycle_started = _cycle_monitor_start("advisor")
             summary = ai_periodic_summary_payload()
             d = summary["decisionsToday"]
             sh = summary["shadow"]
@@ -16344,7 +16513,10 @@ def ai_periodic_summary_worker() -> None:
                 f"validated=+{adv.get('validatedPositive',0)}/-{adv.get('validatedNegative',0)} "
                 f"learning_runs={adv.get('learningRuns',0)} live_changes=False"
             )
+            _cycle_monitor_finish("advisor", _advisor_cycle_started, True)
         except Exception as exc:
+            if "_advisor_cycle_started" in locals():
+                _cycle_monitor_finish("advisor", _advisor_cycle_started, False, str(exc))
             print(f"AI ADVISOR SUMMARY ERROR: {exc}")
         time.sleep(AI_SUMMARY_LOG_INTERVAL_SECONDS)
 
@@ -18990,9 +19162,13 @@ def _v14_scientist_worker() -> None:
     time.sleep(V14_SCIENTIST_STARTUP_DELAY_SECONDS)
     while True:
         try:
+            _scientist_cycle_started = _cycle_monitor_start("scientist")
             result=v14_scientist_refresh(); s=result["summary"]
             print(f"V14 SCIENTIST | hypotheses={s['hypotheses']} experiments={s['experiments']} shadow_ready={s['shadowReady']} board_eligible={s['boardEligible']}")
+            _cycle_monitor_finish("scientist", _scientist_cycle_started, True)
         except Exception as exc:
+            if "_scientist_cycle_started" in locals():
+                _cycle_monitor_finish("scientist", _scientist_cycle_started, False, str(exc))
             print(f"V14 SCIENTIST WORKER ERROR: {exc}")
         time.sleep(V14_SCIENTIST_INTERVAL_SECONDS)
 

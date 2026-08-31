@@ -10,6 +10,8 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
   const finalGate = data?.finalGateMonitor || {};
   const shadow = data?.shadow || data?.shadowTrading || {};
   const outcomes = Number(data?.ai?.outcomes || data?.learning?.outcomes || data?.outcomes || 0);
+  const cycleMonitor = data?.cycleMonitor || {};
+  const cycleRows = cycleMonitor?.cycles || {};
 
   const systems = [
     ["V6 Outcome Engine", "OPERATIONAL"],
@@ -68,6 +70,14 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
         <div className="system-list">{systems.map(([name, state]) => <div key={name}><span className="system-check">✓</span><span>{name}</span><b>{state}</b></div>)}</div>
       </Card>
 
+
+      <Card title="Cycle Monitor" className="command-panel cycle-monitor-panel">
+        <div className="research-badge">LIVE</div>
+        <div className="summary compact-summary">
+          {[["Bot", "bot"], ["Scientist", "scientist"], ["Research", "research"], ["Advisor", "advisor"], ["Scanner", "scanner"]].map(([label, key]) => { const row = cycleRows?.[key] || {}; return <div key={key}><span>{label}</span><b>{Number(row.thisRunCompleted || 0)} run · {Number(row.thisRunFailed || 0)} failed</b><small>Lifetime {Number(row.lifetimeCompleted || 0).toLocaleString("en-GB")} · {row.lastCompletedAt ? formatClock(row.lastCompletedAt) : "waiting"}</small></div>; })}
+          <div><span>Current uptime</span><b>{Math.floor(Number(cycleMonitor?.uptimeSeconds || 0) / 3600)}h {Math.floor((Number(cycleMonitor?.uptimeSeconds || 0) % 3600) / 60)}m</b></div>
+        </div>
+      </Card>
       <Card title="AI Research & Learning" className="command-panel research-panel">
         <div className="research-badge">ACTIVE</div>
         <div className="summary compact-summary">
