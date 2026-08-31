@@ -3680,7 +3680,7 @@ def v17_live_entry_gate_pipeline(
     planner can never rank a symbol that Sniper/A+/Reputation/Trigger/V2 would
     reject.  Read-only callers disable persistence to avoid duplicate learning.
     """
-    raw = list(scans or [])
+    raw = _prioritize_first_dibs_rows(scans)
     survivors = pick_money_mode_stocks(
         raw,
         approval_decision=approval_decision,
@@ -4620,6 +4620,24 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         )
 
     ranked.sort(key=lambda item: (-item["portfolioScore"], -item["confidence"], item["spread"]))
+
+    # V18.2.16 FIRST DIBS: MARA (or configured preferred symbol) only receives
+    # priority *after* normal score qualification. If it fails any gate or the
+    # portfolio minimum, it is absent from `ranked` and receives no preference.
+    preferred = _first_dibs_symbol()
+    if preferred:
+        original_rank = next((i + 1 for i, item in enumerate(ranked) if str(item.get("symbol") or "").upper() == preferred), None)
+        if original_rank is not None and original_rank > 1:
+            ranked = sorted(ranked, key=lambda item: 0 if str(item.get("symbol") or "").upper() == preferred else 1)
+            print(
+                f"V18.2.16 FIRST DIBS | symbol={preferred} result=QUALIFIED_PRIORITY "
+                f"original_rank={original_rank} final_rank=1 score={float(ranked[0].get('portfolioScore') or 0.0):.3f}"
+            )
+        elif original_rank == 1:
+            print(
+                f"V18.2.16 FIRST DIBS | symbol={preferred} result=QUALIFIED_ALREADY_FIRST "
+                f"final_rank=1 score={float(ranked[0].get('portfolioScore') or 0.0):.3f}"
+            )
     qualified_ranked = list(ranked)
     actionable_ranked = qualified_ranked[:order_limit] if order_limit > 0 else []
     actionable_symbols = {item["symbol"] for item in actionable_ranked}
@@ -10093,7 +10111,12 @@ def run_bot_loop():
                         print(f"V2 OUTCOME LOOP ERROR: {e}")
 
                 scans = []
-                for symbol in current_universe:
+                preferred_scan_symbol = _first_dibs_symbol()
+                scan_order = sorted(
+                    list(current_universe),
+                    key=lambda sym: 0 if preferred_scan_symbol and str(sym).upper() == preferred_scan_symbol else 1,
+                )
+                for symbol in scan_order:
                     try:
                         scan = compute_scan(symbol)
                         scans.append(scan)
@@ -11168,6 +11191,30 @@ def api_dynamic_market_scanner_refresh(request: Request):
 # whole scanner. Fresh broad-market discoveries compete for most runtime slots.
 # No entry, sizing, daily-lock or exit gate is bypassed by this layer.
 ADAPTIVE_UNIVERSE_ENABLED = os.getenv("ADAPTIVE_UNIVERSE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+# V18.2.16 MARA FIRST DIBS
+# The preferred symbol is always kept in the adaptive scan set (where capacity
+# allows), scanned first, and promoted to portfolio rank #1 only *after* it has
+# passed every normal live entry gate and the portfolio minimum score. Nothing
+# here bypasses account/PDT/daily locks, reputation, Sniper, A+, trigger, V2,
+# portfolio score, or the final execution lock.
+FIRST_DIBS_SYMBOL = str(os.getenv("TRADEBOT_FIRST_DIBS_SYMBOL", "MARA") or "MARA").upper().strip()
+FIRST_DIBS_ENABLED = os.getenv("TRADEBOT_FIRST_DIBS_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+def _first_dibs_symbol() -> str:
+    return FIRST_DIBS_SYMBOL if FIRST_DIBS_ENABLED else ""
+
+def _prioritize_first_dibs_rows(rows):
+    """Stable priority: move the configured symbol to the front, if present.
+
+    This function never adds eligibility; it only changes evaluation/ranking
+    order for a symbol that is already present in the supplied rows.
+    """
+    preferred = _first_dibs_symbol()
+    items = list(rows or [])
+    if not preferred:
+        return items
+    return sorted(items, key=lambda row: 0 if str((row or {}).get("symbol") or "").upper().strip() == preferred else 1)
 ADAPTIVE_UNIVERSE_TARGET_SIZE = max(6, int(os.getenv("ADAPTIVE_UNIVERSE_TARGET_SIZE", str(AUTO_UNIVERSE_SIZE)) or AUTO_UNIVERSE_SIZE))
 ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS = max(1, min(ADAPTIVE_UNIVERSE_TARGET_SIZE, int(os.getenv("ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS", "8") or 8)))
 ADAPTIVE_UNIVERSE_CORE_SLOTS = max(0, min(ADAPTIVE_UNIVERSE_TARGET_SIZE, int(os.getenv("ADAPTIVE_UNIVERSE_CORE_SLOTS", "4") or 4)))
@@ -11323,6 +11370,18 @@ def refresh_adaptive_universe(force: bool = False) -> Dict[str, Any]:
         if sym not in seen and sym not in globals().get("BLOCKED_WEAK_TICKERS", set()):
             add_row({"symbol": sym, "score": 998.0, "reason": "manual pin | retained in adaptive universe", "manualPick": True}, "PIN")
 
+    # V18.2.16: reserve one runtime scan slot for the first-dibs symbol so it
+    # cannot disappear during an adaptive rotation. It still has to pass every
+    # live gate before it can be ranked or bought.
+    preferred = _first_dibs_symbol()
+    if preferred and preferred not in seen:
+        add_row({
+            "symbol": preferred,
+            "score": 997.0,
+            "reason": "first dibs watch | checked first but never bypasses gates",
+            "firstDibs": True,
+        }, "PRIORITY")
+
     discovery_added = 0
     for row in discoveries:
         if len(selected) >= ADAPTIVE_UNIVERSE_TARGET_SIZE or discovery_added >= ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS:
@@ -11376,6 +11435,9 @@ def refresh_adaptive_universe(force: bool = False) -> Dict[str, Any]:
         "coreCount": len([r for r in selected if r.get("adaptiveSource") == "CORE"]),
         "heldCount": len([r for r in selected if r.get("adaptiveSource") == "HELD"]),
         "pinCount": len([r for r in selected if r.get("adaptiveSource") == "PIN"]),
+        "priorityCount": len([r for r in selected if r.get("adaptiveSource") == "PRIORITY"]),
+        "firstDibsEnabled": bool(FIRST_DIBS_ENABLED),
+        "firstDibsSymbol": _first_dibs_symbol() or None,
         "symbols": list(current_universe),
         "activeSymbols": list(current_universe),
         "rows": selected,
