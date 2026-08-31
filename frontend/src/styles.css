@@ -388,3 +388,10 @@
 .phone-layout .chart-trade-selection > div { min-width:140px; flex:1 1 140px; }
 .phone-layout .chart-trade-selection button { flex:1 1 100%; }
 .phone-layout .moment-filter-banner .ghost { width:100%; margin-left:0; }
+
+
+/* V18.2.22 Chart Click Fix */
+.interactive-equity-chart .recharts-wrapper,
+.interactive-equity-chart .recharts-surface { cursor: crosshair; }
+.interactive-equity-chart .recharts-active-dot { cursor: pointer; }
+.chart-trade-selection { scroll-margin-top: 90px; }
