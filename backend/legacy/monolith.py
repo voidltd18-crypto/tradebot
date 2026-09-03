@@ -801,13 +801,122 @@ def reset_daily_flags_if_needed():
             pass
 
 
+# V18.2.27 — MARA TWO-ENTRY DAILY ALLOWANCE
+# MARA is the only symbol allowed two submitted/filled BUY entries per trading
+# day. Every other symbol keeps the existing one-cycle-per-day behaviour.
+# The first MARA exit deliberately does not arm the next-day symbol lock; after
+# the second MARA entry/exit the normal daily lock applies again. All normal
+# entry gates, max-position limits, sizing, stops and exit rules remain intact.
+MARA_DAILY_ENTRY_LIMIT = max(2, int(os.getenv("TRADEBOT_MARA_DAILY_ENTRY_LIMIT", "2") or 2))
+_MARA_DB_BUY_COUNT_CACHE = {"day": "", "count": 0, "checked_at": 0.0}
+
+
+def _today_symbol_buy_count_from_db(symbol: str) -> int:
+    """Count actual filled Alpaca BUY orders for today when available.
+
+    Bot timeline rows are written at order submission and can have qty=0, while
+    Alpaca backfill rows carry the real order id/filled qty. Restricting this DB
+    count to positive-qty rows with an Alpaca order id avoids counting the
+    timeline copy twice.
+    """
+    sym = str(symbol or "").upper().strip()
+    if not (SQLITE_ENABLED and sym):
+        return 0
+    # is_locked_today() is a scanner hot path. Cache this resilience lookup so
+    # the MARA exception does not turn every scan into a SQLite read.
+    if sym == "MARA":
+        day = today_str()
+        now_mono = time.monotonic()
+        if (
+            _MARA_DB_BUY_COUNT_CACHE.get("day") == day
+            and now_mono - float(_MARA_DB_BUY_COUNT_CACHE.get("checked_at") or 0.0) < 60.0
+        ):
+            return int(_MARA_DB_BUY_COUNT_CACHE.get("count") or 0)
+    try:
+        init_db()
+        conn = db_connect()
+        row = conn.execute(
+            """SELECT COUNT(DISTINCT alpaca_order_id) AS n
+               FROM trades
+               WHERE day=? AND UPPER(symbol)=? AND side='BUY'
+                 AND qty > ?
+                 AND alpaca_order_id IS NOT NULL
+                 AND TRIM(alpaca_order_id) <> ''""",
+            (today_str(), sym, float(DUST_THRESHOLD)),
+        ).fetchone()
+        conn.close()
+        count = int((row["n"] if row else 0) or 0)
+        if sym == "MARA":
+            _MARA_DB_BUY_COUNT_CACHE.update({"day": today_str(), "count": count, "checked_at": time.monotonic()})
+        return count
+    except Exception:
+        return 0
+
+
+def today_symbol_buy_count(symbol: str) -> int:
+    """Best available count of successful BUY submissions/fills today.
+
+    trade_history survives a restart and receives one row after submit_order()
+    succeeds. The DB count catches filled Alpaca orders after sync/backfill. We
+    take the larger count instead of adding them because they represent the same
+    orders through two persistence paths.
+    """
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return 0
+    day = today_str()
+    history_count = sum(
+        1 for event in trade_history
+        if str(event.get("symbol") or "").upper().strip() == sym
+        and str(event.get("side") or "").upper() == "BUY"
+        and event.get("day") == day
+    )
+    live_count = sum(
+        1 for event in trade_events
+        if str(event.get("symbol") or "").upper().strip() == sym
+        and str(event.get("side") or "").upper() == "BUY"
+        and event.get("day") == day
+    )
+    return max(history_count, live_count, _today_symbol_buy_count_from_db(sym))
+
+
+def daily_symbol_entry_limit(symbol: str) -> int:
+    return MARA_DAILY_ENTRY_LIMIT if str(symbol or "").upper().strip() == "MARA" else 1
+
+
+def mara_second_entry_eligible() -> bool:
+    return today_symbol_buy_count("MARA") < MARA_DAILY_ENTRY_LIMIT
+
+
 def lock_symbol_until_tomorrow(symbol: str):
-    if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY:
-        locked_today[symbol] = today_str()
+    if not STRICT_ONE_CYCLE_PER_STOCK_PER_DAY:
+        return
+    sym = str(symbol or "").upper().strip()
+    if sym == "MARA":
+        buys = today_symbol_buy_count(sym)
+        if buys < MARA_DAILY_ENTRY_LIMIT:
+            # First MARA cycle is complete: explicitly keep MARA unlocked so it
+            # can compete for one fresh, fully-qualified second setup.
+            locked_today.pop(sym, None)
+            print(
+                f"V18.2.27 MARA DAILY ALLOWANCE | filled_entries={buys}/{MARA_DAILY_ENTRY_LIMIT} "
+                "second_entry_eligible=True daily_lock=BYPASSED_FOR_MARA_ONLY"
+            )
+            return
+        locked_today[sym] = today_str()
+        print(
+            f"V18.2.27 MARA DAILY ALLOWANCE | filled_entries={buys}/{MARA_DAILY_ENTRY_LIMIT} "
+            "daily_lock=ACTIVE unlock=NEXT_TRADING_DAY"
+        )
+        return
+    locked_today[sym] = today_str()
 
 
 def is_locked_today(symbol: str):
-    return locked_today.get(symbol) == today_str()
+    sym = str(symbol or "").upper().strip()
+    if sym == "MARA" and today_symbol_buy_count(sym) < MARA_DAILY_ENTRY_LIMIT:
+        return False
+    return locked_today.get(sym) == today_str()
 
 
 def floor_qty(qty: float, decimals: int = 6):
@@ -1703,13 +1812,20 @@ def proposed_buy_qty(scan: Dict[str, Any]) -> float:
 
 
 def can_buy_symbol(symbol: str):
-    if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and is_locked_today(symbol):
-        return False, f"{symbol} locked until tomorrow"
-    if has_open_order(symbol):
-        return False, f"{symbol} existing open order"
-    qty, _ = get_position(symbol)
+    sym = str(symbol or "").upper().strip()
+    # V18.2.27: MARA may submit at most two successful entries in one trading
+    # day. This hard cap is checked independently of the sell-driven lock so an
+    # external/manual position close cannot accidentally create a third entry.
+    if sym == "MARA" and today_symbol_buy_count(sym) >= MARA_DAILY_ENTRY_LIMIT:
+        locked_today[sym] = today_str()
+        return False, f"{sym} locked until tomorrow (MARA daily entries {MARA_DAILY_ENTRY_LIMIT}/{MARA_DAILY_ENTRY_LIMIT})"
+    if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and is_locked_today(sym):
+        return False, f"{sym} locked until tomorrow"
+    if has_open_order(sym):
+        return False, f"{sym} existing open order"
+    qty, _ = get_position(sym)
     if qty > DUST_THRESHOLD:
-        return False, f"{symbol} already holding"
+        return False, f"{sym} already holding"
     return True, ""
 
 
@@ -1773,6 +1889,18 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
     }
     trade_events.append(event)
     add_trade_history_event(event)
+    if str(symbol or "").upper().strip() == "MARA":
+        mara_buys = today_symbol_buy_count("MARA")
+        _MARA_DB_BUY_COUNT_CACHE.update({
+            "day": today_str(),
+            "count": max(int(_MARA_DB_BUY_COUNT_CACHE.get("count") or 0), mara_buys),
+            "checked_at": time.monotonic(),
+        })
+        remaining = max(0, MARA_DAILY_ENTRY_LIMIT - mara_buys)
+        print(
+            f"V18.2.27 MARA DAILY ALLOWANCE | filled_entries={mara_buys}/{MARA_DAILY_ENTRY_LIMIT} "
+            f"remaining={remaining} daily_lock={'READY_AFTER_EXIT' if remaining > 0 else 'LIMIT_REACHED'}"
+        )
     notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
 
 
@@ -7039,6 +7167,12 @@ def restore_today_sell_locks_from_db() -> List[str]:
         for row in rows:
             symbol = str(row["symbol"] or "").upper().strip()
             if not symbol:
+                continue
+            # V18.2.27: a restart after MARA's first completed cycle must not
+            # resurrect the old one-cycle lock. Only restore MARA after its
+            # second daily entry has been used. Other symbols are unchanged.
+            if symbol == "MARA" and today_symbol_buy_count(symbol) < MARA_DAILY_ENTRY_LIMIT:
+                locked_today.pop(symbol, None)
                 continue
             if not is_locked_today(symbol):
                 locked_today[symbol] = today_str()
