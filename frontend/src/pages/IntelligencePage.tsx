@@ -271,7 +271,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         }
       };
       await Promise.all(Array.from({ length: Math.min(3, Math.max(1, queue.length)) }, () => worker()));
-      setLastUpdated(new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
+      setLastUpdated(new Date().toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour: "2-digit", minute: "2-digit", second: "2-digit" }));
     } finally {
       setRefreshing(false);
     }
@@ -402,7 +402,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       : operatorStableRuns >= operatorRequiredRuns
         ? "READY FOR CLOSED-MARKET APPLY"
         : "COLLECTING STABLE EVIDENCE";
-  const operatorLastRun = operator.lastRunAt ? new Date(String(operator.lastRunAt)).toLocaleString("en-GB") : "Not run yet";
+  const operatorLastRun = operator.lastRunAt ? new Date(String(operator.lastRunAt)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "Not run yet";
   const operatorHistory = firstArray(operator.history);
   const evolutionActions = [...operatorHistory].reverse().map((row, index) => {
     const before = firstObject(row.before);
@@ -578,7 +578,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     ];
   const rawCeoJournal = firstArray(ceoJournalData.items, ceoBackend.journal);
   const ceoJournal = rawCeoJournal.length ? rawCeoJournal.map((entry) => ({
-    time: entry.created_at ? new Date(String(entry.created_at)).toLocaleString("en-GB", { dateStyle: "short", timeStyle: "medium" }) : text(entry.day, "Recorded"),
+    time: entry.created_at ? new Date(String(entry.created_at)).toLocaleString("en-GB", { timeZone: "Europe/London", dateStyle: "short", timeStyle: "medium" }) : text(entry.day, "Recorded"),
     title: text(entry.title, keyLabel(text(entry.category, "CEO event"))),
     detail: text(entry.detail, "No detail recorded."),
     severity: text(entry.severity, "INFO"),
@@ -589,7 +589,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const ceoReviewRows = firstArray(ceoReviewsData.items);
   const ceoManualActionRequired = ceoBackend.manualActionRequired === true;
   const ceoGradeLetter = text(ceoBackend.gradeLetter, "—");
-  const ceoCreatedAt = ceoBackend.createdAt ? new Date(String(ceoBackend.createdAt)).toLocaleString("en-GB") : "Not generated yet";
+  const ceoCreatedAt = ceoBackend.createdAt ? new Date(String(ceoBackend.createdAt)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "Not generated yet";
 
   const refreshAll = async () => {
     await Promise.all([load(true), fetchData(true)]);
@@ -693,7 +693,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
 
       // One atomic state publication means the PDF render cannot mix old and new endpoint data.
       setSources((previous) => ({ ...previous, ...results }));
-      setLastUpdated(new Date().toLocaleTimeString("en-GB"));
+      setLastUpdated(new Date().toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false }));
       setExportProgress("Rendering complete snapshot…");
       setExportingPdf(true);
 
@@ -860,7 +860,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <div className="intelligence-stat-grid">
         <StatTile label="Intelligence Health" value={`${intelligenceHealth}%`} sub={lastUpdated ? `Updated ${lastUpdated}` : "Connecting"} />
         <StatTile label="Market Regime" value={text(advisor.marketRegime ?? marketDna.currentRegime ?? weekly.currentRegime ?? marketRegime)} />
-        <StatTile label="Evidence Collected" value={evidenceCount.toLocaleString("en-GB")} sub={`${discoveryCount.toLocaleString("en-GB")} discoveries`} />
+        <StatTile label="Evidence Collected" value={evidenceCount.toLocaleString("en-GB", { timeZone: "Europe/London" })} sub={`${discoveryCount.toLocaleString("en-GB", { timeZone: "Europe/London" })} discoveries`} />
         <StatTile label="Decision Confidence" value={`${Math.round(aiConfidence)}%`} />
       </div>
     </Card>
@@ -883,7 +883,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <div><span>Market source</span><b>{text(fullBotMarket.source, "—")}</b></div>
           <div><span>Open positions</span><b>{fullBotPositions.length}</b></div>
           <div><span>Current universe</span><b>{(Array.isArray(liveStatus.universe) ? liveStatus.universe.length : Array.isArray(liveStatus.currentUniverse) ? liveStatus.currentUniverse.length : fullBotAdaptiveRows.length)}</b></div>
-          <div><span>Report generated</span><b>{new Date().toLocaleString("en-GB")}</b></div>
+          <div><span>Report generated</span><b>{new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>
         </div>
       </Card>
       <Card title="Profit Vault">
@@ -1027,7 +1027,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
       <Card title="Recent Rejected Opportunities" wide>
         {firstArray(auditData.recent).length ? <DataTable rows={firstArray(auditData.recent).slice(0,30)} columns={[
-          { key: "decision_at", label: "Time", render: (row) => text(row.decision_at ? new Date(String(row.decision_at)).toLocaleString("en-GB") : "—") },
+          { key: "decision_at", label: "Time", render: (row) => text(row.decision_at ? new Date(String(row.decision_at)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "—") },
           { key: "symbol", label: "Symbol" }, { key: "stage", label: "Gate" },
           { key: "return_15m", label: "15m", render: (row) => row.return_15m == null ? "—" : `${num(row.return_15m).toFixed(2)}%` },
           { key: "return_30m", label: "30m", render: (row) => row.return_30m == null ? "—" : `${num(row.return_30m).toFixed(2)}%` },
@@ -1147,8 +1147,8 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         <div className="summary">
           <div><span>Autonomy</span><b>{text(backendEvolution.mode, operator.mode)}</b></div>
           <div><span>Calibration</span><b>{Math.round(pct(backendLearning.confidenceCalibration ?? calibration))}%</b></div>
-          <div><span>Completed outcomes</span><b>{num(backendLearning.completedOutcomes, evidenceCount).toLocaleString("en-GB")}</b></div>
-          <div><span>Ready outcomes</span><b>{num(backendLearning.readyOutcomes).toLocaleString("en-GB")}</b></div>
+          <div><span>Completed outcomes</span><b>{num(backendLearning.completedOutcomes, evidenceCount).toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>
+          <div><span>Ready outcomes</span><b>{num(backendLearning.readyOutcomes).toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>
         </div>
       </Card>
 
@@ -1177,7 +1177,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
 
       <Card title="CEO Review History">
         <DataTable rows={ceoReviewRows.slice(0, 10)} columns={[
-          { key: "created_at", label: "Date", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB") : "—" },
+          { key: "created_at", label: "Date", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "—" },
           { key: "review_type", label: "Type" },
           { key: "grade_letter", label: "Grade", render: (row) => `${text(row.grade_letter, "—")} (${num(row.grade).toFixed(1)})` },
           { key: "risk_level", label: "Risk" },
@@ -1222,7 +1222,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="Board Next Action" className="ceo-decision-card">
         <span className={`pill ${boardStatus.finalDecision === "VETO" ? "bad" : boardStatus.finalDecision === "DELAY" ? "warn" : "ok"}`}>{text(boardStatus.finalDecision, "PENDING")}</span>
         <h3>{text(boardStatus.nextAction, "Waiting for the first automatic board review.")}</h3>
-        <p className="muted">Meeting type: {text(boardStatus.meetingType, "—")} · {boardStatus.createdAt ? new Date(String(boardStatus.createdAt)).toLocaleString("en-GB") : "—"}</p>
+        <p className="muted">Meeting type: {text(boardStatus.meetingType, "—")} · {boardStatus.createdAt ? new Date(String(boardStatus.createdAt)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "—"}</p>
       </Card>
 
       <Card title="Director Votes" wide>
@@ -1236,7 +1236,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
 
       <Card title="Board Meeting History" wide>
         <DataTable rows={firstArray(boardHistoryData.items).slice(0, 15)} columns={[
-          { key: "created_at", label: "Date", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB") : "—" },
+          { key: "created_at", label: "Date", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "—" },
           { key: "meeting_type", label: "Meeting" },
           { key: "final_decision", label: "Decision" },
           { key: "ceo_grade", label: "CEO Grade", render: (row) => num(row.ceo_grade).toFixed(1) },
@@ -1301,7 +1301,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         </div> : <div className="operator-no-change">No parameter change is currently proposed.</div>}
 
         <div className="operator-evidence-grid">
-          <div><span>Evidence samples</span><b>{num(operatorProposal.evidenceSamples).toLocaleString("en-GB")}</b></div>
+          <div><span>Evidence samples</span><b>{num(operatorProposal.evidenceSamples).toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>
           <div><span>Eligible</span><b>{operatorEligible ? "YES" : "NO"}</b></div>
           <div><span>Automatic changes</span><b>{text(operator.mode, "SHADOW") === "AUTO" ? "ENABLED" : "DISABLED"}</b></div>
           <div><span>Rollback protection</span><b>ACTIVE</b></div>
@@ -1344,7 +1344,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <div><span>Proposed confidence gate</span><b>{Object.keys(promotionCandidate).length ? num(promotionCandidate.confidence).toFixed(2) : "—"}</b></div>
           <div><span>Current quality gate</span><b>{num(promotion.current?.quality).toFixed(3)}</b></div>
           <div><span>Proposed quality gate</span><b>{Object.keys(promotionCandidate).length ? num(promotionCandidate.quality).toFixed(3) : "—"}</b></div>
-          <div><span>Samples</span><b>{num(promotionCandidate.samples).toLocaleString("en-GB")}</b></div>
+          <div><span>Samples</span><b>{num(promotionCandidate.samples).toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>
           <div><span>Candidate expectancy</span><b>{num(promotionCandidate.expectancyPct).toFixed(2)}%</b></div>
           <div><span>Profit factor</span><b>{num(promotionCandidate.profitFactor).toFixed(2)}</b></div>
           <div><span>Stability</span><b>{num(promotionLatest.matching_runs ?? promotionOptimizer.stability?.matchingRuns)} / {num(promotionLatest.required_runs ?? promotionOptimizer.stability?.requiredRuns)}</b></div>
@@ -1376,7 +1376,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="Strategy Intelligence" wide>
         <DataTable rows={strategyRows.slice(0, 12)} columns={[
           { key: "name", label: "Strategy", render: (row) => <b>{text(row.name ?? row.strategy ?? row.key)}</b> },
-          { key: "trades", label: "Samples", render: (row) => num(row.trades ?? row.samples ?? row.observations).toLocaleString("en-GB") },
+          { key: "trades", label: "Samples", render: (row) => num(row.trades ?? row.samples ?? row.observations).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
           { key: "winRate", label: "Win Rate", render: (row) => `${Math.round(pct(row.winRate ?? row.accuracy))}%` },
           { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.averageReturnPct ?? row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
           { key: "status", label: "Status", render: (row) => <span className="pill">{text(row.status ?? row.verdict ?? row.readiness, "Learning")}</span> },
@@ -1426,7 +1426,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         <DataTable rows={researchRows.slice(0, 25)} columns={[
           { key: "name", label: "Brain", render: (row) => <b>{text(row.name ?? row.key ?? row.brainName)}</b> },
           { key: "generation", label: "Generation", render: (row) => text(row.generation ?? row.origin, "—") },
-          { key: "trades", label: "Samples", render: (row) => num(row.trades ?? row.samples).toLocaleString("en-GB") },
+          { key: "trades", label: "Samples", render: (row) => num(row.trades ?? row.samples).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
           { key: "winRate", label: "Win Rate", render: (row) => `${Math.round(pct(row.winRate ?? row.accuracy))}%` },
           { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.expectancyPct ?? row.expectancy).toFixed(2)}%` },
           { key: "score", label: "Score", render: (row) => num(row.researchScore ?? row.score).toFixed(2) },
@@ -1442,7 +1442,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="Symbol DNA Rankings" wide>
         <DataTable rows={symbolRows.slice(0, 30)} columns={[
           { key: "symbol", label: "Symbol", render: (row) => <b className="symbol-badge">{text(row.symbol ?? row.name ?? row.key)}</b> },
-          { key: "samples", label: "Samples", render: (row) => num(row.trades ?? row.samples ?? row.observations).toLocaleString("en-GB") },
+          { key: "samples", label: "Samples", render: (row) => num(row.trades ?? row.samples ?? row.observations).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
           { key: "winRate", label: "Win Rate", render: (row) => `${Math.round(pct(row.winRate ?? row.accuracy))}%` },
           { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.averageReturnPct ?? row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
           { key: "bestRegime", label: "Best Regime", render: (row) => text(row.status, "Learning") },
@@ -1455,7 +1455,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     {(section === "memory" || exportingPdf) && <div className="pdf-section memory-view" data-pdf-title="AI MEMORY">
       <Card title="V13 Long-Term AI Memory">
         <div className="intelligence-hero-head"><div><span className="eyebrow">AUTONOMOUS KNOWLEDGE LAYER</span><h2>{memoryStatus.enabled === false ? "MEMORY DISABLED" : "MEMORY LEARNING ACTIVE"}</h2><p>Evidence-backed knowledge shared with the CEO, Board, Research and Evolution engines.</p></div><div className="score-ring"><strong>{num(memorySummary.highConfidence)}</strong><span>high-confidence claims</span></div></div>
-        <div className="intelligence-stats four"><StatTile label="Active knowledge" value={num(memorySummary.activeKnowledge).toLocaleString("en-GB")} /><StatTile label="High confidence" value={num(memorySummary.highConfidence).toLocaleString("en-GB")} /><StatTile label="Positive claims" value={num(memorySummary.positiveClaims).toLocaleString("en-GB")} tone="positive" /><StatTile label="Negative claims" value={num(memorySummary.negativeClaims).toLocaleString("en-GB")} tone="negative" /></div>
+        <div className="intelligence-stats four"><StatTile label="Active knowledge" value={num(memorySummary.activeKnowledge).toLocaleString("en-GB", { timeZone: "Europe/London" })} /><StatTile label="High confidence" value={num(memorySummary.highConfidence).toLocaleString("en-GB", { timeZone: "Europe/London" })} /><StatTile label="Positive claims" value={num(memorySummary.positiveClaims).toLocaleString("en-GB", { timeZone: "Europe/London" })} tone="positive" /><StatTile label="Negative claims" value={num(memorySummary.negativeClaims).toLocaleString("en-GB", { timeZone: "Europe/London" })} tone="negative" /></div>
         <div className="status-strip"><span>AUTOMATIC LEARNING ACTIVE</span><span>ADVISORY ONLY</span><span>STALE KNOWLEDGE AUTO-RETIRES</span></div>
       </Card>
       <Card title="What the AI currently knows">
@@ -1464,12 +1464,12 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           { key: "subject", label: "Subject" },
           { key: "claim", label: "Evidence-backed knowledge" },
           { key: "confidence", label: "Confidence", render: (row) => `${num(row.confidence).toFixed(0)}%` },
-          { key: "evidenceCount", label: "Evidence", render: (row) => num(row.evidenceCount).toLocaleString("en-GB") },
+          { key: "evidenceCount", label: "Evidence", render: (row) => num(row.evidenceCount).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
           { key: "status", label: "Status" },
         ]} />
       </Card>
       <div className="grid two">
-        <Card title="Memory activity">{memoryEvents.length ? <div className="journal-list">{memoryEvents.slice(0, 20).map((row, index) => <article key={String(row.id ?? index)}><time>{row.created_at ? new Date(row.created_at).toLocaleString("en-GB") : ""}</time><div><b>{text(row.title, "Memory event")}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <EmptyState endpoint="V13 memory events" error={sources.memoryEvents.error} />}</Card>
+        <Card title="Memory activity">{memoryEvents.length ? <div className="journal-list">{memoryEvents.slice(0, 20).map((row, index) => <article key={String(row.id ?? index)}><time>{row.created_at ? new Date(row.created_at).toLocaleString("en-GB", { timeZone: "Europe/London" }) : ""}</time><div><b>{text(row.title, "Memory event")}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <EmptyState endpoint="V13 memory events" error={sources.memoryEvents.error} />}</Card>
         <Card title="Memory Constitution"><div className="constitution-list">{Array.isArray(memoryConstitution.rules) && memoryConstitution.rules.length ? memoryConstitution.rules.map((rule: unknown, index: number) => <div key={index}><span>{index + 1}</span><p>{text(rule)}</p></div>) : <EmptyState endpoint="V13 memory constitution" error={sources.memoryConstitution.error} />}</div></Card>
       </div>
     </div>}
@@ -1478,7 +1478,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     {(section === "scientist" || exportingPdf) && <div className="pdf-section memory-view scientist-view" data-pdf-title="AI SCIENTIST">
       <Card title="V14 Autonomous AI Scientist">
         <div className="intelligence-hero-head"><div><span className="eyebrow">AUTOMATIC RESEARCH ORGANISATION</span><h2>{scientistStatus.enabled === false ? "SCIENTIST DISABLED" : "SCIENTIST ACTIVE"}</h2><p>Generates evidence-backed hypotheses from AI Memory and designs controlled shadow experiments. It cannot alter live trading.</p></div><div className="score-ring"><strong>{num(scientistSummary.hypotheses)}</strong><span>active hypotheses</span></div></div>
-        <div className="intelligence-stats four"><StatTile label="Hypotheses" value={num(scientistSummary.hypotheses).toLocaleString("en-GB")} /><StatTile label="Experiments" value={num(scientistSummary.experiments).toLocaleString("en-GB")} /><StatTile label="Shadow ready" value={num(scientistSummary.shadowReady).toLocaleString("en-GB")} /><StatTile label="Board eligible" value={num(scientistSummary.boardEligible).toLocaleString("en-GB")} tone={num(scientistSummary.boardEligible) ? "positive" : ""} /></div>
+        <div className="intelligence-stats four"><StatTile label="Hypotheses" value={num(scientistSummary.hypotheses).toLocaleString("en-GB", { timeZone: "Europe/London" })} /><StatTile label="Experiments" value={num(scientistSummary.experiments).toLocaleString("en-GB", { timeZone: "Europe/London" })} /><StatTile label="Shadow ready" value={num(scientistSummary.shadowReady).toLocaleString("en-GB", { timeZone: "Europe/London" })} /><StatTile label="Board eligible" value={num(scientistSummary.boardEligible).toLocaleString("en-GB", { timeZone: "Europe/London" })} tone={num(scientistSummary.boardEligible) ? "positive" : ""} /></div>
         <div className="status-strip"><span>AUTOMATIC HYPOTHESIS GENERATION</span><span>RESEARCH ONLY</span><span>NO MANUAL REVIEW REQUIRED</span></div>
         <p className="muted">{text(scientistStatus.nextAction, "Collecting evidence for the next research cycle.")}</p>
       </Card>
@@ -1489,7 +1489,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           { key: "subject", label: "Subject" },
           { key: "statement", label: "Testable statement" },
           { key: "confidence", label: "Prior confidence", render: (row) => `${num(row.confidence).toFixed(0)}%` },
-          { key: "evidenceCount", label: "Source evidence", render: (row) => num(row.evidenceCount).toLocaleString("en-GB") },
+          { key: "evidenceCount", label: "Source evidence", render: (row) => num(row.evidenceCount).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
           { key: "status", label: "Status" },
         ]} />
       </Card>
@@ -1498,7 +1498,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           { key: "name", label: "Experiment", render: (row) => <b>{text(row.name)}</b> },
           { key: "experimentType", label: "Design", render: (row) => <span className="pill">{text(row.experimentType)}</span> },
           { key: "status", label: "Status" },
-          { key: "sampleSize", label: "Tagged samples", render: (row) => num(row.sampleSize).toLocaleString("en-GB") },
+          { key: "sampleSize", label: "Tagged samples", render: (row) => num(row.sampleSize).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
           { key: "winRate", label: "Win rate", render: (row) => row.winRate === null || row.winRate === undefined ? "—" : `${num(row.winRate).toFixed(0)}%` },
           { key: "expectancyPct", label: "Expectancy", render: (row) => row.expectancyPct === null || row.expectancyPct === undefined ? "—" : `${num(row.expectancyPct).toFixed(2)}%` },
           { key: "evaluationScore", label: "Research score", render: (row) => num(row.evaluationScore).toFixed(2) },
@@ -1506,7 +1506,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         ]} />
       </Card>
       <div className="grid two">
-        <Card title="Scientist activity">{scientistEvents.length ? <div className="journal-list">{scientistEvents.slice(0, 20).map((row, index) => <article key={String(row.id ?? index)}><time>{row.created_at ? new Date(row.created_at).toLocaleString("en-GB") : ""}</time><div><b>{text(row.title, "Scientist event")}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <EmptyState endpoint="V14 scientist events" error={sources.scientistEvents.error} />}</Card>
+        <Card title="Scientist activity">{scientistEvents.length ? <div className="journal-list">{scientistEvents.slice(0, 20).map((row, index) => <article key={String(row.id ?? index)}><time>{row.created_at ? new Date(row.created_at).toLocaleString("en-GB", { timeZone: "Europe/London" }) : ""}</time><div><b>{text(row.title, "Scientist event")}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <EmptyState endpoint="V14 scientist events" error={sources.scientistEvents.error} />}</Card>
         <Card title="Scientist Constitution"><div className="constitution-list">{Array.isArray(scientistConstitution.rules) && scientistConstitution.rules.length ? scientistConstitution.rules.map((rule: unknown, index: number) => <div key={index}><span>{index + 1}</span><p>{text(rule)}</p></div>) : <EmptyState endpoint="V14 scientist constitution" error={sources.scientistConstitution.error} />}</div></Card>
       </div>
     </div>}
@@ -1524,10 +1524,10 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <span className={`pill ${portfolioData.enabled === false ? "bad" : "ok"}`}>{portfolioData.enabled === false ? "DISABLED" : "ACTIVE"}</span>
         </div>
         <div className="intelligence-stats four">
-          <StatTile label="Qualified" value={num(portfolioData.qualifiedCandidates ?? portfolioAllocations.length).toLocaleString("en-GB")} />
+          <StatTile label="Qualified" value={num(portfolioData.qualifiedCandidates ?? portfolioAllocations.length).toLocaleString("en-GB", { timeZone: "Europe/London" })} />
           <StatTile label="Deploy" value={`$${num(portfolioData.deployCapitalUsd ?? portfolioData.plan?.deployCapitalUsd).toFixed(2)}`} tone="positive" />
           <StatTile label="Cash Reserve" value={`$${num(portfolioData.cashReserveUsd ?? portfolioData.plan?.cashReserveUsd ?? portfolioCapacity.buyingPowerUsd).toFixed(2)}`} />
-          <StatTile label="Available Slots" value={num(portfolioCapacity.availableSlots).toLocaleString("en-GB")} />
+          <StatTile label="Available Slots" value={num(portfolioCapacity.availableSlots).toLocaleString("en-GB", { timeZone: "Europe/London" })} />
         </div>
         <p className="notice">{text(portfolioData.reason ?? portfolioData.plan?.reason, portfolioData.status === "WAITING_FOR_PLAN" ? "Waiting for the next scan cycle to produce qualified candidates." : "Portfolio plan ready.")}</p>
       </Card>
@@ -1567,9 +1567,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     {(section === "operations" || exportingPdf) && <div className="pdf-section memory-view operations-view" data-pdf-title="AI OPERATIONS">
       <Card title="V15.1 AI Operations Centre Pro">
         <div className="intelligence-hero-head"><div><span className="eyebrow">AUTOMATIC FULL-SYSTEM MONITORING</span><h2>{text(operationsSummary.overallStatus, "STARTING")}</h2><p>Continuously checks the full dependency tree, registered APIs, database integrity, queues, workers, intelligence, governance and host resources.</p></div><div className="score-ring"><strong>{num(operationsSummary.healthScore).toFixed(0)}%</strong><span>system health</span></div></div>
-        <div className="intelligence-stats four"><StatTile label="Passed" value={num(operationsSummary.passed).toLocaleString("en-GB")} tone="positive" /><StatTile label="Warnings" value={num(operationsSummary.warnings).toLocaleString("en-GB")} /><StatTile label="Failed" value={num(operationsSummary.failed).toLocaleString("en-GB")} tone={num(operationsSummary.failed) ? "negative" : ""} /><StatTile label="Active alerts" value={operationsAlerts.length.toLocaleString("en-GB")} tone={operationsAlerts.length ? "negative" : "positive"} /></div>
+        <div className="intelligence-stats four"><StatTile label="Passed" value={num(operationsSummary.passed).toLocaleString("en-GB", { timeZone: "Europe/London" })} tone="positive" /><StatTile label="Warnings" value={num(operationsSummary.warnings).toLocaleString("en-GB", { timeZone: "Europe/London" })} /><StatTile label="Failed" value={num(operationsSummary.failed).toLocaleString("en-GB", { timeZone: "Europe/London" })} tone={num(operationsSummary.failed) ? "negative" : ""} /><StatTile label="Active alerts" value={operationsAlerts.length.toLocaleString("en-GB", { timeZone: "Europe/London" })} tone={operationsAlerts.length ? "negative" : "positive"} /></div>
         <div className="status-strip"><span>AUTOMATIC AUDITS ACTIVE</span><span>EVERY {Math.max(1, Math.round(num(operationsSummary.nextAuditInSeconds, 900) / 60))} MINUTES</span><span>ENDPOINT DISCOVERY</span><span>WORKER WATCHDOG</span><span>NO MANUAL REVIEW</span></div>
-        <p className="muted">Last audit: {operationsSummary.checkedAt ? new Date(String(operationsSummary.checkedAt)).toLocaleString("en-GB") : "Waiting for first automatic audit"}. {text(operationsStatus.nextAction, "No intervention required.")}</p>
+        <p className="muted">Last audit: {operationsSummary.checkedAt ? new Date(String(operationsSummary.checkedAt)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "Waiting for first automatic audit"}. {text(operationsStatus.nextAction, "No intervention required.")}</p>
       </Card>
       <Card title="Holiday Mode">
         <div className="intelligence-hero-head"><div><span className="eyebrow">AUTOMATIC HOLIDAY SUPERVISION</span><h2>{text(holidayMode.headline, "WAITING FOR FIRST AUDIT")}</h2><p>{holidayMode.safeToLeaveRunning === false ? "A critical condition needs human attention." : "The system is monitoring itself and will keep warnings visible until they clear."}</p></div><div className="score-ring"><strong>{num(holidayMode.healthScore).toFixed(0)}%</strong><span>holiday health</span></div></div>
@@ -1600,7 +1600,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           { key: "name", label: "Watchdog" }, { key: "message", label: "Latest result" },
           { key: "durationMs", label: "Check", render: (row) => `${num(row.durationMs).toFixed(0)} ms` },
         ]} /></Card>
-        <Card title="Queue & Audit Stores"><div className="summary">{Object.entries(operationsQueues).length ? Object.entries(operationsQueues).map(([key,value]: any) => <div key={key}><span>{keyLabel(key)}</span><b>{typeof value === "object" ? text(value.total ?? value.status ?? value.table, "AVAILABLE") : num(value).toLocaleString("en-GB")}</b></div>) : <div><span>Status</span><b>Waiting for audit</b></div>}</div></Card>
+        <Card title="Queue & Audit Stores"><div className="summary">{Object.entries(operationsQueues).length ? Object.entries(operationsQueues).map(([key,value]: any) => <div key={key}><span>{keyLabel(key)}</span><b>{typeof value === "object" ? text(value.total ?? value.status ?? value.table, "AVAILABLE") : num(value).toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>) : <div><span>Status</span><b>Waiting for audit</b></div>}</div></Card>
       </div>
       <Card title="Subsystem Health">
         <DataTable rows={operationsComponents} columns={[
@@ -1613,9 +1613,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         ]} />
       </Card>
       <div className="grid two">
-        <Card title="Active Operations Alerts">{operationsAlerts.length ? <div className="journal-list">{operationsAlerts.slice(0, 30).map((row, index) => <article key={String(row.id ?? index)}><time>{row.last_seen ? new Date(String(row.last_seen)).toLocaleString("en-GB") : ""}</time><div><b>{text(row.severity)} · {text(row.title)}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <div className="intelligence-empty"><strong>All clear</strong><span>No active system alerts.</span></div>}</Card>
+        <Card title="Active Operations Alerts">{operationsAlerts.length ? <div className="journal-list">{operationsAlerts.slice(0, 30).map((row, index) => <article key={String(row.id ?? index)}><time>{row.last_seen ? new Date(String(row.last_seen)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : ""}</time><div><b>{text(row.severity)} · {text(row.title)}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <div className="intelligence-empty"><strong>All clear</strong><span>No active system alerts.</span></div>}</Card>
         <Card title="Health History"><DataTable rows={operationsHistory.slice(0, 30)} columns={[
-          { key: "created_at", label: "Audit", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB") : "—" },
+          { key: "created_at", label: "Audit", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "—" },
           { key: "overallStatus", label: "Status" },
           { key: "healthScore", label: "Health", render: (row) => `${num(row.healthScore).toFixed(0)}%` },
           { key: "passed", label: "Pass" }, { key: "warnings", label: "Warn" }, { key: "failed", label: "Fail" },
@@ -1635,7 +1635,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <div><span>Promotions recorded</span><b>{promotionActions.length}</b></div>
           <div><span>Rollbacks recorded</span><b>{evolutionActions.filter((row) => row.actionType.includes("ROLLBACK")).length}</b></div>
           <div><span>Current stability</span><b>{operatorStableRuns} / {operatorRequiredRuns}</b></div>
-          <div><span>Last applied</span><b>{operator.lastApplyAt ? new Date(String(operator.lastApplyAt)).toLocaleString("en-GB") : "No promotion yet"}</b></div>
+          <div><span>Last applied</span><b>{operator.lastApplyAt ? new Date(String(operator.lastApplyAt)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "No promotion yet"}</b></div>
           <div><span>Rollback protection</span><b>{operator.history?.length ? "ACTIVE" : "ARMED"}</b></div>
         </div>
       </Card>
@@ -1647,7 +1647,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <small>{operatorChangeCount ? `${Math.max(0, operatorRequiredRuns - operatorStableRuns)} matching reviews remain.` : "No evidence-backed change is currently required."}</small>
         </div>
         {operatorChangeCount ? <div className="evolution-candidate-list">{Object.entries(operatorChanged).map(([key, change]) => { const item = firstObject(change); return <div key={key}><span>{keyLabel(key)}</span><b>{formatOperatorValue(key, item.before)} → {formatOperatorValue(key, item.after)}</b></div>; })}</div> : <EmptyState endpoint="autonomous candidate" />}
-        <p className="muted">Evidence: {num(operatorProposal.evidenceSamples).toLocaleString("en-GB")} completed observations. Apply window: market closed only.</p>
+        <p className="muted">Evidence: {num(operatorProposal.evidenceSamples).toLocaleString("en-GB", { timeZone: "Europe/London" })} completed observations. Apply window: market closed only.</p>
       </Card>
 
       <Card title="Evolution Equity Checkpoints" wide>
@@ -1662,9 +1662,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="Evolution Timeline" wide>
         {evolutionActions.length ? <div className="evolution-timeline">{[...evolutionActions].reverse().map((row) => <article key={String(row.id ?? `${row.createdAt}-${row.generation}`)} className={`evolution-entry ${row.actionType.includes("ROLLBACK") ? "rollback" : "promotion"}`}>
           <div className="evolution-node" />
-          <div className="evolution-entry-head"><div><span className="pill">G{row.generation}</span><b>{keyLabel(row.actionType)}</b></div><time>{row.createdAt ? new Date(row.createdAt).toLocaleString("en-GB") : "Unknown time"}</time></div>
+          <div className="evolution-entry-head"><div><span className="pill">G{row.generation}</span><b>{keyLabel(row.actionType)}</b></div><time>{row.createdAt ? new Date(row.createdAt).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "Unknown time"}</time></div>
           <p>{row.reason}</p>
-          <div className="evolution-meta"><span>Evidence <b>{row.samples.toLocaleString("en-GB")}</b></span><span>Status <b>{row.status}</b></span>{row.equity > 0 && <span>Equity <b>${row.equity.toFixed(2)}</b></span>}</div>
+          <div className="evolution-meta"><span>Evidence <b>{row.samples.toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></span><span>Status <b>{row.status}</b></span>{row.equity > 0 && <span>Equity <b>${row.equity.toFixed(2)}</b></span>}</div>
           {Object.keys(row.changed).length > 0 && <div className="evolution-change-list">{Object.entries(row.changed).map(([key, value]) => { const change = firstObject(value); return <div key={key}><span>{keyLabel(key)}</span><b>{formatOperatorValue(key, change.before)} → {formatOperatorValue(key, change.after)}</b></div>; })}</div>}
         </article>)}</div> : <EmptyState endpoint="autonomous promotion history" />}
       </Card>
@@ -1674,7 +1674,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="Rule Intelligence" wide>
         <DataTable rows={ruleRows.slice(0, 30)} columns={[
           { key: "rule", label: "Rule", render: (row) => <b>{text(row.rule ?? row.name ?? row.key)}</b> },
-          { key: "triggered", label: "Triggered", render: (row) => num(row.triggered ?? row.samples ?? row.count).toLocaleString("en-GB") },
+          { key: "triggered", label: "Triggered", render: (row) => num(row.triggered ?? row.samples ?? row.count).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
           { key: "helped", label: "Helped", render: (row) => `${Math.round(pct(row.helpedRate ?? row.helpRate ?? row.successRate ?? row.winRate))}%` },
           { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.rejectedTradeAverageReturnPct ?? row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
           { key: "verdict", label: "Verdict", render: (row) => <span className="pill">{text(row.rating ?? row.verdict ?? row.status ?? row.recommendation, "Learning")}</span> },
@@ -1684,7 +1684,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         <DataTable rows={weaknessRows.slice(0, 30)} columns={[
           { key: "weakness", label: "Weakness", render: (row) => <b>{text(row.finding ?? row.weakness ?? row.name ?? row.title ?? row.rule)}</b> },
           { key: "severity", label: "Severity", render: (row) => text(row.severity ?? row.risk ?? row.level, "Unknown") },
-          { key: "samples", label: "Evidence", render: (row) => num(row.samples ?? row.trades ?? row.count).toLocaleString("en-GB") },
+          { key: "samples", label: "Evidence", render: (row) => num(row.samples ?? row.trades ?? row.count).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
           { key: "impact", label: "Impact", render: (row) => text(row.severity ?? row.impactPct ?? row.expectancyPct ?? row.impact, "—") },
           { key: "recommendation", label: "Recommendation", render: (row) => text(row.recommendation ?? row.action ?? row.note, "Observe") },
         ]} />

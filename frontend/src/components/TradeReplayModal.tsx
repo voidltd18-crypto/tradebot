@@ -40,7 +40,7 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
     const dt = new Date(String(p.time || ""));
     return {
       ...p,
-      label: Number.isFinite(dt.getTime()) ? dt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : String(p.time || ""),
+      label: Number.isFinite(dt.getTime()) ? dt.toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour: "2-digit", minute: "2-digit", second: "2-digit" }) : String(p.time || ""),
       price: Number(p.price || 0),
     };
   }), [payload?.points]);
@@ -112,7 +112,7 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
         </div>
         <div className="replay-footer">
           <span>{chart.length} saved points · recording every ~{Number(payload?.sampleSeconds || 10)} seconds · live refresh 5 seconds</span>
-          <span>{session.startedAt ? `Recording since ${new Date(session.startedAt).toLocaleString("en-GB")}` : ""}</span>
+          <span>{session.startedAt ? `Recording since ${new Date(session.startedAt).toLocaleString("en-GB", { timeZone: "Europe/London" })}` : ""}</span>
         </div>
       </>}
     </section>

@@ -19,14 +19,14 @@ function parseReportTimestamp(entry: AnyObj): number {
   const day = String(entry?.day || entry?.date || "").trim();
   const clock = String(entry?.clock || entry?.timeOfDay || "00:00:00").trim();
   if (/^\d{4}-\d{2}-\d{2}$/.test(day)) {
-    const joined = Date.parse(`${day}T${clock || "00:00:00"}`);
+    const joined = Date.parse(`${day}T${clock || "00:00:00"}Z`);
     if (Number.isFinite(joined)) return joined;
   }
 
   // UK legacy dates (DD/MM/YYYY).
   const uk = day.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
   if (uk) {
-    const joined = Date.parse(`${uk[3]}-${uk[2]}-${uk[1]}T${clock || "00:00:00"}`);
+    const joined = Date.parse(`${uk[3]}-${uk[2]}-${uk[1]}T${clock || "00:00:00"}Z`);
     if (Number.isFinite(joined)) return joined;
   }
   return 0;
@@ -65,7 +65,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       const ts = parseReportTimestamp(entry);
       const date = ts ? new Date(ts) : null;
       const equity = chartCurrency === "GBP" ? Number(entry.equityGbp ?? entry.valueGbp ?? Number(entry.equity || entry.value || 0) * rate) : Number(entry.equity ?? entry.value ?? 0);
-      return { ts, equity, label: date ? date.toLocaleString("en-GB", { day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit", hour12:false }) : `#${index + 1}` };
+      return { ts, equity, label: date ? date.toLocaleString("en-GB", { timeZone: "Europe/London", day:"2-digit", month:"short", hour:"2-digit", minute:"2-digit", hour12:false }) : `#${index + 1}` };
     }).filter((p) => p.ts >= start && p.equity > 0).sort((a,b) => a.ts-b.ts);
   }, [equityHistory, chartCurrency, rate, range]);
 
@@ -179,12 +179,12 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
     if (range === "today") {
       from = chartSelection.ts - 30 * 60 * 1000;
       to = chartSelection.ts + 30 * 60 * 1000;
-      label = `Within 30 minutes of ${selected.toLocaleString("en-GB", { dateStyle:"medium", timeStyle:"short" })}`;
+      label = `Within 30 minutes of ${selected.toLocaleString("en-GB", { timeZone: "Europe/London", dateStyle:"medium", timeStyle:"short" })}`;
     } else {
       const start = new Date(selected); start.setHours(0,0,0,0);
       const end = new Date(selected); end.setHours(23,59,59,999);
       from = start.getTime(); to = end.getTime();
-      label = selected.toLocaleDateString("en-GB", { dateStyle:"full" });
+      label = selected.toLocaleDateString("en-GB", { timeZone: "Europe/London", dateStyle:"full" });
     }
     setSymbolFilter("ALL");
     setFromDate("");
@@ -198,7 +198,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       <div className="actions"><button onClick={() => loadReports(true)} disabled={reportsLoading}>{reportsLoading ? "Loading Reports..." : "Refresh Reports"}</button></div>
       {reportsLoading && <p className="notice">Reports are loading separately. Live trading, positions and AI remain available.</p>}
       {reportsError && <p className="notice loss">{reportsError}</p>}
-      {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { hour12: false })}</p>}
+      {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })}</p>}
     </Card>
 
     <Card title="Performance Summary" wide><section className="stats"><Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={usd(totalDeposited)}/><Stat label="Earned" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)}/><Stat label="Lost" value={gbp(lost * rate)} sub={usd(lost)} className="loss"/><Stat label="Current Equity" value={gbp(Number(reports?.currentEquity ?? data?.account?.equity ?? 0) * rate)} sub={usd(reports?.currentEquity ?? data?.account?.equity ?? 0)}/></section><p className={tone(totalGainLoss)}>Total gain/loss: {gbp(totalGainLoss * rate)}</p></Card>
@@ -208,9 +208,9 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
         <div className="range-tabs">{(["today","week","month","year"] as RangeKey[]).map(r => <button key={r} className={range===r?"active":""} onClick={() => setRange(r)}>{r[0].toUpperCase()+r.slice(1)}</button>)}</div>
         <div className="chart-controls"><button className={chartCurrency === "GBP" ? "active" : ""} onClick={() => setChartCurrency("GBP")}>GBP</button><button className={chartCurrency === "USD" ? "active" : ""} onClick={() => setChartCurrency("USD")}>USD</button></div>
       </div>
-      <div ref={chartShellRef} className="equity-chart-clean interactive-equity-chart" onPointerUp={selectNearestPointFromPointer}>{reportChart.length ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={reportChart} margin={{top:12,right:18,left:8,bottom:8}} onMouseMove={rememberChartPoint} onClick={selectChartPoint}><defs><linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#38bdf8" stopOpacity={0.28}/><stop offset="100%" stopColor="#38bdf8" stopOpacity={0.02}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke="#1e2b43" vertical={false}/><XAxis dataKey="ts" type="number" domain={["dataMin","dataMax"]} stroke="#94a3b8" tickFormatter={(v) => new Date(v).toLocaleDateString("en-GB", range==="today"?{hour:"2-digit",minute:"2-digit"}:{day:"2-digit",month:"short"})} minTickGap={44}/><YAxis stroke="#94a3b8" domain={["auto","auto"]} tickFormatter={(v) => `${chartCurrency==="GBP"?"£":"$"}${Number(v).toFixed(0)}`}/><Tooltip labelFormatter={(v) => new Date(Number(v)).toLocaleString("en-GB", {dateStyle:"medium",timeStyle:"short"})} formatter={(value:any) => [chartCurrency === "GBP" ? gbp(value) : usd(value), "Account value"]}/>{chartSelection && <ReferenceLine x={chartSelection.ts} strokeDasharray="4 4" label={{ value: "Selected", position: "insideTopRight" }} />}<Area type="monotone" dataKey="equity" stroke="#38bdf8" strokeWidth={2.5} fill="url(#equityFill)" dot={reportChart.length === 1 ? { r: 4 } : false} activeDot={{r:5, onClick: selectAreaPoint, style: { cursor: "pointer" }}} onClick={selectAreaPoint}/></AreaChart></ResponsiveContainer> : <div className="chart-empty"><b>No account-value points in this period</b><span>Choose a wider range or wait for more recorded history.</span></div>}</div>
+      <div ref={chartShellRef} className="equity-chart-clean interactive-equity-chart" onPointerUp={selectNearestPointFromPointer}>{reportChart.length ? <ResponsiveContainer width="100%" height="100%"><AreaChart data={reportChart} margin={{top:12,right:18,left:8,bottom:8}} onMouseMove={rememberChartPoint} onClick={selectChartPoint}><defs><linearGradient id="equityFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#38bdf8" stopOpacity={0.28}/><stop offset="100%" stopColor="#38bdf8" stopOpacity={0.02}/></linearGradient></defs><CartesianGrid strokeDasharray="3 3" stroke="#1e2b43" vertical={false}/><XAxis dataKey="ts" type="number" domain={["dataMin","dataMax"]} stroke="#94a3b8" tickFormatter={(v) => new Date(v).toLocaleDateString("en-GB", range==="today"?{timeZone:"Europe/London",hour:"2-digit",minute:"2-digit"}:{timeZone:"Europe/London",day:"2-digit",month:"short"})} minTickGap={44}/><YAxis stroke="#94a3b8" domain={["auto","auto"]} tickFormatter={(v) => `${chartCurrency==="GBP"?"£":"$"}${Number(v).toFixed(0)}`}/><Tooltip labelFormatter={(v) => new Date(Number(v)).toLocaleString("en-GB", { timeZone: "Europe/London",dateStyle:"medium",timeStyle:"short"})} formatter={(value:any) => [chartCurrency === "GBP" ? gbp(value) : usd(value), "Account value"]}/>{chartSelection && <ReferenceLine x={chartSelection.ts} strokeDasharray="4 4" label={{ value: "Selected", position: "insideTopRight" }} />}<Area type="monotone" dataKey="equity" stroke="#38bdf8" strokeWidth={2.5} fill="url(#equityFill)" dot={reportChart.length === 1 ? { r: 4 } : false} activeDot={{r:5, onClick: selectAreaPoint, style: { cursor: "pointer" }}} onClick={selectAreaPoint}/></AreaChart></ResponsiveContainer> : <div className="chart-empty"><b>No account-value points in this period</b><span>Choose a wider range or wait for more recorded history.</span></div>}</div>
       {chartSelection && <div className="chart-trade-selection">
-        <div><span>Selected point</span><b>{new Date(chartSelection.ts).toLocaleString("en-GB", { dateStyle:"medium", timeStyle:"short" })}</b></div>
+        <div><span>Selected point</span><b>{new Date(chartSelection.ts).toLocaleString("en-GB", { timeZone: "Europe/London", dateStyle:"medium", timeStyle:"short" })}</b></div>
         <div><span>Account value</span><b>{chartCurrency === "GBP" ? gbp(chartSelection.equity) : usd(chartSelection.equity)}</b></div>
         <div><span>Closed trades in this {range === "today" ? "±30 min window" : "day"}</span><b>{selectionTrades.length}</b>{selectionTrades.length > 0 && <small>{Array.from(new Set(selectionTrades.map(t => String(t?.symbol || "").toUpperCase()).filter(Boolean))).slice(0,6).join(", ")}</small>}</div>
         <button onClick={viewTradesAtSelection}>View trades around this point</button>

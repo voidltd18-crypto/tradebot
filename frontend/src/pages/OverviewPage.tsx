@@ -28,7 +28,7 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
   const formatClock = (value: unknown) => {
     if (!value) return "—";
     const d = new Date(String(value));
-    return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString("en-GB", { weekday: "short", hour: "2-digit", minute: "2-digit" });
+    return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString("en-GB", { timeZone: "Europe/London", weekday: "short", hour: "2-digit", minute: "2-digit" });
   };
 
   return <main className="home-command-center">
@@ -74,17 +74,17 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
       <Card title="Cycle Monitor" className="command-panel cycle-monitor-panel">
         <div className="research-badge">LIVE</div>
         <div className="summary compact-summary">
-          {[["Bot", "bot"], ["Scientist", "scientist"], ["Research", "research"], ["Advisor", "advisor"], ["Scanner", "scanner"]].map(([label, key]) => { const row = cycleRows?.[key] || {}; return <div key={key}><span>{label}</span><b>{Number(row.thisRunCompleted || 0)} run · {Number(row.thisRunFailed || 0)} failed</b><small>Lifetime {Number(row.lifetimeCompleted || 0).toLocaleString("en-GB")} · {row.lastCompletedAt ? formatClock(row.lastCompletedAt) : "waiting"}</small></div>; })}
+          {[["Bot", "bot"], ["Scientist", "scientist"], ["Research", "research"], ["Advisor", "advisor"], ["Scanner", "scanner"]].map(([label, key]) => { const row = cycleRows?.[key] || {}; return <div key={key}><span>{label}</span><b>{Number(row.thisRunCompleted || 0)} run · {Number(row.thisRunFailed || 0)} failed</b><small>Lifetime {Number(row.lifetimeCompleted || 0).toLocaleString("en-GB", { timeZone: "Europe/London" })} · {row.lastCompletedAt ? formatClock(row.lastCompletedAt) : "waiting"}</small></div>; })}
           <div><span>Current uptime</span><b>{Math.floor(Number(cycleMonitor?.uptimeSeconds || 0) / 3600)}h {Math.floor((Number(cycleMonitor?.uptimeSeconds || 0) % 3600) / 60)}m</b></div>
         </div>
       </Card>
       <Card title="AI Research & Learning" className="command-panel research-panel">
         <div className="research-badge">ACTIVE</div>
         <div className="summary compact-summary">
-          <div><span>Outcome evidence</span><b>{outcomes ? outcomes.toLocaleString("en-GB") : "LIVE"}</b></div>
+          <div><span>Outcome evidence</span><b>{outcomes ? outcomes.toLocaleString("en-GB", { timeZone: "Europe/London" }) : "LIVE"}</b></div>
           <div><span>AI confidence</span><b>{Math.round(aiConfidence)}%</b></div>
           <div><span>System health</span><b>{botHealth}%</b></div>
-          <div><span>Shadow pending</span><b>{Number(shadow?.pending || 0).toLocaleString("en-GB")}</b></div>
+          <div><span>Shadow pending</span><b>{Number(shadow?.pending || 0).toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>
           <div><span>Current action</span><b className="research-action">{currentAction}</b></div>
         </div>
       </Card>
