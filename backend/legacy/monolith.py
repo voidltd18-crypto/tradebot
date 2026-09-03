@@ -212,6 +212,14 @@ STALL_EXIT_ENABLED = True
 STALL_EXIT_AFTER_MINUTES = 4320
 STALL_EXIT_MIN_PNL_PCT = -1.00
 
+# V18.2.28 — One-Hour Profit Exit
+# Additional profit-taking backstop only. Existing stops, Peak Exhaustion,
+# adaptive trailing exits and all entry logic remain unchanged. Once a position
+# has been held for at least 60 minutes, any positive P&L can be banked.
+ONE_HOUR_PROFIT_EXIT_ENABLED = str(os.getenv("TRADEBOT_ONE_HOUR_PROFIT_EXIT_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+ONE_HOUR_PROFIT_EXIT_MINUTES = max(1, int(os.getenv("TRADEBOT_ONE_HOUR_PROFIT_EXIT_MINUTES", "60") or 60))
+ONE_HOUR_PROFIT_EXIT_MIN_PNL_PCT = float(os.getenv("TRADEBOT_ONE_HOUR_PROFIT_EXIT_MIN_PNL_PCT", "0.0") or 0.0)
+
 # Swing Hold AI: learns from closed-trade history and avoids quick exits.
 SWING_SNIPER_SAFE_MODE = True
 HOLD_AI_ENABLED = True
@@ -1330,6 +1338,9 @@ def get_all_positions():
                 "partialProfitTriggerPct": PARTIAL_PROFIT_TRIGGER_PCT,
                 "fastStopLossPct": FAST_STOP_LOSS_PCT,
                 "stallExitAfterMinutes": STALL_EXIT_AFTER_MINUTES,
+                "oneHourProfitExitEnabled": ONE_HOUR_PROFIT_EXIT_ENABLED,
+                "oneHourProfitExitMinutes": ONE_HOUR_PROFIT_EXIT_MINUTES,
+                "oneHourProfitExitMinPnlPct": ONE_HOUR_PROFIT_EXIT_MIN_PNL_PCT,
             })
         except Exception:
             continue
@@ -2153,6 +2164,34 @@ def should_fast_stop(position: Dict[str, Any]):
     profile = _ai_risk_effective_profile(symbol) if "_ai_risk_effective_profile" in globals() else {}
     threshold = -abs(float(profile.get("fastStopLossPct") or abs(FAST_STOP_LOSS_PCT)))
     return pnl_pct <= threshold, f"adaptive fast stop pnl={pnl_pct:.2f}% threshold={threshold:.2f}%"
+
+
+def should_one_hour_profit_exit(position: Dict[str, Any]):
+    """V18.2.28: bank a positive position once it has been held >= configured minutes.
+
+    This is intentionally additive: hard stops and Peak Exhaustion are evaluated
+    before this rule. It does not require HOLD AI approval because this rule is
+    the explicit time-based profit override requested by the operator.
+    """
+    if not ONE_HOUR_PROFIT_EXIT_ENABLED:
+        return False, "one-hour profit exit disabled"
+
+    minutes = int(position.get("minutesSinceBuy") or 0)
+    pnl_pct = float(position.get("pnlPct") or 0.0)
+    qty = float(position.get("qty") or 0.0)
+    price = float(position.get("price") or 0.0)
+
+    # Unknown/invalid age must never cause an immediate sell after a restart.
+    if minutes <= 0 or minutes >= 999999:
+        return False, "position age unavailable"
+    if minutes < ONE_HOUR_PROFIT_EXIT_MINUTES:
+        return False, f"held {minutes}m below {ONE_HOUR_PROFIT_EXIT_MINUTES}m profit timer"
+    if pnl_pct <= ONE_HOUR_PROFIT_EXIT_MIN_PNL_PCT:
+        return False, f"pnl {pnl_pct:.2f}% not above {ONE_HOUR_PROFIT_EXIT_MIN_PNL_PCT:.2f}%"
+    if qty <= DUST_THRESHOLD or price <= 0 or not sell_notional_ok(qty, price):
+        return False, "position too small for full profit exit"
+
+    return True, f"held {minutes}m and positive pnl={pnl_pct:.2f}%"
 
 
 def should_stall_exit(position: Dict[str, Any]):
@@ -4423,6 +4462,26 @@ def manage_money_mode_positions():
                 )
             except Exception as e:
                 print(f"PEAK EXHAUSTION SELL ERROR {symbol}: {e}")
+            continue
+
+        one_hour_profit_ok, one_hour_profit_reason = should_one_hour_profit_exit(p)
+        if one_hour_profit_ok:
+            try:
+                # Explicit V18.2.28 operator rule: this same-day profit exit is
+                # intentionally allowed after the timer, even when the legacy
+                # PDT-aware soft-profit hold would normally defer it. Broker-side
+                # PDT/account restrictions still remain authoritative.
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason="ONE HOUR PROFIT EXIT")
+                state[symbol]["highest_since_entry"] = None
+                _v17_reset_peak_exhaustion(symbol)
+                _v17_reset_runner_trail(symbol)
+                print(
+                    f"V18.2.28 ONE HOUR PROFIT EXIT | {symbol} qty={qty:.6f} "
+                    f"held={int(p.get('minutesSinceBuy') or 0)}m pnl={float(p.get('pnlPct') or 0.0):.2f}% "
+                    f"price={price:.2f} entry={entry:.2f}"
+                )
+            except Exception as e:
+                print(f"ONE HOUR PROFIT EXIT ERROR {symbol}: {e}")
             continue
 
         partial_ok, partial_reason = should_partial_profit(p)
@@ -8066,6 +8125,7 @@ def build_status_payload(bot_name, scans):
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
+            f"1H PROFIT EXIT | enabled={ONE_HOUR_PROFIT_EXIT_ENABLED} | after={ONE_HOUR_PROFIT_EXIT_MINUTES}m | min_pnl=>{ONE_HOUR_PROFIT_EXIT_MIN_PNL_PCT:.2f}%",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f}",
             f"POSITIONS | {len(positions)}",
