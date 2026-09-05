@@ -37,7 +37,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
     try {
       const res = await fetch(`${API_URL}/v18/crypto-bridge/release`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "X-API-Key": authToken, "x-api-key": authToken },
+        headers: { "Content-Type": "application/json", "X-Auth-Token": authToken, "x-api-key": authToken },
         body: JSON.stringify({ amountGbp: amount, confirmation: "UNLOCK CRYPTO" }),
       });
       const body = await res.json();
@@ -52,7 +52,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const positions = Array.isArray(data.positions) ? data.positions : [];
   return <div className="page-stack">
     <section className="card hero-card">
-      <div className="eyebrow">V18.2.34 · VAULT-FUNDED LIVE CRYPTO PILOT</div>
+      <div className="eyebrow">V18.2.35 · CRYPTO RELEASE AUTH FIX</div>
       <h2>24/7 Crypto Research Engine</h2>
       <p className="muted">Shadow research stays active 24/7. Live crypto is a separate, manually funded pilot using only the amount you release from the Profit Vault.</p>
       <div className="pill-row"><span className="pill good">SHADOW RESEARCH ON</span><span className="pill">24/7 MARKET</span><span className="pill">LIVE PILOT AVAILABLE</span><span className="pill">{data.running ? "ENGINE RUNNING" : "ENGINE IDLE"}</span></div>
