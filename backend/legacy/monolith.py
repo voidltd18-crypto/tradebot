@@ -1255,6 +1255,12 @@ def get_all_positions():
     for pos in raw_positions:
         try:
             symbol = str(pos.symbol).upper()
+            # V18.2.34: crypto positions are managed exclusively by Crypto Lab.
+            # Never let a BTC/USD-style position consume the stock bot's 1/1 slot
+            # or flow through stock quotes/stops/trailing logic.
+            asset_class = str(getattr(pos, "asset_class", "") or "").lower()
+            if "/" in symbol or "crypto" in asset_class:
+                continue
             qty = float(pos.qty)
             entry = float(pos.avg_entry_price)
             market_value = float(pos.market_value)
@@ -6139,6 +6145,28 @@ def _init_db_impl():
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18232_crypto_trades_time ON v18232_crypto_trades(timestamp)""")
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18232_crypto_trades_symbol ON v18232_crypto_trades(symbol)""")
 
+    # V18.2.34 — real-money crypto pilot ledger. Live orders remain manually
+    # permissioned by the Vault release and are capped independently of stocks.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v18234_crypto_live_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            order_id TEXT,
+            qty REAL,
+            price REAL,
+            notional_usd REAL,
+            pnl_usd REAL,
+            pnl_pct REAL,
+            score REAL,
+            reason TEXT,
+            status TEXT,
+            request_id TEXT
+        )
+    """)
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18234_crypto_live_time ON v18234_crypto_live_trades(timestamp)""")
+
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS weekly_universe (
@@ -10962,6 +10990,12 @@ def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
     finally:
         conn.close()
     _crypto_shadow_runtime.update({"running": True, "lastError": None, "lastScanAt": now})
+    # V18.2.34: same market scan can drive the separately permissioned live pilot.
+    try:
+        v18234_crypto_live_cycle(scans)
+    except Exception as exc:
+        _crypto_live_runtime["lastError"] = str(exc)[:500]
+        print(f"V18.2.34 CRYPTO LIVE CYCLE ERROR | {exc}", flush=True)
     return {"ok": True, "enabled": True, "scans": len(scans)}
 
 
@@ -10997,6 +11031,251 @@ def v18232_crypto_shadow_payload() -> Dict[str, Any]:
                    "entryScore": V18232_CRYPTO_ENTRY_SCORE, "stopPct": V18232_CRYPTO_STOP_PCT,
                    "trailStartPct": V18232_CRYPTO_TRAIL_START_PCT, "trailGivebackPct": V18232_CRYPTO_TRAIL_GIVEBACK_PCT},
     }
+
+
+
+# =========================
+# V18.2.34 — VAULT-FUNDED LIVE CRYPTO PILOT
+# The user must explicitly release Vault capital before real crypto can trade.
+# The live pilot is hard-capped, cannot auto-refill, cannot touch stock capital,
+# and remains independent from the stock 1-position engine.
+# =========================
+V18234_CRYPTO_LIVE_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_LIVE_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
+V18234_CRYPTO_LIVE_PILOT_MAX_GBP = max(1.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_PILOT_MAX_GBP", "25") or 25))
+V18234_CRYPTO_LIVE_MAX_POSITIONS = 1
+V18234_CRYPTO_LIVE_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_ENTRY_SCORE", str(V18232_CRYPTO_ENTRY_SCORE)) or V18232_CRYPTO_ENTRY_SCORE)))
+V18234_CRYPTO_LIVE_STOP_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_LIVE_STOP_PCT", str(V18232_CRYPTO_STOP_PCT)) or V18232_CRYPTO_STOP_PCT))
+V18234_CRYPTO_LIVE_TRAIL_START_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_LIVE_TRAIL_START_PCT", str(V18232_CRYPTO_TRAIL_START_PCT)) or V18232_CRYPTO_TRAIL_START_PCT))
+V18234_CRYPTO_LIVE_TRAIL_GIVEBACK_PCT = max(0.10, float(os.getenv("TRADEBOT_CRYPTO_LIVE_TRAIL_GIVEBACK_PCT", str(V18232_CRYPTO_TRAIL_GIVEBACK_PCT)) or V18232_CRYPTO_TRAIL_GIVEBACK_PCT))
+V18234_CRYPTO_LIVE_EXIT_SCORE = max(0.0, min(V18234_CRYPTO_LIVE_ENTRY_SCORE, float(os.getenv("TRADEBOT_CRYPTO_LIVE_EXIT_SCORE", str(V18232_CRYPTO_EXIT_SCORE)) or V18232_CRYPTO_EXIT_SCORE)))
+_crypto_live_lock = threading.RLock()
+_crypto_live_runtime: Dict[str, Any] = {"lastError": None, "lastActionAt": None}
+
+
+def _v18234_crypto_account_status() -> Dict[str, Any]:
+    if PAPER:
+        return {"active": False, "status": "PAPER_ACCOUNT", "message": "TradeBot is using Alpaca paper credentials; real crypto is disabled."}
+    try:
+        account = get_account()
+        raw = getattr(account, "crypto_status", None)
+        status = str(getattr(raw, "value", raw) or "UNKNOWN").upper()
+        active = status == "ACTIVE"
+        return {"active": active, "status": status, "message": "Crypto trading enabled on Alpaca." if active else f"Alpaca crypto_status is {status}."}
+    except Exception as exc:
+        return {"active": False, "status": "UNKNOWN", "message": f"Unable to read Alpaca crypto status: {str(exc)[:200]}"}
+
+
+def _v18234_raw_crypto_positions() -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    try:
+        raw = trading_client.get_all_positions()
+    except Exception:
+        return out
+    for pos in raw:
+        try:
+            symbol = str(getattr(pos, "symbol", "") or "").upper()
+            asset_class = str(getattr(pos, "asset_class", "") or "").lower()
+            if "/" not in symbol and "crypto" not in asset_class:
+                continue
+            qty = float(getattr(pos, "qty", 0) or 0)
+            entry = float(getattr(pos, "avg_entry_price", 0) or 0)
+            price = float(getattr(pos, "current_price", 0) or 0)
+            if qty <= 0:
+                continue
+            out.append({"symbol": symbol, "qty": qty, "entry": entry, "price": price,
+                        "marketValueUsd": float(getattr(pos, "market_value", 0) or 0)})
+        except Exception:
+            continue
+    return out
+
+
+def _v18234_log_live_trade(symbol: str, side: str, order: Any, qty: float, price: float, notional: float,
+                            pnl: Optional[float], pnl_pct: Optional[float], score: float, reason: str, status: str = "submitted") -> None:
+    try:
+        conn = db_connect(); now = datetime.now(UTC).isoformat()
+        conn.execute("""INSERT INTO v18234_crypto_live_trades
+            (timestamp,symbol,side,order_id,qty,price,notional_usd,pnl_usd,pnl_pct,score,reason,status,request_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (now, symbol, side, str(getattr(order, "id", "") or ""), qty, price, notional, pnl, pnl_pct, score, reason,
+             str(getattr(getattr(order, "status", None), "value", getattr(order, "status", status)) or status), ""))
+        conn.commit(); conn.close()
+    except Exception as exc:
+        print(f"V18.2.34 CRYPTO LIVE LEDGER ERROR | {exc}", flush=True)
+
+
+def _v18234_poll_fill(order: Any, fallback_price: float, fallback_qty: float = 0.0) -> Tuple[float, float]:
+    oid = getattr(order, "id", None)
+    current = order
+    for _ in range(5):
+        try:
+            filled_price = float(getattr(current, "filled_avg_price", 0) or 0)
+            filled_qty = float(getattr(current, "filled_qty", 0) or 0)
+            if filled_price > 0 and filled_qty > 0:
+                return filled_price, filled_qty
+            if oid and hasattr(trading_client, "get_order_by_id"):
+                time.sleep(1)
+                current = trading_client.get_order_by_id(oid)
+                continue
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return float(fallback_price or 0), float(fallback_qty or 0)
+
+
+def _v18234_live_buy(scan: Dict[str, Any]) -> bool:
+    symbol = str(scan.get("symbol") or "").upper(); price = float(scan.get("price") or 0); score = float(scan.get("score") or 0)
+    if not symbol or price <= 0 or score < V18234_CRYPTO_LIVE_ENTRY_SCORE:
+        return False
+    state = load_profit_vault_state()
+    allocation_gbp = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
+    if not state.get("cryptoLivePilotEnabled") or allocation_gbp <= 0:
+        return False
+    if _v18234_raw_crypto_positions():
+        return False
+    rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
+    notional_usd = min(allocation_gbp, V18234_CRYPTO_LIVE_PILOT_MAX_GBP) / max(rate, 0.0001)
+    if notional_usd < 1.0:
+        return False
+    acct = _v18234_crypto_account_status()
+    if not acct.get("active"):
+        _crypto_live_runtime["lastError"] = acct.get("message")
+        return False
+    with _crypto_live_lock:
+        try:
+            req = MarketOrderRequest(symbol=symbol, notional=round(notional_usd, 2), side=OrderSide.BUY, time_in_force=TimeInForce.GTC)
+            order = trading_client.submit_order(order_data=req)
+            fill_price, fill_qty = _v18234_poll_fill(order, price, notional_usd / price)
+            _v18234_log_live_trade(symbol, "BUY", order, fill_qty, fill_price, notional_usd, None, None, score, "CRYPTO LIVE PILOT ENTRY")
+            _crypto_live_runtime.update({"lastError": None, "lastActionAt": datetime.now(UTC).isoformat()})
+            print(f"V18.2.34 CRYPTO LIVE BUY | {symbol} notional=${notional_usd:.2f} fill={fill_price:.8f} qty={fill_qty:.8f} score={score:.3f}", flush=True)
+            return True
+        except Exception as exc:
+            _crypto_live_runtime["lastError"] = str(exc)[:500]
+            print(f"V18.2.34 CRYPTO LIVE BUY ERROR | {symbol} {exc}", flush=True)
+            return False
+
+
+def _v18234_live_sell(position: Dict[str, Any], price: float, score: float, reason: str) -> bool:
+    symbol = str(position.get("symbol") or "").upper(); qty = float(position.get("qty") or 0); entry = float(position.get("entry") or 0)
+    if not symbol or qty <= 0 or entry <= 0 or price <= 0:
+        return False
+    with _crypto_live_lock:
+        try:
+            req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
+            order = trading_client.submit_order(order_data=req)
+            fill_price, fill_qty = _v18234_poll_fill(order, price, qty)
+            pnl_usd = (fill_price - entry) * (fill_qty or qty)
+            pnl_pct = ((fill_price / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+            notional = fill_price * (fill_qty or qty)
+            _v18234_log_live_trade(symbol, "SELL", order, fill_qty or qty, fill_price, notional, pnl_usd, pnl_pct, score, reason)
+            state = load_profit_vault_state(); rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
+            pnl_gbp = pnl_usd * rate
+            state["cryptoRealisedPnlGbp"] = round(float(state.get("cryptoRealisedPnlGbp") or 0.0) + pnl_gbp, 4)
+            # Profits are swept back into the protected Vault; losses reduce the pilot allocation.
+            if pnl_gbp > 0:
+                state["bankedProfitGbp"] = round(float(state.get("bankedProfitGbp") or 0.0) + pnl_gbp, 4)
+                state["lifetimeBankedGbp"] = round(float(state.get("lifetimeBankedGbp") or 0.0) + pnl_gbp, 4)
+                state["cryptoLifetimeProfitBankedGbp"] = round(float(state.get("cryptoLifetimeProfitBankedGbp") or 0.0) + pnl_gbp, 4)
+            elif pnl_gbp < 0:
+                state["cryptoAllocatedGbp"] = round(max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0) + pnl_gbp), 4)
+            state["lastCryptoLiveExitAt"] = datetime.now(UTC).isoformat(); state["lastCryptoLivePnlGbp"] = round(pnl_gbp, 4)
+            save_profit_vault_state(state)
+            _crypto_live_runtime.update({"lastError": None, "lastActionAt": datetime.now(UTC).isoformat()})
+            print(f"V18.2.34 CRYPTO LIVE SELL | {symbol} fill={fill_price:.8f} pnl=${pnl_usd:.2f} pnl_pct={pnl_pct:.2f}% reason={reason}", flush=True)
+            return True
+        except Exception as exc:
+            _crypto_live_runtime["lastError"] = str(exc)[:500]
+            print(f"V18.2.34 CRYPTO LIVE SELL ERROR | {symbol} {exc}", flush=True)
+            return False
+
+
+def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    if not V18234_CRYPTO_LIVE_ENABLED or PAPER:
+        return {"ok": True, "enabled": False}
+    state = load_profit_vault_state()
+    if not state.get("cryptoLivePilotEnabled") or float(state.get("cryptoAllocatedGbp") or 0.0) <= 0:
+        return {"ok": True, "enabled": True, "armed": False}
+    scans = scans if isinstance(scans, list) else _v18232_fetch_scans()
+    by_symbol = {str(x.get("symbol") or "").upper(): x for x in scans if isinstance(x, dict)}
+    positions = _v18234_raw_crypto_positions()
+    if positions:
+        p = positions[0]; scan = by_symbol.get(p["symbol"], {}); price = float(scan.get("price") or p.get("price") or 0); score = float(scan.get("score") or 0)
+        entry = float(p.get("entry") or 0); pnl_pct = ((price / entry) - 1.0) * 100.0 if entry > 0 and price > 0 else 0.0
+        # Track high-water mark in persistent Vault state to survive restarts.
+        high_key = "cryptoLiveHighPrice"; high = max(float(state.get(high_key) or 0.0), price)
+        state[high_key] = high; state["cryptoLiveSymbol"] = p["symbol"]; save_profit_vault_state(state)
+        trail_floor = high * (1.0 - V18234_CRYPTO_LIVE_TRAIL_GIVEBACK_PCT / 100.0)
+        reason = None
+        if pnl_pct <= -V18234_CRYPTO_LIVE_STOP_PCT: reason = "CRYPTO LIVE STOP"
+        elif ((high / entry) - 1.0) * 100.0 >= V18234_CRYPTO_LIVE_TRAIL_START_PCT and price <= trail_floor: reason = "CRYPTO LIVE TRAIL"
+        elif score > 0 and score <= V18234_CRYPTO_LIVE_EXIT_SCORE and pnl_pct > 0: reason = "CRYPTO LIVE MOMENTUM EXIT"
+        if reason: _v18234_live_sell(p, price, score, reason)
+    else:
+        if float(state.get("cryptoLiveHighPrice") or 0.0) != 0:
+            state["cryptoLiveHighPrice"] = 0.0; state["cryptoLiveSymbol"] = ""; save_profit_vault_state(state)
+        for scan in scans:
+            if float(scan.get("score") or 0) >= V18234_CRYPTO_LIVE_ENTRY_SCORE:
+                _v18234_live_buy(scan); break
+    return {"ok": True, "enabled": True, "armed": True, "positions": len(positions)}
+
+
+def v18234_crypto_bridge_payload() -> Dict[str, Any]:
+    vault = profit_vault_payload(); account = _v18234_crypto_account_status(); state = load_profit_vault_state()
+    crypto = v18232_crypto_shadow_payload()
+    allocated = max(0.0, float(vault.get("cryptoAllocatedGbp") or 0.0))
+    return {
+        "ok": True, "version": "V18.2.34", "manualOnly": True, "automaticRelease": False,
+        "liveExecutionInstalled": True, "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
+        "accountCrypto": account, "vaultAvailableGbp": round(float(vault.get("bankedProfitGbp") or 0.0),2),
+        "cryptoAllocatedGbp": round(allocated,2), "pilotMaxGbp": round(V18234_CRYPTO_LIVE_PILOT_MAX_GBP,2),
+        "remainingPilotCapacityGbp": round(max(0.0, V18234_CRYPTO_LIVE_PILOT_MAX_GBP-allocated),2),
+        "lifetimeCryptoReleasedGbp": round(float(vault.get("lifetimeCryptoReleasedGbp") or 0.0),2),
+        "cryptoRealisedPnlGbp": round(float(state.get("cryptoRealisedPnlGbp") or 0.0),2),
+        "cryptoLifetimeProfitBankedGbp": round(float(state.get("cryptoLifetimeProfitBankedGbp") or 0.0),2),
+        "livePositions": _v18234_raw_crypto_positions(), "lastError": _crypto_live_runtime.get("lastError"),
+        "shadowEvidence": {"closedTests": int(crypto.get("closedTrades") or 0), "winRate": float(crypto.get("winRate") or 0), "totalPnlUsd": float(crypto.get("totalPnlUsd") or 0)},
+        "locked": not bool(account.get("active")),
+        "message": account.get("message"),
+    }
+
+
+def v18234_release_vault_to_crypto(amount_gbp: float, confirmation: str) -> Dict[str, Any]:
+    try: amount = round(float(amount_gbp), 2)
+    except Exception: amount = 0.0
+    if confirmation.strip().upper() != "UNLOCK CRYPTO": return {"ok": False, "message": "Confirmation must be UNLOCK CRYPTO."}
+    account = _v18234_crypto_account_status()
+    if not account.get("active"): return {"ok": False, "message": account.get("message"), "accountCrypto": account}
+    if amount <= 0: return {"ok": False, "message": "Release amount must be greater than £0."}
+    state = load_profit_vault_state(); available = max(0.0, float(state.get("bankedProfitGbp") or 0.0)); allocated = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
+    remaining = max(0.0, V18234_CRYPTO_LIVE_PILOT_MAX_GBP - allocated)
+    if amount > remaining: return {"ok": False, "message": f"Live pilot is capped at £{V18234_CRYPTO_LIVE_PILOT_MAX_GBP:.2f}; remaining capacity is £{remaining:.2f}."}
+    if amount > available: return {"ok": False, "message": f"Vault only has £{available:.2f} available."}
+    state["bankedProfitGbp"] = round(available-amount,4); state["cryptoAllocatedGbp"] = round(allocated+amount,4)
+    state["lifetimeCryptoReleasedGbp"] = round(float(state.get("lifetimeCryptoReleasedGbp") or 0.0)+amount,4)
+    state["lastCryptoReleaseAt"] = datetime.now(UTC).isoformat(); state["lastCryptoReleaseGbp"] = amount
+    state["cryptoLivePilotEnabled"] = True; state["cryptoLivePilotActivatedAt"] = datetime.now(UTC).isoformat()
+    save_profit_vault_state(state)
+    print(f"V18.2.34 VAULT TO CRYPTO LIVE | released=£{amount:.2f} pilot_cap=£{V18234_CRYPTO_LIVE_PILOT_MAX_GBP:.2f} manual=True", flush=True)
+    return {"ok": True, "message": f"£{amount:.2f} released and the live crypto pilot is ARMED.", "bridge": v18234_crypto_bridge_payload()}
+
+
+@app.get('/v18/crypto-bridge')
+def api_v18234_crypto_bridge(request: Request):
+    verify_api_key(request); return v18234_crypto_bridge_payload()
+
+
+@app.post('/v18/crypto-bridge/release')
+def api_v18234_crypto_bridge_release(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request); return v18234_release_vault_to_crypto(payload.get("amountGbp",0), str(payload.get("confirmation") or ""))
+
+
+@app.post('/v18/crypto-live/disable')
+def api_v18234_crypto_live_disable(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    if str(payload.get("confirmation") or "").strip().upper() != "DISABLE LIVE CRYPTO":
+        return {"ok": False, "message": "Confirmation must be DISABLE LIVE CRYPTO."}
+    state = load_profit_vault_state(); state["cryptoLivePilotEnabled"] = False; save_profit_vault_state(state)
+    return {"ok": True, "message": "Live crypto pilot disabled. Existing crypto position is not force-sold.", "bridge": v18234_crypto_bridge_payload()}
 
 
 @app.get('/v18/crypto-shadow')
@@ -11201,6 +11480,8 @@ def startup_event():
         v18232_crypto_shadow_thread_started = True
         threading.Thread(target=v18232_crypto_shadow_worker, daemon=True, name="v18-crypto-shadow").start()
         print(f"V18.2.32 CRYPTO SHADOW | enabled=True interval={V18232_CRYPTO_INTERVAL_SECONDS}s symbols={len(V18232_CRYPTO_SYMBOLS)} virtual_capital=${V18232_CRYPTO_CAPITAL_USD:.2f} advisory_only=True live_orders=False")
+        acct = _v18234_crypto_account_status()
+        print(f"V18.2.34 CRYPTO LIVE PILOT | installed=True account_crypto={acct.get('status')} pilot_cap=£{V18234_CRYPTO_LIVE_PILOT_MAX_GBP:.2f} manual_vault_release=True auto_refill=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
@@ -12922,6 +13203,18 @@ def _profit_vault_default_state() -> Dict[str, Any]:
         "baselineSeeded": False,
         "baselineSeededAt": "",
         "baselineSeedAmountGbp": 0.0,
+        # V18.2.33 — Vault → Crypto Bridge. This is a separate reserve bucket:
+        # it remains excluded from stock buying power after the user releases it.
+        "cryptoAllocatedGbp": 0.0,
+        "lifetimeCryptoReleasedGbp": 0.0,
+        "lastCryptoReleaseAt": "",
+        "lastCryptoReleaseGbp": 0.0,
+        "cryptoLivePilotEnabled": False,
+        "cryptoLivePilotActivatedAt": "",
+        "cryptoRealisedPnlGbp": 0.0,
+        "cryptoLifetimeProfitBankedGbp": 0.0,
+        "cryptoLiveHighPrice": 0.0,
+        "cryptoLiveSymbol": "",
     }
 
 def load_profit_vault_state() -> Dict[str, Any]:
@@ -12938,6 +13231,8 @@ def load_profit_vault_state() -> Dict[str, Any]:
                 default["bankPct"] = max(0.0, min(1.0, float(default.get("bankPct") if default.get("bankPct") is not None else PROFIT_VAULT_BANK_PCT)))
                 default["bankedProfitGbp"] = max(0.0, float(default.get("bankedProfitGbp") or 0.0))
                 default["lifetimeBankedGbp"] = max(default["bankedProfitGbp"], float(default.get("lifetimeBankedGbp") or 0.0))
+                default["cryptoAllocatedGbp"] = max(0.0, float(default.get("cryptoAllocatedGbp") or 0.0))
+                default["lifetimeCryptoReleasedGbp"] = max(default["cryptoAllocatedGbp"], float(default.get("lifetimeCryptoReleasedGbp") or 0.0))
                 return default
         except Exception as exc:
             print(f"V17.6 PROFIT VAULT LOAD ERROR | {exc}")
@@ -12961,6 +13256,8 @@ def save_profit_vault_state(state: Dict[str, Any]) -> Dict[str, Any]:
         data["updatedAt"] = datetime.now(UTC).isoformat()
         data["bankedProfitGbp"] = round(max(0.0, float(data.get("bankedProfitGbp") or 0.0)), 4)
         data["lifetimeBankedGbp"] = round(max(data["bankedProfitGbp"], float(data.get("lifetimeBankedGbp") or 0.0)), 4)
+        data["cryptoAllocatedGbp"] = round(max(0.0, float(data.get("cryptoAllocatedGbp") or 0.0)), 4)
+        data["lifetimeCryptoReleasedGbp"] = round(max(data["cryptoAllocatedGbp"], float(data.get("lifetimeCryptoReleasedGbp") or 0.0)), 4)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -13068,8 +13365,10 @@ def profit_vault_reserved_usd() -> float:
     if not state.get("enabled"):
         return 0.0
     banked_gbp = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
+    crypto_gbp = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
     rate = get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP
-    return max(0.0, banked_gbp / max(float(rate), 0.0001))
+    # Both vault cash and released crypto capital are off-limits to the stock engine.
+    return max(0.0, (banked_gbp + crypto_gbp) / max(float(rate), 0.0001))
 
 def profit_vault_deployable_usd(account_equity: float, buying_power: Optional[float] = None) -> float:
     try:
@@ -13128,7 +13427,9 @@ def profit_vault_payload(account: Any = None) -> Dict[str, Any]:
     rate = get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP
     equity_gbp = equity_usd * float(rate)
     banked_gbp = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
-    reserved_usd = banked_gbp / max(float(rate), 0.0001)
+    crypto_allocated_gbp = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
+    total_reserved_gbp = banked_gbp + crypto_allocated_gbp
+    reserved_usd = total_reserved_gbp / max(float(rate), 0.0001)
     working_usd = profit_vault_deployable_usd(equity_usd, buying_power_usd)
     return {
         "version": PROFIT_VAULT_VERSION,
@@ -13136,7 +13437,11 @@ def profit_vault_payload(account: Any = None) -> Dict[str, Any]:
         "baselineGbp": round(float(state.get("baselineGbp") or PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2),
         "bankPct": round(float(state.get("bankPct") or 0.0), 4),
         "bankedProfitGbp": round(banked_gbp, 2),
-        "bankedProfitUsd": round(reserved_usd, 2),
+        "bankedProfitUsd": round(banked_gbp / max(float(rate), 0.0001), 2),
+        "cryptoAllocatedGbp": round(crypto_allocated_gbp, 2),
+        "cryptoAllocatedUsd": round(crypto_allocated_gbp / max(float(rate), 0.0001), 2),
+        "totalProtectedReserveGbp": round(total_reserved_gbp, 2),
+        "lifetimeCryptoReleasedGbp": round(float(state.get("lifetimeCryptoReleasedGbp") or 0.0), 2),
         "lifetimeBankedGbp": round(float(state.get("lifetimeBankedGbp") or 0.0), 2),
         "accountEquityGbp": round(equity_gbp, 2),
         "accountEquityUsd": round(equity_usd, 2),
@@ -13146,7 +13451,7 @@ def profit_vault_payload(account: Any = None) -> Dict[str, Any]:
         "workingCapitalUsd": round(working_usd, 2),
         "freeCashGbp": round(working_usd * float(rate), 2),
         "freeCashUsd": round(working_usd, 2),
-        "tradingCapitalGbp": round(max(0.0, equity_gbp - banked_gbp), 2),
+        "tradingCapitalGbp": round(max(0.0, equity_gbp - total_reserved_gbp), 2),
         "tradingCapitalUsd": round(max(0.0, equity_usd - reserved_usd), 2),
         "buyingPowerUsd": round(buying_power_usd, 2),
         "lastBankedAt": state.get("lastBankedAt", ""),
