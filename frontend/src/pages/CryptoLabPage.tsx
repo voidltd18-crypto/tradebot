@@ -141,19 +141,22 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const entryScore = Number(data.config?.entryScore || 0.34);
   const armed = Boolean(bridge?.livePilotEnabled);
   const accountActive = Boolean(bridge?.accountCrypto?.active);
+  const entriesPaused = Boolean(bridge?.newEntriesPaused);
 
   return <div className="crypto-lab-page">
     <section className="crypto-hero">
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.45 · DYNAMIC CRYPTO MARKET SCANNER</div>
+          <div className="eyebrow">V18.2.46 · CRYPTO OWNERSHIP RECOVERY + SAFE PAUSE</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
       </div>
-      <div className={`crypto-live-badge ${armed ? "armed" : "idle"}`}><span>●</span>{armed ? "LIVE PILOT ARMED" : "LIVE PILOT OFF"}</div>
+      <div className={`crypto-live-badge ${armed ? "armed" : "idle"}`}><span>●</span>{armed ? (entriesPaused ? "PAUSED · EXITS ARMED" : "LIVE PILOT ARMED") : "LIVE PILOT OFF"}</div>
     </section>
+
+    {entriesPaused && <div className="crypto-notice">New crypto entries are paused with the main bot. Existing bot-managed crypto positions keep stop-loss and trailing protection active.</div>}
 
     <section className="crypto-summary-grid">
       <div className="crypto-summary-card"><div className="crypto-summary-icon vault">▣</div><div><span>Vault Available</span><strong>{gbp(bridge?.vaultAvailableGbp)}</strong><small>Protected capital</small></div></div>

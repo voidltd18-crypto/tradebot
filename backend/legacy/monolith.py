@@ -11305,6 +11305,17 @@ def _v18234_crypto_account_status() -> Dict[str, Any]:
         return {"active": False, "status": "UNKNOWN", "message": f"Unable to read Alpaca crypto status: {str(exc)[:200]}"}
 
 
+def _v18246_crypto_symbol_key(symbol: Any) -> str:
+    """Canonical comparison key for Alpaca crypto symbols.
+
+    Alpaca market-data scans commonly use BTC/USD while positions/order ledgers
+    may surface BTCUSD.  Ownership and safety checks must treat those as the
+    same instrument across refreshes and service restarts.
+    """
+    raw = str(symbol or "").strip().upper()
+    return "".join(ch for ch in raw if ch.isalnum())
+
+
 def _v18237_pilot_open_symbols() -> set[str]:
     """Return crypto symbols with a bot-recorded BUY that has not been followed by a SELL.
 
@@ -11323,7 +11334,7 @@ def _v18237_pilot_open_symbols() -> set[str]:
         conn.close()
         for row in rows:
             try:
-                symbol = str(row[0] or "").upper()
+                symbol = _v18246_crypto_symbol_key(row[0])
                 side = str(row[1] or "").upper()
                 if symbol and side == "BUY":
                     open_symbols.add(symbol)
@@ -11359,7 +11370,7 @@ def _v18234_raw_crypto_positions() -> List[Dict[str, Any]]:
             out.append({"symbol": symbol, "qty": qty, "entry": entry, "price": price,
                         "marketValueUsd": market_value, "pnlUsd": unrealised_usd,
                         "pnlGbp": unrealised_usd * rate, "pnlPct": pnl_pct,
-                        "managedByPilot": symbol in pilot_symbols})
+                        "managedByPilot": _v18246_crypto_symbol_key(symbol) in pilot_symbols})
         except Exception:
             continue
     return out
@@ -11409,7 +11420,7 @@ def _v18234_live_buy(scan: Dict[str, Any], allocation_gbp_override: Optional[flo
     if not state.get("cryptoLivePilotEnabled") or allocation_gbp <= 0:
         return False
     positions = _v18234_raw_crypto_positions()
-    if len(positions) >= V18234_CRYPTO_LIVE_MAX_POSITIONS or any(str(p.get("symbol") or "").upper() == symbol for p in positions):
+    if len(positions) >= V18234_CRYPTO_LIVE_MAX_POSITIONS or any(_v18246_crypto_symbol_key(p.get("symbol")) == _v18246_crypto_symbol_key(symbol) for p in positions):
         return False
     rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
     desired_notional_usd = min(allocation_gbp, V18234_CRYPTO_LIVE_PILOT_MAX_GBP) / max(rate, 0.0001)
@@ -11492,7 +11503,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Di
         return {"ok": True, "enabled": True, "armed": False}
     scans = scans if isinstance(scans, list) else _v18232_fetch_scans()
     scans = sorted([x for x in scans if isinstance(x, dict)], key=lambda x: float(x.get("score") or 0), reverse=True)
-    by_symbol = {str(x.get("symbol") or "").upper(): x for x in scans}
+    by_symbol = {_v18246_crypto_symbol_key(x.get("symbol")): x for x in scans}
     positions = _v18234_raw_crypto_positions()
     managed_positions = [p for p in positions if bool(p.get("managedByPilot"))]
 
@@ -11509,7 +11520,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Di
     sold_any = False
     for p in list(managed_positions):
         symbol = str(p.get("symbol") or "").upper()
-        scan = by_symbol.get(symbol, {})
+        scan = by_symbol.get(_v18246_crypto_symbol_key(symbol), {})
         price = float(scan.get("price") or p.get("price") or 0)
         score = float(scan.get("score") or 0)
         entry = float(p.get("entry") or 0)
@@ -11531,13 +11542,32 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Di
     state["cryptoLiveSymbol"] = ""
     save_profit_vault_state(state)
 
+    # V18.2.46: the global Pause/Manual Override/Emergency Stop blocks NEW crypto
+    # entries, but deliberately leaves protective exits above active for positions
+    # already owned by the pilot. Pausing the bot must never remove stop/trail safety.
+    entries_paused = (not bool(bot_enabled)) or bool(manual_override) or bool(emergency_stop)
+    if entries_paused:
+        final_positions = _v18234_raw_crypto_positions()
+        final_managed = [p for p in final_positions if bool(p.get("managedByPilot"))]
+        _crypto_live_runtime["entriesPaused"] = True
+        _crypto_live_runtime["pauseReason"] = (
+            "BOT_PAUSED" if not bool(bot_enabled) else
+            "MANUAL_OVERRIDE" if bool(manual_override) else
+            "EMERGENCY_STOP"
+        )
+        return {"ok": True, "enabled": True, "armed": True, "entriesPaused": True,
+                "protectiveExitsActive": True, "positions": len(final_positions),
+                "managedPositions": len(final_managed), "maxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS}
+    _crypto_live_runtime["entriesPaused"] = False
+    _crypto_live_runtime["pauseReason"] = None
+
     # Refresh after exits. External/manual crypto positions count toward the two-position
     # safety cap but remain visible-only: the bot never auto-sells them.
     positions = _v18234_raw_crypto_positions()
-    held_symbols = {str(p.get("symbol") or "").upper() for p in positions}
+    held_symbols = {_v18246_crypto_symbol_key(p.get("symbol")) for p in positions}
     slots = max(0, V18234_CRYPTO_LIVE_MAX_POSITIONS - len(positions))
     if slots > 0:
-        qualified = [x for x in scans if float(x.get("score") or 0) >= V18234_CRYPTO_LIVE_ENTRY_SCORE and str(x.get("symbol") or "").upper() not in held_symbols]
+        qualified = [x for x in scans if float(x.get("score") or 0) >= V18234_CRYPTO_LIVE_ENTRY_SCORE and _v18246_crypto_symbol_key(x.get("symbol")) not in held_symbols]
         qualified = qualified[:slots]
         if qualified:
             rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
@@ -11554,11 +11584,11 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Di
                     budget = min(budget, budget_left)
                 if budget >= 1.0 and _v18234_live_buy(scan, budget):
                     budget_left = max(0.0, budget_left - budget)
-                    held_symbols.add(str(scan.get("symbol") or "").upper())
+                    held_symbols.add(_v18246_crypto_symbol_key(scan.get("symbol")))
 
     final_positions = _v18234_raw_crypto_positions()
     final_managed = [p for p in final_positions if bool(p.get("managedByPilot"))]
-    return {"ok": True, "enabled": True, "armed": True, "positions": len(final_positions), "managedPositions": len(final_managed), "maxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS}
+    return {"ok": True, "enabled": True, "armed": True, "entriesPaused": False, "protectiveExitsActive": True, "positions": len(final_positions), "managedPositions": len(final_managed), "maxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS}
 
 
 # V18.2.44 — two-position live crypto pilot + V18.2.43 tighter crypto-only exits.
@@ -11609,7 +11639,7 @@ def v18237_manual_crypto_sell(symbol: str, confirmation: str) -> Dict[str, Any]:
     account = _v18234_crypto_account_status()
     if not account.get("active"):
         return {"ok": False, "message": account.get("message"), "accountCrypto": account}
-    position = next((p for p in _v18234_raw_crypto_positions() if str(p.get("symbol") or "").upper() == symbol), None)
+    position = next((p for p in _v18234_raw_crypto_positions() if _v18246_crypto_symbol_key(p.get("symbol")) == _v18246_crypto_symbol_key(symbol)), None)
     if not position:
         return {"ok": False, "message": f"No open {symbol} crypto position was found."}
     price = float(position.get("price") or 0.0)
@@ -11662,11 +11692,14 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     usable_max = min(pool, V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
     live_positions = _v18234_raw_crypto_positions()
     return {
-        "ok": True, "version": "V18.2.45", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.46", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "allocationLockedByPosition": bool(live_positions),
         "liveExecutionInstalled": True, "liveExecutorIntervalSeconds": V18242_CRYPTO_LIVE_INTERVAL_SECONDS, "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
         "liveMaxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS,
+        "newEntriesPaused": (not bool(bot_enabled)) or bool(manual_override) or bool(emergency_stop),
+        "pauseReason": ("BOT_PAUSED" if not bool(bot_enabled) else "MANUAL_OVERRIDE" if bool(manual_override) else "EMERGENCY_STOP" if bool(emergency_stop) else None),
+        "protectiveExitsActiveWhilePaused": True,
         "accountCrypto": account, "vaultAvailableGbp": round(vault_available,2),
         "vaultReserveGbp": round(reserve,2), "cryptoPoolGbp": round(pool,2),
         "cryptoAllocatedGbp": round(allocated,2), "pilotMaxGbp": round(usable_max,2),
@@ -12007,11 +12040,11 @@ def startup_event():
         threading.Thread(target=v18232_crypto_shadow_worker, daemon=True, name="v18-crypto-shadow").start()
         print(f"V18.2.32 CRYPTO SHADOW | enabled=True interval={V18232_CRYPTO_INTERVAL_SECONDS}s symbols={len(V18232_CRYPTO_SYMBOLS)} virtual_capital=${V18232_CRYPTO_CAPITAL_USD:.2f} advisory_only=True live_orders=False")
         acct = _v18234_crypto_account_status()
-        print(f"V18.2.45 CRYPTO LIVE PILOT | installed=True account_crypto={acct.get('status')} full_vault_default=True vault_reserve_adjustable=True broker_safe_sizing=True live_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s", flush=True)
+        print(f"V18.2.46 CRYPTO LIVE PILOT | installed=True account_crypto={acct.get('status')} full_vault_default=True vault_reserve_adjustable=True broker_safe_sizing=True live_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s", flush=True)
     if V18234_CRYPTO_LIVE_ENABLED and not PAPER and not v18242_crypto_live_thread_started:
         v18242_crypto_live_thread_started = True
         threading.Thread(target=v18242_crypto_live_worker, daemon=True, name="v18-crypto-live").start()
-        print(f"V18.2.45 CRYPTO LIVE EXECUTOR | interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s independent_of_shadow=True", flush=True)
+        print(f"V18.2.46 CRYPTO LIVE EXECUTOR | interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s independent_of_shadow=True", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
