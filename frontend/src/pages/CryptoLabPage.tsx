@@ -147,7 +147,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.41 · FULL VAULT CRYPTO + SAFE SIZING</div>
+          <div className="eyebrow">V18.2.42 · FAST LIVE CRYPTO EXECUTION</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -218,7 +218,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-panel-head">
         <div>
           <h3><span className="panel-icon">⌒</span> Crypto Bridge</h3>
-          <p>Crypto uses the full protected pool by default. Set a Vault reserve only if you want to hold money back.</p>
+          <p>Crypto uses the full protected pool by default. Qualified live entries are checked every 15 seconds; set a Vault reserve only if you want to hold money back.</p>
         </div>
         <span className={`crypto-chip ${armed ? "live" : accountActive ? "building" : ""}`}>{armed ? "LIVE PILOT ARMED" : accountActive ? "READY TO ARM" : "CRYPTO NOT ACTIVE"}</span>
       </div>

@@ -523,6 +523,7 @@ ai_summary_thread_started = False
 v18224_live_audit_thread_started = False
 v18230_evidence_thread_started = False
 v18232_crypto_shadow_thread_started = False
+v18242_crypto_live_thread_started = False
 AI_SUMMARY_LOG_ENABLED = os.getenv("AI_SUMMARY_LOG_ENABLED", "true").lower() in ("1","true","yes","on")
 AI_SUMMARY_LOG_INTERVAL_SECONDS = max(300, int(os.getenv("AI_SUMMARY_LOG_INTERVAL_SECONDS", "3600")))
 AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS = max(30, int(os.getenv("AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS", "120")))
@@ -10886,6 +10887,7 @@ V18232_CRYPTO_STOP_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_STOP_PCT", "
 V18232_CRYPTO_TRAIL_START_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_TRAIL_START_PCT", "4.0") or 4.0))
 V18232_CRYPTO_TRAIL_GIVEBACK_PCT = max(0.10, float(os.getenv("TRADEBOT_CRYPTO_TRAIL_GIVEBACK_PCT", "1.5") or 1.5))
 V18232_CRYPTO_EXIT_SCORE = max(0.0, min(V18232_CRYPTO_ENTRY_SCORE, float(os.getenv("TRADEBOT_CRYPTO_EXIT_SCORE", "0.34") or 0.34)))
+V18242_CRYPTO_LIVE_INTERVAL_SECONDS = max(5, int(os.getenv("TRADEBOT_CRYPTO_LIVE_INTERVAL_SECONDS", "15") or 15))
 
 _crypto_shadow_lock = threading.RLock()
 _crypto_shadow_last_scans: List[Dict[str, Any]] = []
@@ -11409,6 +11411,42 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Di
     return {"ok": True, "enabled": True, "armed": True, "positions": len(positions), "managedPositions": len(managed_positions)}
 
 
+# V18.2.42 — decouple live crypto execution from the 5-minute shadow-research cadence.
+# The scanner can remain on 5-minute bars, but once a candidate is already qualified
+# the live pilot should not wait up to another 300 seconds before acting.
+_crypto_live_cycle_guard = threading.Lock()
+_v18234_crypto_live_cycle_original = v18234_crypto_live_cycle
+
+def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    if not _crypto_live_cycle_guard.acquire(blocking=False):
+        return {"ok": True, "enabled": True, "busy": True}
+    try:
+        return _v18234_crypto_live_cycle_original(scans)
+    finally:
+        _crypto_live_cycle_guard.release()
+
+def v18242_crypto_live_worker() -> None:
+    # Give startup/schema work a moment to settle, then check qualified crypto
+    # candidates frequently using the already-populated scanner cache.
+    time.sleep(8)
+    while True:
+        try:
+            with _crypto_shadow_lock:
+                scans = [dict(x) for x in _crypto_shadow_last_scans]
+            if not scans:
+                scans = _v18232_fetch_scans()
+                with _crypto_shadow_lock:
+                    _crypto_shadow_last_scans.clear()
+                    _crypto_shadow_last_scans.extend(scans)
+            result = v18234_crypto_live_cycle(scans)
+            if result.get("busy"):
+                pass
+        except Exception as exc:
+            _crypto_live_runtime["lastError"] = str(exc)[:500]
+            print(f"V18.2.42 CRYPTO LIVE WORKER ERROR | {str(exc)[:500]}", flush=True)
+        time.sleep(V18242_CRYPTO_LIVE_INTERVAL_SECONDS)
+
+
 def v18237_manual_crypto_sell(symbol: str, confirmation: str) -> Dict[str, Any]:
     symbol = str(symbol or "").strip().upper()
     if confirmation.strip().upper() != "SELL CRYPTO NOW":
@@ -11471,10 +11509,10 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     usable_max = min(pool, V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
     live_positions = _v18234_raw_crypto_positions()
     return {
-        "ok": True, "version": "V18.2.41", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.42", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "allocationLockedByPosition": bool(live_positions),
-        "liveExecutionInstalled": True, "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
+        "liveExecutionInstalled": True, "liveExecutorIntervalSeconds": V18242_CRYPTO_LIVE_INTERVAL_SECONDS, "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
         "accountCrypto": account, "vaultAvailableGbp": round(vault_available,2),
         "vaultReserveGbp": round(reserve,2), "cryptoPoolGbp": round(pool,2),
         "cryptoAllocatedGbp": round(allocated,2), "pilotMaxGbp": round(usable_max,2),
@@ -11765,7 +11803,7 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started, v18224_live_audit_thread_started, v18230_evidence_thread_started, v18232_crypto_shadow_thread_started
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started, v18224_live_audit_thread_started, v18230_evidence_thread_started, v18232_crypto_shadow_thread_started, v18242_crypto_live_thread_started
     # Initialise the shared SQLite schema synchronously before any worker threads start.
     # This removes the startup race where multiple workers all tried to create tables.
     init_db()
@@ -11815,7 +11853,11 @@ def startup_event():
         threading.Thread(target=v18232_crypto_shadow_worker, daemon=True, name="v18-crypto-shadow").start()
         print(f"V18.2.32 CRYPTO SHADOW | enabled=True interval={V18232_CRYPTO_INTERVAL_SECONDS}s symbols={len(V18232_CRYPTO_SYMBOLS)} virtual_capital=${V18232_CRYPTO_CAPITAL_USD:.2f} advisory_only=True live_orders=False")
         acct = _v18234_crypto_account_status()
-        print(f"V18.2.41 CRYPTO LIVE PILOT | installed=True account_crypto={acct.get('status')} full_vault_default=True vault_reserve_adjustable=True broker_safe_sizing=True", flush=True)
+        print(f"V18.2.42 CRYPTO LIVE PILOT | installed=True account_crypto={acct.get('status')} full_vault_default=True vault_reserve_adjustable=True broker_safe_sizing=True live_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s", flush=True)
+    if V18234_CRYPTO_LIVE_ENABLED and not PAPER and not v18242_crypto_live_thread_started:
+        v18242_crypto_live_thread_started = True
+        threading.Thread(target=v18242_crypto_live_worker, daemon=True, name="v18-crypto-live").start()
+        print(f"V18.2.42 CRYPTO LIVE EXECUTOR | interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s independent_of_shadow=True", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
