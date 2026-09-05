@@ -522,6 +522,7 @@ ai_research_thread_started = False
 ai_summary_thread_started = False
 v18224_live_audit_thread_started = False
 v18230_evidence_thread_started = False
+v18232_crypto_shadow_thread_started = False
 AI_SUMMARY_LOG_ENABLED = os.getenv("AI_SUMMARY_LOG_ENABLED", "true").lower() in ("1","true","yes","on")
 AI_SUMMARY_LOG_INTERVAL_SECONDS = max(300, int(os.getenv("AI_SUMMARY_LOG_INTERVAL_SECONDS", "3600")))
 AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS = max(30, int(os.getenv("AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS", "120")))
@@ -6095,6 +6096,49 @@ def _init_db_impl():
     """)
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18230_exit_due ON v18230_one_hour_exit_evidence(status, sold_at)""")
 
+    # V18.2.32 — isolated crypto shadow lab. Virtual capital and virtual
+    # positions only. This schema is never used by live stock execution.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v18232_crypto_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            virtual_cash_usd REAL NOT NULL,
+            realised_pnl_usd REAL NOT NULL DEFAULT 0,
+            last_scan_at TEXT,
+            last_error TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v18232_crypto_positions (
+            symbol TEXT PRIMARY KEY,
+            qty REAL NOT NULL,
+            entry_price REAL NOT NULL,
+            high_price REAL NOT NULL,
+            opened_at TEXT NOT NULL,
+            entry_score REAL,
+            virtual_notional REAL NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v18232_crypto_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            qty REAL NOT NULL,
+            price REAL NOT NULL,
+            notional_usd REAL NOT NULL,
+            pnl_usd REAL,
+            pnl_pct REAL,
+            score REAL,
+            reason TEXT,
+            shadow_only INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18232_crypto_trades_time ON v18232_crypto_trades(timestamp)""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18232_crypto_trades_symbol ON v18232_crypto_trades(symbol)""")
+
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS weekly_universe (
@@ -10706,6 +10750,279 @@ def v18230_evidence_worker():
         time.sleep(V18230_EVIDENCE_INTERVAL_SECONDS)
 
 
+# =========================
+# V18.2.32 — ALPACA CRYPTO SHADOW LAB
+# Evidence-only 24/7 crypto engine. It deliberately contains no TradingClient
+# order-submission call and cannot touch stock capital, Profit Vault or live
+# brokerage positions.
+# =========================
+V18232_CRYPTO_SHADOW_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_SHADOW_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
+V18232_CRYPTO_INTERVAL_SECONDS = max(60, int(os.getenv("TRADEBOT_CRYPTO_SHADOW_INTERVAL_SECONDS", "300") or 300))
+V18232_CRYPTO_CAPITAL_USD = max(10.0, float(os.getenv("TRADEBOT_CRYPTO_SHADOW_CAPITAL_USD", "250") or 250))
+V18232_CRYPTO_POSITION_PCT = max(0.05, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_SHADOW_POSITION_PCT", "0.95") or 0.95)))
+V18232_CRYPTO_MAX_POSITIONS = max(1, min(5, int(os.getenv("TRADEBOT_CRYPTO_SHADOW_MAX_POSITIONS", "1") or 1)))
+V18232_CRYPTO_LOCATION = str(os.getenv("TRADEBOT_CRYPTO_LOCATION", "us") or "us").strip().lower()
+V18232_CRYPTO_SYMBOLS = [x.strip().upper() for x in str(os.getenv(
+    "TRADEBOT_CRYPTO_SYMBOLS", "BTC/USD,ETH/USD,SOL/USD,XRP/USD,DOGE/USD,LINK/USD,LTC/USD,AVAX/USD"
+)).split(",") if x.strip()]
+V18232_CRYPTO_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_ENTRY_SCORE", "0.68") or 0.68)))
+V18232_CRYPTO_STOP_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_STOP_PCT", "3.0") or 3.0))
+V18232_CRYPTO_TRAIL_START_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_TRAIL_START_PCT", "4.0") or 4.0))
+V18232_CRYPTO_TRAIL_GIVEBACK_PCT = max(0.10, float(os.getenv("TRADEBOT_CRYPTO_TRAIL_GIVEBACK_PCT", "1.5") or 1.5))
+V18232_CRYPTO_EXIT_SCORE = max(0.0, min(V18232_CRYPTO_ENTRY_SCORE, float(os.getenv("TRADEBOT_CRYPTO_EXIT_SCORE", "0.34") or 0.34)))
+
+_crypto_shadow_lock = threading.RLock()
+_crypto_shadow_last_scans: List[Dict[str, Any]] = []
+_crypto_shadow_runtime: Dict[str, Any] = {"running": False, "lastError": None, "lastScanAt": None}
+
+
+def _v18232_clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, float(value)))
+
+
+def _v18232_ensure_state() -> None:
+    if not SQLITE_ENABLED:
+        return
+    now = datetime.now(UTC).isoformat()
+    conn = db_connect()
+    try:
+        conn.execute(
+            """INSERT OR IGNORE INTO v18232_crypto_state
+               (id,virtual_cash_usd,realised_pnl_usd,last_scan_at,last_error,updated_at)
+               VALUES (1,?,?,NULL,NULL,?)""",
+            (V18232_CRYPTO_CAPITAL_USD, 0.0, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _v18232_crypto_data_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"https://data.alpaca.markets/v1beta3/crypto/{V18232_CRYPTO_LOCATION}/{path.lstrip('/')}"
+    headers = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET, "Accept": "application/json"}
+    response = requests.get(url, headers=headers, params=params, timeout=20)
+    if response.status_code >= 400:
+        detail = (response.text or "")[:500]
+        raise RuntimeError(f"Alpaca crypto data HTTP {response.status_code}: {detail}")
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {}
+
+
+def _v18232_fetch_scans() -> List[Dict[str, Any]]:
+    if not V18232_CRYPTO_SYMBOLS:
+        return []
+    start = (datetime.now(UTC) - timedelta(minutes=95)).isoformat().replace("+00:00", "Z")
+    payload = _v18232_crypto_data_get("bars", {
+        "symbols": ",".join(V18232_CRYPTO_SYMBOLS),
+        "timeframe": "5Min",
+        "start": start,
+        "limit": 1000,
+        "sort": "asc",
+    })
+    grouped = payload.get("bars") or {}
+    scans: List[Dict[str, Any]] = []
+    for symbol in V18232_CRYPTO_SYMBOLS:
+        raw = grouped.get(symbol) or []
+        bars = [b for b in raw if isinstance(b, dict) and float(b.get("c") or 0) > 0]
+        if len(bars) < 4:
+            continue
+        price = float(bars[-1].get("c") or 0)
+        close_15 = float(bars[-4].get("c") or price) if len(bars) >= 4 else price
+        close_60 = float(bars[-13].get("c") or price) if len(bars) >= 13 else float(bars[0].get("c") or price)
+        ret15 = ((price / close_15) - 1.0) * 100.0 if close_15 > 0 else 0.0
+        ret60 = ((price / close_60) - 1.0) * 100.0 if close_60 > 0 else 0.0
+        recent = bars[-12:] if len(bars) >= 12 else bars
+        highs = [float(b.get("h") or b.get("c") or price) for b in recent]
+        lows = [float(b.get("l") or b.get("c") or price) for b in recent]
+        high60 = max(highs) if highs else price
+        low60 = min(lows) if lows else price
+        range60 = ((high60 / low60) - 1.0) * 100.0 if low60 > 0 else 0.0
+        last6 = bars[-6:] if len(bars) >= 6 else bars
+        avg6 = sum(float(b.get("c") or price) for b in last6) / max(1, len(last6))
+        trend = 1.0 if price >= avg6 else 0.0
+        momentum15 = _v18232_clamp((ret15 + 0.35) / 2.50)
+        momentum60 = _v18232_clamp((ret60 + 0.75) / 5.00)
+        # Prefer enough movement to create opportunity without rewarding extreme one-hour ranges.
+        range_quality = _v18232_clamp(1.0 - abs(range60 - 2.0) / 5.0)
+        score = _v18232_clamp(0.38 * momentum15 + 0.34 * momentum60 + 0.18 * trend + 0.10 * range_quality)
+        scans.append({
+            "symbol": symbol, "price": round(price, 8), "score": round(score, 4),
+            "return15mPct": round(ret15, 4), "return60mPct": round(ret60, 4),
+            "range60mPct": round(range60, 4), "qualified": bool(score >= V18232_CRYPTO_ENTRY_SCORE),
+            "bars": len(bars), "source": "alpaca_crypto_5min",
+        })
+    scans.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
+    return scans
+
+
+def _v18232_load_state() -> Dict[str, Any]:
+    _v18232_ensure_state()
+    conn = db_connect()
+    try:
+        state = conn.execute("SELECT * FROM v18232_crypto_state WHERE id=1").fetchone()
+        positions = [dict(r) for r in conn.execute("SELECT * FROM v18232_crypto_positions ORDER BY opened_at ASC").fetchall()]
+        closed = conn.execute("SELECT COUNT(*), SUM(CASE WHEN COALESCE(pnl_usd,0)>0 THEN 1 ELSE 0 END) FROM v18232_crypto_trades WHERE side='SELL'").fetchone()
+        return {
+            "state": dict(state) if state else {}, "positions": positions,
+            "closedTrades": int(closed[0] or 0), "wins": int(closed[1] or 0),
+        }
+    finally:
+        conn.close()
+
+
+def _v18232_shadow_buy(scan: Dict[str, Any]) -> bool:
+    symbol = str(scan.get("symbol") or "").upper(); price = float(scan.get("price") or 0); score = float(scan.get("score") or 0)
+    if not symbol or price <= 0 or score < V18232_CRYPTO_ENTRY_SCORE:
+        return False
+    with _crypto_shadow_lock:
+        data = _v18232_load_state(); positions = data["positions"]
+        if len(positions) >= V18232_CRYPTO_MAX_POSITIONS or any(str(p.get("symbol")) == symbol for p in positions):
+            return False
+        cash = float(data["state"].get("virtual_cash_usd") or 0)
+        notional = min(cash, max(0.0, cash * V18232_CRYPTO_POSITION_PCT))
+        if notional < 1.0:
+            return False
+        qty = notional / price; now = datetime.now(UTC).isoformat(); conn = db_connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("UPDATE v18232_crypto_state SET virtual_cash_usd=virtual_cash_usd-?,updated_at=? WHERE id=1", (notional, now))
+            conn.execute("""INSERT OR REPLACE INTO v18232_crypto_positions
+                (symbol,qty,entry_price,high_price,opened_at,entry_score,virtual_notional,updated_at)
+                VALUES (?,?,?,?,?,?,?,?)""", (symbol, qty, price, price, now, score, notional, now))
+            conn.execute("""INSERT INTO v18232_crypto_trades
+                (timestamp,symbol,side,qty,price,notional_usd,pnl_usd,pnl_pct,score,reason,shadow_only)
+                VALUES (?,?,?,?,?,?,NULL,NULL,?,'CRYPTO SHADOW ENTRY',1)""", (now, symbol, "BUY", qty, price, notional, score))
+            conn.commit()
+        finally:
+            conn.close()
+        print(f"V18.2.32 CRYPTO SHADOW BUY | {symbol} price={price:.8f} notional=${notional:.2f} score={score:.3f} live_orders=False")
+        return True
+
+
+def _v18232_shadow_sell(position: Dict[str, Any], price: float, score: float, reason: str) -> bool:
+    symbol = str(position.get("symbol") or "").upper(); qty = float(position.get("qty") or 0); entry = float(position.get("entry_price") or 0)
+    if not symbol or qty <= 0 or entry <= 0 or price <= 0:
+        return False
+    proceeds = qty * price; pnl = (price - entry) * qty; pnl_pct = ((price / entry) - 1.0) * 100.0; now = datetime.now(UTC).isoformat()
+    with _crypto_shadow_lock:
+        conn = db_connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("UPDATE v18232_crypto_state SET virtual_cash_usd=virtual_cash_usd+?,realised_pnl_usd=realised_pnl_usd+?,updated_at=? WHERE id=1", (proceeds, pnl, now))
+            conn.execute("DELETE FROM v18232_crypto_positions WHERE symbol=?", (symbol,))
+            conn.execute("""INSERT INTO v18232_crypto_trades
+                (timestamp,symbol,side,qty,price,notional_usd,pnl_usd,pnl_pct,score,reason,shadow_only)
+                VALUES (?,?,?,?,?,?,?,?,?,?,1)""", (now, symbol, "SELL", qty, price, proceeds, pnl, pnl_pct, score, reason))
+            conn.commit()
+        finally:
+            conn.close()
+    print(f"V18.2.32 CRYPTO SHADOW SELL | {symbol} price={price:.8f} pnl=${pnl:.2f} pnl_pct={pnl_pct:.2f}% reason={reason} live_orders=False")
+    return True
+
+
+def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
+    if not V18232_CRYPTO_SHADOW_ENABLED:
+        return {"ok": True, "enabled": False, "scans": 0}
+    _v18232_ensure_state(); scans = _v18232_fetch_scans(); scan_map = {s["symbol"]: s for s in scans}; now = datetime.now(UTC).isoformat()
+    with _crypto_shadow_lock:
+        _crypto_shadow_last_scans.clear(); _crypto_shadow_last_scans.extend(scans)
+    data = _v18232_load_state()
+    for position in list(data["positions"]):
+        scan = scan_map.get(str(position.get("symbol") or ""))
+        if not scan:
+            continue
+        price = float(scan["price"]); score = float(scan["score"]); entry = float(position["entry_price"]); high = max(float(position.get("high_price") or entry), price)
+        pnl_pct = ((price / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+        peak_pct = ((high / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+        giveback_pct = ((high - price) / high) * 100.0 if high > 0 else 0.0
+        reason = None
+        if pnl_pct <= -V18232_CRYPTO_STOP_PCT:
+            reason = "CRYPTO SHADOW STOP"
+        elif peak_pct >= V18232_CRYPTO_TRAIL_START_PCT and giveback_pct >= V18232_CRYPTO_TRAIL_GIVEBACK_PCT:
+            reason = "CRYPTO SHADOW TRAIL"
+        elif pnl_pct > 0 and score <= V18232_CRYPTO_EXIT_SCORE:
+            reason = "CRYPTO SHADOW MOMENTUM EXIT"
+        if reason:
+            _v18232_shadow_sell(position, price, score, reason)
+        elif high > float(position.get("high_price") or 0):
+            conn = db_connect()
+            try:
+                conn.execute("UPDATE v18232_crypto_positions SET high_price=?,updated_at=? WHERE symbol=?", (high, now, position["symbol"])); conn.commit()
+            finally:
+                conn.close()
+    # Re-load after exits, then allow at most one new shadow entry per cycle.
+    data = _v18232_load_state()
+    if len(data["positions"]) < V18232_CRYPTO_MAX_POSITIONS:
+        for scan in scans:
+            if scan.get("qualified") and _v18232_shadow_buy(scan):
+                break
+    conn = db_connect()
+    try:
+        conn.execute("UPDATE v18232_crypto_state SET last_scan_at=?,last_error=NULL,updated_at=? WHERE id=1", (now, now)); conn.commit()
+    finally:
+        conn.close()
+    _crypto_shadow_runtime.update({"running": True, "lastError": None, "lastScanAt": now})
+    return {"ok": True, "enabled": True, "scans": len(scans)}
+
+
+def v18232_crypto_shadow_payload() -> Dict[str, Any]:
+    _v18232_ensure_state(); data = _v18232_load_state(); state = data["state"]
+    with _crypto_shadow_lock:
+        scans = [dict(x) for x in _crypto_shadow_last_scans]
+    price_map = {str(x.get("symbol")): float(x.get("price") or 0) for x in scans}
+    positions = [] ; open_value = 0.0 ; unrealised = 0.0
+    for p in data["positions"]:
+        item = dict(p); price = price_map.get(str(item.get("symbol"))) or float(item.get("entry_price") or 0)
+        qty = float(item.get("qty") or 0); entry = float(item.get("entry_price") or 0); value = qty * price; pnl = (price - entry) * qty
+        open_value += value; unrealised += pnl
+        positions.append({
+            "symbol": item.get("symbol"), "qty": qty, "entry": entry, "price": price,
+            "pnlUsd": round(pnl, 4), "pnlPct": round(((price / entry)-1.0)*100.0 if entry > 0 else 0.0, 4),
+            "openedAt": item.get("opened_at"), "entryScore": item.get("entry_score")
+        })
+    cash = float(state.get("virtual_cash_usd") or 0); realised = float(state.get("realised_pnl_usd") or 0); equity = cash + open_value
+    closed = int(data.get("closedTrades") or 0); wins = int(data.get("wins") or 0)
+    return {
+        "ok": True, "version": "V18.2.32", "name": "Alpaca Crypto Shadow Lab",
+        "enabled": V18232_CRYPTO_SHADOW_ENABLED, "running": bool(_crypto_shadow_runtime.get("running")),
+        "shadowOnly": True, "liveOrders": False, "advisoryOnly": True,
+        "virtualCapitalUsd": V18232_CRYPTO_CAPITAL_USD, "cashUsd": round(cash, 4), "equityUsd": round(equity, 4),
+        "realisedPnlUsd": round(realised, 4), "unrealisedPnlUsd": round(unrealised, 4),
+        "totalPnlUsd": round(equity - V18232_CRYPTO_CAPITAL_USD, 4),
+        "closedTrades": closed, "winRate": round((wins / closed * 100.0) if closed else 0.0, 2),
+        "positions": positions, "scans": scans, "lastScanAt": state.get("last_scan_at") or _crypto_shadow_runtime.get("lastScanAt"),
+        "lastError": _crypto_shadow_runtime.get("lastError") or state.get("last_error"),
+        "config": {"symbols": V18232_CRYPTO_SYMBOLS, "intervalSeconds": V18232_CRYPTO_INTERVAL_SECONDS,
+                   "positionPct": V18232_CRYPTO_POSITION_PCT, "maxPositions": V18232_CRYPTO_MAX_POSITIONS,
+                   "entryScore": V18232_CRYPTO_ENTRY_SCORE, "stopPct": V18232_CRYPTO_STOP_PCT,
+                   "trailStartPct": V18232_CRYPTO_TRAIL_START_PCT, "trailGivebackPct": V18232_CRYPTO_TRAIL_GIVEBACK_PCT},
+    }
+
+
+@app.get('/v18/crypto-shadow')
+def api_v18232_crypto_shadow(request: Request):
+    verify_api_key(request)
+    return v18232_crypto_shadow_payload()
+
+
+def v18232_crypto_shadow_worker() -> None:
+    # Short startup delay lets the shared DB schema finish before first market-data call.
+    time.sleep(5)
+    while True:
+        try:
+            v18232_crypto_shadow_cycle()
+        except Exception as exc:
+            text = str(exc)[:1000]; now = datetime.now(UTC).isoformat()
+            _crypto_shadow_runtime.update({"running": True, "lastError": text, "lastScanAt": now})
+            try:
+                _v18232_ensure_state(); conn = db_connect(); conn.execute(
+                    "UPDATE v18232_crypto_state SET last_error=?,updated_at=? WHERE id=1", (text, now)); conn.commit(); conn.close()
+            except Exception:
+                pass
+            print(f"V18.2.32 CRYPTO SHADOW ERROR | {text} live_orders=False")
+        time.sleep(V18232_CRYPTO_INTERVAL_SECONDS)
+
+
 def run_bot_loop():
     print("Rebuilt Sniper Profit Bot started...")
     init_db()
@@ -10835,7 +11152,7 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started, v18224_live_audit_thread_started, v18230_evidence_thread_started
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started, v18224_live_audit_thread_started, v18230_evidence_thread_started, v18232_crypto_shadow_thread_started
     # Initialise the shared SQLite schema synchronously before any worker threads start.
     # This removes the startup race where multiple workers all tried to create tables.
     init_db()
@@ -10880,6 +11197,10 @@ def startup_event():
         v18230_evidence_thread_started = True
         threading.Thread(target=v18230_evidence_worker, daemon=True, name="v18-trade-evidence").start()
         print(f"V18.2.30 TRADE EVIDENCE | enabled interval={V18230_EVIDENCE_INTERVAL_SECONDS}s advisory_only=True")
+    if V18232_CRYPTO_SHADOW_ENABLED and not v18232_crypto_shadow_thread_started:
+        v18232_crypto_shadow_thread_started = True
+        threading.Thread(target=v18232_crypto_shadow_worker, daemon=True, name="v18-crypto-shadow").start()
+        print(f"V18.2.32 CRYPTO SHADOW | enabled=True interval={V18232_CRYPTO_INTERVAL_SECONDS}s symbols={len(V18232_CRYPTO_SYMBOLS)} virtual_capital=${V18232_CRYPTO_CAPITAL_USD:.2f} advisory_only=True live_orders=False")
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
