@@ -30,16 +30,16 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [data, setData] = useState<AnyObj | null>(null);
   const [error, setError] = useState("");
   const [bridge, setBridge] = useState<AnyObj | null>(null);
-  const [releaseAmount, setReleaseAmount] = useState("25");
+  const [releaseAmount, setReleaseAmount] = useState("0");
   const [bridgeMessage, setBridgeMessage] = useState("");
   const [bridgeBusy, setBridgeBusy] = useState(false);
   const [sellBusySymbol, setSellBusySymbol] = useState("");
   const [sellMessage, setSellMessage] = useState("");
 
   useEffect(() => {
-    const current = Number(bridge?.cryptoAllocatedGbp || 0);
-    if (current > 0 && releaseAmount === "25" && Math.abs(current - 25) > 0.001) {
-      setReleaseAmount(String(Number(current.toFixed(2))));
+    const currentReserve = Number(bridge?.vaultReserveGbp || 0);
+    if (releaseAmount === "0" && currentReserve > 0.001) {
+      setReleaseAmount(String(Number(currentReserve.toFixed(2))));
     }
   }, [bridge, releaseAmount]);
 
@@ -69,35 +69,38 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
     };
   }, [authToken]);
 
-  const setCryptoAllocation = async () => {
+  const setVaultReserve = async () => {
     if (!bridge || bridge.locked || bridge.allocationLockedByPosition) return;
     const amount = Number(releaseAmount || 0);
-    const hardMax = Number(bridge?.pilotMaxGbp || 250);
-    if (!Number.isFinite(amount) || amount < 0 || amount > hardMax) {
-      setBridgeMessage(`Enter an amount from £0 to £${hardMax.toFixed(2)}.`);
+    const pool = Number(bridge?.cryptoPoolGbp || 0);
+    if (!Number.isFinite(amount) || amount < 0 || amount > pool) {
+      setBridgeMessage(`Enter an amount from £0 to £${pool.toFixed(2)}.`);
       return;
     }
-    const current = Number(bridge?.cryptoAllocatedGbp || 0);
-    const action = amount > current ? `increase from £${current.toFixed(2)} to £${amount.toFixed(2)}` : amount < current ? `reduce from £${current.toFixed(2)} to £${amount.toFixed(2)}` : `keep at £${amount.toFixed(2)}`;
-    if (!window.confirm(`Set the Crypto trading allocation to £${amount.toFixed(2)}?\n\nThis will ${action}. Increases come from the protected Profit Vault; reductions return unused allocation to it.`)) return;
+    const cryptoAfter = Math.max(0, pool - amount);
+    const text = amount <= 0
+      ? `Use the full protected pool of £${pool.toFixed(2)} for crypto?\n\n£0.00 will be kept back in the Vault.`
+      : `Keep £${amount.toFixed(2)} protected in the Vault?\n\nCrypto will be able to use £${cryptoAfter.toFixed(2)}.`;
+    if (!window.confirm(text)) return;
     setBridgeBusy(true);
     setBridgeMessage("");
     try {
-      const res = await fetch(`${API_URL}/v18/crypto-bridge/allocation`, {
+      const res = await fetch(`${API_URL}/v18/crypto-bridge/vault-reserve`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Auth-Token": authToken, "x-api-key": authToken },
-        body: JSON.stringify({ amountGbp: amount, confirmation: "SET CRYPTO ALLOCATION" }),
+        body: JSON.stringify({ reserveGbp: amount, confirmation: "SET VAULT RESERVE" }),
       });
       const body = await res.json();
       if (!res.ok || body?.ok === false) throw new Error(body?.message || body?.detail || `HTTP ${res.status}`);
       setBridge(body.bridge || bridge);
-      setBridgeMessage(body.message || "Crypto allocation updated.");
+      setBridgeMessage(body.message || "Vault reserve updated.");
     } catch (e: any) {
-      setBridgeMessage(e?.message || "Crypto allocation update failed.");
+      setBridgeMessage(e?.message || "Vault reserve update failed.");
     } finally {
       setBridgeBusy(false);
     }
   };
+
 
   const manualSellCrypto = async (position: AnyObj) => {
     const symbol = String(position?.symbol || "").toUpperCase();
@@ -144,7 +147,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.40 · ADJUSTABLE CRYPTO CAPITAL</div>
+          <div className="eyebrow">V18.2.41 · FULL VAULT CRYPTO + SAFE SIZING</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -215,7 +218,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-panel-head">
         <div>
           <h3><span className="panel-icon">⌒</span> Crypto Bridge</h3>
-          <p>Choose how much capital the crypto bot can use. Maximum {gbp(bridge?.pilotMaxGbp || 250)}.</p>
+          <p>Crypto uses the full protected pool by default. Set a Vault reserve only if you want to hold money back.</p>
         </div>
         <span className={`crypto-chip ${armed ? "live" : accountActive ? "building" : ""}`}>{armed ? "LIVE PILOT ARMED" : accountActive ? "READY TO ARM" : "CRYPTO NOT ACTIVE"}</span>
       </div>
@@ -223,13 +226,16 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-bridge-grid">
         <div className="bridge-metric"><span className="crypto-summary-icon vault">▣</span><div><small>Vault Available</small><strong>{gbp(bridge?.vaultAvailableGbp)}</strong></div></div>
         <div className="bridge-metric"><span className="crypto-summary-icon allocation">●</span><div><small>Crypto Allocation</small><strong>{gbp(bridge?.cryptoAllocatedGbp)}</strong></div></div>
-        <div className="bridge-metric"><span className="crypto-summary-icon pnl">◇</span><div><small>Maximum Allowed</small><strong>{gbp(bridge?.pilotMaxGbp || 250)}</strong></div></div>
+        <div className="bridge-metric"><span className="crypto-summary-icon pnl">◇</span><div><small>Protected Pool</small><strong>{gbp(bridge?.cryptoPoolGbp)}</strong></div></div>
         <div className="bridge-metric"><span className="crypto-summary-icon returned">◎</span><div><small>Status</small><strong className={armed ? "gain" : ""}>{armed ? "● Armed" : "Off"}</strong></div></div>
         <div className={`bridge-action ${armed ? "allocated" : ""}`}>
           <div className="crypto-allocation-editor">
-            <div className="crypto-allocation-presets">{[10,25,50,100].filter(v => v <= Number(bridge?.pilotMaxGbp || 250)).map(v => <button key={v} type="button" onClick={() => setReleaseAmount(String(v))} disabled={bridgeBusy || Boolean(bridge?.allocationLockedByPosition)}>£{v}</button>)}</div>
-            <div className="bridge-release-controls"><input aria-label="Crypto trading allocation in pounds" type="number" min="0" max={Number(bridge?.pilotMaxGbp || 250)} step="1" value={releaseAmount} onChange={e => setReleaseAmount(e.target.value)} /><button onClick={setCryptoAllocation} disabled={bridgeBusy || !bridge || bridge.locked || Boolean(bridge?.allocationLockedByPosition)}>{bridgeBusy ? "UPDATING…" : Number(releaseAmount || 0) === 0 ? "STOP & RETURN" : `SET ${gbp(releaseAmount)}`}</button></div>
-            <small>{bridge?.allocationLockedByPosition ? "Close the open crypto position before changing allocation." : `Current ${gbp(bridge?.cryptoAllocatedGbp)} · Available up to ${gbp(bridge?.allocationAvailableGbp ?? bridge?.pilotMaxGbp)}`}</small>
+            <div className="crypto-allocation-presets">
+              <button type="button" onClick={() => setReleaseAmount("0")} disabled={bridgeBusy || Boolean(bridge?.allocationLockedByPosition)}>USE ALL</button>
+              {[25,50,100].filter(v => v <= Number(bridge?.cryptoPoolGbp || 0)).map(v => <button key={v} type="button" onClick={() => setReleaseAmount(String(v))} disabled={bridgeBusy || Boolean(bridge?.allocationLockedByPosition)}>KEEP £{v}</button>)}
+            </div>
+            <div className="bridge-release-controls"><input aria-label="Amount to keep protected in the Vault in pounds" type="number" min="0" max={Number(bridge?.cryptoPoolGbp || 0)} step="1" value={releaseAmount} onChange={e => setReleaseAmount(e.target.value)} /><button onClick={setVaultReserve} disabled={bridgeBusy || !bridge || bridge.locked || Boolean(bridge?.allocationLockedByPosition)}>{bridgeBusy ? "UPDATING…" : Number(releaseAmount || 0) === 0 ? "USE FULL VAULT" : `KEEP ${gbp(releaseAmount)}`}</button></div>
+            <small>{bridge?.allocationLockedByPosition ? "Close the open crypto position before changing the Vault reserve." : `Keeping ${gbp(bridge?.vaultReserveGbp)} in Vault · Crypto can use ${gbp(bridge?.cryptoAllocatedGbp)} of ${gbp(bridge?.cryptoPoolGbp)}`}</small>
           </div>
         </div>
       </div>
