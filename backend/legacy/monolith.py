@@ -176,6 +176,7 @@ PEAK_EXHAUSTION_MARKET_OPEN_ONLY = os.getenv("PEAK_EXHAUSTION_MARKET_OPEN_ONLY",
 MAX_DAILY_LOSS = -100.00
 MAX_TRADES_PER_DAY = 12
 DUST_THRESHOLD = 0.1
+PHANTOM_CLOSED_TRADE_QTY_EPSILON = 1e-9
 
 STRICT_ONE_CYCLE_PER_STOCK_PER_DAY = True
 ALLOW_CUSTOM_BUY = True
@@ -520,6 +521,7 @@ v11_learning_thread_started = False
 ai_research_thread_started = False
 ai_summary_thread_started = False
 v18224_live_audit_thread_started = False
+v18230_evidence_thread_started = False
 AI_SUMMARY_LOG_ENABLED = os.getenv("AI_SUMMARY_LOG_ENABLED", "true").lower() in ("1","true","yes","on")
 AI_SUMMARY_LOG_INTERVAL_SECONDS = max(300, int(os.getenv("AI_SUMMARY_LOG_INTERVAL_SECONDS", "3600")))
 AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS = max(30, int(os.getenv("AI_SUMMARY_LOG_STARTUP_DELAY_SECONDS", "120")))
@@ -1900,6 +1902,12 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
     }
     trade_events.append(event)
     add_trade_history_event(event)
+    try:
+        if "v18230_record_entry_timing" in globals():
+            observed_price = float((scan or {}).get("price") or 0.0)
+            v18230_record_entry_timing(symbol, observed_price, reason)
+    except Exception as evidence_error:
+        print(f"V18.2.30 ENTRY TIMING RECORD ERROR {symbol}: {evidence_error}")
     if str(symbol or "").upper().strip() == "MARA":
         mara_buys = today_symbol_buy_count("MARA")
         _MARA_DB_BUY_COUNT_CACHE.update({
@@ -3288,7 +3296,7 @@ def v181_performance_observatory(days: int = 7) -> Dict[str, Any]:
     days=max(1,min(int(days),90)); cutoff=(datetime.now(UTC)-timedelta(days=days)).isoformat()
     try:
         init_db(); conn=db_connect()
-        trades=[dict(r) for r in conn.execute("SELECT * FROM closed_trades WHERE timestamp>=? ORDER BY timestamp ASC",(cutoff,)).fetchall()]
+        trades=[dict(r) for r in conn.execute("SELECT * FROM closed_trades WHERE timestamp>=? AND COALESCE(qty,0)>? ORDER BY timestamp ASC",(cutoff,PHANTOM_CLOSED_TRADE_QTY_EPSILON)).fetchall()]
         pnls=[float(t.get('pnl_gbp') if t.get('pnl_gbp') is not None else (t.get('pnl') or 0.0)) for t in trades]
         wins=[x for x in pnls if x>0]; losses=[x for x in pnls if x<0]
         curve=0.0; peak=0.0; max_dd=0.0
@@ -4472,6 +4480,11 @@ def manage_money_mode_positions():
                 # PDT-aware soft-profit hold would normally defer it. Broker-side
                 # PDT/account restrictions still remain authoritative.
                 market_sell_qty(symbol, qty, entry=entry, price=price, reason="ONE HOUR PROFIT EXIT")
+                try:
+                    if "v18230_record_one_hour_exit" in globals():
+                        v18230_record_one_hour_exit(symbol, entry, price, qty)
+                except Exception as evidence_error:
+                    print(f"V18.2.30 ONE HOUR EVIDENCE RECORD ERROR {symbol}: {evidence_error}")
                 state[symbol]["highest_since_entry"] = None
                 _v17_reset_peak_exhaustion(symbol)
                 _v17_reset_runner_trail(symbol)
@@ -6045,6 +6058,43 @@ def _init_db_impl():
         ON closed_trades(symbol)
     """)
 
+    # V18.2.30 — evidence-only entry/exit observatory. These tables never
+    # participate in live qualification, sizing or order execution.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v18230_entry_timing (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            observed_at TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            buy_reason TEXT,
+            price_1m REAL, ret_1m REAL,
+            price_5m REAL, ret_5m REAL,
+            price_15m REAL, ret_15m REAL,
+            price_30m REAL, ret_30m REAL,
+            mfe_30m REAL, mae_30m REAL,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            updated_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18230_entry_due ON v18230_entry_timing(status, observed_at)""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v18230_one_hour_exit_evidence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sold_at TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            exit_price REAL NOT NULL,
+            qty REAL NOT NULL,
+            realised_pnl_pct REAL,
+            realised_pnl_gbp REAL,
+            price_30m REAL, after_30m_pct REAL,
+            price_60m REAL, after_60m_pct REAL,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            updated_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18230_exit_due ON v18230_one_hour_exit_evidence(status, sold_at)""")
+
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS weekly_universe (
@@ -6620,9 +6670,10 @@ def closed_trades_from_db(limit: int = 1000):
         conn = db_connect()
         rows = conn.execute("""
             SELECT * FROM closed_trades
+            WHERE COALESCE(qty, 0) > ?
             ORDER BY timestamp DESC
             LIMIT ?
-        """, (limit,)).fetchall()
+        """, (PHANTOM_CLOSED_TRADE_QTY_EPSILON, limit)).fetchall()
         conn.close()
 
         return [
@@ -10464,17 +10515,24 @@ def trade_replay_closed_payload(trade_id: int, limit: int = TRADE_REPLAY_MAX_POI
     row = conn.execute(
         "SELECT * FROM trade_replay_sessions WHERE closed_trade_id=? ORDER BY id DESC LIMIT 1", (int(trade_id),)
     ).fetchone()
-    if not row:
-        # Historical matcher rows may have been written before the replay session
-        # was linked. Prefer the most recent session for this symbol that began
-        # before the trade closed.
-        row = conn.execute(
+    if not row and float(tr.get("qty") or 0.0) > PHANTOM_CLOSED_TRADE_QTY_EPSILON:
+        # V18.2.30 exact-binding fallback: old rows pre-date closed_trade_id links.
+        # Only bind a legacy replay when the session entry price agrees with this
+        # specific closed trade (within 0.5%). This prevents symbol/time-only
+        # matching from attaching a phantom or unrelated replay.
+        entry_price = float(tr.get("entry_price") or 0.0)
+        candidates = conn.execute(
             """SELECT * FROM trade_replay_sessions
                WHERE symbol=? AND started_at<=?
-               ORDER BY CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END, ABS(strftime('%s', COALESCE(ended_at,updated_at))-strftime('%s',?)) ASC
-               LIMIT 1""",
+               ORDER BY ABS(strftime('%s', COALESCE(ended_at,updated_at))-strftime('%s',?)) ASC
+               LIMIT 12""",
             (symbol, exit_ts, exit_ts),
-        ).fetchone()
+        ).fetchall()
+        for candidate in candidates:
+            candidate_entry = float(candidate["entry_price"] or 0.0)
+            if entry_price > 0 and candidate_entry > 0 and abs(candidate_entry-entry_price)/entry_price <= 0.005:
+                row = candidate
+                break
     conn.close()
     trade = {"id": int(tr["id"]), "timestamp": tr.get("timestamp"), "symbol": symbol,
              "qty": float(tr.get("qty") or 0.0), "entryPrice": float(tr.get("entry_price") or 0.0),
@@ -10482,6 +10540,170 @@ def trade_replay_closed_payload(trade_id: int, limit: int = TRADE_REPLAY_MAX_POI
              "pnlGbp": float(tr.get("pnl_gbp") or 0.0), "pnlPct": float(tr.get("pnl_pct") or 0.0),
              "reason": tr.get("reason") or ""}
     return _trade_replay_payload(row, limit, trade)
+
+
+# =========================
+# V18.2.30 — TRADE EVIDENCE CLEANUP + TIMING OBSERVATORY
+# Read-only evidence. No live gate, sizing, position-limit or exit threshold is
+# changed by this subsystem.
+# =========================
+V18230_EVIDENCE_ENABLED = str(os.getenv("TRADEBOT_V18230_EVIDENCE_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
+V18230_EVIDENCE_INTERVAL_SECONDS = max(60, int(os.getenv("TRADEBOT_V18230_EVIDENCE_INTERVAL_SECONDS", "120") or 120))
+
+
+def v18230_record_entry_timing(symbol: str, entry_price: float, reason: str = "") -> None:
+    if not SQLITE_ENABLED or not V18230_EVIDENCE_ENABLED:
+        return
+    price = float(entry_price or 0.0)
+    if price <= 0:
+        return
+    now = datetime.now(UTC).isoformat()
+    conn = db_connect()
+    try:
+        conn.execute(
+            """INSERT INTO v18230_entry_timing(observed_at,symbol,entry_price,buy_reason,status,updated_at)
+               VALUES (?,?,?,?, 'PENDING', ?)""",
+            (now, str(symbol or "").upper().strip(), price, str(reason or ""), now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"V18.2.30 ENTRY TIMING | recorded {str(symbol).upper()} entry={price:.4f} advisory_only=True")
+
+
+def v18230_record_one_hour_exit(symbol: str, entry_price: float, exit_price: float, qty: float) -> None:
+    if not SQLITE_ENABLED or not V18230_EVIDENCE_ENABLED:
+        return
+    entry = float(entry_price or 0.0); exit_px = float(exit_price or 0.0); q = float(qty or 0.0)
+    if entry <= 0 or exit_px <= 0 or q <= PHANTOM_CLOSED_TRADE_QTY_EPSILON:
+        return
+    pnl_pct = ((exit_px / entry) - 1.0) * 100.0
+    pnl_gbp = money_gbp((exit_px - entry) * q)
+    now = datetime.now(UTC).isoformat()
+    conn = db_connect()
+    try:
+        conn.execute(
+            """INSERT INTO v18230_one_hour_exit_evidence
+               (sold_at,symbol,entry_price,exit_price,qty,realised_pnl_pct,realised_pnl_gbp,status,updated_at)
+               VALUES (?,?,?,?,?,?,?,'PENDING',?)""",
+            (now, str(symbol or "").upper().strip(), entry, exit_px, q, pnl_pct, pnl_gbp, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"V18.2.30 ONE HOUR EVIDENCE | recorded {str(symbol).upper()} realised={pnl_pct:.2f}% advisory_only=True")
+
+
+def _v18230_range_stats(symbol: str, start_at: Any, end_at: Any) -> Dict[str, float]:
+    start = _v6_parse_utc(start_at); end = _v6_parse_utc(end_at)
+    sym = str(symbol or "").upper().strip()
+    def request(feed=None):
+        kwargs={"symbol_or_symbols":[sym],"timeframe":TimeFrame.Minute,"start":start,"end":end}
+        if feed is not None: kwargs["feed"] = feed
+        resp=data_client.get_stock_bars(StockBarsRequest(**kwargs))
+        try: bars=list(resp[sym])
+        except Exception: bars=list((getattr(resp,"data",{}) or {}).get(sym,[]))
+        prices=[float(getattr(b,"close",0) or 0) for b in bars if float(getattr(b,"close",0) or 0)>0]
+        if not prices: raise RuntimeError("historical_range_unavailable")
+        return {"high":max(prices),"low":min(prices)}
+    try:
+        return request()
+    except Exception as exc:
+        text=str(exc).lower()
+        if "sip" in text or "subscription" in text or "not permit" in text:
+            return request(DataFeed.IEX)
+        raise
+
+
+def v18230_evaluate_evidence(limit: int = 25) -> Dict[str, Any]:
+    if not SQLITE_ENABLED or not V18230_EVIDENCE_ENABLED:
+        return {"ok":False,"evaluated":0}
+    now = datetime.now(UTC)
+    init_db(); conn=db_connect()
+    entries=[dict(r) for r in conn.execute(
+        "SELECT * FROM v18230_entry_timing WHERE status='PENDING' ORDER BY observed_at ASC LIMIT ?",(int(limit),)
+    ).fetchall()]
+    exits=[dict(r) for r in conn.execute(
+        "SELECT * FROM v18230_one_hour_exit_evidence WHERE status='PENDING' ORDER BY sold_at ASC LIMIT ?",(int(limit),)
+    ).fetchall()]
+    conn.close()
+    evaluated=0; errors=0
+    for row in entries:
+        try:
+            observed=_v6_parse_utc(row["observed_at"]); entry=float(row["entry_price"] or 0)
+            updates={}
+            for mins,col in ((1,"1m"),(5,"5m"),(15,"15m"),(30,"30m")):
+                due=observed+timedelta(minutes=mins)
+                if now < due: continue
+                if row.get(f"price_{col}") is None:
+                    px=float(_v6_historical_checkpoint_price(row["symbol"],due)["price"])
+                    updates[f"price_{col}"]=px; updates[f"ret_{col}"]=((px/entry)-1.0)*100.0 if entry>0 else 0.0
+            if now >= observed+timedelta(minutes=30) and row.get("mfe_30m") is None:
+                rs=_v18230_range_stats(row["symbol"],observed,observed+timedelta(minutes=30))
+                updates["mfe_30m"]=((float(rs["high"])/entry)-1.0)*100.0
+                updates["mae_30m"]=((float(rs["low"])/entry)-1.0)*100.0
+                updates["status"]="COMPLETE"
+            if updates:
+                sets=", ".join(f"{k}=?" for k in updates)+", updated_at=?"
+                vals=list(updates.values())+[datetime.now(UTC).isoformat(),int(row["id"])]
+                c=db_connect(); c.execute(f"UPDATE v18230_entry_timing SET {sets} WHERE id=?",vals); c.commit(); c.close(); evaluated+=1
+        except Exception as exc:
+            errors+=1; print(f"V18.2.30 ENTRY EVIDENCE ERROR id={row.get('id')}: {exc}")
+    for row in exits:
+        try:
+            sold=_v6_parse_utc(row["sold_at"]); exit_px=float(row["exit_price"] or 0); updates={}
+            for mins,col in ((30,"30m"),(60,"60m")):
+                due=sold+timedelta(minutes=mins)
+                if now < due: continue
+                if row.get(f"price_{col}") is None:
+                    px=float(_v6_historical_checkpoint_price(row["symbol"],due)["price"])
+                    updates[f"price_{col}"]=px; updates[f"after_{col}_pct"]=((px/exit_px)-1.0)*100.0 if exit_px>0 else 0.0
+            if now >= sold+timedelta(minutes=60) and updates.get("price_60m") is not None or row.get("price_60m") is not None:
+                updates["status"]="COMPLETE"
+            if updates:
+                sets=", ".join(f"{k}=?" for k in updates)+", updated_at=?"
+                vals=list(updates.values())+[datetime.now(UTC).isoformat(),int(row["id"])]
+                c=db_connect(); c.execute(f"UPDATE v18230_one_hour_exit_evidence SET {sets} WHERE id=?",vals); c.commit(); c.close(); evaluated+=1
+        except Exception as exc:
+            errors+=1; print(f"V18.2.30 EXIT EVIDENCE ERROR id={row.get('id')}: {exc}")
+    if evaluated or errors:
+        print(f"V18.2.30 EVIDENCE WORKER | evaluated={evaluated} errors={errors} advisory_only=True")
+    return {"ok":True,"evaluated":evaluated,"errors":errors}
+
+
+def v18230_evidence_payload(days: int = 7) -> Dict[str, Any]:
+    init_db(); cutoff=(datetime.now(UTC)-timedelta(days=max(1,int(days)))).isoformat(); conn=db_connect()
+    entries=[dict(r) for r in conn.execute("SELECT * FROM v18230_entry_timing WHERE observed_at>=? ORDER BY observed_at DESC",(cutoff,)).fetchall()]
+    exits=[dict(r) for r in conn.execute("SELECT * FROM v18230_one_hour_exit_evidence WHERE sold_at>=? ORDER BY sold_at DESC",(cutoff,)).fetchall()]
+    conn.close()
+    complete_entries=[x for x in entries if x.get("status")=="COMPLETE"]
+    complete_exits=[x for x in exits if x.get("status")=="COMPLETE"]
+    def avg(rows,key):
+        vals=[float(x[key]) for x in rows if x.get(key) is not None]
+        return round(sum(vals)/len(vals),4) if vals else None
+    return {"ok":True,"version":"V18.2.30","advisoryOnly":True,
+        "entryTiming":{"samples":len(entries),"complete":len(complete_entries),
+            "avg1mPct":avg(complete_entries,"ret_1m"),"avg5mPct":avg(complete_entries,"ret_5m"),
+            "avg15mPct":avg(complete_entries,"ret_15m"),"avg30mPct":avg(complete_entries,"ret_30m"),
+            "avgMfe30mPct":avg(complete_entries,"mfe_30m"),"avgMae30mPct":avg(complete_entries,"mae_30m"),
+            "recent":entries[:25]},
+        "oneHourExit":{"samples":len(exits),"complete":len(complete_exits),
+            "realisedPnlGbp":round(sum(float(x.get("realised_pnl_gbp") or 0) for x in exits),2),
+            "avgRealisedPct":avg(exits,"realised_pnl_pct"),"avgAfter30mPct":avg(complete_exits,"after_30m_pct"),
+            "avgAfter60mPct":avg(complete_exits,"after_60m_pct"),"recent":exits[:25]},
+        "phantomTradeFilter":{"enabled":True,"quantityEpsilon":PHANTOM_CLOSED_TRADE_QTY_EPSILON}}
+
+
+@app.get('/v18/trade-evidence')
+def api_v18230_trade_evidence(request: Request, days: int = 7):
+    verify_api_key(request); return v18230_evidence_payload(days)
+
+
+def v18230_evidence_worker():
+    while True:
+        try: v18230_evaluate_evidence(25)
+        except Exception as exc: print(f"V18.2.30 EVIDENCE WORKER ERROR: {exc}")
+        time.sleep(V18230_EVIDENCE_INTERVAL_SECONDS)
 
 
 def run_bot_loop():
@@ -10613,7 +10835,7 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started, v18224_live_audit_thread_started
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started, v18224_live_audit_thread_started, v18230_evidence_thread_started
     # Initialise the shared SQLite schema synchronously before any worker threads start.
     # This removes the startup race where multiple workers all tried to create tables.
     init_db()
@@ -10654,6 +10876,10 @@ def startup_event():
         v18224_live_audit_thread_started = True
         threading.Thread(target=v18224_live_decision_audit_worker, daemon=True, name="v18-live-decision-audit").start()
         print(f"V18.2.24 LIVE DECISION AUDIT | enabled interval={V18224_LIVE_AUDIT_INTERVAL_SECONDS}s limit={V18224_LIVE_AUDIT_LIMIT} advisory_only=True")
+    if V18230_EVIDENCE_ENABLED and not v18230_evidence_thread_started:
+        v18230_evidence_thread_started = True
+        threading.Thread(target=v18230_evidence_worker, daemon=True, name="v18-trade-evidence").start()
+        print(f"V18.2.30 TRADE EVIDENCE | enabled interval={V18230_EVIDENCE_INTERVAL_SECONDS}s advisory_only=True")
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
@@ -10915,7 +11141,8 @@ def _reports_fast_performance_snapshot(status: Dict[str, Any]) -> Dict[str, Any]
                 COALESCE(SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END), 0) AS gross_profit,
                 COALESCE(ABS(SUM(CASE WHEN pnl < 0 THEN pnl ELSE 0 END)), 0) AS gross_loss
             FROM closed_trades
-        """).fetchone()
+            WHERE COALESCE(qty,0) > ?
+        """, (PHANTOM_CLOSED_TRADE_QTY_EPSILON,)).fetchone()
         try:
             state = conn.execute("SELECT baseline_equity, total_withdrawn, updated_at FROM performance_state WHERE id=1").fetchone()
         except Exception:
