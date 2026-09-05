@@ -70,9 +70,6 @@ export default function App() {
   const totalDeposited = Number(bot.reports?.totalDeposited || 0);
   const totalGainLoss = Number(bot.reports?.totalGainLoss || 0);
   const profitVault = bot.banking?.profitVault || bot.data?.banking?.profitVault || {};
-  const vaultFreeCashGbp = Number(profitVault?.workingCapitalGbp || 0);
-  const brokerBuyingPowerUsd = Number(bot.data?.account?.buyingPower || 0);
-  const displayedFreeCashGbp = vaultFreeCashGbp > 0 ? vaultFreeCashGbp : brokerBuyingPowerUsd * bot.rate;
   const bankedProfitGbp = Number(profitVault?.bankedProfitGbp || 0);
   const accountEquityGbp = Number(bot.data?.account?.equity || 0) * bot.rate;
   const tradingCapitalGbp = Math.max(0, Number(profitVault?.accountEquityGbp || accountEquityGbp) - bankedProfitGbp);
@@ -88,7 +85,6 @@ export default function App() {
         <section className="stats command-stats">
           <Stat label="Equity" value={gbp(accountEquityGbp)} sub={usd(bot.data?.account?.equity)} />
           <Stat label="Trading Capital" value={gbp(tradingCapitalGbp)} sub="Invested + free cash · vault excluded" />
-          <Stat label="Free Cash" value={gbp(displayedFreeCashGbp)} sub={bot.positions.length ? "Uninvested cash · position already open" : "Available for the next trade"} />
           <Stat label="Today P&L" value={gbp(Number(bot.data?.account?.pnlDay || 0) * bot.rate)} sub="Since midnight" className={tone(bot.data?.account?.pnlDay)} />
           <Stat label="Total Gain/Loss" value={gbp(totalGainLoss)} sub={`Deposited ${gbp(totalDeposited)}`} className={tone(totalGainLoss)} />
           <Stat label="Profit Vault" value={gbp(bankedProfitGbp)} sub="Protected realised profit" className={bankedProfitGbp > 0 ? "gain" : ""} />
