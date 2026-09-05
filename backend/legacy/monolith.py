@@ -10878,6 +10878,19 @@ V18232_CRYPTO_LOCATION = str(os.getenv("TRADEBOT_CRYPTO_LOCATION", "us") or "us"
 V18232_CRYPTO_SYMBOLS = [x.strip().upper() for x in str(os.getenv(
     "TRADEBOT_CRYPTO_SYMBOLS", "BTC/USD,ETH/USD,SOL/USD,XRP/USD,DOGE/USD,LINK/USD,LTC/USD,AVAX/USD"
 )).split(",") if x.strip()]
+# V18.2.45 — Dynamic Alpaca crypto market scanner. The configured list above is
+# now a fallback/seed only. By default the bot discovers every active, tradable
+# Alpaca crypto pair quoted in USD, then scans the complete discovered universe in
+# API-sized batches. There is deliberately no hard symbol-count cap.
+V18245_CRYPTO_DYNAMIC_UNIVERSE = str(os.getenv("TRADEBOT_CRYPTO_DYNAMIC_UNIVERSE", "true")).lower() in ("1", "true", "yes", "on")
+V18245_CRYPTO_UNIVERSE_REFRESH_SECONDS = max(300, int(os.getenv("TRADEBOT_CRYPTO_UNIVERSE_REFRESH_SECONDS", "900") or 900))
+V18245_CRYPTO_SCAN_BATCH_SIZE = max(5, min(50, int(os.getenv("TRADEBOT_CRYPTO_SCAN_BATCH_SIZE", "20") or 20)))
+V18245_CRYPTO_MIN_60M_NOTIONAL_USD = max(0.0, float(os.getenv("TRADEBOT_CRYPTO_MIN_60M_NOTIONAL_USD", "5000") or 5000))
+_crypto_universe_lock = threading.RLock()
+_crypto_universe_runtime: Dict[str, Any] = {
+    "symbols": list(V18232_CRYPTO_SYMBOLS), "lastRefreshAt": None, "lastRefreshEpoch": 0.0,
+    "lastError": None, "discovered": len(V18232_CRYPTO_SYMBOLS), "eligible": len(V18232_CRYPTO_SYMBOLS),
+}
 # V18.2.39 — Crypto momentum mode: the old 0.68 gate was too strict for the
 # 5-minute score scale and routinely ignored modest but genuine green moves.
 # 0.34 still requires the setup to rank near the top of the scanner while
@@ -10926,20 +10939,91 @@ def _v18232_crypto_data_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]
     return payload if isinstance(payload, dict) else {}
 
 
+def _v18245_discover_crypto_symbols(force: bool = False) -> List[str]:
+    """Discover the full active/tradable Alpaca USD crypto universe.
+
+    Discovery is cached because Alpaca's asset catalogue does not need to be
+    reloaded every scan. If discovery is unavailable, the known-good configured
+    symbol list remains the fallback so live crypto never loses its universe.
+    """
+    now_epoch = time.time()
+    with _crypto_universe_lock:
+        cached = [str(x).upper() for x in (_crypto_universe_runtime.get("symbols") or []) if str(x).strip()]
+        age = now_epoch - float(_crypto_universe_runtime.get("lastRefreshEpoch") or 0.0)
+        if cached and not force and age < V18245_CRYPTO_UNIVERSE_REFRESH_SECONDS:
+            return cached
+    if not V18245_CRYPTO_DYNAMIC_UNIVERSE:
+        return list(V18232_CRYPTO_SYMBOLS)
+    try:
+        assets = trading_client.get_all_assets()
+        discovered: List[str] = []
+        for asset in assets or []:
+            try:
+                raw_class = getattr(asset, "asset_class", "")
+                asset_class = str(getattr(raw_class, "value", raw_class) or "").lower()
+                if "crypto" not in asset_class:
+                    continue
+                if not bool(getattr(asset, "tradable", False)):
+                    continue
+                raw_status = getattr(asset, "status", "")
+                status = str(getattr(raw_status, "value", raw_status) or "").lower()
+                if status and status not in ("active", "assetstatus.active") and "active" not in status:
+                    continue
+                symbol = str(getattr(asset, "symbol", "") or "").strip().upper()
+                # The live pilot is USD-funded, so only directly USD-quoted pairs
+                # are eligible for automatic discovery/trading.
+                if not symbol.endswith("/USD"):
+                    continue
+                if symbol not in discovered:
+                    discovered.append(symbol)
+            except Exception:
+                continue
+        discovered.sort()
+        if not discovered:
+            raise RuntimeError("Alpaca returned no active/tradable USD crypto pairs")
+        stamp = datetime.now(UTC).isoformat()
+        with _crypto_universe_lock:
+            _crypto_universe_runtime.update({
+                "symbols": discovered, "lastRefreshAt": stamp, "lastRefreshEpoch": now_epoch,
+                "lastError": None, "discovered": len(discovered),
+            })
+        print(f"V18.2.45 CRYPTO MARKET DISCOVERY | discovered={len(discovered)} usd_pairs={len(discovered)} dynamic=True", flush=True)
+        return discovered
+    except Exception as exc:
+        text = str(exc)[:500]
+        with _crypto_universe_lock:
+            _crypto_universe_runtime["lastError"] = text
+            fallback = [str(x).upper() for x in (_crypto_universe_runtime.get("symbols") or V18232_CRYPTO_SYMBOLS) if str(x).strip()]
+        print(f"V18.2.45 CRYPTO MARKET DISCOVERY DEFERRED | {text} fallback={len(fallback)}", flush=True)
+        return fallback or list(V18232_CRYPTO_SYMBOLS)
+
+
 def _v18232_fetch_scans() -> List[Dict[str, Any]]:
-    if not V18232_CRYPTO_SYMBOLS:
+    symbols = _v18245_discover_crypto_symbols()
+    if not symbols:
         return []
     start = (datetime.now(UTC) - timedelta(minutes=95)).isoformat().replace("+00:00", "Z")
-    payload = _v18232_crypto_data_get("bars", {
-        "symbols": ",".join(V18232_CRYPTO_SYMBOLS),
-        "timeframe": "5Min",
-        "start": start,
-        "limit": 1000,
-        "sort": "asc",
-    })
-    grouped = payload.get("bars") or {}
+    grouped: Dict[str, Any] = {}
+    # Batch the full universe instead of applying a symbol-count limit. Keeping
+    # each request small also prevents Alpaca's 1000-bar response limit from
+    # starving symbols at the end of a large universe.
+    for offset in range(0, len(symbols), V18245_CRYPTO_SCAN_BATCH_SIZE):
+        batch = symbols[offset:offset + V18245_CRYPTO_SCAN_BATCH_SIZE]
+        try:
+            payload = _v18232_crypto_data_get("bars", {
+                "symbols": ",".join(batch), "timeframe": "5Min", "start": start,
+                "limit": 1000, "sort": "asc",
+            })
+            bars_map = payload.get("bars") or {}
+            if isinstance(bars_map, dict):
+                grouped.update(bars_map)
+        except Exception as exc:
+            print(f"V18.2.45 CRYPTO SCAN BATCH DEFERRED | offset={offset} size={len(batch)} error={str(exc)[:240]}", flush=True)
+            continue
+
     scans: List[Dict[str, Any]] = []
-    for symbol in V18232_CRYPTO_SYMBOLS:
+    liquid_count = 0
+    for symbol in symbols:
         raw = grouped.get(symbol) or []
         bars = [b for b in raw if isinstance(b, dict) and float(b.get("c") or 0) > 0]
         if len(bars) < 4:
@@ -10955,21 +11039,36 @@ def _v18232_fetch_scans() -> List[Dict[str, Any]]:
         high60 = max(highs) if highs else price
         low60 = min(lows) if lows else price
         range60 = ((high60 / low60) - 1.0) * 100.0 if low60 > 0 else 0.0
+        # Estimate recent tradable depth from Alpaca bar volume. This is used as
+        # a safety gate, not a ranking boost, so thin pairs cannot win purely on
+        # a noisy percentage spike.
+        notional60 = 0.0
+        for b in recent:
+            try:
+                notional60 += max(0.0, float(b.get("v") or 0.0)) * max(0.0, float(b.get("c") or price))
+            except Exception:
+                pass
+        liquid = bool(notional60 >= V18245_CRYPTO_MIN_60M_NOTIONAL_USD)
+        if liquid:
+            liquid_count += 1
         last6 = bars[-6:] if len(bars) >= 6 else bars
         avg6 = sum(float(b.get("c") or price) for b in last6) / max(1, len(last6))
         trend = 1.0 if price >= avg6 else 0.0
         momentum15 = _v18232_clamp((ret15 + 0.35) / 2.50)
         momentum60 = _v18232_clamp((ret60 + 0.75) / 5.00)
-        # Prefer enough movement to create opportunity without rewarding extreme one-hour ranges.
         range_quality = _v18232_clamp(1.0 - abs(range60 - 2.0) / 5.0)
         score = _v18232_clamp(0.38 * momentum15 + 0.34 * momentum60 + 0.18 * trend + 0.10 * range_quality)
+        qualified = bool(score >= V18232_CRYPTO_ENTRY_SCORE and liquid)
         scans.append({
             "symbol": symbol, "price": round(price, 8), "score": round(score, 4),
             "return15mPct": round(ret15, 4), "return60mPct": round(ret60, 4),
-            "range60mPct": round(range60, 4), "qualified": bool(score >= V18232_CRYPTO_ENTRY_SCORE),
-            "bars": len(bars), "source": "alpaca_crypto_5min",
+            "range60mPct": round(range60, 4), "liquidity60mUsd": round(notional60, 2),
+            "liquid": liquid, "qualified": qualified,
+            "bars": len(bars), "source": "alpaca_crypto_dynamic_5min",
         })
     scans.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
+    with _crypto_universe_lock:
+        _crypto_universe_runtime["eligible"] = liquid_count
     return scans
 
 
@@ -11107,7 +11206,7 @@ def v18232_crypto_shadow_payload() -> Dict[str, Any]:
     cash = float(state.get("virtual_cash_usd") or 0); realised = float(state.get("realised_pnl_usd") or 0); equity = cash + open_value
     closed = int(data.get("closedTrades") or 0); wins = int(data.get("wins") or 0)
     return {
-        "ok": True, "version": "V18.2.32", "name": "Alpaca Crypto Shadow Lab",
+        "ok": True, "version": "V18.2.45", "name": "Alpaca Dynamic Crypto Market Scanner",
         "enabled": V18232_CRYPTO_SHADOW_ENABLED, "running": bool(_crypto_shadow_runtime.get("running")),
         "shadowOnly": True, "liveOrders": False, "advisoryOnly": True,
         "virtualCapitalUsd": V18232_CRYPTO_CAPITAL_USD, "cashUsd": round(cash, 4), "equityUsd": round(equity, 4),
@@ -11116,7 +11215,18 @@ def v18232_crypto_shadow_payload() -> Dict[str, Any]:
         "closedTrades": closed, "winRate": round((wins / closed * 100.0) if closed else 0.0, 2),
         "positions": positions, "scans": scans, "lastScanAt": state.get("last_scan_at") or _crypto_shadow_runtime.get("lastScanAt"),
         "lastError": _crypto_shadow_runtime.get("lastError") or state.get("last_error"),
-        "config": {"symbols": V18232_CRYPTO_SYMBOLS, "intervalSeconds": V18232_CRYPTO_INTERVAL_SECONDS,
+        "marketDiscovery": {
+            "dynamic": V18245_CRYPTO_DYNAMIC_UNIVERSE,
+            "discovered": int(_crypto_universe_runtime.get("discovered") or 0),
+            "eligible": int(_crypto_universe_runtime.get("eligible") or 0),
+            "scanned": len(scans),
+            "qualified": sum(1 for x in scans if bool(x.get("qualified"))),
+            "lastRefreshAt": _crypto_universe_runtime.get("lastRefreshAt"),
+            "lastError": _crypto_universe_runtime.get("lastError"),
+        },
+        "config": {"symbols": [x.get("symbol") for x in scans], "intervalSeconds": V18232_CRYPTO_INTERVAL_SECONDS,
+                   "dynamicUniverse": V18245_CRYPTO_DYNAMIC_UNIVERSE, "universeRefreshSeconds": V18245_CRYPTO_UNIVERSE_REFRESH_SECONDS,
+                   "minLiquidity60mUsd": V18245_CRYPTO_MIN_60M_NOTIONAL_USD,
                    "positionPct": V18232_CRYPTO_POSITION_PCT, "maxPositions": V18232_CRYPTO_MAX_POSITIONS,
                    "entryScore": V18232_CRYPTO_ENTRY_SCORE, "stopPct": V18232_CRYPTO_STOP_PCT,
                    "trailStartPct": V18232_CRYPTO_TRAIL_START_PCT, "trailGivebackPct": V18232_CRYPTO_TRAIL_GIVEBACK_PCT},
@@ -11321,7 +11431,7 @@ def _v18234_live_buy(scan: Dict[str, Any], allocation_gbp_override: Optional[flo
         _crypto_live_runtime["lastError"] = f"Insufficient broker USD cash after safety buffer (available=${broker_cash_usd:.2f})."
         return False
     if notional_usd + 0.009 < desired_notional_usd:
-        print(f"V18.2.44 CRYPTO BUY SIZING | {symbol} desired=${desired_notional_usd:.2f} broker_cash=${broker_cash_usd:.2f} buffer=${cash_buffer_usd:.2f} order=${notional_usd:.2f}", flush=True)
+        print(f"V18.2.45 CRYPTO BUY SIZING | {symbol} desired=${desired_notional_usd:.2f} broker_cash=${broker_cash_usd:.2f} buffer=${cash_buffer_usd:.2f} order=${notional_usd:.2f}", flush=True)
     with _crypto_live_lock:
         try:
             req = MarketOrderRequest(symbol=symbol, notional=notional_usd, side=OrderSide.BUY, time_in_force=TimeInForce.GTC)
@@ -11329,11 +11439,11 @@ def _v18234_live_buy(scan: Dict[str, Any], allocation_gbp_override: Optional[flo
             fill_price, fill_qty = _v18234_poll_fill(order, price, notional_usd / price)
             _v18234_log_live_trade(symbol, "BUY", order, fill_qty, fill_price, notional_usd, None, None, score, "CRYPTO LIVE PILOT ENTRY")
             _crypto_live_runtime.update({"lastError": None, "lastActionAt": datetime.now(UTC).isoformat()})
-            print(f"V18.2.44 CRYPTO LIVE BUY | {symbol} notional=${notional_usd:.2f} fill={fill_price:.8f} qty={fill_qty:.8f} score={score:.3f}", flush=True)
+            print(f"V18.2.45 CRYPTO LIVE BUY | {symbol} notional=${notional_usd:.2f} fill={fill_price:.8f} qty={fill_qty:.8f} score={score:.3f}", flush=True)
             return True
         except Exception as exc:
             _crypto_live_runtime["lastError"] = str(exc)[:500]
-            print(f"V18.2.44 CRYPTO LIVE BUY ERROR | {symbol} {exc}", flush=True)
+            print(f"V18.2.45 CRYPTO LIVE BUY ERROR | {symbol} {exc}", flush=True)
             return False
 
 def _v18234_live_sell(position: Dict[str, Any], price: float, score: float, reason: str) -> bool:
@@ -11552,7 +11662,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     usable_max = min(pool, V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
     live_positions = _v18234_raw_crypto_positions()
     return {
-        "ok": True, "version": "V18.2.44", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.45", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "allocationLockedByPosition": bool(live_positions),
         "liveExecutionInstalled": True, "liveExecutorIntervalSeconds": V18242_CRYPTO_LIVE_INTERVAL_SECONDS, "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
@@ -11897,11 +12007,11 @@ def startup_event():
         threading.Thread(target=v18232_crypto_shadow_worker, daemon=True, name="v18-crypto-shadow").start()
         print(f"V18.2.32 CRYPTO SHADOW | enabled=True interval={V18232_CRYPTO_INTERVAL_SECONDS}s symbols={len(V18232_CRYPTO_SYMBOLS)} virtual_capital=${V18232_CRYPTO_CAPITAL_USD:.2f} advisory_only=True live_orders=False")
         acct = _v18234_crypto_account_status()
-        print(f"V18.2.44 CRYPTO LIVE PILOT | installed=True account_crypto={acct.get('status')} full_vault_default=True vault_reserve_adjustable=True broker_safe_sizing=True live_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s", flush=True)
+        print(f"V18.2.45 CRYPTO LIVE PILOT | installed=True account_crypto={acct.get('status')} full_vault_default=True vault_reserve_adjustable=True broker_safe_sizing=True live_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s", flush=True)
     if V18234_CRYPTO_LIVE_ENABLED and not PAPER and not v18242_crypto_live_thread_started:
         v18242_crypto_live_thread_started = True
         threading.Thread(target=v18242_crypto_live_worker, daemon=True, name="v18-crypto-live").start()
-        print(f"V18.2.44 CRYPTO LIVE EXECUTOR | interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s independent_of_shadow=True", flush=True)
+        print(f"V18.2.45 CRYPTO LIVE EXECUTOR | interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s independent_of_shadow=True", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()

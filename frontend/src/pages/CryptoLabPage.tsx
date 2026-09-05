@@ -147,7 +147,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.44 · TWO-POSITION CRYPTO PILOT</div>
+          <div className="eyebrow">V18.2.45 · DYNAMIC CRYPTO MARKET SCANNER</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -187,16 +187,16 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-panel-head">
         <div>
           <h3><span className="panel-icon">◈</span> Crypto Scanner</h3>
-          <p>AI scans the market and ranks opportunities. Trades only when score ≥ {entryScore.toFixed(2)}.</p>
+          <p>Automatically discovers Alpaca's active USD crypto market, filters thin pairs and ranks every scanned opportunity. Trades only when score ≥ {entryScore.toFixed(2)}.</p>
         </div>
-        <div className="scanner-state"><span className="crypto-chip">{scans.length} assets</span><span className="scanning-dot">●</span><span>Scanning</span></div>
+        <div className="scanner-state"><span className="crypto-chip">{Number(data?.marketDiscovery?.discovered || scans.length)} discovered</span><span className="crypto-chip">{Number(data?.marketDiscovery?.eligible || scans.filter((s: AnyObj) => s.liquid !== false).length)} liquid</span><span className="crypto-chip">{scans.filter((s: AnyObj) => Boolean(s.qualified)).length} qualified</span><span className="scanning-dot">●</span><span>Dynamic</span></div>
       </div>
       <div className="crypto-table-wrap">
         <table className="crypto-scanner-table">
-          <thead><tr><th>Symbol</th><th>Price</th><th>Score</th><th>15m</th><th>60m</th><th>60m Range</th><th>Status</th></tr></thead>
+          <thead><tr><th>Symbol</th><th>Price</th><th>Score</th><th>15m</th><th>60m</th><th>60m Range</th><th>Liquidity</th><th>Status</th></tr></thead>
           <tbody>{scans.map((s: AnyObj) => {
             const score = Number(s.score || 0);
-            const state = scoreState(score, entryScore);
+            const state = s.liquid === false ? { label: "THIN", cls: "watching" } : scoreState(score, entryScore);
             const progress = Math.max(4, Math.min(100, (score / entryScore) * 100));
             return <tr key={s.symbol} className={s.qualified ? "qualified-row" : ""}>
               <td><div className="crypto-symbol"><span className="coin-icon small">{coinGlyph(s.symbol)}</span><strong>{s.symbol}</strong></div></td>
@@ -205,6 +205,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
               <td className={Number(s.return15mPct || 0) >= 0 ? "gain" : "loss"}>{pct(s.return15mPct)}</td>
               <td className={Number(s.return60mPct || 0) >= 0 ? "gain" : "loss"}>{pct(s.return60mPct)}</td>
               <td>{pct(s.range60mPct)}</td>
+              <td>{s.liquid === false ? <span className="loss">THIN</span> : money(s.liquidity60mUsd)}</td>
               <td><div className="crypto-status-cell"><span className={`crypto-chip ${state.cls}`}>{state.label}</span><span className="score-track"><span style={{ width: `${progress}%` }} /></span></div></td>
             </tr>;
           })}</tbody>
