@@ -125,7 +125,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
 
   const positions = Array.isArray(data.positions) ? data.positions : [];
   const livePositions = Array.isArray(bridge?.livePositions) ? bridge.livePositions : [];
-  const entryScore = Number(data.config?.entryScore || 0.68);
+  const entryScore = Number(data.config?.entryScore || 0.34);
   const armed = Boolean(bridge?.livePilotEnabled);
   const accountActive = Boolean(bridge?.accountCrypto?.active);
 

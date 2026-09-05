@@ -3202,33 +3202,108 @@ def _v179_episode_profiles(decisions: List[Dict[str, Any]], episode_gap_minutes:
     return {"episodeGapMinutes":episode_gap_minutes,"missedMoveEpisodes":missed_episodes,"nearMissProfiles":profiles}
 
 def v179_evaluate_decision_audit(limit: int = 200) -> Dict[str, Any]:
+    """Evaluate matured V17.9 checkpoints without holding SQLite during network I/O.
+
+    V18.2.38: historical Alpaca lookups can take seconds (especially when SIP
+    falls back to IEX).  The previous implementation opened one SQLite write
+    transaction on the first UPDATE and then kept that transaction/writer lock
+    while every remaining network request ran.  That blocked unrelated writers
+    such as performance state and Trade Replay for 10+ seconds.
+
+    This implementation has three phases:
+      1. read pending rows and close the DB connection;
+      2. perform all historical-data work with no DB writer held;
+      3. reopen SQLite briefly and batch the resulting updates in one commit.
+
+    Trading decisions, gates and order submission are not touched.
+    """
     if not SQLITE_ENABLED:
-        return {"ok":False,"evaluated":0,"errors":0}
-    evaluated=errors=0
+        return {"ok":False,"evaluated":0,"errors":0,"deferred":0}
+
+    evaluated = errors = deferred = 0
+    complete_updates = []
+    error_updates = []
+    conn = None
+
     try:
-        init_db(); conn=db_connect()
-        rows=conn.execute("SELECT * FROM v179_decision_audit WHERE status='PENDING' AND due_at<=? ORDER BY due_at LIMIT ?",
-                          (datetime.now(UTC).isoformat(),max(1,min(int(limit),1000)))).fetchall()
+        init_db()
+        conn = db_connect()
+        rows = conn.execute(
+            "SELECT * FROM v179_decision_audit WHERE status='PENDING' AND due_at<=? ORDER BY due_at LIMIT ?",
+            (datetime.now(UTC).isoformat(), max(1, min(int(limit), 1000))),
+        ).fetchall()
+        conn.close()
+        conn = None
+
+        # Exact minute-level cache: repeated scans of the same symbol commonly
+        # mature in the same one-minute bar, so one historical request can safely
+        # serve those checkpoints while preserving the intended minute granularity.
+        checkpoint_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
         for row in rows:
             try:
-                cp=_v6_historical_checkpoint_price(str(row["symbol"]),row["due_at"])
-                entry=float(row["entry_price"] or 0); price=float(cp["price"] or 0)
-                if entry <= 0 or price <= 0: raise RuntimeError("invalid_audit_price")
-                ret=((price/entry)-1.0)*100.0
-                conn.execute("""UPDATE v179_decision_audit SET evaluated_at=?,outcome_price=?,return_pct=?,
-                    best_move_pct=?,worst_move_pct=?,classification=?,status='COMPLETE',error=NULL,source=? WHERE id=?""",
-                    (cp.get("barAt"),price,ret,max(0.0,ret),min(0.0,ret),_v179_classify(ret),cp.get("source"),int(row["id"])))
+                symbol = str(row["symbol"] or "").upper().strip()
+                due_dt = _v6_parse_utc(row["due_at"])
+                cache_key = (symbol, due_dt.replace(second=0, microsecond=0).isoformat())
+                cp = checkpoint_cache.get(cache_key)
+                if cp is None:
+                    cp = _v6_historical_checkpoint_price(symbol, row["due_at"])
+                    checkpoint_cache[cache_key] = cp
+
+                entry = float(row["entry_price"] or 0)
+                price = float(cp["price"] or 0)
+                if entry <= 0 or price <= 0:
+                    raise RuntimeError("invalid_audit_price")
+
+                ret = ((price / entry) - 1.0) * 100.0
+                complete_updates.append((
+                    cp.get("barAt"), price, ret, max(0.0, ret), min(0.0, ret),
+                    _v179_classify(ret), cp.get("source"), int(row["id"]),
+                ))
                 evaluated += 1
             except Exception as exc:
+                message = str(exc) or exc.__class__.__name__
+                # A checkpoint whose next tradable bar does not exist yet is not
+                # a broken audit row. Keep it PENDING so the next live session can
+                # complete it instead of repeatedly recording a false error.
+                if "historical_bar_unavailable" in message or "no_bar_at_or_after_checkpoint" in message:
+                    deferred += 1
+                    continue
                 errors += 1
-                conn.execute("UPDATE v179_decision_audit SET error=? WHERE id=?",(str(exc)[:500],int(row["id"])))
-        conn.commit(); conn.close()
-        if evaluated or errors: print(f"V17.9 DECISION AUDIT | evaluated={evaluated} errors={errors}")
-        return {"ok":True,"evaluated":evaluated,"errors":errors}
+                error_updates.append((message[:500], int(row["id"])))
+
+        if complete_updates or error_updates:
+            conn = db_connect()
+            if complete_updates:
+                conn.executemany(
+                    """UPDATE v179_decision_audit SET evaluated_at=?,outcome_price=?,return_pct=?,
+                       best_move_pct=?,worst_move_pct=?,classification=?,status='COMPLETE',error=NULL,source=? WHERE id=?""",
+                    complete_updates,
+                )
+            if error_updates:
+                conn.executemany(
+                    "UPDATE v179_decision_audit SET error=? WHERE id=?",
+                    error_updates,
+                )
+            conn.commit()
+            conn.close()
+            conn = None
+
+        if evaluated or errors or deferred:
+            print(
+                f"V17.9 DECISION AUDIT | evaluated={evaluated} errors={errors} deferred={deferred}"
+            )
+        return {"ok":True,"evaluated":evaluated,"errors":errors,"deferred":deferred}
     except Exception as exc:
-        try: conn.close()
-        except Exception: pass
-        return {"ok":False,"evaluated":evaluated,"errors":errors+1,"error":str(exc)}
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+        return {
+            "ok":False,"evaluated":evaluated,"errors":errors+1,
+            "deferred":deferred,"error":str(exc),
+        }
 
 def v179_decision_audit_summary(days: int = 7) -> Dict[str, Any]:
     days=max(1,min(int(days),365)); cutoff=(datetime.now(UTC)-timedelta(days=days)).isoformat()
@@ -10112,7 +10187,16 @@ def closed_market_ai_research_worker() -> None:
             started = datetime.now(UTC).isoformat()
             seeded = v2_seed_missing_outcomes()
             outcomes = v2_drain_due_outcomes()
-            v179_audit = v179_evaluate_decision_audit()
+            # V18.2.38: do not hammer Decision Audit checkpoints on Saturday/
+            # Sunday. A weekend due_at cannot have a tradable bar at/after it until
+            # the next session, so evaluating it here only creates avoidable API
+            # calls and false historical_bar_unavailable errors. Weekday after-hours
+            # research still evaluates normally.
+            now_et = datetime.now(UTC).astimezone(ZoneInfo("America/New_York"))
+            if now_et.weekday() >= 5:
+                v179_audit = {"ok": True, "evaluated": 0, "errors": 0, "deferred": 0, "skipped": True, "reason": "weekend"}
+            else:
+                v179_audit = v179_evaluate_decision_audit()
             v18_review = _v18_build_review(V18_WINDOW_DAYS, True)
             v6_result = v6_sync_brains(V6_DEFAULT_HORIZON_HOURS, V6_AUTO_SYNC_LIMIT) if V6_BRAINS_ENABLED else {"ok": True, "skipped": True}
             v11_result = v11_learning_cycle("closed_market", force=False) if V11_AUTO_LEARNING_ENABLED else {"ok": True, "skipped": True}
@@ -10793,7 +10877,11 @@ V18232_CRYPTO_LOCATION = str(os.getenv("TRADEBOT_CRYPTO_LOCATION", "us") or "us"
 V18232_CRYPTO_SYMBOLS = [x.strip().upper() for x in str(os.getenv(
     "TRADEBOT_CRYPTO_SYMBOLS", "BTC/USD,ETH/USD,SOL/USD,XRP/USD,DOGE/USD,LINK/USD,LTC/USD,AVAX/USD"
 )).split(",") if x.strip()]
-V18232_CRYPTO_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_ENTRY_SCORE", "0.68") or 0.68)))
+# V18.2.39 — Crypto momentum mode: the old 0.68 gate was too strict for the
+# 5-minute score scale and routinely ignored modest but genuine green moves.
+# 0.34 still requires the setup to rank near the top of the scanner while
+# allowing the live crypto pilot to participate earlier in positive momentum.
+V18232_CRYPTO_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_ENTRY_SCORE", "0.34") or 0.34)))
 V18232_CRYPTO_STOP_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_STOP_PCT", "3.0") or 3.0))
 V18232_CRYPTO_TRAIL_START_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_TRAIL_START_PCT", "4.0") or 4.0))
 V18232_CRYPTO_TRAIL_GIVEBACK_PCT = max(0.10, float(os.getenv("TRADEBOT_CRYPTO_TRAIL_GIVEBACK_PCT", "1.5") or 1.5))
