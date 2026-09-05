@@ -11248,6 +11248,11 @@ V18234_CRYPTO_LIVE_STOP_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_LIVE_ST
 V18234_CRYPTO_LIVE_TRAIL_START_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_LIVE_TRAIL_START_PCT", str(V18232_CRYPTO_TRAIL_START_PCT)) or V18232_CRYPTO_TRAIL_START_PCT))
 V18234_CRYPTO_LIVE_TRAIL_GIVEBACK_PCT = max(0.10, float(os.getenv("TRADEBOT_CRYPTO_LIVE_TRAIL_GIVEBACK_PCT", str(V18232_CRYPTO_TRAIL_GIVEBACK_PCT)) or V18232_CRYPTO_TRAIL_GIVEBACK_PCT))
 V18234_CRYPTO_LIVE_EXIT_SCORE = max(0.0, min(V18234_CRYPTO_LIVE_ENTRY_SCORE, float(os.getenv("TRADEBOT_CRYPTO_LIVE_EXIT_SCORE", str(V18232_CRYPTO_EXIT_SCORE)) or V18232_CRYPTO_EXIT_SCORE)))
+# V18.2.48 — crypto-only timed profit capture. Every 15 minutes, each
+# TradeBot-managed position is checked; if it is above its entry price, the
+# pilot exits 100% at market. Stop/trail protection continues to run every
+# live cycle and stock trading rules are untouched.
+V18248_CRYPTO_PROFIT_TAKE_INTERVAL_SECONDS = max(60, int(os.getenv("TRADEBOT_CRYPTO_PROFIT_TAKE_INTERVAL_SECONDS", "900") or 900))
 _crypto_live_lock = threading.RLock()
 _crypto_live_runtime: Dict[str, Any] = {"lastError": None, "lastActionAt": None}
 
@@ -11449,8 +11454,19 @@ def _v18234_live_buy(scan: Dict[str, Any], allocation_gbp_override: Optional[flo
             order = trading_client.submit_order(order_data=req)
             fill_price, fill_qty = _v18234_poll_fill(order, price, notional_usd / price)
             _v18234_log_live_trade(symbol, "BUY", order, fill_qty, fill_price, notional_usd, None, None, score, "CRYPTO LIVE PILOT ENTRY")
+            # Start this position's 15-minute profit-check clock at the fill.
+            try:
+                timer_state = load_profit_vault_state()
+                timers = timer_state.get("cryptoProfitCheckAt")
+                if not isinstance(timers, dict):
+                    timers = {}
+                timers[_v18246_crypto_symbol_key(symbol)] = datetime.now(UTC).isoformat()
+                timer_state["cryptoProfitCheckAt"] = timers
+                save_profit_vault_state(timer_state)
+            except Exception as timer_exc:
+                print(f"V18.2.48 CRYPTO PROFIT TIMER INIT ERROR | {symbol} {timer_exc}", flush=True)
             _crypto_live_runtime.update({"lastError": None, "lastActionAt": datetime.now(UTC).isoformat()})
-            print(f"V18.2.45 CRYPTO LIVE BUY | {symbol} notional=${notional_usd:.2f} fill={fill_price:.8f} qty={fill_qty:.8f} score={score:.3f}", flush=True)
+            print(f"V18.2.48 CRYPTO LIVE BUY | {symbol} notional=${notional_usd:.2f} fill={fill_price:.8f} qty={fill_qty:.8f} score={score:.3f} profit_check=15m", flush=True)
             return True
         except Exception as exc:
             _crypto_live_runtime["lastError"] = str(exc)[:500]
@@ -11481,6 +11497,10 @@ def _v18234_live_sell(position: Dict[str, Any], price: float, score: float, reas
             elif pnl_gbp < 0:
                 state["cryptoAllocatedGbp"] = round(max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0) + pnl_gbp), 4)
             state["lastCryptoLiveExitAt"] = datetime.now(UTC).isoformat(); state["lastCryptoLivePnlGbp"] = round(pnl_gbp, 4)
+            timers = state.get("cryptoProfitCheckAt")
+            if isinstance(timers, dict):
+                timers.pop(_v18246_crypto_symbol_key(symbol), None)
+                state["cryptoProfitCheckAt"] = timers
             # V18.2.41: honour the chosen Vault reserve. With reserve £0,
             # realised crypto profit immediately grows the next crypto allocation.
             state = _v18241_apply_vault_reserve(state, save=False)
@@ -11517,6 +11537,14 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Di
     if legacy_symbol and legacy_high > 0 and legacy_symbol not in highs:
         highs[legacy_symbol] = legacy_high
 
+    # V18.2.48: persistent per-position timed profit checks. Existing managed
+    # positions discovered after an upgrade/restart start a fresh 15-minute
+    # clock rather than being sold immediately on boot.
+    profit_checks = state.get("cryptoProfitCheckAt")
+    if not isinstance(profit_checks, dict):
+        profit_checks = {}
+    now_dt = datetime.now(UTC)
+
     sold_any = False
     for p in list(managed_positions):
         symbol = str(p.get("symbol") or "").upper()
@@ -11529,17 +11557,43 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Di
         highs[symbol] = high
         trail_floor = high * (1.0 - V18234_CRYPTO_LIVE_TRAIL_GIVEBACK_PCT / 100.0)
         reason = None
-        if pnl_pct <= -V18234_CRYPTO_LIVE_STOP_PCT: reason = "CRYPTO LIVE STOP"
-        elif ((high / entry) - 1.0) * 100.0 >= V18234_CRYPTO_LIVE_TRAIL_START_PCT and price <= trail_floor: reason = "CRYPTO LIVE TRAIL"
-        elif score > 0 and score <= V18234_CRYPTO_LIVE_EXIT_SCORE and pnl_pct > 0: reason = "CRYPTO LIVE MOMENTUM EXIT"
+        symbol_key = _v18246_crypto_symbol_key(symbol)
+        last_check_raw = str(profit_checks.get(symbol_key) or "")
+        profit_check_due = False
+        if not last_check_raw:
+            profit_checks[symbol_key] = now_dt.isoformat()
+        else:
+            try:
+                last_check_dt = datetime.fromisoformat(last_check_raw.replace("Z", "+00:00"))
+                if last_check_dt.tzinfo is None:
+                    last_check_dt = last_check_dt.replace(tzinfo=UTC)
+                profit_check_due = (now_dt - last_check_dt).total_seconds() >= V18248_CRYPTO_PROFIT_TAKE_INTERVAL_SECONDS
+            except Exception:
+                profit_checks[symbol_key] = now_dt.isoformat()
+
+        if pnl_pct <= -V18234_CRYPTO_LIVE_STOP_PCT:
+            reason = "CRYPTO LIVE STOP"
+        elif ((high / entry) - 1.0) * 100.0 >= V18234_CRYPTO_LIVE_TRAIL_START_PCT and price <= trail_floor:
+            reason = "CRYPTO LIVE TRAIL"
+        elif profit_check_due and pnl_pct > 0:
+            reason = "CRYPTO 15M PROFIT TAKE"
+        elif score > 0 and score <= V18234_CRYPTO_LIVE_EXIT_SCORE and pnl_pct > 0:
+            reason = "CRYPTO LIVE MOMENTUM EXIT"
+
         if reason and _v18234_live_sell(p, price, score, reason):
             highs.pop(symbol, None)
+            profit_checks.pop(symbol_key, None)
             sold_any = True
+        elif profit_check_due:
+            # No profit at this checkpoint: record it and try again in 15 minutes.
+            profit_checks[symbol_key] = now_dt.isoformat()
+            print(f"V18.2.48 CRYPTO 15M CHECK | {symbol} pnl={pnl_pct:.3f}% action=HOLD next_check=15m", flush=True)
 
     state = load_profit_vault_state()
     state["cryptoLiveHighPrices"] = highs
     state["cryptoLiveHighPrice"] = 0.0
     state["cryptoLiveSymbol"] = ""
+    state["cryptoProfitCheckAt"] = profit_checks
     save_profit_vault_state(state)
 
     # V18.2.46: the global Pause/Manual Override/Emergency Stop blocks NEW crypto
@@ -11591,7 +11645,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Di
     return {"ok": True, "enabled": True, "armed": True, "entriesPaused": False, "protectiveExitsActive": True, "positions": len(final_positions), "managedPositions": len(final_managed), "maxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS}
 
 
-# V18.2.44 — two-position live crypto pilot + V18.2.43 tighter crypto-only exits.
+# V18.2.48 — 15-minute crypto profit capture + two-position live crypto pilot.
 # Crypto defaults: stop 1.50%, trail activation 1.50%, giveback 0.60%.
 # Stock engine constants/rules are intentionally untouched.
 # V18.2.42 decoupled live crypto execution from the 5-minute shadow-research cadence.
@@ -11692,7 +11746,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     usable_max = min(pool, V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
     live_positions = _v18234_raw_crypto_positions()
     return {
-        "ok": True, "version": "V18.2.46", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.48", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "allocationLockedByPosition": bool(live_positions),
         "liveExecutionInstalled": True, "liveExecutorIntervalSeconds": V18242_CRYPTO_LIVE_INTERVAL_SECONDS, "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
@@ -11700,6 +11754,9 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "newEntriesPaused": (not bool(bot_enabled)) or bool(manual_override) or bool(emergency_stop),
         "pauseReason": ("BOT_PAUSED" if not bool(bot_enabled) else "MANUAL_OVERRIDE" if bool(manual_override) else "EMERGENCY_STOP" if bool(emergency_stop) else None),
         "protectiveExitsActiveWhilePaused": True,
+        "timedProfitTakeEnabled": True,
+        "timedProfitTakeIntervalSeconds": V18248_CRYPTO_PROFIT_TAKE_INTERVAL_SECONDS,
+        "timedProfitTakeWhilePaused": True,
         "accountCrypto": account, "vaultAvailableGbp": round(vault_available,2),
         "vaultReserveGbp": round(reserve,2), "cryptoPoolGbp": round(pool,2),
         "cryptoAllocatedGbp": round(allocated,2), "pilotMaxGbp": round(usable_max,2),

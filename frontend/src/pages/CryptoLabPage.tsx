@@ -148,7 +148,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.46 · CRYPTO OWNERSHIP RECOVERY + SAFE PAUSE</div>
+          <div className="eyebrow">V18.2.48 · 15-MIN PROFIT CAPTURE + MOBILE CRYPTO LAB</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -156,7 +156,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className={`crypto-live-badge ${armed ? "armed" : "idle"}`}><span>●</span>{armed ? (entriesPaused ? "PAUSED · EXITS ARMED" : "LIVE PILOT ARMED") : "LIVE PILOT OFF"}</div>
     </section>
 
-    {entriesPaused && <div className="crypto-notice">New crypto entries are paused with the main bot. Existing bot-managed crypto positions keep stop-loss and trailing protection active.</div>}
+    {entriesPaused && <div className="crypto-notice">New crypto entries are paused with the main bot. Existing bot-managed crypto positions keep stop-loss, trailing protection and 15-minute profit capture active.</div>}
 
     <section className="crypto-summary-grid">
       <div className="crypto-summary-card"><div className="crypto-summary-icon vault">▣</div><div><span>Vault Available</span><strong>{gbp(bridge?.vaultAvailableGbp)}</strong><small>Protected capital</small></div></div>
@@ -167,7 +167,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
 
     {livePositions.length > 0 && <section className="crypto-panel crypto-live-positions">
       <div className="crypto-panel-head">
-        <div><h3>Live Crypto Positions</h3><p>Up to 2 real Alpaca crypto positions. Bot-managed positions have independent exit protection.</p></div>
+        <div><h3>Live Crypto Positions</h3><p>Up to 2 real Alpaca crypto positions. Bot-managed positions have independent protection and a 15-minute profit check.</p></div>
         <span className="crypto-chip live">LIVE</span>
       </div>
       <div className="crypto-position-grid">
@@ -248,7 +248,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
 
     <section className="crypto-footer-strip">
       <span><b>Shadow:</b> {Number(bridge?.shadowEvidence?.closedTests || data.closedTrades || 0)} tests · {money(bridge?.shadowEvidence?.totalPnlUsd ?? data.totalPnlUsd)} · win {pct(bridge?.shadowEvidence?.winRate ?? data.winRate)}</span>
-      <span><b>Safety:</b> Stop {pct(data.config?.stopPct)} · Trail {pct(data.config?.trailStartPct)} / {pct(data.config?.trailGivebackPct)}</span>
+      <span><b>Safety:</b> Stop {pct(data.config?.stopPct)} · Trail {pct(data.config?.trailStartPct)} / {pct(data.config?.trailGivebackPct)} · Profit check every 15m</span>
       <span><b>Stock engine:</b> £900 baseline and MARA rules untouched</span>
     </section>
   </div>;

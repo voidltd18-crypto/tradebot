@@ -406,3 +406,150 @@
 @media(max-width:1120px){.crypto-summary-grid{grid-template-columns:1fr 1fr}.crypto-bridge-grid{grid-template-columns:1fr 1fr}.bridge-metric{border-bottom:1px solid #20344e}.bridge-action{grid-column:1/-1;min-height:88px}}
 .crypto-position-actions{display:grid;justify-items:end;gap:5px}.crypto-position-actions small{color:#8095af;font-size:10px;text-align:right}.crypto-sell-now{border:1px solid rgba(248,113,113,.55)!important;background:linear-gradient(135deg,rgba(153,27,27,.88),rgba(127,29,29,.94))!important;color:#fff!important;font-weight:900!important;padding:10px 14px!important;border-radius:11px!important;box-shadow:0 8px 20px rgba(127,29,29,.18)}.crypto-sell-now:hover:not(:disabled){filter:brightness(1.12)}.crypto-sell-now:disabled{opacity:.55;cursor:not-allowed}.crypto-sell-notice{border-color:rgba(248,113,113,.35)}
 @media(max-width:760px){.crypto-lab-page{gap:10px}.crypto-hero{padding:14px;align-items:flex-start}.crypto-hero-main{align-items:flex-start}.crypto-hero-icon{width:46px;height:46px;border-radius:15px;font-size:26px}.crypto-hero h2{font-size:24px}.crypto-hero p{font-size:11px}.crypto-live-badge{font-size:9px;padding:7px 9px}.crypto-summary-grid{grid-template-columns:1fr 1fr;gap:8px}.crypto-summary-card{min-height:92px;padding:12px;gap:9px}.crypto-summary-icon{width:36px;height:36px;flex-basis:36px}.crypto-summary-card strong{font-size:19px}.crypto-summary-card span,.crypto-summary-card small{font-size:9px}.crypto-panel{padding:12px;border-radius:16px}.crypto-panel-head{margin-bottom:10px}.crypto-panel-head h3{font-size:15px}.crypto-panel-head p{font-size:10px}.scanner-state{display:none}.crypto-position-card{grid-template-columns:1fr 1fr}.crypto-position-actions{grid-column:1/-1;justify-items:stretch}.crypto-position-actions small{text-align:left}.crypto-sell-now{width:100%}.crypto-position-card .crypto-position-metric:last-of-type{grid-column:auto}.crypto-bridge-grid{grid-template-columns:1fr 1fr}.bridge-metric{padding:10px}.bridge-metric strong{font-size:14px}.bridge-metric small{font-size:9px}.crypto-footer-strip{font-size:9px}.phone-layout .crypto-table-wrap{margin:0 -12px;padding:0 12px;overflow-x:auto}.phone-layout .crypto-scanner-table{min-width:760px}}
+
+/* V18.2.47 Crypto Lab mobile hard override
+   The app's .phone-layout class is driven by real device/visual viewport detection.
+   Do not rely only on @media here because mobile Safari can expose a desktop-like CSS viewport. */
+.phone-layout .crypto-lab-page{
+  width:100%!important;
+  max-width:100%!important;
+  min-width:0!important;
+  overflow-x:hidden!important;
+  gap:10px!important;
+}
+.phone-layout .crypto-lab-page *{box-sizing:border-box}
+.phone-layout .crypto-hero{
+  width:100%!important;
+  max-width:100%!important;
+  min-width:0!important;
+  padding:14px!important;
+  display:grid!important;
+  grid-template-columns:minmax(0,1fr)!important;
+  gap:10px!important;
+  align-items:start!important;
+  overflow:hidden!important;
+  border-radius:17px!important;
+}
+.phone-layout .crypto-hero-main{
+  width:100%!important;
+  min-width:0!important;
+  display:grid!important;
+  grid-template-columns:46px minmax(0,1fr)!important;
+  gap:11px!important;
+  align-items:start!important;
+}
+.phone-layout .crypto-hero-main>div:last-child{min-width:0!important;max-width:100%!important}
+.phone-layout .crypto-hero-icon{width:46px!important;height:46px!important;border-radius:15px!important;font-size:26px!important}
+.phone-layout .crypto-hero .eyebrow{
+  max-width:100%!important;
+  white-space:normal!important;
+  overflow-wrap:anywhere!important;
+  word-break:break-word!important;
+  font-size:8px!important;
+  line-height:1.35!important;
+  letter-spacing:.11em!important;
+}
+.phone-layout .crypto-hero h2{font-size:25px!important;line-height:1.05!important;margin:4px 0!important}
+.phone-layout .crypto-hero p{font-size:10px!important;line-height:1.35!important;white-space:normal!important}
+.phone-layout .crypto-live-badge{
+  justify-self:start!important;
+  max-width:100%!important;
+  white-space:normal!important;
+  font-size:9px!important;
+  line-height:1.2!important;
+  padding:7px 9px!important;
+}
+.phone-layout .crypto-notice{width:100%!important;max-width:100%!important;font-size:10px!important;line-height:1.4!important;margin-top:0!important}
+.phone-layout .crypto-summary-grid{
+  width:100%!important;
+  max-width:100%!important;
+  min-width:0!important;
+  display:grid!important;
+  grid-template-columns:repeat(2,minmax(0,1fr))!important;
+  gap:8px!important;
+}
+.phone-layout .crypto-summary-card{
+  width:100%!important;
+  max-width:100%!important;
+  min-width:0!important;
+  min-height:92px!important;
+  padding:11px!important;
+  gap:8px!important;
+  border-radius:15px!important;
+  overflow:hidden!important;
+}
+.phone-layout .crypto-summary-icon{width:34px!important;height:34px!important;flex:0 0 34px!important;font-size:16px!important;border-radius:11px!important}
+.phone-layout .crypto-summary-card>div:last-child{min-width:0!important;overflow:hidden!important}
+.phone-layout .crypto-summary-card span,.phone-layout .crypto-summary-card small{font-size:9px!important;line-height:1.2!important;white-space:normal!important}
+.phone-layout .crypto-summary-card strong{font-size:18px!important;line-height:1.05!important;margin:4px 0!important;white-space:nowrap!important}
+.phone-layout .crypto-panel{
+  width:100%!important;
+  max-width:100%!important;
+  min-width:0!important;
+  padding:12px!important;
+  border-radius:16px!important;
+  overflow:hidden!important;
+}
+.phone-layout .crypto-panel-head{width:100%!important;min-width:0!important;gap:8px!important;margin-bottom:10px!important}
+.phone-layout .crypto-panel-head>div{min-width:0!important}
+.phone-layout .crypto-panel-head h3{font-size:15px!important;line-height:1.2!important;white-space:normal!important}
+.phone-layout .crypto-panel-head p{font-size:10px!important;line-height:1.4!important;white-space:normal!important;overflow-wrap:anywhere!important}
+.phone-layout .scanner-state{display:none!important}
+.phone-layout .crypto-chip{flex:0 0 auto!important;font-size:9px!important;padding:6px 8px!important}
+.phone-layout .crypto-position-grid{width:100%!important;min-width:0!important;gap:8px!important}
+.phone-layout .crypto-position-card{
+  width:100%!important;
+  max-width:100%!important;
+  min-width:0!important;
+  display:grid!important;
+  grid-template-columns:minmax(0,1fr) minmax(0,1fr)!important;
+  gap:10px!important;
+  padding:12px!important;
+  overflow:hidden!important;
+}
+.phone-layout .crypto-position-symbol{grid-column:1/-1!important;min-width:0!important}
+.phone-layout .crypto-position-symbol>div{min-width:0!important}
+.phone-layout .crypto-position-symbol strong{font-size:14px!important;overflow-wrap:anywhere!important}
+.phone-layout .crypto-position-symbol small,.phone-layout .crypto-position-metric span,.phone-layout .crypto-position-metric small{font-size:9px!important;line-height:1.25!important;white-space:normal!important}
+.phone-layout .crypto-position-metric{min-width:0!important}
+.phone-layout .crypto-position-metric strong{font-size:15px!important;white-space:nowrap!important}
+.phone-layout .crypto-position-actions{grid-column:1/-1!important;width:100%!important;justify-items:stretch!important}
+.phone-layout .crypto-position-actions small{text-align:left!important}
+.phone-layout .crypto-sell-now{width:100%!important;max-width:100%!important;padding:10px!important;font-size:11px!important}
+.phone-layout .crypto-table-wrap{
+  width:calc(100% + 24px)!important;
+  max-width:none!important;
+  min-width:0!important;
+  margin:0 -12px!important;
+  padding:0 12px 4px!important;
+  overflow-x:auto!important;
+  overflow-y:hidden!important;
+  -webkit-overflow-scrolling:touch!important;
+  overscroll-behavior-inline:contain!important;
+}
+.phone-layout .crypto-scanner-table{min-width:760px!important;width:760px!important;font-size:10px!important}
+.phone-layout .crypto-bridge-grid{
+  width:100%!important;
+  max-width:100%!important;
+  min-width:0!important;
+  display:grid!important;
+  grid-template-columns:repeat(2,minmax(0,1fr))!important;
+}
+.phone-layout .bridge-metric{min-width:0!important;padding:9px!important;gap:7px!important}
+.phone-layout .bridge-metric .crypto-summary-icon{width:30px!important;height:30px!important;flex:0 0 30px!important;font-size:13px!important}
+.phone-layout .bridge-metric>div:last-child{min-width:0!important}
+.phone-layout .bridge-metric strong{font-size:13px!important;white-space:nowrap!important}
+.phone-layout .bridge-metric small{font-size:8px!important;white-space:normal!important}
+.phone-layout .bridge-action{grid-column:1/-1!important;width:100%!important;min-width:0!important;padding:10px!important}
+.phone-layout .crypto-allocation-editor{width:100%!important;min-width:0!important}
+.phone-layout .crypto-allocation-presets{width:100%!important;gap:5px!important}
+.phone-layout .crypto-allocation-presets button{flex:1 1 calc(50% - 5px)!important;min-width:0!important}
+.phone-layout .bridge-release-controls{width:100%!important;display:grid!important;grid-template-columns:minmax(0,95px) minmax(0,1fr)!important;gap:7px!important}
+.phone-layout .bridge-release-controls input,.phone-layout .bridge-release-controls button{width:100%!important;min-width:0!important}
+.phone-layout .crypto-footer-strip{width:100%!important;max-width:100%!important;display:grid!important;grid-template-columns:1fr!important;gap:5px!important;font-size:9px!important;padding:9px 10px!important}
+
+@media(max-width:390px){
+  .phone-layout .crypto-summary-grid{grid-template-columns:minmax(0,1fr)!important}
+  .phone-layout .crypto-position-card{grid-template-columns:minmax(0,1fr)!important}
+  .phone-layout .crypto-position-symbol,.phone-layout .crypto-position-actions{grid-column:1!important}
+}
