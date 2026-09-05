@@ -11129,7 +11129,7 @@ def v18232_crypto_shadow_payload() -> Dict[str, Any]:
 # and remains independent from the stock 1-position engine.
 # =========================
 V18234_CRYPTO_LIVE_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_LIVE_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
-V18234_CRYPTO_LIVE_PILOT_MAX_GBP = max(1.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_PILOT_MAX_GBP", "25") or 25))
+V18234_CRYPTO_LIVE_PILOT_MAX_GBP = max(25.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_PILOT_MAX_GBP", "250") or 250))
 V18234_CRYPTO_LIVE_MAX_POSITIONS = 1
 V18234_CRYPTO_LIVE_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_ENTRY_SCORE", str(V18232_CRYPTO_ENTRY_SCORE)) or V18232_CRYPTO_ENTRY_SCORE)))
 V18234_CRYPTO_LIVE_STOP_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_LIVE_STOP_PCT", str(V18232_CRYPTO_STOP_PCT)) or V18232_CRYPTO_STOP_PCT))
@@ -11338,7 +11338,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Di
     elif positions:
         # Operator/manual Alpaca crypto positions are visible in Crypto Lab but are
         # never auto-sold by the pilot. They also block a new pilot entry so the
-        # £25 pilot cannot overlap an externally opened crypto position.
+        # The live crypto allocation cannot overlap an externally opened crypto position.
         if float(state.get("cryptoLiveHighPrice") or 0.0) != 0:
             state["cryptoLiveHighPrice"] = 0.0; state["cryptoLiveSymbol"] = ""; save_profit_vault_state(state)
     else:
@@ -11405,16 +11405,20 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     vault = profit_vault_payload(); account = _v18234_crypto_account_status(); state = load_profit_vault_state()
     crypto = v18232_crypto_shadow_payload()
     allocated = max(0.0, float(vault.get("cryptoAllocatedGbp") or 0.0))
+    vault_available = max(0.0, float(vault.get("bankedProfitGbp") or 0.0))
+    live_positions = _v18234_raw_crypto_positions()
     return {
-        "ok": True, "version": "V18.2.37", "manualOnly": True, "automaticRelease": False,
+        "ok": True, "version": "V18.2.40", "manualOnly": True, "automaticRelease": False,
+        "allocationAdjustable": True, "allocationLockedByPosition": bool(live_positions),
         "liveExecutionInstalled": True, "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
-        "accountCrypto": account, "vaultAvailableGbp": round(float(vault.get("bankedProfitGbp") or 0.0),2),
+        "accountCrypto": account, "vaultAvailableGbp": round(vault_available,2),
         "cryptoAllocatedGbp": round(allocated,2), "pilotMaxGbp": round(V18234_CRYPTO_LIVE_PILOT_MAX_GBP,2),
+        "allocationAvailableGbp": round(min(V18234_CRYPTO_LIVE_PILOT_MAX_GBP, allocated + vault_available),2),
         "remainingPilotCapacityGbp": round(max(0.0, V18234_CRYPTO_LIVE_PILOT_MAX_GBP-allocated),2),
         "lifetimeCryptoReleasedGbp": round(float(vault.get("lifetimeCryptoReleasedGbp") or 0.0),2),
         "cryptoRealisedPnlGbp": round(float(state.get("cryptoRealisedPnlGbp") or 0.0),2),
         "cryptoLifetimeProfitBankedGbp": round(float(state.get("cryptoLifetimeProfitBankedGbp") or 0.0),2),
-        "livePositions": _v18234_raw_crypto_positions(), "lastError": _crypto_live_runtime.get("lastError"),
+        "livePositions": live_positions, "lastError": _crypto_live_runtime.get("lastError"),
         "shadowEvidence": {"closedTests": int(crypto.get("closedTrades") or 0), "winRate": float(crypto.get("winRate") or 0), "totalPnlUsd": float(crypto.get("totalPnlUsd") or 0)},
         "locked": not bool(account.get("active")),
         "message": account.get("message"),
@@ -11441,9 +11445,69 @@ def v18234_release_vault_to_crypto(amount_gbp: float, confirmation: str) -> Dict
     return {"ok": True, "message": f"£{amount:.2f} released and the live crypto pilot is ARMED.", "bridge": v18234_crypto_bridge_payload()}
 
 
+def v18240_set_crypto_allocation(target_gbp: float, confirmation: str) -> Dict[str, Any]:
+    try:
+        target = round(float(target_gbp), 2)
+    except Exception:
+        target = -1.0
+    if confirmation.strip().upper() != "SET CRYPTO ALLOCATION":
+        return {"ok": False, "message": "Confirmation must be SET CRYPTO ALLOCATION."}
+    account = _v18234_crypto_account_status()
+    if not account.get("active"):
+        return {"ok": False, "message": account.get("message"), "accountCrypto": account}
+    if target < 0:
+        return {"ok": False, "message": "Crypto allocation cannot be negative."}
+    if target > V18234_CRYPTO_LIVE_PILOT_MAX_GBP:
+        return {"ok": False, "message": f"Crypto allocation is capped at £{V18234_CRYPTO_LIVE_PILOT_MAX_GBP:.2f}."}
+    live_positions = _v18234_raw_crypto_positions()
+    if live_positions:
+        return {"ok": False, "message": "Allocation cannot be changed while a crypto position is open. Sell/close the position first."}
+
+    state = load_profit_vault_state()
+    available = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
+    current = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
+    delta = round(target - current, 2)
+
+    if delta > 0 and delta > available:
+        return {"ok": False, "message": f"Vault only has £{available:.2f} available to add. Current crypto allocation is £{current:.2f}."}
+
+    if delta > 0:
+        state["bankedProfitGbp"] = round(available - delta, 4)
+        state["lifetimeCryptoReleasedGbp"] = round(float(state.get("lifetimeCryptoReleasedGbp") or 0.0) + delta, 4)
+        state["lastCryptoReleaseAt"] = datetime.now(UTC).isoformat()
+        state["lastCryptoReleaseGbp"] = delta
+    elif delta < 0:
+        state["bankedProfitGbp"] = round(available + abs(delta), 4)
+        state["lastCryptoReturnAt"] = datetime.now(UTC).isoformat()
+        state["lastCryptoReturnGbp"] = abs(delta)
+
+    state["cryptoAllocatedGbp"] = round(target, 4)
+    state["cryptoLivePilotEnabled"] = target > 0
+    if target > 0:
+        state["cryptoLivePilotActivatedAt"] = datetime.now(UTC).isoformat()
+    save_profit_vault_state(state)
+
+    action = "unchanged"
+    if delta > 0:
+        action = f"added £{delta:.2f} from Vault"
+    elif delta < 0:
+        action = f"returned £{abs(delta):.2f} to Vault"
+    print(f"V18.2.40 CRYPTO ALLOCATION SET | target=£{target:.2f} previous=£{current:.2f} delta=£{delta:.2f} {action}", flush=True)
+    message = f"Crypto trading allocation set to £{target:.2f}."
+    if target <= 0:
+        message = "Crypto allocation returned to £0.00 and the live crypto pilot is OFF."
+    return {"ok": True, "message": message, "bridge": v18234_crypto_bridge_payload()}
+
+
 @app.get('/v18/crypto-bridge')
 def api_v18234_crypto_bridge(request: Request):
     verify_api_key(request); return v18234_crypto_bridge_payload()
+
+
+@app.post('/v18/crypto-bridge/allocation')
+def api_v18240_crypto_bridge_allocation(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v18240_set_crypto_allocation(payload.get("amountGbp", 0), str(payload.get("confirmation") or ""))
 
 
 @app.post('/v18/crypto-bridge/release')

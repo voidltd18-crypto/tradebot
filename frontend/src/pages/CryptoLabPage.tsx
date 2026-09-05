@@ -37,6 +37,13 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [sellMessage, setSellMessage] = useState("");
 
   useEffect(() => {
+    const current = Number(bridge?.cryptoAllocatedGbp || 0);
+    if (current > 0 && releaseAmount === "25" && Math.abs(current - 25) > 0.001) {
+      setReleaseAmount(String(Number(current.toFixed(2))));
+    }
+  }, [bridge, releaseAmount]);
+
+  useEffect(() => {
     let alive = true;
     const load = async () => {
       try {
@@ -62,28 +69,31 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
     };
   }, [authToken]);
 
-  const releaseVault = async () => {
-    if (!bridge || bridge.locked || bridge.livePilotEnabled) return;
+  const setCryptoAllocation = async () => {
+    if (!bridge || bridge.locked || bridge.allocationLockedByPosition) return;
     const amount = Number(releaseAmount || 0);
-    if (!Number.isFinite(amount) || amount <= 0) {
-      setBridgeMessage("Enter a valid amount.");
+    const hardMax = Number(bridge?.pilotMaxGbp || 250);
+    if (!Number.isFinite(amount) || amount < 0 || amount > hardMax) {
+      setBridgeMessage(`Enter an amount from £0 to £${hardMax.toFixed(2)}.`);
       return;
     }
-    if (!window.confirm(`Release £${amount.toFixed(2)} from the protected Profit Vault to Crypto?\n\nThis is a manual capital decision and cannot be performed by the AI.`)) return;
+    const current = Number(bridge?.cryptoAllocatedGbp || 0);
+    const action = amount > current ? `increase from £${current.toFixed(2)} to £${amount.toFixed(2)}` : amount < current ? `reduce from £${current.toFixed(2)} to £${amount.toFixed(2)}` : `keep at £${amount.toFixed(2)}`;
+    if (!window.confirm(`Set the Crypto trading allocation to £${amount.toFixed(2)}?\n\nThis will ${action}. Increases come from the protected Profit Vault; reductions return unused allocation to it.`)) return;
     setBridgeBusy(true);
     setBridgeMessage("");
     try {
-      const res = await fetch(`${API_URL}/v18/crypto-bridge/release`, {
+      const res = await fetch(`${API_URL}/v18/crypto-bridge/allocation`, {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Auth-Token": authToken, "x-api-key": authToken },
-        body: JSON.stringify({ amountGbp: amount, confirmation: "UNLOCK CRYPTO" }),
+        body: JSON.stringify({ amountGbp: amount, confirmation: "SET CRYPTO ALLOCATION" }),
       });
       const body = await res.json();
       if (!res.ok || body?.ok === false) throw new Error(body?.message || body?.detail || `HTTP ${res.status}`);
       setBridge(body.bridge || bridge);
-      setBridgeMessage(body.message || "Vault allocation updated.");
+      setBridgeMessage(body.message || "Crypto allocation updated.");
     } catch (e: any) {
-      setBridgeMessage(e?.message || "Vault release failed.");
+      setBridgeMessage(e?.message || "Crypto allocation update failed.");
     } finally {
       setBridgeBusy(false);
     }
@@ -134,7 +144,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.37 · MANUAL CRYPTO SELL</div>
+          <div className="eyebrow">V18.2.40 · ADJUSTABLE CRYPTO CAPITAL</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -205,7 +215,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-panel-head">
         <div>
           <h3><span className="panel-icon">⌒</span> Crypto Bridge</h3>
-          <p>Manually release funds to the live crypto pilot. Maximum {gbp(bridge?.pilotMaxGbp || 25)}.</p>
+          <p>Choose how much capital the crypto bot can use. Maximum {gbp(bridge?.pilotMaxGbp || 250)}.</p>
         </div>
         <span className={`crypto-chip ${armed ? "live" : accountActive ? "building" : ""}`}>{armed ? "LIVE PILOT ARMED" : accountActive ? "READY TO ARM" : "CRYPTO NOT ACTIVE"}</span>
       </div>
@@ -213,13 +223,14 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-bridge-grid">
         <div className="bridge-metric"><span className="crypto-summary-icon vault">▣</span><div><small>Vault Available</small><strong>{gbp(bridge?.vaultAvailableGbp)}</strong></div></div>
         <div className="bridge-metric"><span className="crypto-summary-icon allocation">●</span><div><small>Crypto Allocation</small><strong>{gbp(bridge?.cryptoAllocatedGbp)}</strong></div></div>
-        <div className="bridge-metric"><span className="crypto-summary-icon pnl">◇</span><div><small>Live Pilot Cap</small><strong>{gbp(bridge?.pilotMaxGbp || 25)}</strong></div></div>
+        <div className="bridge-metric"><span className="crypto-summary-icon pnl">◇</span><div><small>Maximum Allowed</small><strong>{gbp(bridge?.pilotMaxGbp || 250)}</strong></div></div>
         <div className="bridge-metric"><span className="crypto-summary-icon returned">◎</span><div><small>Status</small><strong className={armed ? "gain" : ""}>{armed ? "● Armed" : "Off"}</strong></div></div>
         <div className={`bridge-action ${armed ? "allocated" : ""}`}>
-          {armed ? <><strong>🔒 {gbp(bridge?.cryptoAllocatedGbp)} ALLOCATED</strong><small>Live pilot armed — waiting for signal</small></> : <>
-            <div className="bridge-release-controls"><input aria-label="Crypto release amount in pounds" type="number" min="1" max={Number(bridge?.pilotMaxGbp || 25)} step="1" value={releaseAmount} onChange={e => setReleaseAmount(e.target.value)} /><button onClick={releaseVault} disabled={bridgeBusy || !bridge || bridge.locked}>{bridgeBusy ? "ARMING…" : `UNLOCK ${gbp(releaseAmount)} & START`}</button></div>
-            <small>Manual approval only · no auto-refill</small>
-          </>}
+          <div className="crypto-allocation-editor">
+            <div className="crypto-allocation-presets">{[10,25,50,100].filter(v => v <= Number(bridge?.pilotMaxGbp || 250)).map(v => <button key={v} type="button" onClick={() => setReleaseAmount(String(v))} disabled={bridgeBusy || Boolean(bridge?.allocationLockedByPosition)}>£{v}</button>)}</div>
+            <div className="bridge-release-controls"><input aria-label="Crypto trading allocation in pounds" type="number" min="0" max={Number(bridge?.pilotMaxGbp || 250)} step="1" value={releaseAmount} onChange={e => setReleaseAmount(e.target.value)} /><button onClick={setCryptoAllocation} disabled={bridgeBusy || !bridge || bridge.locked || Boolean(bridge?.allocationLockedByPosition)}>{bridgeBusy ? "UPDATING…" : Number(releaseAmount || 0) === 0 ? "STOP & RETURN" : `SET ${gbp(releaseAmount)}`}</button></div>
+            <small>{bridge?.allocationLockedByPosition ? "Close the open crypto position before changing allocation." : `Current ${gbp(bridge?.cryptoAllocatedGbp)} · Available up to ${gbp(bridge?.allocationAvailableGbp ?? bridge?.pilotMaxGbp)}`}</small>
+          </div>
         </div>
       </div>
       {bridgeMessage && <div className="crypto-notice">{bridgeMessage}</div>}
