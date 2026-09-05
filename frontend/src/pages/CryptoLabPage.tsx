@@ -33,6 +33,8 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [releaseAmount, setReleaseAmount] = useState("25");
   const [bridgeMessage, setBridgeMessage] = useState("");
   const [bridgeBusy, setBridgeBusy] = useState(false);
+  const [sellBusySymbol, setSellBusySymbol] = useState("");
+  const [sellMessage, setSellMessage] = useState("");
 
   useEffect(() => {
     let alive = true;
@@ -87,6 +89,31 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
     }
   };
 
+  const manualSellCrypto = async (position: AnyObj) => {
+    const symbol = String(position?.symbol || "").toUpperCase();
+    if (!symbol || sellBusySymbol) return;
+    const managed = Boolean(position?.managedByPilot);
+    const ownershipText = managed ? "TradeBot live-pilot" : "manual/external Alpaca";
+    if (!window.confirm(`SELL 100% of ${symbol} now?\n\nThis will submit a real market sell for the ${ownershipText} position.`)) return;
+    setSellBusySymbol(symbol);
+    setSellMessage("");
+    try {
+      const res = await fetch(`${API_URL}/v18/crypto-bridge/manual-sell`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Auth-Token": authToken, "x-api-key": authToken },
+        body: JSON.stringify({ symbol, confirmation: "SELL CRYPTO NOW" }),
+      });
+      const body = await res.json();
+      if (!res.ok || body?.ok === false) throw new Error(body?.message || body?.detail || `HTTP ${res.status}`);
+      if (body?.bridge) setBridge(body.bridge);
+      setSellMessage(body?.message || `Manual sell submitted for ${symbol}.`);
+    } catch (e: any) {
+      setSellMessage(e?.message || `Manual sell failed for ${symbol}.`);
+    } finally {
+      setSellBusySymbol("");
+    }
+  };
+
   const scans = useMemo(() => {
     const rows = Array.isArray(data?.scans) ? [...data.scans] : [];
     return rows.sort((a: AnyObj, b: AnyObj) => Number(b?.score || 0) - Number(a?.score || 0));
@@ -107,7 +134,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.35 · LIVE CRYPTO PILOT</div>
+          <div className="eyebrow">V18.2.37 · MANUAL CRYPTO SELL</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -131,13 +158,16 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
         {livePositions.map((p: AnyObj) => {
           const pnl = Number(p.pnlGbp ?? p.pnlUsd ?? 0);
           const pnlPct = Number(p.pnlPct || 0);
+          const managed = Boolean(p.managedByPilot);
           return <div className="crypto-position-card" key={p.symbol}>
-            <div className="crypto-position-symbol"><span className="coin-icon">{coinGlyph(p.symbol)}</span><div><strong>{p.symbol}</strong><small>Entry {money(p.entry)}</small></div></div>
+            <div className="crypto-position-symbol"><span className="coin-icon">{coinGlyph(p.symbol)}</span><div><strong>{p.symbol}</strong><small>Entry {money(p.entry)} · {managed ? "BOT MANAGED" : "MANUAL / EXTERNAL"}</small></div></div>
             <div className="crypto-position-metric"><span>Market Value</span><strong>{money(p.marketValueUsd)}</strong><small>Qty {Number(p.qty || 0).toFixed(8)}</small></div>
             <div className={`crypto-position-metric ${pnl >= 0 ? "gain" : "loss"}`}><span>P&amp;L</span><strong>{gbp(pnl)}</strong><small>{pct(pnlPct)}</small></div>
+            <div className="crypto-position-actions"><button className="crypto-sell-now" onClick={() => manualSellCrypto(p)} disabled={Boolean(sellBusySymbol)}>{sellBusySymbol === p.symbol ? "SELLING…" : "SELL CRYPTO NOW"}</button><small>100% market sell · confirmation required</small></div>
           </div>;
         })}
       </div>
+      {sellMessage && <div className="crypto-notice crypto-sell-notice">{sellMessage}</div>}
     </section>}
 
     <section className="crypto-panel crypto-scanner-panel">

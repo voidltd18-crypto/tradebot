@@ -11065,12 +11065,42 @@ def _v18234_crypto_account_status() -> Dict[str, Any]:
         return {"active": False, "status": "UNKNOWN", "message": f"Unable to read Alpaca crypto status: {str(exc)[:200]}"}
 
 
+def _v18237_pilot_open_symbols() -> set[str]:
+    """Return crypto symbols with a bot-recorded BUY that has not been followed by a SELL.
+
+    This lets the live worker distinguish TradeBot-owned pilot positions from
+    positions the operator opened manually in Alpaca.
+    """
+    open_symbols: set[str] = set()
+    try:
+        conn = db_connect()
+        rows = conn.execute(
+            """SELECT symbol, side FROM v18234_crypto_live_trades
+               WHERE id IN (
+                   SELECT MAX(id) FROM v18234_crypto_live_trades GROUP BY symbol
+               )"""
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            try:
+                symbol = str(row[0] or "").upper()
+                side = str(row[1] or "").upper()
+                if symbol and side == "BUY":
+                    open_symbols.add(symbol)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return open_symbols
+
+
 def _v18234_raw_crypto_positions() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     try:
         raw = trading_client.get_all_positions()
     except Exception:
         return out
+    pilot_symbols = _v18237_pilot_open_symbols()
     for pos in raw:
         try:
             symbol = str(getattr(pos, "symbol", "") or "").upper()
@@ -11082,8 +11112,14 @@ def _v18234_raw_crypto_positions() -> List[Dict[str, Any]]:
             price = float(getattr(pos, "current_price", 0) or 0)
             if qty <= 0:
                 continue
+            market_value = float(getattr(pos, "market_value", 0) or 0)
+            unrealised_usd = (price - entry) * qty if price > 0 and entry > 0 else 0.0
+            pnl_pct = ((price / entry) - 1.0) * 100.0 if price > 0 and entry > 0 else 0.0
+            rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
             out.append({"symbol": symbol, "qty": qty, "entry": entry, "price": price,
-                        "marketValueUsd": float(getattr(pos, "market_value", 0) or 0)})
+                        "marketValueUsd": market_value, "pnlUsd": unrealised_usd,
+                        "pnlGbp": unrealised_usd * rate, "pnlPct": pnl_pct,
+                        "managedByPilot": symbol in pilot_symbols})
         except Exception:
             continue
     return out
@@ -11198,8 +11234,9 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Di
     scans = scans if isinstance(scans, list) else _v18232_fetch_scans()
     by_symbol = {str(x.get("symbol") or "").upper(): x for x in scans if isinstance(x, dict)}
     positions = _v18234_raw_crypto_positions()
-    if positions:
-        p = positions[0]; scan = by_symbol.get(p["symbol"], {}); price = float(scan.get("price") or p.get("price") or 0); score = float(scan.get("score") or 0)
+    managed_positions = [p for p in positions if bool(p.get("managedByPilot"))]
+    if managed_positions:
+        p = managed_positions[0]; scan = by_symbol.get(p["symbol"], {}); price = float(scan.get("price") or p.get("price") or 0); score = float(scan.get("score") or 0)
         entry = float(p.get("entry") or 0); pnl_pct = ((price / entry) - 1.0) * 100.0 if entry > 0 and price > 0 else 0.0
         # Track high-water mark in persistent Vault state to survive restarts.
         high_key = "cryptoLiveHighPrice"; high = max(float(state.get(high_key) or 0.0), price)
@@ -11210,13 +11247,70 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Di
         elif ((high / entry) - 1.0) * 100.0 >= V18234_CRYPTO_LIVE_TRAIL_START_PCT and price <= trail_floor: reason = "CRYPTO LIVE TRAIL"
         elif score > 0 and score <= V18234_CRYPTO_LIVE_EXIT_SCORE and pnl_pct > 0: reason = "CRYPTO LIVE MOMENTUM EXIT"
         if reason: _v18234_live_sell(p, price, score, reason)
+    elif positions:
+        # Operator/manual Alpaca crypto positions are visible in Crypto Lab but are
+        # never auto-sold by the pilot. They also block a new pilot entry so the
+        # £25 pilot cannot overlap an externally opened crypto position.
+        if float(state.get("cryptoLiveHighPrice") or 0.0) != 0:
+            state["cryptoLiveHighPrice"] = 0.0; state["cryptoLiveSymbol"] = ""; save_profit_vault_state(state)
     else:
         if float(state.get("cryptoLiveHighPrice") or 0.0) != 0:
             state["cryptoLiveHighPrice"] = 0.0; state["cryptoLiveSymbol"] = ""; save_profit_vault_state(state)
         for scan in scans:
             if float(scan.get("score") or 0) >= V18234_CRYPTO_LIVE_ENTRY_SCORE:
                 _v18234_live_buy(scan); break
-    return {"ok": True, "enabled": True, "armed": True, "positions": len(positions)}
+    return {"ok": True, "enabled": True, "armed": True, "positions": len(positions), "managedPositions": len(managed_positions)}
+
+
+def v18237_manual_crypto_sell(symbol: str, confirmation: str) -> Dict[str, Any]:
+    symbol = str(symbol or "").strip().upper()
+    if confirmation.strip().upper() != "SELL CRYPTO NOW":
+        return {"ok": False, "message": "Confirmation must be SELL CRYPTO NOW."}
+    if not symbol:
+        return {"ok": False, "message": "Crypto symbol is required."}
+    account = _v18234_crypto_account_status()
+    if not account.get("active"):
+        return {"ok": False, "message": account.get("message"), "accountCrypto": account}
+    position = next((p for p in _v18234_raw_crypto_positions() if str(p.get("symbol") or "").upper() == symbol), None)
+    if not position:
+        return {"ok": False, "message": f"No open {symbol} crypto position was found."}
+    price = float(position.get("price") or 0.0)
+    qty = float(position.get("qty") or 0.0)
+    entry = float(position.get("entry") or 0.0)
+    if price <= 0 or qty <= 0:
+        return {"ok": False, "message": f"Unable to read a valid live {symbol} position."}
+    managed = bool(position.get("managedByPilot"))
+    if managed:
+        ok = _v18234_live_sell(position, price, 0.0, "MANUAL CRYPTO SELL")
+        if not ok:
+            return {"ok": False, "message": _crypto_live_runtime.get("lastError") or f"Manual sell failed for {symbol}."}
+    else:
+        # Explicit operator sell of an externally/manual-opened Alpaca crypto
+        # position. Do not sweep its P&L into the TradeBot Vault or alter the
+        # pilot allocation because TradeBot did not fund/open this position.
+        with _crypto_live_lock:
+            try:
+                req = MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC)
+                order = trading_client.submit_order(order_data=req)
+                fill_price, fill_qty = _v18234_poll_fill(order, price, qty)
+                used_qty = fill_qty or qty
+                pnl_usd = (fill_price - entry) * used_qty if entry > 0 else 0.0
+                pnl_pct = ((fill_price / entry) - 1.0) * 100.0 if entry > 0 else 0.0
+                _v18234_log_live_trade(symbol, "SELL", order, used_qty, fill_price, fill_price * used_qty, pnl_usd, pnl_pct, 0.0, "MANUAL CRYPTO SELL - EXTERNAL")
+                _crypto_live_runtime.update({"lastError": None, "lastActionAt": datetime.now(UTC).isoformat()})
+                print(f"V18.2.37 MANUAL CRYPTO SELL | {symbol} external=True fill={fill_price:.8f} qty={used_qty:.8f} pnl=${pnl_usd:.4f}", flush=True)
+            except Exception as exc:
+                _crypto_live_runtime["lastError"] = str(exc)[:500]
+                print(f"V18.2.37 MANUAL CRYPTO SELL ERROR | {symbol} {exc}", flush=True)
+                return {"ok": False, "message": str(exc)[:500]}
+    time.sleep(0.5)
+    return {"ok": True, "message": f"Manual sell submitted for 100% of {symbol}.", "bridge": v18234_crypto_bridge_payload()}
+
+
+@app.post('/v18/crypto-bridge/manual-sell')
+def api_v18237_crypto_manual_sell(request: Request, payload: Dict[str, Any] = Body(default={})):
+    verify_api_key(request)
+    return v18237_manual_crypto_sell(str(payload.get("symbol") or ""), str(payload.get("confirmation") or ""))
 
 
 def v18234_crypto_bridge_payload() -> Dict[str, Any]:
@@ -11224,7 +11318,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     crypto = v18232_crypto_shadow_payload()
     allocated = max(0.0, float(vault.get("cryptoAllocatedGbp") or 0.0))
     return {
-        "ok": True, "version": "V18.2.34", "manualOnly": True, "automaticRelease": False,
+        "ok": True, "version": "V18.2.37", "manualOnly": True, "automaticRelease": False,
         "liveExecutionInstalled": True, "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
         "accountCrypto": account, "vaultAvailableGbp": round(float(vault.get("bankedProfitGbp") or 0.0),2),
         "cryptoAllocatedGbp": round(allocated,2), "pilotMaxGbp": round(V18234_CRYPTO_LIVE_PILOT_MAX_GBP,2),
