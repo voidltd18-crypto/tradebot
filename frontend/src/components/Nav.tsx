@@ -11,6 +11,7 @@ const tabs: { id: Tab; label: string; icon: string; badge?: string }[] = [
   { id: "intelligence", label: "AI Intelligence", icon: "✣" },
   { id: "weekly", label: "Weekly Review", icon: "▣", badge: "V18" },
   { id: "observatory", label: "Observatory", icon: "◉", badge: "V18.1" },
+  { id: "crypto", label: "Crypto Lab", icon: "◇", badge: "SHADOW" },
   { id: "admin", label: "Settings", icon: "⚙" },
 ];
 

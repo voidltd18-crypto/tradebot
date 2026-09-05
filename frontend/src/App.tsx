@@ -17,6 +17,7 @@ const PortfolioPage = lazy(() => import("./pages/PortfolioPage").then((module) =
 const ObservatoryPage = lazy(() => import("./pages/ObservatoryPage").then((module) => ({ default: module.ObservatoryPage })));
 const WeeklyReviewPage = lazy(() => import("./pages/WeeklyReviewPage").then((module) => ({ default: module.WeeklyReviewPage })));
 const AuditPage = lazy(() => import("./pages/AuditPage").then((module) => ({ default: module.AuditPage })));
+const CryptoLabPage = lazy(() => import("./pages/CryptoLabPage").then((module) => ({ default: module.CryptoLabPage })));
 const ReportsPage = lazy(() => import("./pages/ReportsPage").then((module) => ({ default: module.ReportsPage })));
 
 
@@ -101,6 +102,7 @@ export default function App() {
           {tab === "audit" && <AuditPage authToken={bot.authToken} />}
           {tab === "weekly" && <WeeklyReviewPage authToken={bot.authToken} />}
           {tab === "observatory" && <ObservatoryPage authToken={bot.authToken} />}
+          {tab === "crypto" && <CryptoLabPage authToken={bot.authToken} />}
           {tab === "admin" && <AdminPage {...bot} />}
           {exportRequested && tab !== "intelligence" && <div className="home-export-host" aria-hidden="true"><IntelligencePage authToken={bot.authToken} marketRegime={bot.marketRegime} botHealth={bot.botHealth} aiConfidence={bot.aiConfidence} fetchData={bot.fetchData} autoExport onExportComplete={() => setExportRequested(false)} /></div>}
         </Suspense>
