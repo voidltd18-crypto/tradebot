@@ -11128,11 +11128,11 @@ def v18232_crypto_shadow_payload() -> Dict[str, Any]:
 # V18.2.34 — VAULT-FUNDED LIVE CRYPTO PILOT
 # V18.2.41: the protected crypto pool can automatically use all Vault capital,
 # while the operator may keep an explicit GBP reserve in the Vault. The crypto
-# engine remains isolated from stock capital and is still limited to one position.
+# engine remains isolated from stock capital. V18.2.44 allows up to two live crypto positions.
 # =========================
 V18234_CRYPTO_LIVE_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_LIVE_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
 V18234_CRYPTO_LIVE_PILOT_MAX_GBP = max(25.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_PILOT_MAX_GBP", "10000") or 10000))
-V18234_CRYPTO_LIVE_MAX_POSITIONS = 1
+V18234_CRYPTO_LIVE_MAX_POSITIONS = max(1, min(2, int(os.getenv("TRADEBOT_CRYPTO_LIVE_MAX_POSITIONS", "2") or 2)))
 V18234_CRYPTO_LIVE_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_ENTRY_SCORE", str(V18232_CRYPTO_ENTRY_SCORE)) or V18232_CRYPTO_ENTRY_SCORE)))
 V18234_CRYPTO_LIVE_STOP_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_LIVE_STOP_PCT", str(V18232_CRYPTO_STOP_PCT)) or V18232_CRYPTO_STOP_PCT))
 V18234_CRYPTO_LIVE_TRAIL_START_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_LIVE_TRAIL_START_PCT", str(V18232_CRYPTO_TRAIL_START_PCT)) or V18232_CRYPTO_TRAIL_START_PCT))
@@ -11288,15 +11288,18 @@ def _v18234_poll_fill(order: Any, fallback_price: float, fallback_qty: float = 0
     return float(fallback_price or 0), float(fallback_qty or 0)
 
 
-def _v18234_live_buy(scan: Dict[str, Any]) -> bool:
+def _v18234_live_buy(scan: Dict[str, Any], allocation_gbp_override: Optional[float] = None) -> bool:
     symbol = str(scan.get("symbol") or "").upper(); price = float(scan.get("price") or 0); score = float(scan.get("score") or 0)
     if not symbol or price <= 0 or score < V18234_CRYPTO_LIVE_ENTRY_SCORE:
         return False
     state = load_profit_vault_state()
     allocation_gbp = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
+    if allocation_gbp_override is not None:
+        allocation_gbp = min(allocation_gbp, max(0.0, float(allocation_gbp_override)))
     if not state.get("cryptoLivePilotEnabled") or allocation_gbp <= 0:
         return False
-    if _v18234_raw_crypto_positions():
+    positions = _v18234_raw_crypto_positions()
+    if len(positions) >= V18234_CRYPTO_LIVE_MAX_POSITIONS or any(str(p.get("symbol") or "").upper() == symbol for p in positions):
         return False
     rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
     desired_notional_usd = min(allocation_gbp, V18234_CRYPTO_LIVE_PILOT_MAX_GBP) / max(rate, 0.0001)
@@ -11305,9 +11308,6 @@ def _v18234_live_buy(scan: Dict[str, Any]) -> bool:
         _crypto_live_runtime["lastError"] = acct.get("message")
         return False
 
-    # V18.2.41 broker-safe sizing: crypto orders are cash-backed. Never ask
-    # Alpaca for more USD than is actually available, and leave a small buffer
-    # for FX drift / quote movement between sizing and order acceptance.
     try:
         live_account = get_account()
         broker_cash_usd = max(0.0, float(getattr(live_account, "cash", 0.0) or 0.0))
@@ -11316,12 +11316,12 @@ def _v18234_live_buy(scan: Dict[str, Any]) -> bool:
     cash_buffer_usd = max(1.00, broker_cash_usd * 0.0025)
     broker_safe_usd = max(0.0, broker_cash_usd - cash_buffer_usd)
     notional_usd = min(desired_notional_usd, broker_safe_usd)
-    notional_usd = max(0.0, int(notional_usd * 100.0) / 100.0)  # round down, never up
+    notional_usd = max(0.0, int(notional_usd * 100.0) / 100.0)
     if notional_usd < 1.0:
         _crypto_live_runtime["lastError"] = f"Insufficient broker USD cash after safety buffer (available=${broker_cash_usd:.2f})."
         return False
     if notional_usd + 0.009 < desired_notional_usd:
-        print(f"V18.2.41 CRYPTO BUY SIZING | {symbol} desired=${desired_notional_usd:.2f} broker_cash=${broker_cash_usd:.2f} buffer=${cash_buffer_usd:.2f} order=${notional_usd:.2f}", flush=True)
+        print(f"V18.2.44 CRYPTO BUY SIZING | {symbol} desired=${desired_notional_usd:.2f} broker_cash=${broker_cash_usd:.2f} buffer=${cash_buffer_usd:.2f} order=${notional_usd:.2f}", flush=True)
     with _crypto_live_lock:
         try:
             req = MarketOrderRequest(symbol=symbol, notional=notional_usd, side=OrderSide.BUY, time_in_force=TimeInForce.GTC)
@@ -11329,13 +11329,12 @@ def _v18234_live_buy(scan: Dict[str, Any]) -> bool:
             fill_price, fill_qty = _v18234_poll_fill(order, price, notional_usd / price)
             _v18234_log_live_trade(symbol, "BUY", order, fill_qty, fill_price, notional_usd, None, None, score, "CRYPTO LIVE PILOT ENTRY")
             _crypto_live_runtime.update({"lastError": None, "lastActionAt": datetime.now(UTC).isoformat()})
-            print(f"V18.2.34 CRYPTO LIVE BUY | {symbol} notional=${notional_usd:.2f} fill={fill_price:.8f} qty={fill_qty:.8f} score={score:.3f}", flush=True)
+            print(f"V18.2.44 CRYPTO LIVE BUY | {symbol} notional=${notional_usd:.2f} fill={fill_price:.8f} qty={fill_qty:.8f} score={score:.3f}", flush=True)
             return True
         except Exception as exc:
             _crypto_live_runtime["lastError"] = str(exc)[:500]
-            print(f"V18.2.34 CRYPTO LIVE BUY ERROR | {symbol} {exc}", flush=True)
+            print(f"V18.2.44 CRYPTO LIVE BUY ERROR | {symbol} {exc}", flush=True)
             return False
-
 
 def _v18234_live_sell(position: Dict[str, Any], price: float, score: float, reason: str) -> bool:
     symbol = str(position.get("symbol") or "").upper(); qty = float(position.get("qty") or 0); entry = float(position.get("entry") or 0)
@@ -11378,40 +11377,81 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None) -> Di
     if not V18234_CRYPTO_LIVE_ENABLED or PAPER:
         return {"ok": True, "enabled": False}
     state = _v18241_apply_vault_reserve(load_profit_vault_state(), save=True)
-    if not state.get("cryptoLivePilotEnabled") or float(state.get("cryptoAllocatedGbp") or 0.0) <= 0:
+    allocation_gbp = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
+    if not state.get("cryptoLivePilotEnabled") or allocation_gbp <= 0:
         return {"ok": True, "enabled": True, "armed": False}
     scans = scans if isinstance(scans, list) else _v18232_fetch_scans()
-    by_symbol = {str(x.get("symbol") or "").upper(): x for x in scans if isinstance(x, dict)}
+    scans = sorted([x for x in scans if isinstance(x, dict)], key=lambda x: float(x.get("score") or 0), reverse=True)
+    by_symbol = {str(x.get("symbol") or "").upper(): x for x in scans}
     positions = _v18234_raw_crypto_positions()
     managed_positions = [p for p in positions if bool(p.get("managedByPilot"))]
-    if managed_positions:
-        p = managed_positions[0]; scan = by_symbol.get(p["symbol"], {}); price = float(scan.get("price") or p.get("price") or 0); score = float(scan.get("score") or 0)
-        entry = float(p.get("entry") or 0); pnl_pct = ((price / entry) - 1.0) * 100.0 if entry > 0 and price > 0 else 0.0
-        # Track high-water mark in persistent Vault state to survive restarts.
-        high_key = "cryptoLiveHighPrice"; high = max(float(state.get(high_key) or 0.0), price)
-        state[high_key] = high; state["cryptoLiveSymbol"] = p["symbol"]; save_profit_vault_state(state)
+
+    # V18.2.44: each bot-managed position gets its own persistent high-water mark.
+    # Keep the legacy single high value only as migration input for an existing position.
+    highs = state.get("cryptoLiveHighPrices")
+    if not isinstance(highs, dict):
+        highs = {}
+    legacy_symbol = str(state.get("cryptoLiveSymbol") or "").upper()
+    legacy_high = float(state.get("cryptoLiveHighPrice") or 0.0)
+    if legacy_symbol and legacy_high > 0 and legacy_symbol not in highs:
+        highs[legacy_symbol] = legacy_high
+
+    sold_any = False
+    for p in list(managed_positions):
+        symbol = str(p.get("symbol") or "").upper()
+        scan = by_symbol.get(symbol, {})
+        price = float(scan.get("price") or p.get("price") or 0)
+        score = float(scan.get("score") or 0)
+        entry = float(p.get("entry") or 0)
+        pnl_pct = ((price / entry) - 1.0) * 100.0 if entry > 0 and price > 0 else 0.0
+        high = max(float(highs.get(symbol) or 0.0), price)
+        highs[symbol] = high
         trail_floor = high * (1.0 - V18234_CRYPTO_LIVE_TRAIL_GIVEBACK_PCT / 100.0)
         reason = None
         if pnl_pct <= -V18234_CRYPTO_LIVE_STOP_PCT: reason = "CRYPTO LIVE STOP"
         elif ((high / entry) - 1.0) * 100.0 >= V18234_CRYPTO_LIVE_TRAIL_START_PCT and price <= trail_floor: reason = "CRYPTO LIVE TRAIL"
         elif score > 0 and score <= V18234_CRYPTO_LIVE_EXIT_SCORE and pnl_pct > 0: reason = "CRYPTO LIVE MOMENTUM EXIT"
-        if reason: _v18234_live_sell(p, price, score, reason)
-    elif positions:
-        # Operator/manual Alpaca crypto positions are visible in Crypto Lab but are
-        # never auto-sold by the pilot. They also block a new pilot entry so the
-        # The live crypto allocation cannot overlap an externally opened crypto position.
-        if float(state.get("cryptoLiveHighPrice") or 0.0) != 0:
-            state["cryptoLiveHighPrice"] = 0.0; state["cryptoLiveSymbol"] = ""; save_profit_vault_state(state)
-    else:
-        if float(state.get("cryptoLiveHighPrice") or 0.0) != 0:
-            state["cryptoLiveHighPrice"] = 0.0; state["cryptoLiveSymbol"] = ""; save_profit_vault_state(state)
-        for scan in scans:
-            if float(scan.get("score") or 0) >= V18234_CRYPTO_LIVE_ENTRY_SCORE:
-                _v18234_live_buy(scan); break
-    return {"ok": True, "enabled": True, "armed": True, "positions": len(positions), "managedPositions": len(managed_positions)}
+        if reason and _v18234_live_sell(p, price, score, reason):
+            highs.pop(symbol, None)
+            sold_any = True
+
+    state = load_profit_vault_state()
+    state["cryptoLiveHighPrices"] = highs
+    state["cryptoLiveHighPrice"] = 0.0
+    state["cryptoLiveSymbol"] = ""
+    save_profit_vault_state(state)
+
+    # Refresh after exits. External/manual crypto positions count toward the two-position
+    # safety cap but remain visible-only: the bot never auto-sells them.
+    positions = _v18234_raw_crypto_positions()
+    held_symbols = {str(p.get("symbol") or "").upper() for p in positions}
+    slots = max(0, V18234_CRYPTO_LIVE_MAX_POSITIONS - len(positions))
+    if slots > 0:
+        qualified = [x for x in scans if float(x.get("score") or 0) >= V18234_CRYPTO_LIVE_ENTRY_SCORE and str(x.get("symbol") or "").upper() not in held_symbols]
+        qualified = qualified[:slots]
+        if qualified:
+            rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
+            deployed_gbp = sum(max(0.0, float(p.get("marketValueUsd") or 0.0)) * rate for p in positions)
+            remaining_gbp = max(0.0, allocation_gbp - deployed_gbp)
+            score_total = sum(max(V18234_CRYPTO_LIVE_ENTRY_SCORE, float(x.get("score") or 0)) for x in qualified)
+            budget_left = remaining_gbp
+            for idx, scan in enumerate(qualified):
+                score = max(V18234_CRYPTO_LIVE_ENTRY_SCORE, float(scan.get("score") or 0))
+                if idx == len(qualified) - 1:
+                    budget = budget_left
+                else:
+                    budget = remaining_gbp * (score / score_total) if score_total > 0 else remaining_gbp / len(qualified)
+                    budget = min(budget, budget_left)
+                if budget >= 1.0 and _v18234_live_buy(scan, budget):
+                    budget_left = max(0.0, budget_left - budget)
+                    held_symbols.add(str(scan.get("symbol") or "").upper())
+
+    final_positions = _v18234_raw_crypto_positions()
+    final_managed = [p for p in final_positions if bool(p.get("managedByPilot"))]
+    return {"ok": True, "enabled": True, "armed": True, "positions": len(final_positions), "managedPositions": len(final_managed), "maxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS}
 
 
-# V18.2.43 — fast live crypto execution + tighter crypto-only exits.
+# V18.2.44 — two-position live crypto pilot + V18.2.43 tighter crypto-only exits.
 # Crypto defaults: stop 1.50%, trail activation 1.50%, giveback 0.60%.
 # Stock engine constants/rules are intentionally untouched.
 # V18.2.42 decoupled live crypto execution from the 5-minute shadow-research cadence.
@@ -11512,10 +11552,11 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     usable_max = min(pool, V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
     live_positions = _v18234_raw_crypto_positions()
     return {
-        "ok": True, "version": "V18.2.43", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.44", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "allocationLockedByPosition": bool(live_positions),
         "liveExecutionInstalled": True, "liveExecutorIntervalSeconds": V18242_CRYPTO_LIVE_INTERVAL_SECONDS, "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
+        "liveMaxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS,
         "accountCrypto": account, "vaultAvailableGbp": round(vault_available,2),
         "vaultReserveGbp": round(reserve,2), "cryptoPoolGbp": round(pool,2),
         "cryptoAllocatedGbp": round(allocated,2), "pilotMaxGbp": round(usable_max,2),
@@ -11856,11 +11897,11 @@ def startup_event():
         threading.Thread(target=v18232_crypto_shadow_worker, daemon=True, name="v18-crypto-shadow").start()
         print(f"V18.2.32 CRYPTO SHADOW | enabled=True interval={V18232_CRYPTO_INTERVAL_SECONDS}s symbols={len(V18232_CRYPTO_SYMBOLS)} virtual_capital=${V18232_CRYPTO_CAPITAL_USD:.2f} advisory_only=True live_orders=False")
         acct = _v18234_crypto_account_status()
-        print(f"V18.2.43 CRYPTO LIVE PILOT | installed=True account_crypto={acct.get('status')} full_vault_default=True vault_reserve_adjustable=True broker_safe_sizing=True live_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s", flush=True)
+        print(f"V18.2.44 CRYPTO LIVE PILOT | installed=True account_crypto={acct.get('status')} full_vault_default=True vault_reserve_adjustable=True broker_safe_sizing=True live_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s", flush=True)
     if V18234_CRYPTO_LIVE_ENABLED and not PAPER and not v18242_crypto_live_thread_started:
         v18242_crypto_live_thread_started = True
         threading.Thread(target=v18242_crypto_live_worker, daemon=True, name="v18-crypto-live").start()
-        print(f"V18.2.43 CRYPTO LIVE EXECUTOR | interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s independent_of_shadow=True", flush=True)
+        print(f"V18.2.44 CRYPTO LIVE EXECUTOR | interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s independent_of_shadow=True", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
