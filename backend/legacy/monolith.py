@@ -10903,10 +10903,19 @@ V18245_CRYPTO_DYNAMIC_UNIVERSE = str(os.getenv("TRADEBOT_CRYPTO_DYNAMIC_UNIVERSE
 V18245_CRYPTO_UNIVERSE_REFRESH_SECONDS = max(300, int(os.getenv("TRADEBOT_CRYPTO_UNIVERSE_REFRESH_SECONDS", "900") or 900))
 V18245_CRYPTO_SCAN_BATCH_SIZE = max(5, min(50, int(os.getenv("TRADEBOT_CRYPTO_SCAN_BATCH_SIZE", "20") or 20)))
 V18245_CRYPTO_MIN_60M_NOTIONAL_USD = max(0.0, float(os.getenv("TRADEBOT_CRYPTO_MIN_60M_NOTIONAL_USD", "5000") or 5000))
+# V18.2.53 — Adaptive crypto liquidity gate. Alpaca bar-volume estimates vary a lot
+# between pairs and can make a single fixed $5k gate reject the entire market.
+# Keep the hard $5k safety target, but when the whole market is below it allow only
+# the relatively most-active half of the discovered universe, never below $250/60m.
+V18253_CRYPTO_ADAPTIVE_LIQUIDITY = str(os.getenv("TRADEBOT_CRYPTO_ADAPTIVE_LIQUIDITY", "true")).lower() in ("1", "true", "yes", "on")
+V18253_CRYPTO_MIN_ADAPTIVE_NOTIONAL_USD = max(0.0, float(os.getenv("TRADEBOT_CRYPTO_MIN_ADAPTIVE_NOTIONAL_USD", "250") or 250))
+V18253_CRYPTO_LIQUIDITY_PERCENTILE = max(0.10, min(0.90, float(os.getenv("TRADEBOT_CRYPTO_LIQUIDITY_PERCENTILE", "0.50") or 0.50)))
 _crypto_universe_lock = threading.RLock()
 _crypto_universe_runtime: Dict[str, Any] = {
     "symbols": list(V18232_CRYPTO_SYMBOLS), "lastRefreshAt": None, "lastRefreshEpoch": 0.0,
     "lastError": None, "discovered": len(V18232_CRYPTO_SYMBOLS), "eligible": len(V18232_CRYPTO_SYMBOLS),
+    "effectiveLiquidity60mUsd": V18245_CRYPTO_MIN_60M_NOTIONAL_USD,
+    "liquidityMode": "fixed",
 }
 # V18.2.39 — Crypto momentum mode: the old 0.68 gate was too strict for the
 # 5-minute score scale and routinely ignored modest but genuine green moves.
@@ -11054,7 +11063,6 @@ def _v18232_fetch_scans() -> List[Dict[str, Any]]:
             continue
 
     scans: List[Dict[str, Any]] = []
-    liquid_count = 0
     for symbol in symbols:
         raw = grouped.get(symbol) or []
         bars = [b for b in raw if isinstance(b, dict) and float(b.get("c") or 0) > 0]
@@ -11080,9 +11088,10 @@ def _v18232_fetch_scans() -> List[Dict[str, Any]]:
                 notional60 += max(0.0, float(b.get("v") or 0.0)) * max(0.0, float(b.get("c") or price))
             except Exception:
                 pass
-        liquid = bool(notional60 >= V18245_CRYPTO_MIN_60M_NOTIONAL_USD)
-        if liquid:
-            liquid_count += 1
+        # Final liquidity eligibility is assigned after the full universe is scanned,
+        # so the adaptive gate can compare pairs against one another. Keep the raw
+        # notional estimate here for ranking/diagnostics.
+        liquid = False
         last6 = bars[-6:] if len(bars) >= 6 else bars
         avg6 = sum(float(b.get("c") or price) for b in last6) / max(1, len(last6))
         trend = 1.0 if price >= avg6 else 0.0
@@ -11091,7 +11100,7 @@ def _v18232_fetch_scans() -> List[Dict[str, Any]]:
         range_quality = _v18232_clamp(1.0 - abs(range60 - 2.0) / 5.0)
         score = _v18232_clamp(0.38 * momentum15 + 0.34 * momentum60 + 0.18 * trend + 0.10 * range_quality)
         entry_momentum_ok = bool(ret15 >= V18250_CRYPTO_MIN_15M_MOMENTUM_PCT and ret60 >= V18250_CRYPTO_MIN_60M_MOMENTUM_PCT)
-        qualified = bool(score >= V18232_CRYPTO_ENTRY_SCORE and liquid and entry_momentum_ok)
+        qualified = False
         scans.append({
             "symbol": symbol, "price": round(price, 8), "score": round(score, 4),
             "return15mPct": round(ret15, 4), "return60mPct": round(ret60, 4),
@@ -11099,9 +11108,55 @@ def _v18232_fetch_scans() -> List[Dict[str, Any]]:
             "liquid": liquid, "entryMomentumOk": entry_momentum_ok, "qualified": qualified,
             "bars": len(bars), "source": "alpaca_crypto_dynamic_5min",
         })
+    # V18.2.53 adaptive liquidity safety gate.
+    # Prefer the configured $5k absolute floor. If that would reject every pair,
+    # derive an effective threshold from the market's own 60-minute activity and
+    # only admit the more-active half. The $250 absolute minimum prevents zero/
+    # token-volume artefacts from becoming eligible just because everything is thin.
+    positive_notional = sorted(
+        float(x.get("liquidity60mUsd") or 0.0) for x in scans
+        if float(x.get("liquidity60mUsd") or 0.0) > 0.0
+    )
+    fixed_passes = sum(1 for x in scans if float(x.get("liquidity60mUsd") or 0.0) >= V18245_CRYPTO_MIN_60M_NOTIONAL_USD)
+    effective_liquidity_floor = V18245_CRYPTO_MIN_60M_NOTIONAL_USD
+    liquidity_mode = "fixed"
+    if V18253_CRYPTO_ADAPTIVE_LIQUIDITY and fixed_passes == 0 and positive_notional:
+        idx = int(round((len(positive_notional) - 1) * V18253_CRYPTO_LIQUIDITY_PERCENTILE))
+        idx = max(0, min(len(positive_notional) - 1, idx))
+        relative_floor = positive_notional[idx]
+        effective_liquidity_floor = min(
+            V18245_CRYPTO_MIN_60M_NOTIONAL_USD,
+            max(V18253_CRYPTO_MIN_ADAPTIVE_NOTIONAL_USD, relative_floor),
+        )
+        liquidity_mode = "adaptive"
+
+    liquid_count = 0
+    for item in scans:
+        notional = float(item.get("liquidity60mUsd") or 0.0)
+        liquid = bool(notional >= effective_liquidity_floor and notional >= V18253_CRYPTO_MIN_ADAPTIVE_NOTIONAL_USD)
+        item["liquid"] = liquid
+        item["liquidityThreshold60mUsd"] = round(effective_liquidity_floor, 2)
+        item["liquidityMode"] = liquidity_mode
+        item["qualified"] = bool(
+            float(item.get("score") or 0.0) >= V18232_CRYPTO_ENTRY_SCORE
+            and liquid
+            and bool(item.get("entryMomentumOk"))
+        )
+        if liquid:
+            liquid_count += 1
+
     scans.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
     with _crypto_universe_lock:
         _crypto_universe_runtime["eligible"] = liquid_count
+        _crypto_universe_runtime["effectiveLiquidity60mUsd"] = round(effective_liquidity_floor, 2)
+        _crypto_universe_runtime["liquidityMode"] = liquidity_mode
+    if scans:
+        print(
+            f"V18.2.53 CRYPTO LIQUIDITY | mode={liquidity_mode} "
+            f"floor=${effective_liquidity_floor:.2f} liquid={liquid_count}/{len(scans)} "
+            f"fixed_floor=${V18245_CRYPTO_MIN_60M_NOTIONAL_USD:.2f}",
+            flush=True,
+        )
     return scans
 
 
@@ -11239,7 +11294,7 @@ def v18232_crypto_shadow_payload() -> Dict[str, Any]:
     cash = float(state.get("virtual_cash_usd") or 0); realised = float(state.get("realised_pnl_usd") or 0); equity = cash + open_value
     closed = int(data.get("closedTrades") or 0); wins = int(data.get("wins") or 0)
     return {
-        "ok": True, "version": "V18.2.45", "name": "Alpaca Dynamic Crypto Market Scanner",
+        "ok": True, "version": "V18.2.53", "name": "Alpaca Adaptive Liquidity Crypto Scanner",
         "enabled": V18232_CRYPTO_SHADOW_ENABLED, "running": bool(_crypto_shadow_runtime.get("running")),
         "shadowOnly": True, "liveOrders": False, "advisoryOnly": True,
         "virtualCapitalUsd": V18232_CRYPTO_CAPITAL_USD, "cashUsd": round(cash, 4), "equityUsd": round(equity, 4),
@@ -11256,10 +11311,15 @@ def v18232_crypto_shadow_payload() -> Dict[str, Any]:
             "qualified": sum(1 for x in scans if bool(x.get("qualified"))),
             "lastRefreshAt": _crypto_universe_runtime.get("lastRefreshAt"),
             "lastError": _crypto_universe_runtime.get("lastError"),
+            "effectiveLiquidity60mUsd": float(_crypto_universe_runtime.get("effectiveLiquidity60mUsd") or V18245_CRYPTO_MIN_60M_NOTIONAL_USD),
+            "liquidityMode": str(_crypto_universe_runtime.get("liquidityMode") or "fixed"),
         },
         "config": {"symbols": [x.get("symbol") for x in scans], "intervalSeconds": V18232_CRYPTO_INTERVAL_SECONDS,
                    "dynamicUniverse": V18245_CRYPTO_DYNAMIC_UNIVERSE, "universeRefreshSeconds": V18245_CRYPTO_UNIVERSE_REFRESH_SECONDS,
                    "minLiquidity60mUsd": V18245_CRYPTO_MIN_60M_NOTIONAL_USD,
+                   "adaptiveLiquidity": V18253_CRYPTO_ADAPTIVE_LIQUIDITY,
+                   "minAdaptiveLiquidity60mUsd": V18253_CRYPTO_MIN_ADAPTIVE_NOTIONAL_USD,
+                   "liquidityPercentile": V18253_CRYPTO_LIQUIDITY_PERCENTILE,
                    "positionPct": V18232_CRYPTO_POSITION_PCT, "maxPositions": V18232_CRYPTO_MAX_POSITIONS,
                    "entryScore": V18232_CRYPTO_ENTRY_SCORE, "stopPct": V18232_CRYPTO_STOP_PCT,
                    "trailStartPct": V18232_CRYPTO_TRAIL_START_PCT, "trailGivebackPct": V18232_CRYPTO_TRAIL_GIVEBACK_PCT},
@@ -11812,8 +11872,8 @@ def _v18252_crypto_history_payload(limit: int = 5000) -> Dict[str, Any]:
                          "totalPnlGbp": round(float(r[4] or 0), 4), "trackedValueGbp": round(float(r[5] or 0), 4),
                          "openPositions": int(r[6] or 0)})
     except Exception as exc:
-        return {"ok": False, "version": "V18.2.52", "points": [], "message": str(exc)[:300]}
-    return {"ok": True, "version": "V18.2.52", "points": rows, "count": len(rows),
+        return {"ok": False, "version": "V18.2.53", "points": [], "message": str(exc)[:300]}
+    return {"ok": True, "version": "V18.2.53", "points": rows, "count": len(rows),
             "samplingSeconds": V18242_CRYPTO_LIVE_INTERVAL_SECONDS}
 
 
@@ -11919,7 +11979,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     live_positions = _v18234_raw_crypto_positions()
     active_cooldowns = _v18247_prune_crypto_cooldowns(state, save=True)
     return {
-        "ok": True, "version": "V18.2.52", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.53", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "allocationLockedByPosition": bool(live_positions),
         "liveExecutionInstalled": True,

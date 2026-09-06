@@ -184,7 +184,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.52 · CRYPTO RECORD TRACKER</div>
+          <div className="eyebrow">V18.2.53 · ADAPTIVE LIQUIDITY</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -234,9 +234,9 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-panel-head">
         <div>
           <h3><span className="panel-icon">◈</span> Crypto Scanner</h3>
-          <p>Automatically discovers Alpaca's active USD crypto market, filters thin pairs and ranks every scanned opportunity. Trades only when score ≥ {entryScore.toFixed(2)}.</p>
+          <p>Automatically discovers Alpaca's active USD crypto market and uses an adaptive liquidity floor when a fixed threshold would reject the whole market. Trades only when score ≥ {entryScore.toFixed(2)}.</p>
         </div>
-        <div className="scanner-state"><span className="crypto-chip">{Number(data?.marketDiscovery?.discovered || scans.length)} discovered</span><span className="crypto-chip">{Number(data?.marketDiscovery?.eligible || scans.filter((s: AnyObj) => s.liquid !== false).length)} liquid</span><span className="crypto-chip">{scans.filter((s: AnyObj) => Boolean(s.qualified)).length} qualified</span><span className="scanning-dot">●</span><span>Dynamic</span></div>
+        <div className="scanner-state"><span className="crypto-chip">{Number(data?.marketDiscovery?.discovered || scans.length)} discovered</span><span className="crypto-chip">{Number(data?.marketDiscovery?.eligible || scans.filter((s: AnyObj) => s.liquid !== false).length)} liquid</span><span className="crypto-chip">{scans.filter((s: AnyObj) => Boolean(s.qualified)).length} qualified</span><span className="crypto-chip">{String(data?.marketDiscovery?.liquidityMode || "fixed").toUpperCase()} ≥ {money(data?.marketDiscovery?.effectiveLiquidity60mUsd || data?.config?.minLiquidity60mUsd || 0)}</span><span className="scanning-dot">●</span><span>Dynamic</span></div>
       </div>
       <div className="crypto-table-wrap">
         <table className="crypto-scanner-table">
@@ -252,7 +252,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
               <td className={Number(s.return15mPct || 0) >= 0 ? "gain" : "loss"}>{pct(s.return15mPct)}</td>
               <td className={Number(s.return60mPct || 0) >= 0 ? "gain" : "loss"}>{pct(s.return60mPct)}</td>
               <td>{pct(s.range60mPct)}</td>
-              <td>{s.liquid === false ? <span className="loss">THIN</span> : money(s.liquidity60mUsd)}</td>
+              <td><span className={s.liquid === false ? "loss" : "gain"}>{money(s.liquidity60mUsd)}</span><small style={{display:"block",opacity:.7}}>{s.liquid === false ? "THIN" : "LIQUID"}</small></td>
               <td><div className="crypto-status-cell"><span className={`crypto-chip ${state.cls}`}>{state.label}</span><span className="score-track"><span style={{ width: `${progress}%` }} /></span></div></td>
             </tr>;
           })}</tbody>
