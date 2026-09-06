@@ -148,7 +148,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.50 · CRYPTO LOSS CONTROL</div>
+          <div className="eyebrow">V18.2.51 · BALANCED CRYPTO ENTRY</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
