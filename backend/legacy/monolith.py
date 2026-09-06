@@ -12122,7 +12122,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     live_positions = _v18234_raw_crypto_positions()
     active_cooldowns = _v18247_prune_crypto_cooldowns(state, save=True)
     return {
-        "ok": True, "version": "V18.2.60", "manualOnly": False, "automaticRelease": False,
+        "ok": True, "version": "V18.2.61", "manualOnly": False, "automaticRelease": False,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "profitIsolationEnabled": True,
         "allocationLockedByPosition": bool(live_positions),

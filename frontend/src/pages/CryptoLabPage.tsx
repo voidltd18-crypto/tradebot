@@ -20,7 +20,6 @@ function coinGlyph(symbol: string) {
 }
 
 function scoreState(score: number, threshold: number) {
-  if (score >= threshold) return { label: "QUALIFIED", cls: "qualified" };
   if (score >= Math.max(0.60, threshold - 0.08)) return { label: "NEAR ENTRY", cls: "near" };
   if (score >= 0.50) return { label: "BUILDING", cls: "building" };
   return { label: "WATCHING", cls: "watching" };
@@ -270,16 +269,32 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
             const key = String(s.symbol || "").replace("/", "").toUpperCase();
             const held = liveKeys.has(key);
             const cooldownSecs = cooldownRemaining(s.symbol);
-            const marketState = s.liquid === false ? { label: "THIN", cls: "watching" } : scoreState(score, entryScore);
+            const min15 = Number(bridge?.min15mMomentumPct ?? -0.10);
+            const min60 = Number(bridge?.min60mMomentumPct ?? 0.00);
+            const ret15 = Number(s.return15mPct || 0);
+            const ret60 = Number(s.return60mPct || 0);
+            const backendQualified = Boolean(s.qualified);
+            let blockedState = scoreState(score, entryScore);
+            if (s.liquid === false) {
+              blockedState = { label: "BLOCKED · THIN LIQUIDITY", cls: "watching" };
+            } else if (score < entryScore) {
+              blockedState = { label: `BLOCKED · SCORE ${score.toFixed(3)} < ${entryScore.toFixed(2)}`, cls: "watching" };
+            } else if (ret15 < min15) {
+              blockedState = { label: `BLOCKED · 15m ${ret15.toFixed(2)}% < ${min15.toFixed(2)}%`, cls: "watching" };
+            } else if (ret60 < min60) {
+              blockedState = { label: `BLOCKED · 60m ${ret60.toFixed(2)}% < ${min60.toFixed(2)}%`, cls: "watching" };
+            } else if (!backendQualified) {
+              blockedState = { label: "BLOCKED · BACKEND GATE", cls: "watching" };
+            }
             const state = held
               ? { label: "HELD · EXIT ARMED", cls: "held" }
               : cooldownSecs > 0
                 ? { label: `COOLDOWN ${fmtCountdown(cooldownSecs)}`, cls: "cooldown" }
-                : Boolean(s.qualified)
+                : backendQualified
                   ? { label: nextDecisionSeconds > 0 ? `QUALIFIED · ${fmtCountdown(nextDecisionSeconds)}` : "QUALIFIED · DUE", cls: "qualified" }
-                  : marketState;
+                  : blockedState;
             const progress = Math.max(4, Math.min(100, (score / entryScore) * 100));
-            return <tr key={s.symbol} className={held ? "held-row" : cooldownSecs > 0 ? "cooldown-row" : s.qualified ? "qualified-row" : ""}>
+            return <tr key={s.symbol} className={held ? "held-row" : cooldownSecs > 0 ? "cooldown-row" : backendQualified ? "qualified-row" : ""}>
               <td><div className="crypto-symbol"><span className="coin-icon small">{coinGlyph(s.symbol)}</span><strong>{s.symbol}</strong></div></td>
               <td>{money(s.price)}</td>
               <td><span className={`score-badge ${state.cls}`}>{score.toFixed(3)}</span></td>
