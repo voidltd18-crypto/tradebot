@@ -74,9 +74,6 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [data, setData] = useState<AnyObj | null>(null);
   const [error, setError] = useState("");
   const [bridge, setBridge] = useState<AnyObj | null>(null);
-  const [releaseAmount, setReleaseAmount] = useState("0");
-  const [bridgeMessage, setBridgeMessage] = useState("");
-  const [bridgeBusy, setBridgeBusy] = useState(false);
   const [sellBusySymbol, setSellBusySymbol] = useState("");
   const [sellMessage, setSellMessage] = useState("");
   const [history, setHistory] = useState<AnyObj[]>([]);
@@ -86,13 +83,6 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
     const id = window.setInterval(() => setClockTick(v => v + 1), 1000);
     return () => window.clearInterval(id);
   }, []);
-
-  useEffect(() => {
-    const currentReserve = Number(bridge?.vaultReserveGbp || 0);
-    if (releaseAmount === "0" && currentReserve > 0.001) {
-      setReleaseAmount(String(Number(currentReserve.toFixed(2))));
-    }
-  }, [bridge, releaseAmount]);
 
   useEffect(() => {
     let alive = true;
@@ -122,39 +112,6 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       window.clearInterval(id);
     };
   }, [authToken]);
-
-  const setVaultReserve = async () => {
-    if (!bridge || bridge.locked || bridge.allocationLockedByPosition) return;
-    const amount = Number(releaseAmount || 0);
-    const pool = Number(bridge?.cryptoPoolGbp || 0);
-    if (!Number.isFinite(amount) || amount < 0 || amount > pool) {
-      setBridgeMessage(`Enter an amount from £0 to £${pool.toFixed(2)}.`);
-      return;
-    }
-    const cryptoAfter = Math.max(0, pool - amount);
-    const text = amount <= 0
-      ? `Use all £${pool.toFixed(2)} of the dedicated crypto engine capital?\n\nPiggy Bank money remains untouched.`
-      : `Keep £${amount.toFixed(2)} as crypto engine reserve?\n\nCrypto will use £${cryptoAfter.toFixed(2)}. Piggy Bank money remains untouched.`;
-    if (!window.confirm(text)) return;
-    setBridgeBusy(true);
-    setBridgeMessage("");
-    try {
-      const res = await fetch(`${API_URL}/v18/crypto-bridge/vault-reserve`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Auth-Token": authToken, "x-api-key": authToken },
-        body: JSON.stringify({ reserveGbp: amount, confirmation: "SET VAULT RESERVE" }),
-      });
-      const body = await res.json();
-      if (!res.ok || body?.ok === false) throw new Error(body?.message || body?.detail || `HTTP ${res.status}`);
-      setBridge(body.bridge ? { ...body.bridge, __fetchedAt: Date.now() } : bridge);
-      setBridgeMessage(body.message || "Crypto engine reserve updated.");
-    } catch (e: any) {
-      setBridgeMessage(e?.message || "Crypto engine reserve update failed.");
-    } finally {
-      setBridgeBusy(false);
-    }
-  };
-
 
   const manualSellCrypto = async (position: AnyObj) => {
     const symbol = String(position?.symbol || "").toUpperCase();
@@ -221,7 +178,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.64 · FAST CRYPTO PROTECTION</div>
+          <div className="eyebrow">V18.2.65 · CRYPTO STALL EXIT</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -233,7 +190,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
 
     <section className="crypto-summary-grid">
       <div className="crypto-summary-card"><div className="crypto-summary-icon vault">▣</div><div><span>Piggy Bank</span><strong>{gbp(bridge?.piggyBankGbp ?? bridge?.vaultAvailableGbp)}</strong><small>Banked · never reused</small></div></div>
-      <div className="crypto-summary-card"><div className="crypto-summary-icon allocation">●</div><div><span>Crypto Allocation</span><strong>{gbp(bridge?.cryptoAllocatedGbp)}</strong><small>Live pilot cap</small></div></div>
+      <div className="crypto-summary-card"><div className="crypto-summary-icon allocation">●</div><div><span>Crypto Allocation</span><strong>{gbp(bridge?.cryptoAllocatedGbp)}</strong><small>Automatic surplus above £900 stock reserve</small></div></div>
       <div className="crypto-summary-card"><div className="crypto-summary-icon pnl">↗</div><div><span>Crypto P&amp;L</span><strong className={Number(bridge?.cryptoRealisedPnlGbp || 0) >= 0 ? "gain" : "loss"}>{gbp(bridge?.cryptoRealisedPnlGbp)}</strong><small>Realised live pilot</small></div></div>
     </section>
 
@@ -247,7 +204,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
 
     {livePositions.length > 0 && <section className="crypto-panel crypto-live-positions">
       <div className="crypto-panel-head">
-        <div><h3>Live Crypto Positions</h3><p>Up to 4 real Alpaca crypto positions. Bot-managed positions have independent exit protection.</p></div>
+        <div><h3>Live Crypto Positions</h3><p>Up to 4 real Alpaca crypto positions. Bot-managed positions have independent exit protection and can free stalled slots after 45 minutes.</p></div>
         <span className="crypto-chip live">LIVE</span>
       </div>
       <div className="crypto-position-grid">
@@ -328,7 +285,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-panel-head">
         <div>
           <h3><span className="panel-icon">⌒</span> Crypto Bridge</h3>
-          <p>Crypto uses the full protected pool by default. Safety exits are checked every 15 seconds; normal buys and momentum decisions run every 5 minutes.</p>
+          <p>Capital split is automatic: £900 is reserved for stocks, everything else outside the Piggy Bank is crypto. Crypto profits are banked one-way. Safety exits check every 5 seconds; normal decisions run every 5 minutes.</p>
         </div>
         <span className={`crypto-chip ${armed ? "live" : accountActive ? "building" : ""}`}>{armed ? "LIVE PILOT ARMED" : accountActive ? "READY TO ARM" : "CRYPTO NOT ACTIVE"}</span>
       </div>
@@ -340,16 +297,11 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
         <div className="bridge-metric"><span className="crypto-summary-icon returned">◎</span><div><small>Status</small><strong className={armed ? "gain" : ""}>{armed ? "● Armed" : "Off"}</strong></div></div>
         <div className={`bridge-action ${armed ? "allocated" : ""}`}>
           <div className="crypto-allocation-editor">
-            <div className="crypto-allocation-presets">
-              <button type="button" onClick={() => setReleaseAmount("0")} disabled={bridgeBusy || Boolean(bridge?.allocationLockedByPosition)}>USE ALL</button>
-              {[25,50,100].filter(v => v <= Number(bridge?.cryptoPoolGbp || 0)).map(v => <button key={v} type="button" onClick={() => setReleaseAmount(String(v))} disabled={bridgeBusy || Boolean(bridge?.allocationLockedByPosition)}>KEEP £{v}</button>)}
-            </div>
-            <div className="bridge-release-controls"><input aria-label="Crypto engine reserve in pounds" type="number" min="0" max={Number(bridge?.cryptoPoolGbp || 0)} step="1" value={releaseAmount} onChange={e => setReleaseAmount(e.target.value)} /><button onClick={setVaultReserve} disabled={bridgeBusy || !bridge || bridge.locked || Boolean(bridge?.allocationLockedByPosition)}>{bridgeBusy ? "UPDATING…" : Number(releaseAmount || 0) === 0 ? "USE FULL ENGINE" : `KEEP ${gbp(releaseAmount)}`}</button></div>
-            <small>{bridge?.allocationLockedByPosition ? "Close the open crypto position before changing the engine reserve." : `${gbp(bridge?.vaultReserveGbp)} engine reserve · Crypto can use ${gbp(bridge?.cryptoAllocatedGbp)} of ${gbp(bridge?.cryptoEngineCapitalGbp ?? bridge?.cryptoPoolGbp)} · Piggy Bank never used`}</small>
+            <strong>AUTOMATIC CAPITAL SPLIT</strong>
+            <small>{`${gbp(bridge?.stockCapitalReservedGbp ?? 900)} reserved for stocks · ${gbp(bridge?.cryptoAllocatedGbp)} assigned to crypto · ${gbp(bridge?.piggyBankGbp)} locked in Piggy Bank`}</small>
           </div>
         </div>
       </div>
-      {bridgeMessage && <div className="crypto-notice">{bridgeMessage}</div>}
     </section>
 
     <section className="crypto-footer-strip">

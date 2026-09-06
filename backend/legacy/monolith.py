@@ -10980,6 +10980,11 @@ V18232_CRYPTO_TRAIL_START_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_TRAIL
 V18232_CRYPTO_TRAIL_GIVEBACK_PCT = max(0.10, float(os.getenv("TRADEBOT_CRYPTO_TRAIL_GIVEBACK_PCT", "0.6") or 0.6))
 V18232_CRYPTO_EXIT_SCORE = max(0.0, min(V18232_CRYPTO_ENTRY_SCORE, float(os.getenv("TRADEBOT_CRYPTO_EXIT_SCORE", "0.34") or 0.34)))
 V18242_CRYPTO_LIVE_INTERVAL_SECONDS = max(5, int(os.getenv("TRADEBOT_CRYPTO_LIVE_INTERVAL_SECONDS", "5") or 5))
+V18265_CRYPTO_STALL_EXIT_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_STALL_EXIT_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
+V18265_CRYPTO_STALL_MINUTES = max(15, int(os.getenv("TRADEBOT_CRYPTO_STALL_MINUTES", "45") or 45))
+V18265_CRYPTO_STALL_BAND_PCT = max(0.05, float(os.getenv("TRADEBOT_CRYPTO_STALL_BAND_PCT", "0.25") or 0.25))
+V18265_CRYPTO_STALL_MAX_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_STALL_MAX_SCORE", "0.42") or 0.42)))
+V18265_CRYPTO_STALL_MAX_15M_PCT = float(os.getenv("TRADEBOT_CRYPTO_STALL_MAX_15M_PCT", "0.10") or 0.10)
 # V18.2.48 — separate fast safety monitoring from normal trading cadence.
 # Protective stop/trail checks now run every 5 seconds, while new entries and
 # normal entry/momentum-exit decisions are evaluated no more than once every 5 minutes.
@@ -11388,42 +11393,57 @@ _crypto_live_lock = threading.RLock()
 _crypto_live_runtime: Dict[str, Any] = {"lastError": None, "lastActionAt": None, "normalDecisionCycleCount": 0, "workerStartedAt": None}
 
 
-def _v18241_crypto_pool_gbp(state: Dict[str, Any]) -> float:
-    """Dedicated crypto-engine capital ceiling.
+def _v18266_account_equity_gbp() -> float:
+    """Current Alpaca account equity in GBP, used only to split stock/crypto capital."""
+    try:
+        account = get_account()
+        equity_usd = max(0.0, float(getattr(account, "equity", 0.0) or 0.0))
+        rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
+        return max(0.0, equity_usd * rate)
+    except Exception:
+        return 0.0
 
-    V18.2.55 deliberately excludes bankedProfitGbp (the Piggy Bank). The Piggy
-    Bank is a one-way profit sink and is never available to stocks or crypto.
+
+def _v18241_crypto_pool_gbp(state: Dict[str, Any]) -> float:
+    """V18.2.66 automatic capital split.
+
+    The first £900 of non-Piggy-Bank equity is reserved for stocks.
+    Everything above £900, after subtracting the Piggy Bank, is crypto capital.
+    Positive realised crypto profit is moved into the Piggy Bank, so it is
+    automatically removed from the next crypto allocation.
     """
-    allocated = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
-    ceiling = max(0.0, float(state.get("cryptoEngineCapitalCeilingGbp") or 0.0))
-    if ceiling <= 0.0 and allocated > 0.0:
-        ceiling = allocated
-    return max(allocated, ceiling)
+    piggy = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
+    equity_gbp = _v18266_account_equity_gbp()
+    if equity_gbp <= 0.0:
+        # Broker/account temporarily unavailable: preserve the last safe allocation.
+        allocated = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
+        ceiling = max(0.0, float(state.get("cryptoEngineCapitalCeilingGbp") or 0.0))
+        return min(max(allocated, ceiling), V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
+    surplus = max(0.0, equity_gbp - piggy - V18266_STOCK_CAP_GBP)
+    return min(surplus, V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
 
 
 def _v18241_apply_vault_reserve(state: Dict[str, Any], *, save: bool = False) -> Dict[str, Any]:
-    """V18.2.55 compatibility wrapper for the crypto engine reserve.
+    """V18.2.66 compatibility wrapper.
 
-    The historic function name is retained so old callers keep working, but it
-    no longer moves Piggy Bank money into crypto. Allocation can only move
-    inside the dedicated crypto-engine capital ceiling.
+    Allocation is automatic: £900 is reserved for the stock engine, Piggy Bank
+    remains one-way/untouchable, and all remaining account equity is assigned
+    to crypto. Historic manual reserve fields are zeroed for compatibility.
     """
     pool = min(_v18241_crypto_pool_gbp(state), V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
-    reserve = max(0.0, float(state.get("cryptoVaultReserveGbp") or 0.0))
-    reserve = min(reserve, pool)
-    usable = max(0.0, pool - reserve)
-    new_reserve = round(reserve, 4)
-    new_alloc = round(usable, 4)
+    new_alloc = round(max(0.0, pool), 4)
     changed = (
-        abs(float(state.get("cryptoVaultReserveGbp") or 0.0) - new_reserve) > 0.0001
+        abs(float(state.get("cryptoVaultReserveGbp") or 0.0)) > 0.0001
         or abs(float(state.get("cryptoAllocatedGbp") or 0.0) - new_alloc) > 0.0001
-        or abs(float(state.get("cryptoEngineCapitalCeilingGbp") or 0.0) - pool) > 0.0001
+        or abs(float(state.get("cryptoEngineCapitalCeilingGbp") or 0.0) - new_alloc) > 0.0001
         or bool(state.get("cryptoLivePilotEnabled")) != (new_alloc > 0)
     )
-    state["cryptoVaultReserveGbp"] = new_reserve
+    state["cryptoVaultReserveGbp"] = 0.0
     state["cryptoAllocatedGbp"] = new_alloc
-    state["cryptoEngineCapitalCeilingGbp"] = round(pool, 4)
+    state["cryptoEngineCapitalCeilingGbp"] = new_alloc
     state["cryptoLivePilotEnabled"] = new_alloc > 0
+    state["cryptoCapitalMode"] = "AUTO_SURPLUS_ABOVE_STOCK_CAP"
+    state["stockCapitalReservedGbp"] = round(V18266_STOCK_CAP_GBP, 2)
     if save and changed:
         save_profit_vault_state(state)
     return state
@@ -11776,6 +11796,19 @@ def _v18234_live_sell(position: Dict[str, Any], price: float, score: float, reas
             return False
 
 
+def _v18265_position_age_minutes(position: Dict[str, Any]) -> float:
+    raw = position.get("openedAt")
+    if not raw:
+        return 0.0
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return max(0.0, (datetime.now(UTC) - dt.astimezone(UTC)).total_seconds() / 60.0)
+    except Exception:
+        return 0.0
+
+
 def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow_normal_decisions: bool = True) -> Dict[str, Any]:
     if not V18234_CRYPTO_LIVE_ENABLED or PAPER:
         return {"ok": True, "enabled": False}
@@ -11813,9 +11846,32 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
         highs[symbol] = high
         trail_floor = high * (1.0 - V18234_CRYPTO_LIVE_TRAIL_GIVEBACK_PCT / 100.0)
         reason = None
-        if pnl_pct <= -V18234_CRYPTO_LIVE_STOP_PCT: reason = "CRYPTO LIVE STOP"
-        elif ((high / entry) - 1.0) * 100.0 >= V18234_CRYPTO_LIVE_TRAIL_START_PCT and price <= trail_floor: reason = "CRYPTO LIVE TRAIL"
-        elif allow_normal_decisions and score > 0 and score <= V18234_CRYPTO_LIVE_EXIT_SCORE and pnl_pct > 0: reason = "CRYPTO LIVE MOMENTUM EXIT"
+        age_minutes = _v18265_position_age_minutes(p)
+        ret15 = float(scan.get("return15mPct") or 0.0)
+        stall_flat = abs(pnl_pct) <= V18265_CRYPTO_STALL_BAND_PCT
+        stall_weak = (
+            (score > 0 and score <= V18265_CRYPTO_STALL_MAX_SCORE)
+            or ret15 <= V18265_CRYPTO_STALL_MAX_15M_PCT
+        )
+        if pnl_pct <= -V18234_CRYPTO_LIVE_STOP_PCT:
+            reason = "CRYPTO LIVE STOP"
+        elif ((high / entry) - 1.0) * 100.0 >= V18234_CRYPTO_LIVE_TRAIL_START_PCT and price <= trail_floor:
+            reason = "CRYPTO LIVE TRAIL"
+        elif (
+            V18265_CRYPTO_STALL_EXIT_ENABLED
+            and allow_normal_decisions
+            and age_minutes >= V18265_CRYPTO_STALL_MINUTES
+            and stall_flat
+            and stall_weak
+        ):
+            reason = "CRYPTO STALL EXIT"
+            print(
+                f"V18.2.65 CRYPTO STALL EXIT | {symbol} held={age_minutes:.1f}m pnl={pnl_pct:.2f}% "
+                f"score={score:.3f} ret15={ret15:.2f}% band=±{V18265_CRYPTO_STALL_BAND_PCT:.2f}%",
+                flush=True,
+            )
+        elif allow_normal_decisions and score > 0 and score <= V18234_CRYPTO_LIVE_EXIT_SCORE and pnl_pct > 0:
+            reason = "CRYPTO LIVE MOMENTUM EXIT"
         if reason and _v18234_live_sell(p, price, score, reason):
             highs.pop(symbol, None)
             sold_any = True
@@ -12183,9 +12239,13 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.64", "manualOnly": False, "automaticRelease": False,
-        "allocationAdjustable": True, "vaultReserveAdjustable": True,
+        "ok": True, "version": "V18.2.66", "manualOnly": False, "automaticRelease": True,
+        "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
+        "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
+        "stockCapitalReservedGbp": round(V18266_STOCK_CAP_GBP, 2),
+        "surplusAutomaticallyAssignedToCrypto": True,
+        "cryptoProfitAutomaticallyBanked": True,
         "allocationLockedByPosition": bool(live_positions),
         "liveExecutionInstalled": True,
         "liveExecutorIntervalSeconds": V18242_CRYPTO_LIVE_INTERVAL_SECONDS,
@@ -12206,6 +12266,11 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "lossCooldownMinutes": V18250_CRYPTO_LOSS_COOLDOWN_MINUTES,
         "lossBrakeMinutes": V18250_CRYPTO_LOSS_BRAKE_MINUTES,
         "lossBrakeStreak": V18250_CRYPTO_LOSS_BRAKE_STREAK,
+        "stallExitEnabled": V18265_CRYPTO_STALL_EXIT_ENABLED,
+        "stallExitMinutes": V18265_CRYPTO_STALL_MINUTES,
+        "stallBandPct": V18265_CRYPTO_STALL_BAND_PCT,
+        "stallMaxScore": V18265_CRYPTO_STALL_MAX_SCORE,
+        "stallMax15mPct": V18265_CRYPTO_STALL_MAX_15M_PCT,
         "dailyCryptoPnlGbp": round(float(state.get("cryptoDailyRealisedPnlGbp") or 0.0), 2),
         "dailyLossLimitGbp": round(float(state.get("cryptoDailyLossLimitGbp") or max(V18250_CRYPTO_DAILY_LOSS_MIN_GBP, float(state.get("cryptoAllocatedGbp") or 0.0) * V18250_CRYPTO_DAILY_LOSS_PCT / 100.0)), 2),
         "consecutiveCryptoLosses": int(state.get("cryptoConsecutiveLosses") or 0),
@@ -12243,73 +12308,20 @@ def v18234_release_vault_to_crypto(amount_gbp: float, confirmation: str) -> Dict
 
 
 def v18240_set_crypto_allocation(target_gbp: float, confirmation: str) -> Dict[str, Any]:
-    """Backward-compatible direct allocation control.
-
-    V18.2.41 stores the inverse as a Vault reserve so future profits keep the
-    same operator preference instead of silently resetting the allocation.
-    """
-    try:
-        target = round(float(target_gbp), 2)
-    except Exception:
-        target = -1.0
-    if confirmation.strip().upper() != "SET CRYPTO ALLOCATION":
-        return {"ok": False, "message": "Confirmation must be SET CRYPTO ALLOCATION."}
-    account = _v18234_crypto_account_status()
-    if not account.get("active"):
-        return {"ok": False, "message": account.get("message"), "accountCrypto": account}
-    if target < 0:
-        return {"ok": False, "message": "Crypto allocation cannot be negative."}
-    live_positions = _v18234_raw_crypto_positions()
-    if live_positions:
-        return {"ok": False, "message": "Allocation cannot be changed while a crypto position is open. Sell/close the position first."}
-
-    state = load_profit_vault_state()
-    pool = _v18241_crypto_pool_gbp(state)
-    max_target = min(pool, V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
-    if target > max_target + 0.001:
-        return {"ok": False, "message": f"Crypto engine has £{max_target:.2f} dedicated capital available."}
-
-    current = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
-    state["cryptoVaultReserveGbp"] = round(max(0.0, pool - target), 4)
-    state = _v18241_apply_vault_reserve(state, save=False)
-    state["lastCryptoAllocationChangeAt"] = datetime.now(UTC).isoformat()
-    save_profit_vault_state(state)
-
-    print(f"V18.2.41 CRYPTO ALLOCATION SET | target=£{target:.2f} previous=£{current:.2f} reserve=£{float(state.get('cryptoVaultReserveGbp') or 0):.2f} pool=£{pool:.2f}", flush=True)
-    message = f"Crypto trading allocation set to £{target:.2f}; £{float(state.get('cryptoVaultReserveGbp') or 0):.2f} kept as crypto engine reserve."
-    if target <= 0:
-        message = f"Crypto allocation set to £0.00; the full £{pool:.2f} pool is kept as crypto engine reserve."
-    return {"ok": True, "message": message, "bridge": v18234_crypto_bridge_payload()}
-
+    """V18.2.66: allocation is automatic and cannot be manually overridden."""
+    return {
+        "ok": False,
+        "message": f"Crypto allocation is automatic: stocks reserve £{V18266_STOCK_CAP_GBP:.2f}; all remaining non-Piggy equity is assigned to crypto.",
+        "bridge": v18234_crypto_bridge_payload(),
+    }
 
 def v18241_set_vault_reserve(reserve_gbp: float, confirmation: str) -> Dict[str, Any]:
-    try:
-        reserve = round(float(reserve_gbp), 2)
-    except Exception:
-        reserve = -1.0
-    if confirmation.strip().upper() != "SET VAULT RESERVE":
-        return {"ok": False, "message": "Confirmation must be SET VAULT RESERVE."}
-    account = _v18234_crypto_account_status()
-    if not account.get("active"):
-        return {"ok": False, "message": account.get("message"), "accountCrypto": account}
-    if reserve < 0:
-        return {"ok": False, "message": "Vault reserve cannot be negative."}
-    live_positions = _v18234_raw_crypto_positions()
-    if live_positions:
-        return {"ok": False, "message": "Vault reserve cannot be changed while a crypto position is open. Sell/close the position first."}
-
-    state = load_profit_vault_state()
-    pool = _v18241_crypto_pool_gbp(state)
-    if reserve > pool + 0.001:
-        return {"ok": False, "message": f"Reserve cannot exceed the protected pool of £{pool:.2f}."}
-    previous = max(0.0, float(state.get("cryptoVaultReserveGbp") or 0.0))
-    state["cryptoVaultReserveGbp"] = round(reserve, 4)
-    state = _v18241_apply_vault_reserve(state, save=False)
-    state["lastCryptoVaultReserveChangeAt"] = datetime.now(UTC).isoformat()
-    save_profit_vault_state(state)
-    allocated = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
-    print(f"V18.2.41 VAULT RESERVE SET | reserve=£{reserve:.2f} previous=£{previous:.2f} crypto_allocation=£{allocated:.2f} pool=£{pool:.2f}", flush=True)
-    return {"ok": True, "message": f"Keeping £{reserve:.2f} in Vault; crypto can use £{allocated:.2f}.", "bridge": v18234_crypto_bridge_payload()}
+    """V18.2.66: manual crypto reserve is disabled by the automatic split."""
+    return {
+        "ok": False,
+        "message": f"Manual crypto reserve is disabled. Stocks reserve £{V18266_STOCK_CAP_GBP:.2f}; the surplus is crypto capital automatically.",
+        "bridge": v18234_crypto_bridge_payload(),
+    }
 
 
 @app.get('/v18/crypto-bridge')
@@ -14239,6 +14251,7 @@ def refresh_universe_preview():
 PROFIT_VAULT_VERSION = "V17.6.2"
 PROFIT_VAULT_ENABLED = os.getenv("PROFIT_VAULT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 PROFIT_VAULT_DEFAULT_BASELINE_GBP = 900.00  # starting protected baseline
+V18266_STOCK_CAP_GBP = max(0.0, float(os.getenv("TRADEBOT_STOCK_CAP_GBP", "900") or 900))
 CAPITAL_MILESTONE_STEP_GBP = 100.00
 CAPITAL_MILESTONE_CUSHION_GBP = 25.00
 CAPITAL_MILESTONE_STABILITY_REQUIRED = 5
@@ -14369,12 +14382,14 @@ def profit_vault_seed_existing_surplus(account: Any = None) -> Dict[str, Any]:
     rate = get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP
     equity_gbp = equity_usd * float(rate)
     baseline_gbp = float(PROFIT_VAULT_DEFAULT_BASELINE_GBP)
-    target_banked = round(max(0.0, equity_gbp - baseline_gbp), 4)
+    # V18.2.66: do not bank the existing surplus. The first £900 belongs to
+    # stocks and the remaining non-Piggy equity becomes the crypto allocation.
+    # Only realised positive trading P&L is added to the Piggy Bank.
     existing_banked = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
-    seeded_delta = round(max(0.0, target_banked - existing_banked), 4)
-    state["bankedProfitGbp"] = round(max(existing_banked, target_banked), 4)
+    seeded_delta = 0.0
+    state["bankedProfitGbp"] = round(existing_banked, 4)
     state["lifetimeBankedGbp"] = round(max(
-        float(state.get("lifetimeBankedGbp") or 0.0) + seeded_delta,
+        float(state.get("lifetimeBankedGbp") or 0.0),
         float(state["bankedProfitGbp"]),
     ), 4)
     state["baselineSeeded"] = True
@@ -14444,6 +14459,10 @@ def profit_vault_deployable_usd(account_equity: float, buying_power: Optional[fl
         equity = 0.0
     reserved = profit_vault_reserved_usd()
     working = max(0.0, equity - reserved)
+    # V18.2.66: stocks can never deploy more than the fixed £900 stock pot.
+    rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
+    stock_cap_usd = V18266_STOCK_CAP_GBP / max(rate, 0.0001)
+    working = min(working, stock_cap_usd)
     if buying_power is not None:
         try:
             working = min(working, max(0.0, float(buying_power)))
