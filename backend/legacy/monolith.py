@@ -10979,9 +10979,9 @@ V18232_CRYPTO_STOP_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_STOP_PCT", "
 V18232_CRYPTO_TRAIL_START_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_TRAIL_START_PCT", "1.5") or 1.5))
 V18232_CRYPTO_TRAIL_GIVEBACK_PCT = max(0.10, float(os.getenv("TRADEBOT_CRYPTO_TRAIL_GIVEBACK_PCT", "0.6") or 0.6))
 V18232_CRYPTO_EXIT_SCORE = max(0.0, min(V18232_CRYPTO_ENTRY_SCORE, float(os.getenv("TRADEBOT_CRYPTO_EXIT_SCORE", "0.34") or 0.34)))
-V18242_CRYPTO_LIVE_INTERVAL_SECONDS = max(5, int(os.getenv("TRADEBOT_CRYPTO_LIVE_INTERVAL_SECONDS", "15") or 15))
+V18242_CRYPTO_LIVE_INTERVAL_SECONDS = max(5, int(os.getenv("TRADEBOT_CRYPTO_LIVE_INTERVAL_SECONDS", "5") or 5))
 # V18.2.48 — separate fast safety monitoring from normal trading cadence.
-# Protective stop/trail checks still run every 15 seconds, while new entries and
+# Protective stop/trail checks now run every 5 seconds, while new entries and
 # normal entry/momentum-exit decisions are evaluated no more than once every 5 minutes.
 V18248_CRYPTO_DECISION_INTERVAL_SECONDS = max(60, int(os.getenv("TRADEBOT_CRYPTO_DECISION_INTERVAL_SECONDS", "300") or 300))
 
@@ -12150,8 +12150,40 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     usable_max = min(pool, V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
     live_positions = _v18234_raw_crypto_positions()
     active_cooldowns = _v18247_prune_crypto_cooldowns(state, save=True)
+
+    # V18.2.64: expose the exact protection state used by the live safety loop.
+    # This is display-only telemetry; execution continues to use the same
+    # stop-loss / trail rules, now checked every 5 seconds.
+    live_highs = state.get("cryptoLiveHighPrices")
+    if not isinstance(live_highs, dict):
+        live_highs = {}
+    for pos in live_positions:
+        try:
+            if not bool(pos.get("managedByPilot")):
+                continue
+            symbol = str(pos.get("symbol") or "").upper()
+            entry = float(pos.get("entry") or 0.0)
+            price = float(pos.get("price") or 0.0)
+            high = max(float(live_highs.get(symbol) or 0.0), price)
+            peak_pct = ((high / entry) - 1.0) * 100.0 if entry > 0 and high > 0 else 0.0
+            trail_armed = peak_pct >= V18234_CRYPTO_LIVE_TRAIL_START_PCT
+            stop_price = entry * (1.0 - V18234_CRYPTO_LIVE_STOP_PCT / 100.0) if entry > 0 else 0.0
+            trail_floor = high * (1.0 - V18234_CRYPTO_LIVE_TRAIL_GIVEBACK_PCT / 100.0) if high > 0 else 0.0
+            pos["protection"] = {
+                "safetyCheckSeconds": V18242_CRYPTO_LIVE_INTERVAL_SECONDS,
+                "stopLossPct": V18234_CRYPTO_LIVE_STOP_PCT,
+                "stopPrice": stop_price,
+                "trailStartPct": V18234_CRYPTO_LIVE_TRAIL_START_PCT,
+                "trailGivebackPct": V18234_CRYPTO_LIVE_TRAIL_GIVEBACK_PCT,
+                "trailArmed": bool(trail_armed),
+                "highPrice": high,
+                "trailFloor": trail_floor if trail_armed else 0.0,
+                "activeFloor": max(stop_price, trail_floor) if trail_armed else stop_price,
+            }
+        except Exception:
+            continue
     return {
-        "ok": True, "version": "V18.2.63", "manualOnly": False, "automaticRelease": False,
+        "ok": True, "version": "V18.2.64", "manualOnly": False, "automaticRelease": False,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "profitIsolationEnabled": True,
         "allocationLockedByPosition": bool(live_positions),

@@ -480,3 +480,11 @@
   letter-spacing: .03em;
   color: #66d9ff;
 }
+
+/* V18.2.64 — live crypto protection telemetry */
+.crypto-protection-line {
+  display: block;
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+  color: #4ee6bd;
+}

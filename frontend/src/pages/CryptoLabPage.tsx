@@ -221,7 +221,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.63 · FOUR POSITION CRYPTO</div>
+          <div className="eyebrow">V18.2.64 · FAST CRYPTO PROTECTION</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -256,7 +256,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
           const pnlPct = Number(p.pnlPct || 0);
           const managed = Boolean(p.managedByPilot);
           return <div className="crypto-position-card" key={p.symbol}>
-            <div className="crypto-position-symbol"><span className="coin-icon">{coinGlyph(p.symbol)}</span><div><strong>{p.symbol}</strong><small>Entry {money(p.entry)} · {managed ? "BOT MANAGED" : "MANUAL / EXTERNAL"}</small>{managed && <small className="crypto-held-timer">{fmtHeldDuration(p.openedAt, clockTick)}</small>}</div></div>
+            <div className="crypto-position-symbol"><span className="coin-icon">{coinGlyph(p.symbol)}</span><div><strong>{p.symbol}</strong><small>Entry {money(p.entry)} · {managed ? "BOT MANAGED" : "MANUAL / EXTERNAL"}</small>{managed && <small className="crypto-held-timer">{fmtHeldDuration(p.openedAt, clockTick)}</small>}{managed && p.protection && <small className="crypto-protection-line">{p.protection.trailArmed ? `TRAIL ARMED · HIGH ${money(p.protection.highPrice)} · SELL BELOW ~${money(p.protection.activeFloor)}` : `STOP ARMED · ~${money(p.protection.stopPrice)} · TRAIL AT +${Number(p.protection.trailStartPct || 0).toFixed(1)}%`}</small>}</div></div>
             <div className="crypto-position-metric"><span>Market Value</span><strong>{money(p.marketValueUsd)}</strong><small>Qty {Number(p.qty || 0).toFixed(8)}</small></div>
             <div className={`crypto-position-metric ${pnl >= 0 ? "gain" : "loss"}`}><span>P&amp;L</span><strong>{gbp(pnl)}</strong><small>{pct(pnlPct)}</small></div>
             <div className="crypto-position-actions"><button className="crypto-sell-now" onClick={() => manualSellCrypto(p)} disabled={Boolean(sellBusySymbol)}>{sellBusySymbol === p.symbol ? "SELLING…" : "SELL CRYPTO NOW"}</button><small>100% market sell · confirmation required</small></div>
