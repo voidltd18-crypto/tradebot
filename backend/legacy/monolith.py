@@ -11373,11 +11373,11 @@ def v18232_crypto_shadow_payload() -> Dict[str, Any]:
 # V18.2.34 — VAULT-FUNDED LIVE CRYPTO PILOT
 # V18.2.41: the protected crypto pool can automatically use all Vault capital,
 # while the operator may keep an explicit GBP reserve in the Vault. The crypto
-# engine remains isolated from stock capital. V18.2.44 allows up to two live crypto positions.
+# engine remains isolated from stock capital. V18.2.63 allows up to four live crypto positions.
 # =========================
 V18234_CRYPTO_LIVE_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_LIVE_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
 V18234_CRYPTO_LIVE_PILOT_MAX_GBP = max(25.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_PILOT_MAX_GBP", "10000") or 10000))
-V18234_CRYPTO_LIVE_MAX_POSITIONS = max(1, min(2, int(os.getenv("TRADEBOT_CRYPTO_LIVE_MAX_POSITIONS", "2") or 2)))
+V18234_CRYPTO_LIVE_MAX_POSITIONS = max(1, min(4, int(os.getenv("TRADEBOT_CRYPTO_LIVE_MAX_POSITIONS", "4") or 4)))
 V18234_CRYPTO_LIVE_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_ENTRY_SCORE", str(V18232_CRYPTO_ENTRY_SCORE)) or V18232_CRYPTO_ENTRY_SCORE)))
 V18234_CRYPTO_LIVE_STOP_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_LIVE_STOP_PCT", str(V18232_CRYPTO_STOP_PCT)) or V18232_CRYPTO_STOP_PCT))
 V18234_CRYPTO_LIVE_TRAIL_START_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_LIVE_TRAIL_START_PCT", str(V18232_CRYPTO_TRAIL_START_PCT)) or V18232_CRYPTO_TRAIL_START_PCT))
@@ -11845,7 +11845,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
     _crypto_live_runtime["entriesPaused"] = False
     _crypto_live_runtime["pauseReason"] = None
 
-    # Refresh after exits. External/manual crypto positions count toward the two-position
+    # Refresh after exits. External/manual crypto positions count toward the four-position
     # safety cap but remain visible-only: the bot never auto-sells them.
     positions = _v18234_raw_crypto_positions()
     held_symbols = {_v18246_crypto_symbol_key(p.get("symbol")) for p in positions}
@@ -11868,22 +11868,25 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
             and _v18246_crypto_symbol_key(x.get("symbol")) not in held_symbols
             and _v18246_crypto_symbol_key(x.get("symbol")) not in active_cooldowns
         ]
+        # V18.2.63: rank eligible entries from strongest to weakest. Available
+        # crypto capital is split proportionally by score, so rank #1 receives
+        # the largest allocation and the lowest-ranked qualified entry receives
+        # the smallest. A failed order does not donate its planned allocation to
+        # a weaker candidate; that capital stays idle until a later cycle.
+        qualified.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
         qualified = qualified[:slots]
         if qualified:
             rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
             deployed_gbp = sum(max(0.0, float(p.get("marketValueUsd") or 0.0)) * rate for p in positions)
             remaining_gbp = max(0.0, allocation_gbp - deployed_gbp)
-            score_total = sum(max(V18234_CRYPTO_LIVE_ENTRY_SCORE, float(x.get("score") or 0)) for x in qualified)
-            budget_left = remaining_gbp
-            for idx, scan in enumerate(qualified):
-                score = max(V18234_CRYPTO_LIVE_ENTRY_SCORE, float(scan.get("score") or 0))
-                if idx == len(qualified) - 1:
-                    budget = budget_left
-                else:
-                    budget = remaining_gbp * (score / score_total) if score_total > 0 else remaining_gbp / len(qualified)
-                    budget = min(budget, budget_left)
+            weights = [max(V18234_CRYPTO_LIVE_ENTRY_SCORE, float(x.get("score") or 0)) for x in qualified]
+            score_total = sum(weights)
+            planned_budgets = [
+                (remaining_gbp * (weight / score_total) if score_total > 0 else remaining_gbp / len(qualified))
+                for weight in weights
+            ]
+            for scan, budget in zip(qualified, planned_budgets):
                 if budget >= 1.0 and _v18234_live_buy(scan, budget):
-                    budget_left = max(0.0, budget_left - budget)
                     held_symbols.add(_v18246_crypto_symbol_key(scan.get("symbol")))
 
     final_positions = _v18234_raw_crypto_positions()
@@ -12148,7 +12151,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     live_positions = _v18234_raw_crypto_positions()
     active_cooldowns = _v18247_prune_crypto_cooldowns(state, save=True)
     return {
-        "ok": True, "version": "V18.2.62", "manualOnly": False, "automaticRelease": False,
+        "ok": True, "version": "V18.2.63", "manualOnly": False, "automaticRelease": False,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "profitIsolationEnabled": True,
         "allocationLockedByPosition": bool(live_positions),

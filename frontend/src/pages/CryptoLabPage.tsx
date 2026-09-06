@@ -221,7 +221,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.62 · POSITION HOLD TIMERS</div>
+          <div className="eyebrow">V18.2.63 · FOUR POSITION CRYPTO</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -247,7 +247,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
 
     {livePositions.length > 0 && <section className="crypto-panel crypto-live-positions">
       <div className="crypto-panel-head">
-        <div><h3>Live Crypto Positions</h3><p>Up to 2 real Alpaca crypto positions. Bot-managed positions have independent exit protection.</p></div>
+        <div><h3>Live Crypto Positions</h3><p>Up to 4 real Alpaca crypto positions. Bot-managed positions have independent exit protection.</p></div>
         <span className="crypto-chip live">LIVE</span>
       </div>
       <div className="crypto-position-grid">
