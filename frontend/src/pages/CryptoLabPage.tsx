@@ -68,7 +68,6 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [sellBusySymbol, setSellBusySymbol] = useState("");
   const [sellMessage, setSellMessage] = useState("");
   const [history, setHistory] = useState<AnyObj[]>([]);
-  const [tax, setTax] = useState<AnyObj | null>(null);
 
   useEffect(() => {
     const currentReserve = Number(bridge?.vaultReserveGbp || 0);
@@ -88,13 +87,10 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
         const bridgeBody = await bridgeRes.json();
         const historyRes = await fetch(`${API_URL}/v18/crypto-history?limit=5000`, { headers: { "X-API-Key": authToken } });
         const historyBody = await historyRes.json();
-        const taxRes = await fetch(`${API_URL}/v18/crypto-tax`, { headers: { "X-API-Key": authToken } });
-        const taxBody = await taxRes.json();
         if (alive) {
           setData(body);
           setBridge(bridgeRes.ok ? bridgeBody : null);
           if (historyRes.ok && Array.isArray(historyBody?.points)) setHistory(historyBody.points);
-          if (taxRes.ok && taxBody?.ok !== false) setTax(taxBody);
           setError("");
         }
       } catch (e: any) {
@@ -119,8 +115,8 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
     }
     const cryptoAfter = Math.max(0, pool - amount);
     const text = amount <= 0
-      ? `Use the full protected pool of £${pool.toFixed(2)} for crypto?\n\n£0.00 will be kept back in the Vault.`
-      : `Keep £${amount.toFixed(2)} protected in the Vault?\n\nCrypto will be able to use £${cryptoAfter.toFixed(2)}.`;
+      ? `Use all £${pool.toFixed(2)} of the dedicated crypto engine capital?\n\nPiggy Bank money remains untouched.`
+      : `Keep £${amount.toFixed(2)} as crypto engine reserve?\n\nCrypto will use £${cryptoAfter.toFixed(2)}. Piggy Bank money remains untouched.`;
     if (!window.confirm(text)) return;
     setBridgeBusy(true);
     setBridgeMessage("");
@@ -133,9 +129,9 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       const body = await res.json();
       if (!res.ok || body?.ok === false) throw new Error(body?.message || body?.detail || `HTTP ${res.status}`);
       setBridge(body.bridge || bridge);
-      setBridgeMessage(body.message || "Vault reserve updated.");
+      setBridgeMessage(body.message || "Crypto engine reserve updated.");
     } catch (e: any) {
-      setBridgeMessage(e?.message || "Vault reserve update failed.");
+      setBridgeMessage(e?.message || "Crypto engine reserve update failed.");
     } finally {
       setBridgeBusy(false);
     }
@@ -188,7 +184,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.54 · UK TAX TRACKER</div>
+          <div className="eyebrow">V18.2.55 · PIGGY BANK + ACCOUNT TAX CENTRE</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -199,25 +195,10 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
     {entriesPaused && <div className="crypto-notice">New crypto entries are paused with the main bot. Existing bot-managed crypto positions keep stop-loss and trailing protection active.</div>}
 
     <section className="crypto-summary-grid">
-      <div className="crypto-summary-card"><div className="crypto-summary-icon vault">▣</div><div><span>Vault Available</span><strong>{gbp(bridge?.vaultAvailableGbp)}</strong><small>Protected capital</small></div></div>
+      <div className="crypto-summary-card"><div className="crypto-summary-icon vault">▣</div><div><span>Piggy Bank</span><strong>{gbp(bridge?.piggyBankGbp ?? bridge?.vaultAvailableGbp)}</strong><small>Banked · never reused</small></div></div>
       <div className="crypto-summary-card"><div className="crypto-summary-icon allocation">●</div><div><span>Crypto Allocation</span><strong>{gbp(bridge?.cryptoAllocatedGbp)}</strong><small>Live pilot cap</small></div></div>
       <div className="crypto-summary-card"><div className="crypto-summary-icon pnl">↗</div><div><span>Crypto P&amp;L</span><strong className={Number(bridge?.cryptoRealisedPnlGbp || 0) >= 0 ? "gain" : "loss"}>{gbp(bridge?.cryptoRealisedPnlGbp)}</strong><small>Realised live pilot</small></div></div>
-      <div className="crypto-summary-card"><div className="crypto-summary-icon returned">↻</div><div><span>Profit Returned</span><strong>{gbp(bridge?.cryptoLifetimeProfitBankedGbp)}</strong><small>Swept back to Vault</small></div></div>
-    </section>
-
-    <section className="crypto-panel crypto-tax-panel">
-      <div className="crypto-panel-head">
-        <div><h3><span className="panel-icon">£</span> UK Tax Tracker</h3><p>Planning estimate for live-pilot crypto disposals in the {tax?.taxYear || "current"} UK tax year. Uses your ~£30,069 annual gross employment estimate.</p></div>
-        <span className="crypto-chip live">HMRC ESTIMATE</span>
-      </div>
-      <div className="crypto-tax-grid">
-        <div><span>Net tracked gain</span><strong className={Number(tax?.netTrackedGainGbp || 0) >= 0 ? "gain" : "loss"}>{gbp(tax?.netTrackedGainGbp)}</strong><small>{Number(tax?.trackedDisposals || 0)} disposals recorded</small></div>
-        <div><span>CGT allowance</span><strong>{gbp(tax?.annualExemptAmountGbp || 3000)}</strong><small>Current annual exemption</small></div>
-        <div><span>Estimated taxable gain</span><strong>{gbp(tax?.estimatedTaxableGainGbp)}</strong><small>After tracked losses + allowance</small></div>
-        <div className="tax-reserve"><span>Estimated tax reserve</span><strong>{gbp(tax?.estimatedCgtGbp)}</strong><small>Keep this amount aside</small></div>
-      </div>
-      <div className="crypto-tax-detail">Employment estimate {gbp(tax?.annualGrossPayEstimateGbp || 30069)}/yr · estimated basic-band room {gbp(tax?.basicRateBandRoomGbp)} · gains charged at {Number(tax?.basicCgtRatePct || 18).toFixed(0)}% then {Number(tax?.higherCgtRatePct || 24).toFixed(0)}% when applicable.</div>
-      <div className="crypto-tax-warning">Estimate only — V18.2.54 records future bot disposals in GBP. Earlier crypto activity is not silently reconstructed, and final HMRC figures can differ because of same-day, 30-day and pooled-cost rules, other gains/losses and personal circumstances.</div>
+      <div className="crypto-summary-card"><div className="crypto-summary-icon returned">↻</div><div><span>Crypto Profit Banked</span><strong>{gbp(bridge?.cryptoLifetimeProfitBankedGbp)}</strong><small>Added to Piggy Bank</small></div></div>
     </section>
 
     <section className="crypto-panel crypto-record-panel">
@@ -291,7 +272,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       </div>
 
       <div className="crypto-bridge-grid">
-        <div className="bridge-metric"><span className="crypto-summary-icon vault">▣</span><div><small>Vault Available</small><strong>{gbp(bridge?.vaultAvailableGbp)}</strong></div></div>
+        <div className="bridge-metric"><span className="crypto-summary-icon vault">▣</span><div><small>Piggy Bank</small><strong>{gbp(bridge?.piggyBankGbp ?? bridge?.vaultAvailableGbp)}</strong></div></div>
         <div className="bridge-metric"><span className="crypto-summary-icon allocation">●</span><div><small>Crypto Allocation</small><strong>{gbp(bridge?.cryptoAllocatedGbp)}</strong></div></div>
         <div className="bridge-metric"><span className="crypto-summary-icon pnl">◇</span><div><small>Protected Pool</small><strong>{gbp(bridge?.cryptoPoolGbp)}</strong></div></div>
         <div className="bridge-metric"><span className="crypto-summary-icon returned">◎</span><div><small>Status</small><strong className={armed ? "gain" : ""}>{armed ? "● Armed" : "Off"}</strong></div></div>
@@ -301,8 +282,8 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
               <button type="button" onClick={() => setReleaseAmount("0")} disabled={bridgeBusy || Boolean(bridge?.allocationLockedByPosition)}>USE ALL</button>
               {[25,50,100].filter(v => v <= Number(bridge?.cryptoPoolGbp || 0)).map(v => <button key={v} type="button" onClick={() => setReleaseAmount(String(v))} disabled={bridgeBusy || Boolean(bridge?.allocationLockedByPosition)}>KEEP £{v}</button>)}
             </div>
-            <div className="bridge-release-controls"><input aria-label="Amount to keep protected in the Vault in pounds" type="number" min="0" max={Number(bridge?.cryptoPoolGbp || 0)} step="1" value={releaseAmount} onChange={e => setReleaseAmount(e.target.value)} /><button onClick={setVaultReserve} disabled={bridgeBusy || !bridge || bridge.locked || Boolean(bridge?.allocationLockedByPosition)}>{bridgeBusy ? "UPDATING…" : Number(releaseAmount || 0) === 0 ? "USE FULL VAULT" : `KEEP ${gbp(releaseAmount)}`}</button></div>
-            <small>{bridge?.allocationLockedByPosition ? "Close the open crypto position before changing the Vault reserve." : `Keeping ${gbp(bridge?.vaultReserveGbp)} in Vault · Crypto can use ${gbp(bridge?.cryptoAllocatedGbp)} of ${gbp(bridge?.cryptoPoolGbp)}`}</small>
+            <div className="bridge-release-controls"><input aria-label="Crypto engine reserve in pounds" type="number" min="0" max={Number(bridge?.cryptoPoolGbp || 0)} step="1" value={releaseAmount} onChange={e => setReleaseAmount(e.target.value)} /><button onClick={setVaultReserve} disabled={bridgeBusy || !bridge || bridge.locked || Boolean(bridge?.allocationLockedByPosition)}>{bridgeBusy ? "UPDATING…" : Number(releaseAmount || 0) === 0 ? "USE FULL ENGINE" : `KEEP ${gbp(releaseAmount)}`}</button></div>
+            <small>{bridge?.allocationLockedByPosition ? "Close the open crypto position before changing the engine reserve." : `${gbp(bridge?.vaultReserveGbp)} engine reserve · Crypto can use ${gbp(bridge?.cryptoAllocatedGbp)} of ${gbp(bridge?.cryptoEngineCapitalGbp ?? bridge?.cryptoPoolGbp)} · Piggy Bank never used`}</small>
           </div>
         </div>
       </div>

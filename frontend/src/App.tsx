@@ -71,7 +71,7 @@ export default function App() {
   const totalDeposited = Number(bot.reports?.totalDeposited || 0);
   const totalGainLoss = Number(bot.reports?.totalGainLoss || 0);
   const profitVault = bot.banking?.profitVault || bot.data?.banking?.profitVault || {};
-  const bankedProfitGbp = Number(profitVault?.bankedProfitGbp || 0);
+  const bankedProfitGbp = Number(profitVault?.piggyBankGbp ?? profitVault?.bankedProfitGbp ?? 0);
   const accountEquityGbp = Number(bot.data?.account?.equity || 0) * bot.rate;
   const tradingCapitalGbp = Math.max(0, Number(profitVault?.accountEquityGbp || accountEquityGbp) - bankedProfitGbp);
   const maxPositions = Number(bot.data?.maxPositions || bot.positionSettings?.maxPositions || 0);
@@ -85,10 +85,10 @@ export default function App() {
 
         {tab !== "crypto" && <section className="stats command-stats">
           <Stat label="Equity" value={gbp(accountEquityGbp)} sub={usd(bot.data?.account?.equity)} />
-          <Stat label="Trading Capital" value={gbp(tradingCapitalGbp)} sub="Invested + free cash · vault excluded" />
+          <Stat label="Trading Capital" value={gbp(tradingCapitalGbp)} sub="Invested + free cash · Piggy Bank excluded" />
           <Stat label="Today P&L" value={gbp(Number(bot.data?.account?.pnlDay || 0) * bot.rate)} sub="Since midnight" className={tone(bot.data?.account?.pnlDay)} />
           <Stat label="Total Gain/Loss" value={gbp(totalGainLoss)} sub={`Deposited ${gbp(totalDeposited)}`} className={tone(totalGainLoss)} />
-          <Stat label="Profit Vault" value={gbp(bankedProfitGbp)} sub="Protected realised profit" className={bankedProfitGbp > 0 ? "gain" : ""} />
+          <Stat label="Piggy Bank" value={gbp(bankedProfitGbp)} sub="Banked profit · never reused" className={bankedProfitGbp > 0 ? "gain" : ""} />
           <Stat label="Positions" value={`${bot.positions.length} / ${maxPositions || "—"}`} sub="Open / Max" />
         </section>}
 

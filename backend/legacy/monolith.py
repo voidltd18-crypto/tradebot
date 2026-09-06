@@ -1977,6 +1977,12 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     trade_events.append(event)
     add_trade_history_event(event)
     update_stock_memory_from_sell(symbol, pnl, pnl_pct)
+    try:
+        if "_v18255_record_tax_disposal" in globals():
+            fx_rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
+            _v18255_record_tax_disposal("STOCK", symbol, rounded_qty, max(0.0, price * rounded_qty), pnl, fx_rate, reason)
+    except Exception as tax_exc:
+        print(f"V18.2.55 STOCK TAX LEDGER ERROR | symbol={symbol} error={tax_exc}", flush=True)
     if pnl > 0 and "profit_vault_bank_realised_profit" in globals():
         try:
             profit_vault_bank_realised_profit(pnl, symbol=symbol, reason=reason)
@@ -6277,6 +6283,24 @@ def _init_db_impl():
         )
     """)
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18254_crypto_tax_time ON v18254_crypto_tax_disposals(timestamp)""")
+
+    # V18.2.55 — account-wide UK tax planning ledger. Records future realised
+    # disposals from both the stock engine and the live crypto engine.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v18255_account_tax_disposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            asset_type TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            qty REAL NOT NULL DEFAULT 0,
+            proceeds_usd REAL NOT NULL DEFAULT 0,
+            pnl_usd REAL NOT NULL DEFAULT 0,
+            fx_usd_to_gbp REAL NOT NULL DEFAULT 0,
+            gain_gbp REAL NOT NULL DEFAULT 0,
+            reason TEXT
+        )
+    """)
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18255_account_tax_time ON v18255_account_tax_disposals(timestamp)""")
 
 
     cur.execute("""
@@ -11365,39 +11389,40 @@ _crypto_live_runtime: Dict[str, Any] = {"lastError": None, "lastActionAt": None}
 
 
 def _v18241_crypto_pool_gbp(state: Dict[str, Any]) -> float:
-    """Total protected GBP assigned to the Vault/crypto pool.
+    """Dedicated crypto-engine capital ceiling.
 
-    Moving money between bankedProfitGbp and cryptoAllocatedGbp must not change
-    the amount protected from the stock engine.
+    V18.2.55 deliberately excludes bankedProfitGbp (the Piggy Bank). The Piggy
+    Bank is a one-way profit sink and is never available to stocks or crypto.
     """
-    return max(0.0, float(state.get("bankedProfitGbp") or 0.0)) + max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
+    allocated = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
+    ceiling = max(0.0, float(state.get("cryptoEngineCapitalCeilingGbp") or 0.0))
+    if ceiling <= 0.0 and allocated > 0.0:
+        ceiling = allocated
+    return max(allocated, ceiling)
 
 
 def _v18241_apply_vault_reserve(state: Dict[str, Any], *, save: bool = False) -> Dict[str, Any]:
-    """Keep only the operator-selected reserve in Vault and expose the rest to crypto.
+    """V18.2.55 compatibility wrapper for the crypto engine reserve.
 
-    Default reserve is £0, which means the crypto engine can use the entire
-    protected pool. A positive reserve reduces crypto allocation without
-    releasing that money back to the stock engine.
+    The historic function name is retained so old callers keep working, but it
+    no longer moves Piggy Bank money into crypto. Allocation can only move
+    inside the dedicated crypto-engine capital ceiling.
     """
-    pool = _v18241_crypto_pool_gbp(state)
+    pool = min(_v18241_crypto_pool_gbp(state), V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
     reserve = max(0.0, float(state.get("cryptoVaultReserveGbp") or 0.0))
     reserve = min(reserve, pool)
     usable = max(0.0, pool - reserve)
-    usable = min(usable, V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
-    # If an optional hard ceiling is hit, the excess remains protected in Vault.
-    actual_reserve = max(reserve, pool - usable)
-    new_reserve = round(actual_reserve, 4)
+    new_reserve = round(reserve, 4)
     new_alloc = round(usable, 4)
     changed = (
         abs(float(state.get("cryptoVaultReserveGbp") or 0.0) - new_reserve) > 0.0001
-        or abs(float(state.get("bankedProfitGbp") or 0.0) - new_reserve) > 0.0001
         or abs(float(state.get("cryptoAllocatedGbp") or 0.0) - new_alloc) > 0.0001
+        or abs(float(state.get("cryptoEngineCapitalCeilingGbp") or 0.0) - pool) > 0.0001
         or bool(state.get("cryptoLivePilotEnabled")) != (new_alloc > 0)
     )
     state["cryptoVaultReserveGbp"] = new_reserve
-    state["bankedProfitGbp"] = new_reserve
     state["cryptoAllocatedGbp"] = new_alloc
+    state["cryptoEngineCapitalCeilingGbp"] = round(pool, 4)
     state["cryptoLivePilotEnabled"] = new_alloc > 0
     if save and changed:
         save_profit_vault_state(state)
@@ -11687,7 +11712,7 @@ def _v18234_live_sell(position: Dict[str, Any], price: float, score: float, reas
             _v18234_log_live_trade(symbol, "SELL", order, fill_qty or qty, fill_price, notional, pnl_usd, pnl_pct, score, reason)
             state = load_profit_vault_state(); rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
             pnl_gbp = pnl_usd * rate
-            _v18254_record_tax_disposal(symbol, fill_qty or qty, notional, pnl_usd, rate, reason)
+            _v18255_record_tax_disposal("CRYPTO", symbol, fill_qty or qty, notional, pnl_usd, rate, reason)
             # V18.2.51: losing symbols get a longer lockout; positive exits retain the normal cooldown.
             _v18247_set_crypto_cooldown(symbol, reason=reason, minutes=(V18250_CRYPTO_LOSS_COOLDOWN_MINUTES if pnl_gbp < 0 else V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES))
             state = _v18250_refresh_crypto_risk_state(state, float(state.get("cryptoAllocatedGbp") or 0.0), save=False)
@@ -11703,16 +11728,17 @@ def _v18234_live_sell(position: Dict[str, Any], price: float, score: float, reas
                 state["cryptoConsecutiveLosses"] = 0
                 state["cryptoLossBrakeUntil"] = None
             state["cryptoRealisedPnlGbp"] = round(float(state.get("cryptoRealisedPnlGbp") or 0.0) + pnl_gbp, 4)
-            # Profits are swept back into the protected Vault; losses reduce the pilot allocation.
+            # V18.2.55: positive realised profit goes one-way into the Piggy Bank.
+            # It is never recycled into either crypto or stocks. Losses reduce the
+            # dedicated crypto engine capital so the engine cannot silently refill itself.
             if pnl_gbp > 0:
                 state["bankedProfitGbp"] = round(float(state.get("bankedProfitGbp") or 0.0) + pnl_gbp, 4)
                 state["lifetimeBankedGbp"] = round(float(state.get("lifetimeBankedGbp") or 0.0) + pnl_gbp, 4)
                 state["cryptoLifetimeProfitBankedGbp"] = round(float(state.get("cryptoLifetimeProfitBankedGbp") or 0.0) + pnl_gbp, 4)
             elif pnl_gbp < 0:
                 state["cryptoAllocatedGbp"] = round(max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0) + pnl_gbp), 4)
+                state["cryptoEngineCapitalCeilingGbp"] = round(max(0.0, float(state.get("cryptoEngineCapitalCeilingGbp") or state.get("cryptoAllocatedGbp") or 0.0) + pnl_gbp), 4)
             state["lastCryptoLiveExitAt"] = datetime.now(UTC).isoformat(); state["lastCryptoLivePnlGbp"] = round(pnl_gbp, 4)
-            # V18.2.41: honour the chosen Vault reserve. With reserve £0,
-            # realised crypto profit immediately grows the next crypto allocation.
             state = _v18241_apply_vault_reserve(state, save=False)
             save_profit_vault_state(state)
             _crypto_live_runtime.update({"lastError": None, "lastActionAt": datetime.now(UTC).isoformat()})
@@ -11870,32 +11896,48 @@ def _v18254_tax_year_bounds(now: Optional[datetime] = None) -> Tuple[datetime, d
     end = datetime(year + 1, 4, 6, tzinfo=UTC)
     return start, end, f"{year}/{str(year + 1)[-2:]}"
 
-def _v18254_record_tax_disposal(symbol: str, qty: float, proceeds_usd: float, pnl_usd: float, fx_rate: float, reason: str) -> None:
+def _v18255_record_tax_disposal(asset_type: str, symbol: str, qty: float, proceeds_usd: float, pnl_usd: float, fx_rate: float, reason: str) -> None:
     try:
         conn = db_connect()
-        conn.execute("""INSERT INTO v18254_crypto_tax_disposals
-            (timestamp,symbol,qty,proceeds_usd,pnl_usd,fx_usd_to_gbp,gain_gbp,reason) VALUES (?,?,?,?,?,?,?,?)""",
-            (datetime.now(UTC).isoformat(), symbol, float(qty or 0), float(proceeds_usd or 0), float(pnl_usd or 0),
-             float(fx_rate or 0), float(pnl_usd or 0) * float(fx_rate or 0), reason))
+        conn.execute("""INSERT INTO v18255_account_tax_disposals
+            (timestamp,asset_type,symbol,qty,proceeds_usd,pnl_usd,fx_usd_to_gbp,gain_gbp,reason) VALUES (?,?,?,?,?,?,?,?,?)""",
+            (datetime.now(UTC).isoformat(), str(asset_type or "OTHER").upper(), symbol, float(qty or 0),
+             float(proceeds_usd or 0), float(pnl_usd or 0), float(fx_rate or 0),
+             float(pnl_usd or 0) * float(fx_rate or 0), reason))
         conn.commit(); conn.close()
     except Exception as exc:
-        print(f"V18.2.54 TAX LEDGER ERROR | {str(exc)[:300]}", flush=True)
+        print(f"V18.2.55 ACCOUNT TAX LEDGER ERROR | {str(exc)[:300]}", flush=True)
 
-def _v18254_tax_payload() -> Dict[str, Any]:
+def _v18255_tax_centre_payload() -> Dict[str, Any]:
     start, end, label = _v18254_tax_year_bounds()
-    rows = []
+    rows: List[Dict[str, Any]] = []
     try:
         conn = db_connect()
-        raw = conn.execute("""SELECT timestamp,symbol,qty,proceeds_usd,pnl_usd,fx_usd_to_gbp,gain_gbp,reason
-                              FROM v18254_crypto_tax_disposals
-                              WHERE timestamp >= ? AND timestamp < ? ORDER BY id ASC""",
-                           (start.isoformat(), end.isoformat())).fetchall()
+        current = conn.execute("""SELECT timestamp,asset_type,symbol,qty,proceeds_usd,pnl_usd,fx_usd_to_gbp,gain_gbp,reason
+                                  FROM v18255_account_tax_disposals
+                                  WHERE timestamp >= ? AND timestamp < ? ORDER BY id ASC""",
+                               (start.isoformat(), end.isoformat())).fetchall()
+        rows.extend(dict(r) for r in current)
+        # Preserve any crypto disposals captured if V18.2.54 was deployed before this upgrade.
+        legacy = conn.execute("""SELECT timestamp,'CRYPTO' AS asset_type,symbol,qty,proceeds_usd,pnl_usd,fx_usd_to_gbp,gain_gbp,reason
+                                 FROM v18254_crypto_tax_disposals
+                                 WHERE timestamp >= ? AND timestamp < ? ORDER BY id ASC""",
+                              (start.isoformat(), end.isoformat())).fetchall()
+        rows.extend(dict(r) for r in legacy)
         conn.close()
-        rows = [dict(r) for r in raw]
     except Exception:
+        try: conn.close()
+        except Exception: pass
         rows = []
-    gains = sum(max(0.0, float(r.get("gain_gbp") or 0)) for r in rows)
-    losses = sum(min(0.0, float(r.get("gain_gbp") or 0)) for r in rows)
+
+    def gain(row: Dict[str, Any]) -> float:
+        return float(row.get("gain_gbp") or 0.0)
+    stock_rows = [r for r in rows if str(r.get("asset_type") or "").upper() == "STOCK"]
+    crypto_rows = [r for r in rows if str(r.get("asset_type") or "").upper() == "CRYPTO"]
+    stock_net = sum(gain(r) for r in stock_rows)
+    crypto_net = sum(gain(r) for r in crypto_rows)
+    gains = sum(max(0.0, gain(r)) for r in rows)
+    losses = sum(min(0.0, gain(r)) for r in rows)
     net = gains + losses
     taxable_gain = max(0.0, net - V18254_UK_CGT_ALLOWANCE_GBP)
     estimated_taxable_employment = max(0.0, V18254_UK_ANNUAL_GROSS_PAY_GBP - V18254_UK_PERSONAL_ALLOWANCE_GBP)
@@ -11904,27 +11946,37 @@ def _v18254_tax_payload() -> Dict[str, Any]:
     at_higher = max(0.0, taxable_gain - at_basic)
     estimated_cgt = at_basic * V18254_UK_CGT_BASIC_RATE + at_higher * V18254_UK_CGT_HIGHER_RATE
     state = load_profit_vault_state()
-    total_live_realised = float(state.get("cryptoRealisedPnlGbp") or 0.0)
+    piggy = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
     return {
-        "ok": True, "version": "V18.2.54", "taxYear": label,
+        "ok": True, "version": "V18.2.55", "taxYear": label,
         "taxYearStart": start.date().isoformat(), "taxYearEndExclusive": end.date().isoformat(),
-        "trackedDisposals": len(rows), "grossGainsGbp": round(gains, 2), "lossesGbp": round(losses, 2),
-        "netTrackedGainGbp": round(net, 2), "annualExemptAmountGbp": round(V18254_UK_CGT_ALLOWANCE_GBP, 2),
+        "trackedDisposals": len(rows), "stockDisposals": len(stock_rows), "cryptoDisposals": len(crypto_rows),
+        "stockNetGainGbp": round(stock_net, 2), "cryptoNetGainGbp": round(crypto_net, 2),
+        "grossGainsGbp": round(gains, 2), "lossesGbp": round(losses, 2), "netTrackedGainGbp": round(net, 2),
+        "annualExemptAmountGbp": round(V18254_UK_CGT_ALLOWANCE_GBP, 2),
         "estimatedTaxableGainGbp": round(taxable_gain, 2), "estimatedCgtGbp": round(estimated_cgt, 2),
+        "suggestedHmrcReserveGbp": round(estimated_cgt, 2),
         "basicRateGainGbp": round(at_basic, 2), "higherRateGainGbp": round(at_higher, 2),
         "basicCgtRatePct": V18254_UK_CGT_BASIC_RATE * 100, "higherCgtRatePct": V18254_UK_CGT_HIGHER_RATE * 100,
         "annualGrossPayEstimateGbp": round(V18254_UK_ANNUAL_GROSS_PAY_GBP, 2),
         "estimatedTaxableEmploymentIncomeGbp": round(estimated_taxable_employment, 2),
         "basicRateBandRoomGbp": round(basic_band_room, 2),
-        "livePilotLifetimeRealisedPnlGbp": round(total_live_realised, 2),
-        "trackingStartedWithV18254": True,
-        "warning": "Planning estimate only. HMRC crypto calculations can differ because of same-day, 30-day and pooled-cost rules, other income/gains/losses and personal circumstances."
+        "piggyBankGbp": round(piggy, 2),
+        "trackingStartedWithV18255ForStocks": True,
+        "legacyCryptoRowsIncluded": True,
+        "warning": "Planning estimate only. Final UK CGT can differ because of share pooling, same-day/30-day matching, other gains/losses, income and personal circumstances."
     }
 
+@app.get('/v18/tax-centre')
+def api_v18255_tax_centre(request: Request):
+    verify_api_key(request)
+    return _v18255_tax_centre_payload()
+
+# Backward-compatible crypto-tax URL now returns the account-wide centre too.
 @app.get('/v18/crypto-tax')
 def api_v18254_crypto_tax(request: Request):
     verify_api_key(request)
-    return _v18254_tax_payload()
+    return _v18255_tax_centre_payload()
 
 def _v18252_record_crypto_movement() -> None:
     """Persist one live crypto movement snapshot. Failure must never block trading."""
@@ -11995,12 +12047,12 @@ def v18242_crypto_live_worker() -> None:
                 next_normal_decision_at = now_mono + V18248_CRYPTO_DECISION_INTERVAL_SECONDS
                 _crypto_live_runtime["lastNormalDecisionAt"] = datetime.now(UTC).isoformat()
                 _crypto_live_runtime["nextNormalDecisionInSeconds"] = V18248_CRYPTO_DECISION_INTERVAL_SECONDS
-                print(f"V18.2.54 CRYPTO NORMAL DECISION | cadence={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m positions={result.get('positions')} paused={result.get('entriesPaused')}", flush=True)
+                print(f"V18.2.55 CRYPTO NORMAL DECISION | cadence={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m positions={result.get('positions')} paused={result.get('entriesPaused')}", flush=True)
             else:
                 _crypto_live_runtime["nextNormalDecisionInSeconds"] = max(0, int(next_normal_decision_at - now_mono))
         except Exception as exc:
             _crypto_live_runtime["lastError"] = str(exc)[:500]
-            print(f"V18.2.54 CRYPTO LIVE WORKER ERROR | {str(exc)[:500]}", flush=True)
+            print(f"V18.2.55 CRYPTO LIVE WORKER ERROR | {str(exc)[:500]}", flush=True)
         time.sleep(V18242_CRYPTO_LIVE_INTERVAL_SECONDS)
 
 
@@ -12061,15 +12113,16 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     vault = profit_vault_payload(); account = _v18234_crypto_account_status()
     crypto = v18232_crypto_shadow_payload()
     allocated = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
-    vault_available = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
+    piggy_bank = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
     reserve = max(0.0, float(state.get("cryptoVaultReserveGbp") or 0.0))
-    pool = allocated + vault_available
+    pool = _v18241_crypto_pool_gbp(state)
     usable_max = min(pool, V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
     live_positions = _v18234_raw_crypto_positions()
     active_cooldowns = _v18247_prune_crypto_cooldowns(state, save=True)
     return {
-        "ok": True, "version": "V18.2.53", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.55", "manualOnly": False, "automaticRelease": False,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
+        "profitIsolationEnabled": True,
         "allocationLockedByPosition": bool(live_positions),
         "liveExecutionInstalled": True,
         "liveExecutorIntervalSeconds": V18242_CRYPTO_LIVE_INTERVAL_SECONDS,
@@ -12095,8 +12148,10 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "newEntriesPaused": (not bool(bot_enabled)) or bool(manual_override) or bool(emergency_stop),
         "pauseReason": ("BOT_PAUSED" if not bool(bot_enabled) else "MANUAL_OVERRIDE" if bool(manual_override) else "EMERGENCY_STOP" if bool(emergency_stop) else None),
         "protectiveExitsActiveWhilePaused": True,
-        "accountCrypto": account, "vaultAvailableGbp": round(vault_available,2),
+        "accountCrypto": account, "vaultAvailableGbp": round(piggy_bank,2),
+        "piggyBankGbp": round(piggy_bank,2),
         "vaultReserveGbp": round(reserve,2), "cryptoPoolGbp": round(pool,2),
+        "cryptoEngineCapitalGbp": round(pool,2),
         "cryptoAllocatedGbp": round(allocated,2), "pilotMaxGbp": round(usable_max,2),
         "hardSafetyMaxGbp": round(V18234_CRYPTO_LIVE_PILOT_MAX_GBP,2),
         "allocationAvailableGbp": round(usable_max,2),
@@ -12112,23 +12167,12 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
 
 
 def v18234_release_vault_to_crypto(amount_gbp: float, confirmation: str) -> Dict[str, Any]:
-    try: amount = round(float(amount_gbp), 2)
-    except Exception: amount = 0.0
-    if confirmation.strip().upper() != "UNLOCK CRYPTO": return {"ok": False, "message": "Confirmation must be UNLOCK CRYPTO."}
-    account = _v18234_crypto_account_status()
-    if not account.get("active"): return {"ok": False, "message": account.get("message"), "accountCrypto": account}
-    if amount <= 0: return {"ok": False, "message": "Release amount must be greater than £0."}
-    state = load_profit_vault_state(); available = max(0.0, float(state.get("bankedProfitGbp") or 0.0)); allocated = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
-    remaining = max(0.0, V18234_CRYPTO_LIVE_PILOT_MAX_GBP - allocated)
-    if amount > remaining: return {"ok": False, "message": f"Live pilot is capped at £{V18234_CRYPTO_LIVE_PILOT_MAX_GBP:.2f}; remaining capacity is £{remaining:.2f}."}
-    if amount > available: return {"ok": False, "message": f"Vault only has £{available:.2f} available."}
-    state["bankedProfitGbp"] = round(available-amount,4); state["cryptoAllocatedGbp"] = round(allocated+amount,4)
-    state["lifetimeCryptoReleasedGbp"] = round(float(state.get("lifetimeCryptoReleasedGbp") or 0.0)+amount,4)
-    state["lastCryptoReleaseAt"] = datetime.now(UTC).isoformat(); state["lastCryptoReleaseGbp"] = amount
-    state["cryptoLivePilotEnabled"] = True; state["cryptoLivePilotActivatedAt"] = datetime.now(UTC).isoformat()
-    save_profit_vault_state(state)
-    print(f"V18.2.34 VAULT TO CRYPTO LIVE | released=£{amount:.2f} pilot_cap=£{V18234_CRYPTO_LIVE_PILOT_MAX_GBP:.2f} manual=True", flush=True)
-    return {"ok": True, "message": f"£{amount:.2f} released and the live crypto pilot is ARMED.", "bridge": v18234_crypto_bridge_payload()}
+    """V18.2.55: Piggy Bank is a one-way sink and can never fund trading."""
+    return {
+        "ok": False,
+        "message": "Piggy Bank money is permanently excluded from trading. Crypto can only use its dedicated engine capital.",
+        "bridge": v18234_crypto_bridge_payload(),
+    }
 
 
 def v18240_set_crypto_allocation(target_gbp: float, confirmation: str) -> Dict[str, Any]:
@@ -12156,7 +12200,7 @@ def v18240_set_crypto_allocation(target_gbp: float, confirmation: str) -> Dict[s
     pool = _v18241_crypto_pool_gbp(state)
     max_target = min(pool, V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
     if target > max_target + 0.001:
-        return {"ok": False, "message": f"Protected Vault/crypto pool has £{max_target:.2f} available."}
+        return {"ok": False, "message": f"Crypto engine has £{max_target:.2f} dedicated capital available."}
 
     current = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
     state["cryptoVaultReserveGbp"] = round(max(0.0, pool - target), 4)
@@ -12165,9 +12209,9 @@ def v18240_set_crypto_allocation(target_gbp: float, confirmation: str) -> Dict[s
     save_profit_vault_state(state)
 
     print(f"V18.2.41 CRYPTO ALLOCATION SET | target=£{target:.2f} previous=£{current:.2f} reserve=£{float(state.get('cryptoVaultReserveGbp') or 0):.2f} pool=£{pool:.2f}", flush=True)
-    message = f"Crypto trading allocation set to £{target:.2f}; £{float(state.get('cryptoVaultReserveGbp') or 0):.2f} kept in Vault."
+    message = f"Crypto trading allocation set to £{target:.2f}; £{float(state.get('cryptoVaultReserveGbp') or 0):.2f} kept as crypto engine reserve."
     if target <= 0:
-        message = f"Crypto allocation set to £0.00; the full £{pool:.2f} pool is kept in Vault."
+        message = f"Crypto allocation set to £0.00; the full £{pool:.2f} pool is kept as crypto engine reserve."
     return {"ok": True, "message": message, "bridge": v18234_crypto_bridge_payload()}
 
 
@@ -14164,6 +14208,9 @@ def _profit_vault_default_state() -> Dict[str, Any]:
         # V18.2.33 — Vault → Crypto Bridge. This is a separate reserve bucket:
         # it remains excluded from stock buying power after the user releases it.
         "cryptoAllocatedGbp": 0.0,
+        # V18.2.55: dedicated crypto-engine capital ceiling. Piggy Bank money
+        # is never included in this ceiling and can never be released back to trading.
+        "cryptoEngineCapitalCeilingGbp": 0.0,
         "lifetimeCryptoReleasedGbp": 0.0,
         "lastCryptoReleaseAt": "",
         "lastCryptoReleaseGbp": 0.0,
@@ -14190,6 +14237,10 @@ def load_profit_vault_state() -> Dict[str, Any]:
                 default["bankedProfitGbp"] = max(0.0, float(default.get("bankedProfitGbp") or 0.0))
                 default["lifetimeBankedGbp"] = max(default["bankedProfitGbp"], float(default.get("lifetimeBankedGbp") or 0.0))
                 default["cryptoAllocatedGbp"] = max(0.0, float(default.get("cryptoAllocatedGbp") or 0.0))
+                ceiling = max(0.0, float(default.get("cryptoEngineCapitalCeilingGbp") or 0.0))
+                if ceiling <= 0.0 and default["cryptoAllocatedGbp"] > 0.0:
+                    ceiling = default["cryptoAllocatedGbp"]
+                default["cryptoEngineCapitalCeilingGbp"] = max(default["cryptoAllocatedGbp"], ceiling)
                 default["lifetimeCryptoReleasedGbp"] = max(default["cryptoAllocatedGbp"], float(default.get("lifetimeCryptoReleasedGbp") or 0.0))
                 return default
         except Exception as exc:
@@ -14215,6 +14266,10 @@ def save_profit_vault_state(state: Dict[str, Any]) -> Dict[str, Any]:
         data["bankedProfitGbp"] = round(max(0.0, float(data.get("bankedProfitGbp") or 0.0)), 4)
         data["lifetimeBankedGbp"] = round(max(data["bankedProfitGbp"], float(data.get("lifetimeBankedGbp") or 0.0)), 4)
         data["cryptoAllocatedGbp"] = round(max(0.0, float(data.get("cryptoAllocatedGbp") or 0.0)), 4)
+        ceiling = max(0.0, float(data.get("cryptoEngineCapitalCeilingGbp") or 0.0))
+        if ceiling <= 0.0 and data["cryptoAllocatedGbp"] > 0.0:
+            ceiling = data["cryptoAllocatedGbp"]
+        data["cryptoEngineCapitalCeilingGbp"] = round(max(data["cryptoAllocatedGbp"], ceiling), 4)
         data["lifetimeCryptoReleasedGbp"] = round(max(data["cryptoAllocatedGbp"], float(data.get("lifetimeCryptoReleasedGbp") or 0.0)), 4)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
@@ -14298,25 +14353,12 @@ def capital_milestone_status(state: Optional[Dict[str, Any]] = None, account: An
     return {"version":"V18.2.19","baselineGbp":round(baseline,2),"nextBaselineGbp":round(next_baseline,2),"cushionRequiredGbp":CAPITAL_MILESTONE_CUSHION_GBP,"equityGbp":round(equity_gbp,2),"bankedProfitGbp":round(banked,2),"stabilityCount":stability,"stabilityRequired":CAPITAL_MILESTONE_STABILITY_REQUIRED,"governanceReady":governance_ok,"equityReady":equity_ok,"reserveReady":reserve_ok,"eligible":eligible}
 
 def capital_milestone_try_promote(state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    state = state or load_profit_vault_state()
-    status = capital_milestone_status(state)
-    if not status.get("eligible"):
-        return state
-    try:
-        if len(get_all_positions()) > 0:
-            return state
-    except Exception:
-        return state
-    old = float(status["baselineGbp"]); new = float(status["nextBaselineGbp"]); delta = new-old
-    state["baselineGbp"] = round(new,2)
-    state["bankedProfitGbp"] = round(max(0.0, float(state.get("bankedProfitGbp") or 0.0)-delta),4)
-    state["lastCapitalPromotionAt"] = datetime.now(UTC).isoformat()
-    state["lastCapitalPromotionFromGbp"] = round(old,2)
-    state["lastCapitalPromotionToGbp"] = round(new,2)
-    state["capitalPromotionCount"] = int(state.get("capitalPromotionCount") or 0)+1
-    state = save_profit_vault_state(state)
-    print(f"V18.2.19 CAPITAL MILESTONE PROMOTED | £{old:.2f} -> £{new:.2f} released=£{delta:.2f} vault=£{float(state.get('bankedProfitGbp') or 0):.2f}", flush=True)
-    return state
+    """V18.2.55: Piggy Bank money is never released back into trading.
+
+    Retained as a compatibility no-op for any older caller.
+    """
+    return state or load_profit_vault_state()
+
 
 def profit_vault_reserved_usd() -> float:
     state = load_profit_vault_state()
@@ -14363,18 +14405,12 @@ def profit_vault_bank_realised_profit(pnl_usd: float, symbol: str = "", reason: 
     state["lastBankedReason"] = str(reason or "")
     state["lastBankedAmountGbp"] = bank_amount
     state = save_profit_vault_state(state)
-    state = capital_milestone_try_promote(state)
-    # V18.2.41: when Crypto Lab is configured to use the full Vault, newly
-    # banked profits automatically become available to the crypto allocation.
-    try:
-        if "_v18241_apply_vault_reserve" in globals():
-            state = _v18241_apply_vault_reserve(state, save=True)
-    except Exception:
-        pass
+    # V18.2.55: the Piggy Bank is terminal. No capital milestone or crypto
+    # bridge is allowed to release banked profit back into a trading engine.
     print(
-        f"V17.6 PROFIT VAULT BANK | symbol={str(symbol or '').upper()} "
+        f"V18.2.55 PIGGY BANK | symbol={str(symbol or '').upper()} "
         f"realised_pnl=£{pnl_gbp:.2f} banked=£{bank_amount:.2f} "
-        f"vault=£{float(state.get('bankedProfitGbp') or 0.0):.2f}"
+        f"piggy=£{float(state.get('bankedProfitGbp') or 0.0):.2f}"
     )
     return state
 
@@ -14402,6 +14438,7 @@ def profit_vault_payload(account: Any = None) -> Dict[str, Any]:
         "baselineGbp": round(float(state.get("baselineGbp") or PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2),
         "bankPct": round(float(state.get("bankPct") or 0.0), 4),
         "bankedProfitGbp": round(banked_gbp, 2),
+        "piggyBankGbp": round(banked_gbp, 2),
         "bankedProfitUsd": round(banked_gbp / max(float(rate), 0.0001), 2),
         "cryptoAllocatedGbp": round(crypto_allocated_gbp, 2),
         "cryptoAllocatedUsd": round(crypto_allocated_gbp / max(float(rate), 0.0001), 2),
@@ -14428,7 +14465,7 @@ def profit_vault_payload(account: Any = None) -> Dict[str, Any]:
         "baselineSeedAmountGbp": round(float(state.get("baselineSeedAmountGbp") or 0.0), 2),
         "growthSinceBaselineGbp": round(equity_gbp - float(state.get("baselineGbp") or PROFIT_VAULT_DEFAULT_BASELINE_GBP), 2),
         "capitalMilestone": capital_milestone_status(state, account),
-        "message": "100% of positive realised PnL is reserved and excluded from future buys." if float(state.get("bankPct") or 0.0) >= 0.999 else "A configured share of positive realised PnL is reserved from future buys.",
+        "message": "100% of positive realised PnL is banked in the Piggy Bank and permanently excluded from future buys." if float(state.get("bankPct") or 0.0) >= 0.999 else "A configured share of positive realised PnL is banked in the Piggy Bank and permanently excluded from future buys.",
     }
 
 # ============================================================

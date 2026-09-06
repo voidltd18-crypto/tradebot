@@ -873,7 +873,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="Account & Runtime">
         <div className="intelligence-stat-grid full-bot-stat-grid">
           <StatTile label="Equity" value={reportGbp(account.equity)} sub={`$${num(account.equity).toFixed(2)}`} />
-          <StatTile label="Trading Capital" value={directGbp(fullBotTradingCapitalGbp)} sub="Invested + free cash · vault excluded" />
+          <StatTile label="Trading Capital" value={directGbp(fullBotTradingCapitalGbp)} sub="Invested + free cash · Piggy Bank excluded" />
           <StatTile label="Today" value={reportGbp(account.pnlDay ?? account.dayPnl)} sub={`$${num(account.pnlDay ?? account.dayPnl).toFixed(2)}`} tone={num(account.pnlDay ?? account.dayPnl) >= 0 ? "positive" : "negative"} />
           <StatTile label="Total Gain/Loss" value={reportGbp(reportSummary.totalGainLoss ?? reportSummary.totalPnl ?? reportSummary.netPnl)} tone={num(reportSummary.totalGainLoss ?? reportSummary.totalPnl ?? reportSummary.netPnl) >= 0 ? "positive" : "negative"} />
         </div>
@@ -886,14 +886,14 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <div><span>Report generated</span><b>{new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>
         </div>
       </Card>
-      <Card title="Profit Vault">
+      <Card title="Piggy Bank">
         <div className="summary">
           <div><span>Status</span><b>{fullBotVault.enabled === false ? "OFF" : "ACTIVE"}</b></div>
           <div><span>Protected baseline</span><b>{directGbp(fullBotVault.baselineGbp)}</b></div>
           <div><span>Trading capital</span><b>{directGbp(fullBotTradingCapitalGbp)}</b></div>
           <div><span>Invested capital</span><b>{directGbp(fullBotInvestedCapitalGbp)}</b></div>
           <div><span>Free cash</span><b>{directGbp(fullBotFreeCashGbp)}</b></div>
-          <div><span>Banked profit</span><b>{directGbp(fullBotVault.bankedProfitGbp)}</b></div>
+          <div><span>Piggy Bank</span><b>{directGbp(fullBotVault.bankedProfitGbp)}</b></div>
           <div><span>Lifetime banked</span><b>{directGbp(fullBotVault.lifetimeBankedGbp)}</b></div>
           <div><span>Last banked symbol</span><b>{text(fullBotVault.lastBankedSymbol, "—")}</b></div>
         </div>
@@ -1076,7 +1076,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
       <Card title="Profit Protection & Capture">
         <div className="summary">
-          <div><span>Banked profit</span><b>{directGbp(observatoryData.profitProtection?.bankedProfitGbp)}</b></div>
+          <div><span>Piggy Bank</span><b>{directGbp(observatoryData.profitProtection?.bankedProfitGbp)}</b></div>
           <div><span>Lifetime banked</span><b>{directGbp(observatoryData.profitProtection?.lifetimeBankedGbp)}</b></div>
           <div><span>Trading capital</span><b>{directGbp(observatoryTradingCapitalGbp)}</b></div>
           <div><span>Invested capital</span><b>{directGbp(observatoryInvestedCapitalGbp)}</b></div>
