@@ -12047,12 +12047,12 @@ def v18242_crypto_live_worker() -> None:
                 next_normal_decision_at = now_mono + V18248_CRYPTO_DECISION_INTERVAL_SECONDS
                 _crypto_live_runtime["lastNormalDecisionAt"] = datetime.now(UTC).isoformat()
                 _crypto_live_runtime["nextNormalDecisionInSeconds"] = V18248_CRYPTO_DECISION_INTERVAL_SECONDS
-                print(f"V18.2.55 CRYPTO NORMAL DECISION | cadence={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m positions={result.get('positions')} paused={result.get('entriesPaused')}", flush=True)
+                print(f"V18.2.56 CRYPTO NORMAL DECISION | cadence={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m positions={result.get('positions')} paused={result.get('entriesPaused')}", flush=True)
             else:
                 _crypto_live_runtime["nextNormalDecisionInSeconds"] = max(0, int(next_normal_decision_at - now_mono))
         except Exception as exc:
             _crypto_live_runtime["lastError"] = str(exc)[:500]
-            print(f"V18.2.55 CRYPTO LIVE WORKER ERROR | {str(exc)[:500]}", flush=True)
+            print(f"V18.2.56 CRYPTO LIVE WORKER ERROR | {str(exc)[:500]}", flush=True)
         time.sleep(V18242_CRYPTO_LIVE_INTERVAL_SECONDS)
 
 
@@ -12120,7 +12120,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     live_positions = _v18234_raw_crypto_positions()
     active_cooldowns = _v18247_prune_crypto_cooldowns(state, save=True)
     return {
-        "ok": True, "version": "V18.2.55", "manualOnly": False, "automaticRelease": False,
+        "ok": True, "version": "V18.2.56", "manualOnly": False, "automaticRelease": False,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "profitIsolationEnabled": True,
         "allocationLockedByPosition": bool(live_positions),
@@ -12128,6 +12128,8 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "liveExecutorIntervalSeconds": V18242_CRYPTO_LIVE_INTERVAL_SECONDS,
         "safetyCheckIntervalSeconds": V18242_CRYPTO_LIVE_INTERVAL_SECONDS,
         "normalDecisionIntervalSeconds": V18248_CRYPTO_DECISION_INTERVAL_SECONDS,
+        "nextNormalDecisionInSeconds": max(0, int(_crypto_live_runtime.get("nextNormalDecisionInSeconds") or 0)),
+        "lastNormalDecisionAt": _crypto_live_runtime.get("lastNormalDecisionAt"),
         "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
         "liveMaxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS,
         "reentryCooldownMinutes": V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES,

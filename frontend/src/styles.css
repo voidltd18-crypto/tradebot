@@ -465,3 +465,9 @@
 
 /* V18.2.54 UK Tax Tracker */
 .crypto-tax-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-top:12px}.crypto-tax-grid>div{padding:14px;border:1px solid #203754;border-radius:14px;background:rgba(5,16,31,.58)}.crypto-tax-grid span,.crypto-tax-grid strong,.crypto-tax-grid small{display:block}.crypto-tax-grid span{color:#8ea5bf;font-size:11px}.crypto-tax-grid strong{font-size:21px;margin:5px 0}.crypto-tax-grid small{color:#6f88a5;font-size:10px}.crypto-tax-grid .tax-reserve{border-color:rgba(53,217,170,.35)}.crypto-tax-detail{margin-top:10px;padding:10px 12px;border-radius:11px;background:rgba(19,41,66,.45);color:#9bb0c8;font-size:11px}.crypto-tax-warning{margin-top:8px;color:#d2b978;font-size:10px;line-height:1.45}.phone-layout .crypto-tax-grid{grid-template-columns:1fr 1fr!important;gap:6px!important}.phone-layout .crypto-tax-grid>div{padding:9px!important}.phone-layout .crypto-tax-grid strong{font-size:15px!important}.phone-layout .crypto-tax-detail,.phone-layout .crypto-tax-warning{font-size:9px!important}
+
+/* V18.2.56 live crypto decision/cooldown visibility */
+.crypto-chip.crypto-countdown-chip{background:rgba(37,99,235,.24);color:#8bc1ff;border:1px solid rgba(59,130,246,.25)}
+.crypto-chip.held{background:rgba(14,116,144,.28);color:#67e8f9}.crypto-chip.cooldown{background:rgba(180,83,9,.25);color:#fbbf24}
+.crypto-scanner-table .held-row{background:rgba(14,116,144,.07)}.crypto-scanner-table .cooldown-row{background:rgba(180,83,9,.05)}
+.held-row .score-track>span{background:linear-gradient(90deg,#0891b2,#22d3ee)}.cooldown-row .score-track>span{background:linear-gradient(90deg,#b45309,#f59e0b)}

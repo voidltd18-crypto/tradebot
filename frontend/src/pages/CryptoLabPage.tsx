@@ -68,6 +68,12 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [sellBusySymbol, setSellBusySymbol] = useState("");
   const [sellMessage, setSellMessage] = useState("");
   const [history, setHistory] = useState<AnyObj[]>([]);
+  const [clockTick, setClockTick] = useState(0);
+
+  useEffect(() => {
+    const id = window.setInterval(() => setClockTick(v => v + 1), 1000);
+    return () => window.clearInterval(id);
+  }, []);
 
   useEffect(() => {
     const currentReserve = Number(bridge?.vaultReserveGbp || 0);
@@ -89,7 +95,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
         const historyBody = await historyRes.json();
         if (alive) {
           setData(body);
-          setBridge(bridgeRes.ok ? bridgeBody : null);
+          setBridge(bridgeRes.ok ? { ...bridgeBody, __fetchedAt: Date.now() } : null);
           if (historyRes.ok && Array.isArray(historyBody?.points)) setHistory(historyBody.points);
           setError("");
         }
@@ -128,7 +134,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       });
       const body = await res.json();
       if (!res.ok || body?.ok === false) throw new Error(body?.message || body?.detail || `HTTP ${res.status}`);
-      setBridge(body.bridge || bridge);
+      setBridge(body.bridge ? { ...body.bridge, __fetchedAt: Date.now() } : bridge);
       setBridgeMessage(body.message || "Crypto engine reserve updated.");
     } catch (e: any) {
       setBridgeMessage(e?.message || "Crypto engine reserve update failed.");
@@ -154,7 +160,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       });
       const body = await res.json();
       if (!res.ok || body?.ok === false) throw new Error(body?.message || body?.detail || `HTTP ${res.status}`);
-      if (body?.bridge) setBridge(body.bridge);
+      if (body?.bridge) setBridge({ ...body.bridge, __fetchedAt: Date.now() });
       setSellMessage(body?.message || `Manual sell submitted for ${symbol}.`);
     } catch (e: any) {
       setSellMessage(e?.message || `Manual sell failed for ${symbol}.`);
@@ -178,13 +184,32 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const armed = Boolean(bridge?.livePilotEnabled);
   const accountActive = Boolean(bridge?.accountCrypto?.active);
   const entriesPaused = Boolean(bridge?.newEntriesPaused);
+  const bridgeFetchedAt = Number(bridge?.__fetchedAt || 0);
+  const elapsedSinceBridge = bridgeFetchedAt ? Math.max(0, Math.floor((Date.now() - bridgeFetchedAt) / 1000)) : 0;
+  const nextDecisionSeconds = Math.max(0, Number(bridge?.nextNormalDecisionInSeconds || 0) - elapsedSinceBridge);
+  const fmtCountdown = (seconds: number) => {
+    const total = Math.max(0, Math.floor(seconds));
+    const mm = Math.floor(total / 60);
+    const ss = total % 60;
+    return `${mm}:${String(ss).padStart(2, "0")}`;
+  };
+  void clockTick;
+  const liveKeys = new Set(livePositions.map((p: AnyObj) => String(p?.symbol || "").replace("/", "").toUpperCase()));
+  const cooldowns = bridge?.activeReentryCooldowns && typeof bridge.activeReentryCooldowns === "object" ? bridge.activeReentryCooldowns : {};
+  const cooldownRemaining = (symbol: unknown) => {
+    const key = String(symbol || "").replace("/", "").toUpperCase();
+    const raw = cooldowns?.[key];
+    if (!raw) return 0;
+    const until = new Date(String(raw)).getTime();
+    return Number.isFinite(until) ? Math.max(0, Math.floor((until - Date.now()) / 1000)) : 0;
+  };
 
   return <div className="crypto-lab-page">
     <section className="crypto-hero">
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.55 · PIGGY BANK + ACCOUNT TAX CENTRE</div>
+          <div className="eyebrow">V18.2.56 · LIVE CRYPTO COUNTDOWNS</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -236,16 +261,26 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
           <h3><span className="panel-icon">◈</span> Crypto Scanner</h3>
           <p>Automatically discovers Alpaca's active USD crypto market and uses an adaptive liquidity floor when a fixed threshold would reject the whole market. Trades only when score ≥ {entryScore.toFixed(2)}.</p>
         </div>
-        <div className="scanner-state"><span className="crypto-chip">{Number(data?.marketDiscovery?.discovered || scans.length)} discovered</span><span className="crypto-chip">{Number(data?.marketDiscovery?.eligible || scans.filter((s: AnyObj) => s.liquid !== false).length)} liquid</span><span className="crypto-chip">{scans.filter((s: AnyObj) => Boolean(s.qualified)).length} qualified</span><span className="crypto-chip">{String(data?.marketDiscovery?.liquidityMode || "fixed").toUpperCase()} ≥ {money(data?.marketDiscovery?.effectiveLiquidity60mUsd || data?.config?.minLiquidity60mUsd || 0)}</span><span className="scanning-dot">●</span><span>Dynamic</span></div>
+        <div className="scanner-state"><span className="crypto-chip">{Number(data?.marketDiscovery?.discovered || scans.length)} discovered</span><span className="crypto-chip">{Number(data?.marketDiscovery?.eligible || scans.filter((s: AnyObj) => s.liquid !== false).length)} liquid</span><span className="crypto-chip">{scans.filter((s: AnyObj) => Boolean(s.qualified)).length} qualified</span><span className="crypto-chip crypto-countdown-chip">NEXT DECISION {fmtCountdown(nextDecisionSeconds)}</span><span className="crypto-chip">{String(data?.marketDiscovery?.liquidityMode || "fixed").toUpperCase()} ≥ {money(data?.marketDiscovery?.effectiveLiquidity60mUsd || data?.config?.minLiquidity60mUsd || 0)}</span><span className="scanning-dot">●</span><span>Dynamic</span></div>
       </div>
       <div className="crypto-table-wrap">
         <table className="crypto-scanner-table">
           <thead><tr><th>Symbol</th><th>Price</th><th>Score</th><th>15m</th><th>60m</th><th>60m Range</th><th>Liquidity</th><th>Status</th></tr></thead>
           <tbody>{scans.map((s: AnyObj) => {
             const score = Number(s.score || 0);
-            const state = s.liquid === false ? { label: "THIN", cls: "watching" } : scoreState(score, entryScore);
+            const key = String(s.symbol || "").replace("/", "").toUpperCase();
+            const held = liveKeys.has(key);
+            const cooldownSecs = cooldownRemaining(s.symbol);
+            const marketState = s.liquid === false ? { label: "THIN", cls: "watching" } : scoreState(score, entryScore);
+            const state = held
+              ? { label: "HELD · EXIT ARMED", cls: "held" }
+              : cooldownSecs > 0
+                ? { label: `COOLDOWN ${fmtCountdown(cooldownSecs)}`, cls: "cooldown" }
+                : Boolean(s.qualified)
+                  ? { label: nextDecisionSeconds > 0 ? `QUALIFIED · ${fmtCountdown(nextDecisionSeconds)}` : "QUALIFIED · DUE", cls: "qualified" }
+                  : marketState;
             const progress = Math.max(4, Math.min(100, (score / entryScore) * 100));
-            return <tr key={s.symbol} className={s.qualified ? "qualified-row" : ""}>
+            return <tr key={s.symbol} className={held ? "held-row" : cooldownSecs > 0 ? "cooldown-row" : s.qualified ? "qualified-row" : ""}>
               <td><div className="crypto-symbol"><span className="coin-icon small">{coinGlyph(s.symbol)}</span><strong>{s.symbol}</strong></div></td>
               <td>{money(s.price)}</td>
               <td><span className={`score-badge ${state.cls}`}>{score.toFixed(3)}</span></td>
@@ -293,7 +328,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
     <section className="crypto-footer-strip">
       <span><b>Shadow:</b> {Number(bridge?.shadowEvidence?.closedTests || data.closedTrades || 0)} tests · {money(bridge?.shadowEvidence?.totalPnlUsd ?? data.totalPnlUsd)} · win {pct(bridge?.shadowEvidence?.winRate ?? data.winRate)}</span>
       <span><b>Safety:</b> Stop {pct(data.config?.stopPct)} · Trail {pct(data.config?.trailStartPct)} / {pct(data.config?.trailGivebackPct)}</span>
-      <span><b>Cadence:</b> {Math.round(Number(bridge?.normalDecisionIntervalSeconds || 900) / 60)} min decisions · {Number(bridge?.safetyCheckIntervalSeconds || 15)}s safety</span>
+      <span><b>Next live decision:</b> {fmtCountdown(nextDecisionSeconds)} · safety still checks every {Number(bridge?.safetyCheckIntervalSeconds || 15)}s</span>
       <span><b>Re-entry:</b> {Number(bridge?.reentryCooldownMinutes || 30)} min after wins · {Number(bridge?.lossCooldownMinutes || 120)} min after losses</span>
       <span><b>Loss brake:</b> {Number(bridge?.consecutiveCryptoLosses || 0)}/{Number(bridge?.lossBrakeStreak || 2)} consecutive · daily {gbp(bridge?.dailyCryptoPnlGbp)} / -{gbp(bridge?.dailyLossLimitGbp)}</span>
       <span><b>Stock engine:</b> £900 baseline and MARA rules untouched</span>
