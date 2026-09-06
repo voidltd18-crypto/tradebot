@@ -10982,8 +10982,8 @@ V18232_CRYPTO_EXIT_SCORE = max(0.0, min(V18232_CRYPTO_ENTRY_SCORE, float(os.gete
 V18242_CRYPTO_LIVE_INTERVAL_SECONDS = max(5, int(os.getenv("TRADEBOT_CRYPTO_LIVE_INTERVAL_SECONDS", "15") or 15))
 # V18.2.48 — separate fast safety monitoring from normal trading cadence.
 # Protective stop/trail checks still run every 15 seconds, while new entries and
-# normal momentum-exit decisions are evaluated no more than once every 15 minutes.
-V18248_CRYPTO_DECISION_INTERVAL_SECONDS = max(60, int(os.getenv("TRADEBOT_CRYPTO_DECISION_INTERVAL_SECONDS", "900") or 900))
+# normal entry/momentum-exit decisions are evaluated no more than once every 5 minutes.
+V18248_CRYPTO_DECISION_INTERVAL_SECONDS = max(60, int(os.getenv("TRADEBOT_CRYPTO_DECISION_INTERVAL_SECONDS", "300") or 300))
 
 _crypto_shadow_lock = threading.RLock()
 _crypto_shadow_last_scans: List[Dict[str, Any]] = []
@@ -12026,7 +12026,7 @@ def api_v18252_crypto_history(request: Request, limit: int = 5000):
 
 def v18242_crypto_live_worker() -> None:
     # V18.2.48: fast loop is safety-only most of the time. Normal entries and
-    # momentum exits are allowed once per 15-minute decision window. This keeps
+    # momentum exits are allowed once per 5-minute decision window. This keeps
     # stop/trail protection responsive without churning trades every few seconds.
     time.sleep(8)
     next_normal_decision_at = 0.0

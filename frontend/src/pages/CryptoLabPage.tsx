@@ -209,7 +209,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.56 · LIVE CRYPTO COUNTDOWNS</div>
+          <div className="eyebrow">V18.2.57 · CLEAN PIGGY BANK UI</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -223,7 +223,6 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-summary-card"><div className="crypto-summary-icon vault">▣</div><div><span>Piggy Bank</span><strong>{gbp(bridge?.piggyBankGbp ?? bridge?.vaultAvailableGbp)}</strong><small>Banked · never reused</small></div></div>
       <div className="crypto-summary-card"><div className="crypto-summary-icon allocation">●</div><div><span>Crypto Allocation</span><strong>{gbp(bridge?.cryptoAllocatedGbp)}</strong><small>Live pilot cap</small></div></div>
       <div className="crypto-summary-card"><div className="crypto-summary-icon pnl">↗</div><div><span>Crypto P&amp;L</span><strong className={Number(bridge?.cryptoRealisedPnlGbp || 0) >= 0 ? "gain" : "loss"}>{gbp(bridge?.cryptoRealisedPnlGbp)}</strong><small>Realised live pilot</small></div></div>
-      <div className="crypto-summary-card"><div className="crypto-summary-icon returned">↻</div><div><span>Crypto Profit Banked</span><strong>{gbp(bridge?.cryptoLifetimeProfitBankedGbp)}</strong><small>Added to Piggy Bank</small></div></div>
     </section>
 
     <section className="crypto-panel crypto-record-panel">
@@ -301,7 +300,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-panel-head">
         <div>
           <h3><span className="panel-icon">⌒</span> Crypto Bridge</h3>
-          <p>Crypto uses the full protected pool by default. Safety exits are checked every 15 seconds; normal buys and momentum decisions run every 15 minutes.</p>
+          <p>Crypto uses the full protected pool by default. Safety exits are checked every 15 seconds; normal buys and momentum decisions run every 5 minutes.</p>
         </div>
         <span className={`crypto-chip ${armed ? "live" : accountActive ? "building" : ""}`}>{armed ? "LIVE PILOT ARMED" : accountActive ? "READY TO ARM" : "CRYPTO NOT ACTIVE"}</span>
       </div>
