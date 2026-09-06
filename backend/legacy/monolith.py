@@ -6260,6 +6260,24 @@ def _init_db_impl():
     """)
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18252_crypto_equity_time ON v18252_crypto_equity_history(timestamp)""")
 
+    # V18.2.54 — UK crypto tax planning ledger. This records the GBP gain/loss
+    # produced by each future live-pilot disposal. It is an estimate dashboard,
+    # not a substitute for HMRC share-pooling/same-day/30-day calculations.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v18254_crypto_tax_disposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            qty REAL NOT NULL DEFAULT 0,
+            proceeds_usd REAL NOT NULL DEFAULT 0,
+            pnl_usd REAL NOT NULL DEFAULT 0,
+            fx_usd_to_gbp REAL NOT NULL DEFAULT 0,
+            gain_gbp REAL NOT NULL DEFAULT 0,
+            reason TEXT
+        )
+    """)
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18254_crypto_tax_time ON v18254_crypto_tax_disposals(timestamp)""")
+
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS weekly_universe (
@@ -11669,6 +11687,7 @@ def _v18234_live_sell(position: Dict[str, Any], price: float, score: float, reas
             _v18234_log_live_trade(symbol, "SELL", order, fill_qty or qty, fill_price, notional, pnl_usd, pnl_pct, score, reason)
             state = load_profit_vault_state(); rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
             pnl_gbp = pnl_usd * rate
+            _v18254_record_tax_disposal(symbol, fill_qty or qty, notional, pnl_usd, rate, reason)
             # V18.2.51: losing symbols get a longer lockout; positive exits retain the normal cooldown.
             _v18247_set_crypto_cooldown(symbol, reason=reason, minutes=(V18250_CRYPTO_LOSS_COOLDOWN_MINUTES if pnl_gbp < 0 else V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES))
             state = _v18250_refresh_crypto_risk_state(state, float(state.get("cryptoAllocatedGbp") or 0.0), save=False)
@@ -11837,6 +11856,76 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
     finally:
         _crypto_live_cycle_guard.release()
 
+V18254_UK_ANNUAL_GROSS_PAY_GBP = float(os.getenv("V18254_UK_ANNUAL_GROSS_PAY_GBP", "30069"))
+V18254_UK_PERSONAL_ALLOWANCE_GBP = float(os.getenv("V18254_UK_PERSONAL_ALLOWANCE_GBP", "12570"))
+V18254_UK_BASIC_RATE_BAND_GBP = float(os.getenv("V18254_UK_BASIC_RATE_BAND_GBP", "37700"))
+V18254_UK_CGT_ALLOWANCE_GBP = float(os.getenv("V18254_UK_CGT_ALLOWANCE_GBP", "3000"))
+V18254_UK_CGT_BASIC_RATE = float(os.getenv("V18254_UK_CGT_BASIC_RATE", "0.18"))
+V18254_UK_CGT_HIGHER_RATE = float(os.getenv("V18254_UK_CGT_HIGHER_RATE", "0.24"))
+
+def _v18254_tax_year_bounds(now: Optional[datetime] = None) -> Tuple[datetime, datetime, str]:
+    now = now or datetime.now(UTC)
+    year = now.year if (now.month, now.day) >= (4, 6) else now.year - 1
+    start = datetime(year, 4, 6, tzinfo=UTC)
+    end = datetime(year + 1, 4, 6, tzinfo=UTC)
+    return start, end, f"{year}/{str(year + 1)[-2:]}"
+
+def _v18254_record_tax_disposal(symbol: str, qty: float, proceeds_usd: float, pnl_usd: float, fx_rate: float, reason: str) -> None:
+    try:
+        conn = db_connect()
+        conn.execute("""INSERT INTO v18254_crypto_tax_disposals
+            (timestamp,symbol,qty,proceeds_usd,pnl_usd,fx_usd_to_gbp,gain_gbp,reason) VALUES (?,?,?,?,?,?,?,?)""",
+            (datetime.now(UTC).isoformat(), symbol, float(qty or 0), float(proceeds_usd or 0), float(pnl_usd or 0),
+             float(fx_rate or 0), float(pnl_usd or 0) * float(fx_rate or 0), reason))
+        conn.commit(); conn.close()
+    except Exception as exc:
+        print(f"V18.2.54 TAX LEDGER ERROR | {str(exc)[:300]}", flush=True)
+
+def _v18254_tax_payload() -> Dict[str, Any]:
+    start, end, label = _v18254_tax_year_bounds()
+    rows = []
+    try:
+        conn = db_connect()
+        raw = conn.execute("""SELECT timestamp,symbol,qty,proceeds_usd,pnl_usd,fx_usd_to_gbp,gain_gbp,reason
+                              FROM v18254_crypto_tax_disposals
+                              WHERE timestamp >= ? AND timestamp < ? ORDER BY id ASC""",
+                           (start.isoformat(), end.isoformat())).fetchall()
+        conn.close()
+        rows = [dict(r) for r in raw]
+    except Exception:
+        rows = []
+    gains = sum(max(0.0, float(r.get("gain_gbp") or 0)) for r in rows)
+    losses = sum(min(0.0, float(r.get("gain_gbp") or 0)) for r in rows)
+    net = gains + losses
+    taxable_gain = max(0.0, net - V18254_UK_CGT_ALLOWANCE_GBP)
+    estimated_taxable_employment = max(0.0, V18254_UK_ANNUAL_GROSS_PAY_GBP - V18254_UK_PERSONAL_ALLOWANCE_GBP)
+    basic_band_room = max(0.0, V18254_UK_BASIC_RATE_BAND_GBP - estimated_taxable_employment)
+    at_basic = min(taxable_gain, basic_band_room)
+    at_higher = max(0.0, taxable_gain - at_basic)
+    estimated_cgt = at_basic * V18254_UK_CGT_BASIC_RATE + at_higher * V18254_UK_CGT_HIGHER_RATE
+    state = load_profit_vault_state()
+    total_live_realised = float(state.get("cryptoRealisedPnlGbp") or 0.0)
+    return {
+        "ok": True, "version": "V18.2.54", "taxYear": label,
+        "taxYearStart": start.date().isoformat(), "taxYearEndExclusive": end.date().isoformat(),
+        "trackedDisposals": len(rows), "grossGainsGbp": round(gains, 2), "lossesGbp": round(losses, 2),
+        "netTrackedGainGbp": round(net, 2), "annualExemptAmountGbp": round(V18254_UK_CGT_ALLOWANCE_GBP, 2),
+        "estimatedTaxableGainGbp": round(taxable_gain, 2), "estimatedCgtGbp": round(estimated_cgt, 2),
+        "basicRateGainGbp": round(at_basic, 2), "higherRateGainGbp": round(at_higher, 2),
+        "basicCgtRatePct": V18254_UK_CGT_BASIC_RATE * 100, "higherCgtRatePct": V18254_UK_CGT_HIGHER_RATE * 100,
+        "annualGrossPayEstimateGbp": round(V18254_UK_ANNUAL_GROSS_PAY_GBP, 2),
+        "estimatedTaxableEmploymentIncomeGbp": round(estimated_taxable_employment, 2),
+        "basicRateBandRoomGbp": round(basic_band_room, 2),
+        "livePilotLifetimeRealisedPnlGbp": round(total_live_realised, 2),
+        "trackingStartedWithV18254": True,
+        "warning": "Planning estimate only. HMRC crypto calculations can differ because of same-day, 30-day and pooled-cost rules, other income/gains/losses and personal circumstances."
+    }
+
+@app.get('/v18/crypto-tax')
+def api_v18254_crypto_tax(request: Request):
+    verify_api_key(request)
+    return _v18254_tax_payload()
+
 def _v18252_record_crypto_movement() -> None:
     """Persist one live crypto movement snapshot. Failure must never block trading."""
     try:
@@ -11906,12 +11995,12 @@ def v18242_crypto_live_worker() -> None:
                 next_normal_decision_at = now_mono + V18248_CRYPTO_DECISION_INTERVAL_SECONDS
                 _crypto_live_runtime["lastNormalDecisionAt"] = datetime.now(UTC).isoformat()
                 _crypto_live_runtime["nextNormalDecisionInSeconds"] = V18248_CRYPTO_DECISION_INTERVAL_SECONDS
-                print(f"V18.2.52 CRYPTO NORMAL DECISION | cadence={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m positions={result.get('positions')} paused={result.get('entriesPaused')}", flush=True)
+                print(f"V18.2.54 CRYPTO NORMAL DECISION | cadence={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m positions={result.get('positions')} paused={result.get('entriesPaused')}", flush=True)
             else:
                 _crypto_live_runtime["nextNormalDecisionInSeconds"] = max(0, int(next_normal_decision_at - now_mono))
         except Exception as exc:
             _crypto_live_runtime["lastError"] = str(exc)[:500]
-            print(f"V18.2.52 CRYPTO LIVE WORKER ERROR | {str(exc)[:500]}", flush=True)
+            print(f"V18.2.54 CRYPTO LIVE WORKER ERROR | {str(exc)[:500]}", flush=True)
         time.sleep(V18242_CRYPTO_LIVE_INTERVAL_SECONDS)
 
 
