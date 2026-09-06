@@ -10970,8 +10970,8 @@ V18232_CRYPTO_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_E
 # must retain non-negative 60m momentum.
 V18250_CRYPTO_MIN_15M_MOMENTUM_PCT = float(os.getenv("TRADEBOT_CRYPTO_MIN_15M_MOMENTUM_PCT", "-0.10") or -0.10)
 V18250_CRYPTO_MIN_60M_MOMENTUM_PCT = float(os.getenv("TRADEBOT_CRYPTO_MIN_60M_MOMENTUM_PCT", "0.00") or 0.00)
-V18250_CRYPTO_LOSS_COOLDOWN_MINUTES = max(30, int(os.getenv("TRADEBOT_CRYPTO_LOSS_COOLDOWN_MINUTES", "120") or 120))
-V18250_CRYPTO_LOSS_BRAKE_MINUTES = max(15, int(os.getenv("TRADEBOT_CRYPTO_LOSS_BRAKE_MINUTES", "60") or 60))
+V18250_CRYPTO_LOSS_COOLDOWN_MINUTES = max(30, int(os.getenv("TRADEBOT_CRYPTO_LOSS_COOLDOWN_MINUTES", "30") or 30))
+V18250_CRYPTO_LOSS_BRAKE_MINUTES = max(15, int(os.getenv("TRADEBOT_CRYPTO_LOSS_BRAKE_MINUTES", "15") or 15))
 V18250_CRYPTO_LOSS_BRAKE_STREAK = max(2, int(os.getenv("TRADEBOT_CRYPTO_LOSS_BRAKE_STREAK", "2") or 2))
 V18250_CRYPTO_DAILY_LOSS_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_DAILY_LOSS_PCT", "2.0") or 2.0))
 V18250_CRYPTO_DAILY_LOSS_MIN_GBP = max(1.0, float(os.getenv("TRADEBOT_CRYPTO_DAILY_LOSS_MIN_GBP", "5.0") or 5.0))
@@ -12049,12 +12049,12 @@ def v18242_crypto_live_worker() -> None:
                 _crypto_live_runtime["lastNormalDecisionAt"] = datetime.now(UTC).isoformat()
                 _crypto_live_runtime["normalDecisionCycleCount"] = int(_crypto_live_runtime.get("normalDecisionCycleCount") or 0) + 1
                 _crypto_live_runtime["nextNormalDecisionInSeconds"] = V18248_CRYPTO_DECISION_INTERVAL_SECONDS
-                print(f"V18.2.59 CRYPTO NORMAL DECISION | cycle={_crypto_live_runtime['normalDecisionCycleCount']} cadence={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m positions={result.get('positions')} paused={result.get('entriesPaused')}", flush=True)
+                print(f"V18.2.60 CRYPTO NORMAL DECISION | cycle={_crypto_live_runtime['normalDecisionCycleCount']} cadence={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m positions={result.get('positions')} paused={result.get('entriesPaused')}", flush=True)
             else:
                 _crypto_live_runtime["nextNormalDecisionInSeconds"] = max(0, int(next_normal_decision_at - now_mono))
         except Exception as exc:
             _crypto_live_runtime["lastError"] = str(exc)[:500]
-            print(f"V18.2.59 CRYPTO LIVE WORKER ERROR | {str(exc)[:500]}", flush=True)
+            print(f"V18.2.60 CRYPTO LIVE WORKER ERROR | {str(exc)[:500]}", flush=True)
         time.sleep(V18242_CRYPTO_LIVE_INTERVAL_SECONDS)
 
 
@@ -12122,7 +12122,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     live_positions = _v18234_raw_crypto_positions()
     active_cooldowns = _v18247_prune_crypto_cooldowns(state, save=True)
     return {
-        "ok": True, "version": "V18.2.59", "manualOnly": False, "automaticRelease": False,
+        "ok": True, "version": "V18.2.60", "manualOnly": False, "automaticRelease": False,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "profitIsolationEnabled": True,
         "allocationLockedByPosition": bool(live_positions),
