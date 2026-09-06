@@ -26,6 +26,38 @@ function scoreState(score: number, threshold: number) {
   return { label: "WATCHING", cls: "watching" };
 }
 
+function CryptoRecordTracker({ points }: { points: AnyObj[] }) {
+  const rows = Array.isArray(points) ? points : [];
+  if (!rows.length) return <div className="crypto-chart-empty">Recording starts with V18.2.52. The first movement point will appear after the live worker runs.</div>;
+  const values = rows.map(r => Number(r.totalPnlGbp || 0));
+  let min = Math.min(...values, 0), max = Math.max(...values, 0);
+  if (Math.abs(max - min) < 0.01) { max += 0.5; min -= 0.5; }
+  const width = 1000, height = 280, padX = 18, padY = 18;
+  const x = (i: number) => padX + (rows.length <= 1 ? 0 : i * (width - padX * 2) / (rows.length - 1));
+  const y = (v: number) => padY + (max - v) * (height - padY * 2) / (max - min);
+  const path = rows.map((r, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(Number(r.totalPnlGbp || 0)).toFixed(1)}`).join(" ");
+  const zeroY = y(0);
+  const latest = rows[rows.length - 1];
+  const first = rows[0];
+  const fmtTime = (v: unknown) => { try { return new Date(String(v)).toLocaleString("en-GB", { day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit" }); } catch { return ""; } };
+  return <>
+    <div className="crypto-chart-stats">
+      <span><small>Current movement</small><strong className={Number(latest.totalPnlGbp || 0) >= 0 ? "gain" : "loss"}>{gbp(latest.totalPnlGbp)}</strong></span>
+      <span><small>High</small><strong className="gain">{gbp(max)}</strong></span>
+      <span><small>Low</small><strong className={min < 0 ? "loss" : ""}>{gbp(min)}</strong></span>
+      <span><small>Points recorded</small><strong>{rows.length.toLocaleString("en-GB")}</strong></span>
+    </div>
+    <div className="crypto-record-chart" title={`Latest ${gbp(latest.totalPnlGbp)} · ${fmtTime(latest.timestamp)}`}>
+      <svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label="Crypto profit and loss movement history">
+        <line className="crypto-chart-zero" x1={padX} y1={zeroY} x2={width-padX} y2={zeroY}/>
+        <path className="crypto-chart-line" d={path}/>
+      </svg>
+    </div>
+    <div className="crypto-chart-axis"><span>{fmtTime(first.timestamp)}</span><span>{fmtTime(latest.timestamp)}</span></div>
+    <div className="crypto-chart-legend"><span>● Total crypto P&amp;L movement (realised + live unrealised)</span><span>Snapshots every 15 seconds · persistent across refresh/restart</span></div>
+  </>;
+}
+
 export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [data, setData] = useState<AnyObj | null>(null);
   const [error, setError] = useState("");
@@ -35,6 +67,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [bridgeBusy, setBridgeBusy] = useState(false);
   const [sellBusySymbol, setSellBusySymbol] = useState("");
   const [sellMessage, setSellMessage] = useState("");
+  const [history, setHistory] = useState<AnyObj[]>([]);
 
   useEffect(() => {
     const currentReserve = Number(bridge?.vaultReserveGbp || 0);
@@ -52,9 +85,12 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
         if (!res.ok) throw new Error(body?.detail || body?.message || `HTTP ${res.status}`);
         const bridgeRes = await fetch(`${API_URL}/v18/crypto-bridge`, { headers: { "X-API-Key": authToken } });
         const bridgeBody = await bridgeRes.json();
+        const historyRes = await fetch(`${API_URL}/v18/crypto-history?limit=5000`, { headers: { "X-API-Key": authToken } });
+        const historyBody = await historyRes.json();
         if (alive) {
           setData(body);
           setBridge(bridgeRes.ok ? bridgeBody : null);
+          if (historyRes.ok && Array.isArray(historyBody?.points)) setHistory(historyBody.points);
           setError("");
         }
       } catch (e: any) {
@@ -148,7 +184,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.51 · BALANCED CRYPTO ENTRY</div>
+          <div className="eyebrow">V18.2.52 · CRYPTO RECORD TRACKER</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -163,6 +199,14 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-summary-card"><div className="crypto-summary-icon allocation">●</div><div><span>Crypto Allocation</span><strong>{gbp(bridge?.cryptoAllocatedGbp)}</strong><small>Live pilot cap</small></div></div>
       <div className="crypto-summary-card"><div className="crypto-summary-icon pnl">↗</div><div><span>Crypto P&amp;L</span><strong className={Number(bridge?.cryptoRealisedPnlGbp || 0) >= 0 ? "gain" : "loss"}>{gbp(bridge?.cryptoRealisedPnlGbp)}</strong><small>Realised live pilot</small></div></div>
       <div className="crypto-summary-card"><div className="crypto-summary-icon returned">↻</div><div><span>Profit Returned</span><strong>{gbp(bridge?.cryptoLifetimeProfitBankedGbp)}</strong><small>Swept back to Vault</small></div></div>
+    </section>
+
+    <section className="crypto-panel crypto-record-panel">
+      <div className="crypto-panel-head">
+        <div><h3><span className="panel-icon">⌁</span> Crypto Record Tracker</h3><p>Permanent movement history for the live crypto pilot — records realised and unrealised P&amp;L while positions move.</p></div>
+        <span className="crypto-chip live">RECORDING</span>
+      </div>
+      <CryptoRecordTracker points={history} />
     </section>
 
     {livePositions.length > 0 && <section className="crypto-panel crypto-live-positions">

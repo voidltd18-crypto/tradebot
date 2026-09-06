@@ -6243,6 +6243,23 @@ def _init_db_impl():
     """)
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18234_crypto_live_time ON v18234_crypto_live_trades(timestamp)""")
 
+    # V18.2.52 — persistent Crypto Record Tracker. One snapshot is stored on
+    # every live safety cycle so the Crypto Lab can show the complete movement
+    # of the live crypto allocation, including unrealised movement while open.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v18252_crypto_equity_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            allocated_gbp REAL NOT NULL DEFAULT 0,
+            realised_pnl_gbp REAL NOT NULL DEFAULT 0,
+            unrealised_pnl_gbp REAL NOT NULL DEFAULT 0,
+            total_pnl_gbp REAL NOT NULL DEFAULT 0,
+            tracked_value_gbp REAL NOT NULL DEFAULT 0,
+            open_positions INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18252_crypto_equity_time ON v18252_crypto_equity_history(timestamp)""")
+
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS weekly_universe (
@@ -11760,6 +11777,52 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
     finally:
         _crypto_live_cycle_guard.release()
 
+def _v18252_record_crypto_movement() -> None:
+    """Persist one live crypto movement snapshot. Failure must never block trading."""
+    try:
+        state = load_profit_vault_state()
+        allocated = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
+        realised = float(state.get("cryptoRealisedPnlGbp") or 0.0)
+        positions = _v18234_raw_crypto_positions()
+        unrealised = sum(float(p.get("pnlGbp") or 0.0) for p in positions if p.get("managedByPilot"))
+        total = realised + unrealised
+        tracked = allocated + unrealised
+        conn = db_connect()
+        conn.execute("""INSERT INTO v18252_crypto_equity_history
+            (timestamp,allocated_gbp,realised_pnl_gbp,unrealised_pnl_gbp,total_pnl_gbp,tracked_value_gbp,open_positions)
+            VALUES (?,?,?,?,?,?,?)""",
+            (datetime.now(UTC).isoformat(), allocated, realised, unrealised, total, tracked,
+             sum(1 for p in positions if p.get("managedByPilot"))))
+        conn.commit(); conn.close()
+    except Exception as exc:
+        print(f"V18.2.52 CRYPTO TRACKER SNAPSHOT ERROR | {str(exc)[:300]}", flush=True)
+
+
+def _v18252_crypto_history_payload(limit: int = 5000) -> Dict[str, Any]:
+    limit = max(50, min(int(limit or 5000), 20000))
+    rows: List[Dict[str, Any]] = []
+    try:
+        conn = db_connect()
+        raw = conn.execute("""SELECT timestamp,allocated_gbp,realised_pnl_gbp,unrealised_pnl_gbp,total_pnl_gbp,tracked_value_gbp,open_positions
+                            FROM v18252_crypto_equity_history ORDER BY id DESC LIMIT ?""", (limit,)).fetchall()
+        conn.close()
+        for r in reversed(raw):
+            rows.append({"timestamp": r[0], "allocatedGbp": round(float(r[1] or 0), 4),
+                         "realisedPnlGbp": round(float(r[2] or 0), 4), "unrealisedPnlGbp": round(float(r[3] or 0), 4),
+                         "totalPnlGbp": round(float(r[4] or 0), 4), "trackedValueGbp": round(float(r[5] or 0), 4),
+                         "openPositions": int(r[6] or 0)})
+    except Exception as exc:
+        return {"ok": False, "version": "V18.2.52", "points": [], "message": str(exc)[:300]}
+    return {"ok": True, "version": "V18.2.52", "points": rows, "count": len(rows),
+            "samplingSeconds": V18242_CRYPTO_LIVE_INTERVAL_SECONDS}
+
+
+@app.get('/v18/crypto-history')
+def api_v18252_crypto_history(request: Request, limit: int = 5000):
+    verify_api_key(request)
+    return _v18252_crypto_history_payload(limit)
+
+
 def v18242_crypto_live_worker() -> None:
     # V18.2.48: fast loop is safety-only most of the time. Normal entries and
     # momentum exits are allowed once per 15-minute decision window. This keeps
@@ -11778,16 +11841,17 @@ def v18242_crypto_live_worker() -> None:
             now_mono = time.monotonic()
             allow_normal = now_mono >= next_normal_decision_at
             result = v18234_crypto_live_cycle(scans, allow_normal_decisions=allow_normal)
+            _v18252_record_crypto_movement()
             if allow_normal and not result.get("busy") and result.get("armed", True) and not result.get("entriesPaused"):
                 next_normal_decision_at = now_mono + V18248_CRYPTO_DECISION_INTERVAL_SECONDS
                 _crypto_live_runtime["lastNormalDecisionAt"] = datetime.now(UTC).isoformat()
                 _crypto_live_runtime["nextNormalDecisionInSeconds"] = V18248_CRYPTO_DECISION_INTERVAL_SECONDS
-                print(f"V18.2.51 CRYPTO NORMAL DECISION | cadence={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m positions={result.get('positions')} paused={result.get('entriesPaused')}", flush=True)
+                print(f"V18.2.52 CRYPTO NORMAL DECISION | cadence={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m positions={result.get('positions')} paused={result.get('entriesPaused')}", flush=True)
             else:
                 _crypto_live_runtime["nextNormalDecisionInSeconds"] = max(0, int(next_normal_decision_at - now_mono))
         except Exception as exc:
             _crypto_live_runtime["lastError"] = str(exc)[:500]
-            print(f"V18.2.51 CRYPTO LIVE WORKER ERROR | {str(exc)[:500]}", flush=True)
+            print(f"V18.2.52 CRYPTO LIVE WORKER ERROR | {str(exc)[:500]}", flush=True)
         time.sleep(V18242_CRYPTO_LIVE_INTERVAL_SECONDS)
 
 
@@ -11855,7 +11919,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     live_positions = _v18234_raw_crypto_positions()
     active_cooldowns = _v18247_prune_crypto_cooldowns(state, save=True)
     return {
-        "ok": True, "version": "V18.2.51", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.52", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "allocationLockedByPosition": bool(live_positions),
         "liveExecutionInstalled": True,
