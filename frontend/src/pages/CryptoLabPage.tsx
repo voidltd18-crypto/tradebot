@@ -6,6 +6,19 @@ const money = (n: unknown) => `$${Number(n || 0).toFixed(2)}`;
 const pct = (n: unknown) => `${Number(n || 0).toFixed(2)}%`;
 const gbp = (n: unknown) => `£${Number(n || 0).toFixed(2)}`;
 
+
+function fmtHeldDuration(openedAt: unknown, clockTick = 0) {
+  void clockTick; // forces a fresh calculation on the page's 1-second clock
+  if (!openedAt) return "HELD --:--:--";
+  const started = new Date(String(openedAt)).getTime();
+  if (!Number.isFinite(started)) return "HELD --:--:--";
+  const total = Math.max(0, Math.floor((Date.now() - started) / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  return `HELD ${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
 function coinGlyph(symbol: string) {
   const s = String(symbol || "").split("/")[0].toUpperCase();
   if (s === "BTC") return "₿";
@@ -208,7 +221,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.60 · FASTER LOSS RECOVERY</div>
+          <div className="eyebrow">V18.2.62 · POSITION HOLD TIMERS</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -243,7 +256,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
           const pnlPct = Number(p.pnlPct || 0);
           const managed = Boolean(p.managedByPilot);
           return <div className="crypto-position-card" key={p.symbol}>
-            <div className="crypto-position-symbol"><span className="coin-icon">{coinGlyph(p.symbol)}</span><div><strong>{p.symbol}</strong><small>Entry {money(p.entry)} · {managed ? "BOT MANAGED" : "MANUAL / EXTERNAL"}</small></div></div>
+            <div className="crypto-position-symbol"><span className="coin-icon">{coinGlyph(p.symbol)}</span><div><strong>{p.symbol}</strong><small>Entry {money(p.entry)} · {managed ? "BOT MANAGED" : "MANUAL / EXTERNAL"}</small>{managed && <small className="crypto-held-timer">{fmtHeldDuration(p.openedAt, clockTick)}</small>}</div></div>
             <div className="crypto-position-metric"><span>Market Value</span><strong>{money(p.marketValueUsd)}</strong><small>Qty {Number(p.qty || 0).toFixed(8)}</small></div>
             <div className={`crypto-position-metric ${pnl >= 0 ? "gain" : "loss"}`}><span>P&amp;L</span><strong>{gbp(pnl)}</strong><small>{pct(pnlPct)}</small></div>
             <div className="crypto-position-actions"><button className="crypto-sell-now" onClick={() => manualSellCrypto(p)} disabled={Boolean(sellBusySymbol)}>{sellBusySymbol === p.symbol ? "SELLING…" : "SELL CRYPTO NOW"}</button><small>100% market sell · confirmation required</small></div>

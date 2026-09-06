@@ -471,3 +471,12 @@
 .crypto-chip.held{background:rgba(14,116,144,.28);color:#67e8f9}.crypto-chip.cooldown{background:rgba(180,83,9,.25);color:#fbbf24}
 .crypto-scanner-table .held-row{background:rgba(14,116,144,.07)}.crypto-scanner-table .cooldown-row{background:rgba(180,83,9,.05)}
 .held-row .score-track>span{background:linear-gradient(90deg,#0891b2,#22d3ee)}.cooldown-row .score-track>span{background:linear-gradient(90deg,#b45309,#f59e0b)}
+
+/* V18.2.62 — live per-position hold duration */
+.crypto-held-timer {
+  display: block;
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .03em;
+  color: #66d9ff;
+}

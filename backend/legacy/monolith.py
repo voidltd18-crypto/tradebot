@@ -11585,6 +11585,30 @@ def _v18237_pilot_open_symbols() -> set[str]:
     return open_symbols
 
 
+def _v18262_pilot_opened_at() -> Dict[str, str]:
+    """Return the timestamp of the latest bot BUY for each currently open crypto symbol."""
+    opened: Dict[str, str] = {}
+    try:
+        conn = db_connect()
+        rows = conn.execute(
+            """SELECT symbol, timestamp, side FROM v18234_crypto_live_trades
+               WHERE id IN (
+                   SELECT MAX(id) FROM v18234_crypto_live_trades GROUP BY symbol
+               )"""
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            try:
+                key = _v18246_crypto_symbol_key(row[0])
+                if key and str(row[2] or "").upper() == "BUY" and row[1]:
+                    opened[key] = str(row[1])
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return opened
+
+
 def _v18234_raw_crypto_positions() -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     try:
@@ -11592,6 +11616,7 @@ def _v18234_raw_crypto_positions() -> List[Dict[str, Any]]:
     except Exception:
         return out
     pilot_symbols = _v18237_pilot_open_symbols()
+    pilot_opened_at = _v18262_pilot_opened_at()
     for pos in raw:
         try:
             symbol = str(getattr(pos, "symbol", "") or "").upper()
@@ -11610,7 +11635,8 @@ def _v18234_raw_crypto_positions() -> List[Dict[str, Any]]:
             out.append({"symbol": symbol, "qty": qty, "entry": entry, "price": price,
                         "marketValueUsd": market_value, "pnlUsd": unrealised_usd,
                         "pnlGbp": unrealised_usd * rate, "pnlPct": pnl_pct,
-                        "managedByPilot": _v18246_crypto_symbol_key(symbol) in pilot_symbols})
+                        "managedByPilot": _v18246_crypto_symbol_key(symbol) in pilot_symbols,
+                        "openedAt": pilot_opened_at.get(_v18246_crypto_symbol_key(symbol))})
         except Exception:
             continue
     return out
@@ -12122,7 +12148,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     live_positions = _v18234_raw_crypto_positions()
     active_cooldowns = _v18247_prune_crypto_cooldowns(state, save=True)
     return {
-        "ok": True, "version": "V18.2.61", "manualOnly": False, "automaticRelease": False,
+        "ok": True, "version": "V18.2.62", "manualOnly": False, "automaticRelease": False,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "profitIsolationEnabled": True,
         "allocationLockedByPosition": bool(live_positions),
