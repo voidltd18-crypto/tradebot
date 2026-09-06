@@ -148,7 +148,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.48 · 15-MIN CRYPTO DECISIONS + FAST SAFETY</div>
+          <div className="eyebrow">V18.2.50 · CRYPTO LOSS CONTROL</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -250,7 +250,8 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <span><b>Shadow:</b> {Number(bridge?.shadowEvidence?.closedTests || data.closedTrades || 0)} tests · {money(bridge?.shadowEvidence?.totalPnlUsd ?? data.totalPnlUsd)} · win {pct(bridge?.shadowEvidence?.winRate ?? data.winRate)}</span>
       <span><b>Safety:</b> Stop {pct(data.config?.stopPct)} · Trail {pct(data.config?.trailStartPct)} / {pct(data.config?.trailGivebackPct)}</span>
       <span><b>Cadence:</b> {Math.round(Number(bridge?.normalDecisionIntervalSeconds || 900) / 60)} min decisions · {Number(bridge?.safetyCheckIntervalSeconds || 15)}s safety</span>
-      <span><b>Re-entry:</b> {Number(bridge?.reentryCooldownMinutes || 30)} min same-coin cooldown · {Number(bridge?.activeReentryCooldownCount || 0)} active</span>
+      <span><b>Re-entry:</b> {Number(bridge?.reentryCooldownMinutes || 30)} min after wins · {Number(bridge?.lossCooldownMinutes || 120)} min after losses</span>
+      <span><b>Loss brake:</b> {Number(bridge?.consecutiveCryptoLosses || 0)}/{Number(bridge?.lossBrakeStreak || 2)} consecutive · daily {gbp(bridge?.dailyCryptoPnlGbp)} / -{gbp(bridge?.dailyLossLimitGbp)}</span>
       <span><b>Stock engine:</b> £900 baseline and MARA rules untouched</span>
     </section>
   </div>;

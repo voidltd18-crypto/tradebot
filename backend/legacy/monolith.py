@@ -10895,7 +10895,15 @@ _crypto_universe_runtime: Dict[str, Any] = {
 # 5-minute score scale and routinely ignored modest but genuine green moves.
 # 0.34 still requires the setup to rank near the top of the scanner while
 # allowing the live crypto pilot to participate earlier in positive momentum.
-V18232_CRYPTO_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_ENTRY_SCORE", "0.34") or 0.34)))
+V18232_CRYPTO_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_ENTRY_SCORE", "0.45") or 0.45)))
+# V18.2.50 — crypto-only loss-control gates. These do not affect stocks.
+V18250_CRYPTO_MIN_15M_MOMENTUM_PCT = float(os.getenv("TRADEBOT_CRYPTO_MIN_15M_MOMENTUM_PCT", "0.10") or 0.10)
+V18250_CRYPTO_MIN_60M_MOMENTUM_PCT = float(os.getenv("TRADEBOT_CRYPTO_MIN_60M_MOMENTUM_PCT", "0.30") or 0.30)
+V18250_CRYPTO_LOSS_COOLDOWN_MINUTES = max(30, int(os.getenv("TRADEBOT_CRYPTO_LOSS_COOLDOWN_MINUTES", "120") or 120))
+V18250_CRYPTO_LOSS_BRAKE_MINUTES = max(15, int(os.getenv("TRADEBOT_CRYPTO_LOSS_BRAKE_MINUTES", "60") or 60))
+V18250_CRYPTO_LOSS_BRAKE_STREAK = max(2, int(os.getenv("TRADEBOT_CRYPTO_LOSS_BRAKE_STREAK", "2") or 2))
+V18250_CRYPTO_DAILY_LOSS_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_DAILY_LOSS_PCT", "2.0") or 2.0))
+V18250_CRYPTO_DAILY_LOSS_MIN_GBP = max(1.0, float(os.getenv("TRADEBOT_CRYPTO_DAILY_LOSS_MIN_GBP", "5.0") or 5.0))
 V18232_CRYPTO_STOP_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_STOP_PCT", "1.5") or 1.5))
 V18232_CRYPTO_TRAIL_START_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_TRAIL_START_PCT", "1.5") or 1.5))
 V18232_CRYPTO_TRAIL_GIVEBACK_PCT = max(0.10, float(os.getenv("TRADEBOT_CRYPTO_TRAIL_GIVEBACK_PCT", "0.6") or 0.6))
@@ -11062,12 +11070,13 @@ def _v18232_fetch_scans() -> List[Dict[str, Any]]:
         momentum60 = _v18232_clamp((ret60 + 0.75) / 5.00)
         range_quality = _v18232_clamp(1.0 - abs(range60 - 2.0) / 5.0)
         score = _v18232_clamp(0.38 * momentum15 + 0.34 * momentum60 + 0.18 * trend + 0.10 * range_quality)
-        qualified = bool(score >= V18232_CRYPTO_ENTRY_SCORE and liquid)
+        entry_momentum_ok = bool(ret15 >= V18250_CRYPTO_MIN_15M_MOMENTUM_PCT and ret60 >= V18250_CRYPTO_MIN_60M_MOMENTUM_PCT)
+        qualified = bool(score >= V18232_CRYPTO_ENTRY_SCORE and liquid and entry_momentum_ok)
         scans.append({
             "symbol": symbol, "price": round(price, 8), "score": round(score, 4),
             "return15mPct": round(ret15, 4), "return60mPct": round(ret60, 4),
             "range60mPct": round(range60, 4), "liquidity60mUsd": round(notional60, 2),
-            "liquid": liquid, "qualified": qualified,
+            "liquid": liquid, "entryMomentumOk": entry_momentum_ok, "qualified": qualified,
             "bars": len(bars), "source": "alpaca_crypto_dynamic_5min",
         })
     scans.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
@@ -11338,21 +11347,22 @@ def _v18247_prune_crypto_cooldowns(state: Dict[str, Any], *, save: bool = False)
     return active
 
 
-def _v18247_set_crypto_cooldown(symbol: Any, *, reason: str = "EXIT") -> None:
+def _v18247_set_crypto_cooldown(symbol: Any, *, reason: str = "EXIT", minutes: Optional[int] = None) -> None:
     key = _v18246_crypto_symbol_key(symbol)
     if not key:
         return
     try:
         state = load_profit_vault_state()
         active = _v18247_prune_crypto_cooldowns(state, save=False)
-        until = datetime.now(UTC) + timedelta(minutes=V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES)
+        cooldown_minutes = max(1, int(minutes or V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES))
+        until = datetime.now(UTC) + timedelta(minutes=cooldown_minutes)
         active[key] = until.isoformat()
         state["cryptoReentryCooldowns"] = active
         state["lastCryptoCooldownSymbol"] = key
         state["lastCryptoCooldownUntil"] = until.isoformat()
         state["lastCryptoCooldownReason"] = str(reason or "EXIT")[:80]
         save_profit_vault_state(state)
-        print(f"V18.2.47 CRYPTO REENTRY COOLDOWN | {key} minutes={V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES} reason={reason} until={until.isoformat()}", flush=True)
+        print(f"V18.2.50 CRYPTO REENTRY COOLDOWN | {key} minutes={cooldown_minutes} reason={reason} until={until.isoformat()}", flush=True)
     except Exception as exc:
         print(f"V18.2.47 CRYPTO COOLDOWN STATE ERROR | {key} {str(exc)[:200]}", flush=True)
 
@@ -11365,6 +11375,39 @@ def _v18247_crypto_on_cooldown(symbol: Any, state: Optional[Dict[str, Any]] = No
     except Exception:
         return False
 
+
+
+def _v18250_refresh_crypto_risk_state(state: Dict[str, Any], allocation_gbp: float, *, save: bool = False) -> Dict[str, Any]:
+    """Maintain persistent crypto-only daily loss and loss-streak controls."""
+    today = datetime.now(UTC).date().isoformat()
+    changed = False
+    if str(state.get("cryptoRiskDate") or "") != today:
+        state["cryptoRiskDate"] = today
+        state["cryptoDailyRealisedPnlGbp"] = 0.0
+        state["cryptoConsecutiveLosses"] = 0
+        state["cryptoLossBrakeUntil"] = None
+        changed = True
+    daily_limit = max(V18250_CRYPTO_DAILY_LOSS_MIN_GBP, max(0.0, float(allocation_gbp)) * V18250_CRYPTO_DAILY_LOSS_PCT / 100.0)
+    state["cryptoDailyLossLimitGbp"] = round(daily_limit, 4)
+    brake_until = _v18247_parse_iso(state.get("cryptoLossBrakeUntil"))
+    if brake_until and brake_until <= datetime.now(UTC):
+        state["cryptoLossBrakeUntil"] = None
+        changed = True
+    if save and changed:
+        save_profit_vault_state(state)
+    return state
+
+
+def _v18250_crypto_entry_risk_block(state: Dict[str, Any], allocation_gbp: float) -> tuple[bool, str]:
+    state = _v18250_refresh_crypto_risk_state(state, allocation_gbp, save=False)
+    daily_pnl = float(state.get("cryptoDailyRealisedPnlGbp") or 0.0)
+    daily_limit = float(state.get("cryptoDailyLossLimitGbp") or max(V18250_CRYPTO_DAILY_LOSS_MIN_GBP, allocation_gbp * V18250_CRYPTO_DAILY_LOSS_PCT / 100.0))
+    if daily_pnl <= -daily_limit:
+        return True, f"DAILY_LOSS_BRAKE £{daily_pnl:.2f}/-£{daily_limit:.2f}"
+    brake_until = _v18247_parse_iso(state.get("cryptoLossBrakeUntil"))
+    if brake_until and brake_until > datetime.now(UTC):
+        return True, f"LOSS_STREAK_BRAKE until {brake_until.isoformat()}"
+    return False, ""
 
 def _v18234_crypto_account_status() -> Dict[str, Any]:
     if PAPER:
@@ -11544,9 +11587,22 @@ def _v18234_live_sell(position: Dict[str, Any], price: float, score: float, reas
             pnl_pct = ((fill_price / entry) - 1.0) * 100.0 if entry > 0 else 0.0
             notional = fill_price * (fill_qty or qty)
             _v18234_log_live_trade(symbol, "SELL", order, fill_qty or qty, fill_price, notional, pnl_usd, pnl_pct, score, reason)
-            _v18247_set_crypto_cooldown(symbol, reason=reason)
             state = load_profit_vault_state(); rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
             pnl_gbp = pnl_usd * rate
+            # V18.2.50: losing symbols get a longer lockout; positive exits retain the normal cooldown.
+            _v18247_set_crypto_cooldown(symbol, reason=reason, minutes=(V18250_CRYPTO_LOSS_COOLDOWN_MINUTES if pnl_gbp < 0 else V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES))
+            state = _v18250_refresh_crypto_risk_state(state, float(state.get("cryptoAllocatedGbp") or 0.0), save=False)
+            state["cryptoDailyRealisedPnlGbp"] = round(float(state.get("cryptoDailyRealisedPnlGbp") or 0.0) + pnl_gbp, 4)
+            if pnl_gbp < 0:
+                streak = int(state.get("cryptoConsecutiveLosses") or 0) + 1
+                state["cryptoConsecutiveLosses"] = streak
+                if streak >= V18250_CRYPTO_LOSS_BRAKE_STREAK:
+                    brake_until = datetime.now(UTC) + timedelta(minutes=V18250_CRYPTO_LOSS_BRAKE_MINUTES)
+                    state["cryptoLossBrakeUntil"] = brake_until.isoformat()
+                    print(f"V18.2.50 CRYPTO LOSS BRAKE | streak={streak} minutes={V18250_CRYPTO_LOSS_BRAKE_MINUTES} until={brake_until.isoformat()}", flush=True)
+            else:
+                state["cryptoConsecutiveLosses"] = 0
+                state["cryptoLossBrakeUntil"] = None
             state["cryptoRealisedPnlGbp"] = round(float(state.get("cryptoRealisedPnlGbp") or 0.0) + pnl_gbp, 4)
             # Profits are swept back into the protected Vault; losses reduce the pilot allocation.
             if pnl_gbp > 0:
@@ -11645,10 +11701,19 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
     cooldown_state = load_profit_vault_state()
     active_cooldowns = _v18247_prune_crypto_cooldowns(cooldown_state, save=True)
     slots = max(0, V18234_CRYPTO_LIVE_MAX_POSITIONS - len(positions))
-    if allow_normal_decisions and slots > 0:
+    risk_state = _v18250_refresh_crypto_risk_state(load_profit_vault_state(), allocation_gbp, save=True)
+    risk_blocked, risk_reason = _v18250_crypto_entry_risk_block(risk_state, allocation_gbp)
+    _crypto_live_runtime["riskBlocked"] = risk_blocked
+    _crypto_live_runtime["riskReason"] = risk_reason or None
+    if risk_blocked:
+        print(f"V18.2.50 CRYPTO ENTRY BLOCK | {risk_reason}", flush=True)
+    if allow_normal_decisions and slots > 0 and not risk_blocked:
         qualified = [
             x for x in scans
             if float(x.get("score") or 0) >= V18234_CRYPTO_LIVE_ENTRY_SCORE
+            and float(x.get("return15mPct") or 0) >= V18250_CRYPTO_MIN_15M_MOMENTUM_PCT
+            and float(x.get("return60mPct") or 0) >= V18250_CRYPTO_MIN_60M_MOMENTUM_PCT
+            and bool(x.get("liquid", True))
             and _v18246_crypto_symbol_key(x.get("symbol")) not in held_symbols
             and _v18246_crypto_symbol_key(x.get("symbol")) not in active_cooldowns
         ]
@@ -11714,12 +11779,12 @@ def v18242_crypto_live_worker() -> None:
                 next_normal_decision_at = now_mono + V18248_CRYPTO_DECISION_INTERVAL_SECONDS
                 _crypto_live_runtime["lastNormalDecisionAt"] = datetime.now(UTC).isoformat()
                 _crypto_live_runtime["nextNormalDecisionInSeconds"] = V18248_CRYPTO_DECISION_INTERVAL_SECONDS
-                print(f"V18.2.48 CRYPTO NORMAL DECISION | cadence={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m positions={result.get('positions')} paused={result.get('entriesPaused')}", flush=True)
+                print(f"V18.2.50 CRYPTO NORMAL DECISION | cadence={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m positions={result.get('positions')} paused={result.get('entriesPaused')}", flush=True)
             else:
                 _crypto_live_runtime["nextNormalDecisionInSeconds"] = max(0, int(next_normal_decision_at - now_mono))
         except Exception as exc:
             _crypto_live_runtime["lastError"] = str(exc)[:500]
-            print(f"V18.2.48 CRYPTO LIVE WORKER ERROR | {str(exc)[:500]}", flush=True)
+            print(f"V18.2.50 CRYPTO LIVE WORKER ERROR | {str(exc)[:500]}", flush=True)
         time.sleep(V18242_CRYPTO_LIVE_INTERVAL_SECONDS)
 
 
@@ -11787,7 +11852,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     live_positions = _v18234_raw_crypto_positions()
     active_cooldowns = _v18247_prune_crypto_cooldowns(state, save=True)
     return {
-        "ok": True, "version": "V18.2.48", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.50", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": True, "vaultReserveAdjustable": True,
         "allocationLockedByPosition": bool(live_positions),
         "liveExecutionInstalled": True,
@@ -11799,6 +11864,18 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "reentryCooldownMinutes": V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES,
         "activeReentryCooldowns": active_cooldowns,
         "activeReentryCooldownCount": len(active_cooldowns),
+        "liveEntryScore": V18234_CRYPTO_LIVE_ENTRY_SCORE,
+        "min15mMomentumPct": V18250_CRYPTO_MIN_15M_MOMENTUM_PCT,
+        "min60mMomentumPct": V18250_CRYPTO_MIN_60M_MOMENTUM_PCT,
+        "lossCooldownMinutes": V18250_CRYPTO_LOSS_COOLDOWN_MINUTES,
+        "lossBrakeMinutes": V18250_CRYPTO_LOSS_BRAKE_MINUTES,
+        "lossBrakeStreak": V18250_CRYPTO_LOSS_BRAKE_STREAK,
+        "dailyCryptoPnlGbp": round(float(state.get("cryptoDailyRealisedPnlGbp") or 0.0), 2),
+        "dailyLossLimitGbp": round(float(state.get("cryptoDailyLossLimitGbp") or max(V18250_CRYPTO_DAILY_LOSS_MIN_GBP, float(state.get("cryptoAllocatedGbp") or 0.0) * V18250_CRYPTO_DAILY_LOSS_PCT / 100.0)), 2),
+        "consecutiveCryptoLosses": int(state.get("cryptoConsecutiveLosses") or 0),
+        "lossBrakeUntil": state.get("cryptoLossBrakeUntil"),
+        "riskBlocked": bool(_crypto_live_runtime.get("riskBlocked")),
+        "riskReason": _crypto_live_runtime.get("riskReason"),
         "newEntriesPaused": (not bool(bot_enabled)) or bool(manual_override) or bool(emergency_stop),
         "pauseReason": ("BOT_PAUSED" if not bool(bot_enabled) else "MANUAL_OVERRIDE" if bool(manual_override) else "EMERGENCY_STOP" if bool(emergency_stop) else None),
         "protectiveExitsActiveWhilePaused": True,
@@ -12142,11 +12219,11 @@ def startup_event():
         threading.Thread(target=v18232_crypto_shadow_worker, daemon=True, name="v18-crypto-shadow").start()
         print(f"V18.2.32 CRYPTO SHADOW | enabled=True interval={V18232_CRYPTO_INTERVAL_SECONDS}s symbols={len(V18232_CRYPTO_SYMBOLS)} virtual_capital=${V18232_CRYPTO_CAPITAL_USD:.2f} advisory_only=True live_orders=False")
         acct = _v18234_crypto_account_status()
-        print(f"V18.2.48 CRYPTO LIVE PILOT | installed=True account_crypto={acct.get('status')} full_vault_default=True vault_reserve_adjustable=True broker_safe_sizing=True safety_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s normal_decision_interval={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m", flush=True)
+        print(f"V18.2.50 CRYPTO LIVE PILOT | installed=True account_crypto={acct.get('status')} full_vault_default=True vault_reserve_adjustable=True broker_safe_sizing=True safety_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s normal_decision_interval={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m", flush=True)
     if V18234_CRYPTO_LIVE_ENABLED and not PAPER and not v18242_crypto_live_thread_started:
         v18242_crypto_live_thread_started = True
         threading.Thread(target=v18242_crypto_live_worker, daemon=True, name="v18-crypto-live").start()
-        print(f"V18.2.48 CRYPTO LIVE EXECUTOR | safety_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s normal_decision_interval={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m independent_of_shadow=True", flush=True)
+        print(f"V18.2.50 CRYPTO LIVE EXECUTOR | safety_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s normal_decision_interval={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m independent_of_shadow=True", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
