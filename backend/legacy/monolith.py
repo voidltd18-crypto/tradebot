@@ -10985,6 +10985,14 @@ V18265_CRYPTO_STALL_MINUTES = max(15, int(os.getenv("TRADEBOT_CRYPTO_STALL_MINUT
 V18265_CRYPTO_STALL_BAND_PCT = max(0.05, float(os.getenv("TRADEBOT_CRYPTO_STALL_BAND_PCT", "0.25") or 0.25))
 V18265_CRYPTO_STALL_MAX_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_STALL_MAX_SCORE", "0.42") or 0.42)))
 V18265_CRYPTO_STALL_MAX_15M_PCT = float(os.getenv("TRADEBOT_CRYPTO_STALL_MAX_15M_PCT", "0.10") or 0.10)
+# V18.2.69 — crypto breakeven-cross guard.
+# Once a bot-managed crypto position has traded at entry price or better,
+# the 5-second protection loop exits on the first observed move below entry.
+# This is crypto-only and does not alter stock exits.
+V18269_CRYPTO_BREAKEVEN_GUARD_ENABLED = str(
+    os.getenv("TRADEBOT_CRYPTO_BREAKEVEN_GUARD_ENABLED", "true")
+).lower() in ("1", "true", "yes", "on")
+
 # V18.2.48 — separate fast safety monitoring from normal trading cadence.
 # Protective stop/trail checks now run every 5 seconds, while new entries and
 # normal entry/momentum-exit decisions are evaluated no more than once every 5 minutes.
@@ -11868,7 +11876,26 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
             (score > 0 and score <= V18265_CRYPTO_STALL_MAX_SCORE)
             or ret15 <= V18265_CRYPTO_STALL_MAX_15M_PCT
         )
-        if pnl_pct <= -V18234_CRYPTO_LIVE_STOP_PCT:
+        # V18.2.69: if this position has reached breakeven or better at least once,
+        # protect that recovery. The safety loop runs every 5 seconds, so once the
+        # observed price crosses from >= entry to < entry we submit a market exit.
+        #
+        # Important: this cannot guarantee a non-red realised fill because crypto
+        # can move between observation and execution and market orders can slip.
+        breakeven_armed = bool(
+            V18269_CRYPTO_BREAKEVEN_GUARD_ENABLED
+            and entry > 0
+            and high >= entry
+        )
+        if breakeven_armed and price < entry:
+            reason = "CRYPTO BREAKEVEN CROSS"
+            print(
+                f"V18.2.69 CRYPTO BREAKEVEN CROSS | {symbol} "
+                f"entry={entry:.8f} price={price:.8f} pnl={pnl_pct:.3f}% "
+                f"high={high:.8f}",
+                flush=True,
+            )
+        elif pnl_pct <= -V18234_CRYPTO_LIVE_STOP_PCT:
             reason = "CRYPTO LIVE STOP"
         elif ((high / entry) - 1.0) * 100.0 >= V18234_CRYPTO_LIVE_TRAIL_START_PCT and price <= trail_floor:
             reason = "CRYPTO LIVE TRAIL"
@@ -12403,7 +12430,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.68", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.69", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
@@ -12426,6 +12453,9 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "trackerSnapshotsWritten": int(_v18267_tracker_runtime.get("written") or 0),
         "trackerSnapshotsCoalesced": int(_v18267_tracker_runtime.get("skipped") or 0),
         "manualSellNonBlocking": True,
+        "breakevenGuardEnabled": bool(V18269_CRYPTO_BREAKEVEN_GUARD_ENABLED),
+        "breakevenGuardTriggerPct": 0.0,
+        "breakevenGuardCheckIntervalSeconds": int(V18242_CRYPTO_LIVE_INTERVAL_SECONDS),
         "manualSellStates": {
             k: dict(v) for k, v in list(_v18268_manual_sell_pending.items())[-20:]
         },
@@ -12744,7 +12774,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.68 NON-BLOCKING CRYPTO SELL | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.69 CRYPTO BREAKEVEN GUARD | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
