@@ -10963,7 +10963,7 @@ _crypto_universe_runtime: Dict[str, Any] = {
 # 5-minute score scale and routinely ignored modest but genuine green moves.
 # 0.34 still requires the setup to rank near the top of the scanner while
 # allowing the live crypto pilot to participate earlier in positive momentum.
-V18232_CRYPTO_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_ENTRY_SCORE", "0.42") or 0.42)))
+V18232_CRYPTO_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_ENTRY_SCORE", "0.38") or 0.38)))
 # V18.2.51 — balanced crypto entry gates. These do not affect stocks.
 # Momentum is now a deterioration guard rather than a requirement for an already-large move.
 # A candidate may consolidate slightly over 15m, but must not be materially falling and
@@ -11890,7 +11890,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
         if breakeven_armed and price < entry:
             reason = "CRYPTO BREAKEVEN CROSS"
             print(
-                f"V18.2.69 CRYPTO BREAKEVEN CROSS | {symbol} "
+                f"V18.2.70 CRYPTO BREAKEVEN CROSS | {symbol} "
                 f"entry={entry:.8f} price={price:.8f} pnl={pnl_pct:.3f}% "
                 f"high={high:.8f}",
                 flush=True,
@@ -12430,7 +12430,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.69", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.70", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
@@ -12774,7 +12774,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.69 CRYPTO BREAKEVEN GUARD | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.70 LOWER CRYPTO ENTRY | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
