@@ -224,7 +224,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.70 · LOWER CRYPTO ENTRY</div>
+          <div className="eyebrow">V18.2.71 · RELATIVE CRYPTO LIQUIDITY</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -273,7 +273,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-panel-head">
         <div>
           <h3><span className="panel-icon">◈</span> Crypto Scanner</h3>
-          <p>Automatically discovers Alpaca's active USD crypto market and uses an adaptive liquidity floor when a fixed threshold would reject the whole market. Trades only when score ≥ {entryScore.toFixed(2)}.</p>
+          <p>Automatically discovers Alpaca's active USD crypto market and uses a market-relative liquidity floor with a $250 minimum, so active mid-liquidity pairs are not blocked just because BTC clears the old $5k gate. Trades only when score ≥ {entryScore.toFixed(2)}.</p>
         </div>
         <div className="scanner-state"><span className="crypto-chip">{Number(data?.marketDiscovery?.discovered || scans.length)} discovered</span><span className="crypto-chip">{Number(data?.marketDiscovery?.eligible || scans.filter((s: AnyObj) => s.liquid !== false).length)} liquid</span><span className="crypto-chip">{scans.filter((s: AnyObj) => Boolean(s.qualified)).length} qualified</span><span className="crypto-chip crypto-countdown-chip">NEXT DECISION {fmtCountdown(nextDecisionSeconds)}</span><span className="crypto-chip crypto-cycle-chip">CYCLES {Number(bridge?.normalDecisionCycleCount || 0)}</span><span className="crypto-chip">{String(data?.marketDiscovery?.liquidityMode || "fixed").toUpperCase()} ≥ {money(data?.marketDiscovery?.effectiveLiquidity60mUsd || data?.config?.minLiquidity60mUsd || 0)}</span><span className="scanning-dot">●</span><span>Dynamic</span></div>
       </div>

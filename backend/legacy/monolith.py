@@ -11175,7 +11175,18 @@ def _v18232_fetch_scans() -> List[Dict[str, Any]]:
     fixed_passes = sum(1 for x in scans if float(x.get("liquidity60mUsd") or 0.0) >= V18245_CRYPTO_MIN_60M_NOTIONAL_USD)
     effective_liquidity_floor = V18245_CRYPTO_MIN_60M_NOTIONAL_USD
     liquidity_mode = "fixed"
-    if V18253_CRYPTO_ADAPTIVE_LIQUIDITY and fixed_passes == 0 and positive_notional:
+
+    # V18.2.71 — Relative crypto liquidity.
+    # The previous adaptive mode only switched on when *zero* symbols cleared the
+    # fixed $5k gate. That meant one or two very active pairs (for example BTC/AVAX)
+    # could keep the whole market on the $5k floor and incorrectly block otherwise
+    # useful markets such as ETH/SOL/XRP.
+    #
+    # Adaptive mode now always derives a market-relative floor from the positive
+    # 60-minute notionals, while retaining the hard $250 minimum so $0/dead markets
+    # remain blocked. The configured $5k value is now the ceiling, not a requirement
+    # whenever at least one symbol happens to clear it.
+    if V18253_CRYPTO_ADAPTIVE_LIQUIDITY and positive_notional:
         idx = int(round((len(positive_notional) - 1) * V18253_CRYPTO_LIQUIDITY_PERCENTILE))
         idx = max(0, min(len(positive_notional) - 1, idx))
         relative_floor = positive_notional[idx]
@@ -11183,7 +11194,7 @@ def _v18232_fetch_scans() -> List[Dict[str, Any]]:
             V18245_CRYPTO_MIN_60M_NOTIONAL_USD,
             max(V18253_CRYPTO_MIN_ADAPTIVE_NOTIONAL_USD, relative_floor),
         )
-        liquidity_mode = "adaptive"
+        liquidity_mode = "adaptive-relative"
 
     liquid_count = 0
     for item in scans:
@@ -11207,9 +11218,9 @@ def _v18232_fetch_scans() -> List[Dict[str, Any]]:
         _crypto_universe_runtime["liquidityMode"] = liquidity_mode
     if scans:
         print(
-            f"V18.2.53 CRYPTO LIQUIDITY | mode={liquidity_mode} "
+            f"V18.2.71 CRYPTO LIQUIDITY | mode={liquidity_mode} "
             f"floor=${effective_liquidity_floor:.2f} liquid={liquid_count}/{len(scans)} "
-            f"fixed_floor=${V18245_CRYPTO_MIN_60M_NOTIONAL_USD:.2f}",
+            f"fixed_passes={fixed_passes} fixed_ceiling=${V18245_CRYPTO_MIN_60M_NOTIONAL_USD:.2f}",
             flush=True,
         )
     return scans
@@ -11890,7 +11901,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
         if breakeven_armed and price < entry:
             reason = "CRYPTO BREAKEVEN CROSS"
             print(
-                f"V18.2.70 CRYPTO BREAKEVEN CROSS | {symbol} "
+                f"V18.2.71 CRYPTO BREAKEVEN CROSS | {symbol} "
                 f"entry={entry:.8f} price={price:.8f} pnl={pnl_pct:.3f}% "
                 f"high={high:.8f}",
                 flush=True,
@@ -12430,7 +12441,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.70", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.71", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
@@ -12774,7 +12785,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.70 LOWER CRYPTO ENTRY | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.71 RELATIVE CRYPTO LIQUIDITY | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
