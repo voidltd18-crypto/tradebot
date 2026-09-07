@@ -11401,7 +11401,7 @@ def v18232_crypto_shadow_payload() -> Dict[str, Any]:
 # =========================
 V18234_CRYPTO_LIVE_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_LIVE_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
 V18234_CRYPTO_LIVE_PILOT_MAX_GBP = max(25.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_PILOT_MAX_GBP", "10000") or 10000))
-V18234_CRYPTO_LIVE_MAX_POSITIONS = max(1, min(4, int(os.getenv("TRADEBOT_CRYPTO_LIVE_MAX_POSITIONS", "4") or 4)))
+V18234_CRYPTO_LIVE_MAX_POSITIONS = max(1, min(10, int(os.getenv("TRADEBOT_CRYPTO_LIVE_MAX_POSITIONS", "10") or 10)))
 V18234_CRYPTO_LIVE_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_ENTRY_SCORE", str(V18232_CRYPTO_ENTRY_SCORE)) or V18232_CRYPTO_ENTRY_SCORE)))
 V18234_CRYPTO_LIVE_STOP_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_LIVE_STOP_PCT", str(V18232_CRYPTO_STOP_PCT)) or V18232_CRYPTO_STOP_PCT))
 V18234_CRYPTO_LIVE_TRAIL_START_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_LIVE_TRAIL_START_PCT", str(V18232_CRYPTO_TRAIL_START_PCT)) or V18232_CRYPTO_TRAIL_START_PCT))
@@ -11901,7 +11901,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
         if breakeven_armed and price < entry:
             reason = "CRYPTO BREAKEVEN CROSS"
             print(
-                f"V18.2.71 CRYPTO BREAKEVEN CROSS | {symbol} "
+                f"V18.2.72 CRYPTO BREAKEVEN CROSS | {symbol} "
                 f"entry={entry:.8f} price={price:.8f} pnl={pnl_pct:.3f}% "
                 f"high={high:.8f}",
                 flush=True,
@@ -12441,7 +12441,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.71", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.72", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
@@ -12785,7 +12785,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.71 RELATIVE CRYPTO LIQUIDITY | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.72 TEN CRYPTO POSITIONS | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
