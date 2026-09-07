@@ -12139,7 +12139,7 @@ def _v18267_cache_crypto_shadow_payload(payload: Dict[str, Any]) -> None:
     cached = dict(payload)
     cached["servedFromMemory"] = True
     cached["cacheUpdatedAt"] = datetime.now(UTC).isoformat()
-    cached["version"] = "V18.2.67"
+    cached["version"] = "V18.2.68"
     with _v18267_shadow_api_cache_lock:
         _v18267_shadow_api_cache.clear()
         _v18267_shadow_api_cache.update(cached)
@@ -12265,10 +12265,98 @@ def v18237_manual_crypto_sell(symbol: str, confirmation: str) -> Dict[str, Any]:
     return {"ok": True, "message": f"Manual sell submitted for 100% of {symbol}.", "bridge": v18234_crypto_bridge_payload()}
 
 
+# V18.2.68: manual crypto sells must never hold an HTTP request open while
+# waiting for the live crypto execution lock, broker fill polling, DB logging,
+# Piggy Bank updates, or bridge rebuilding. The endpoint now acknowledges the
+# sell immediately and a dedicated worker performs the existing durable sell
+# path in the background. Duplicate clicks for the same symbol are coalesced.
+_v18268_manual_sell_guard = threading.Lock()
+_v18268_manual_sell_pending: Dict[str, Dict[str, Any]] = {}
+
+
+def _v18268_manual_sell_worker(symbol: str, confirmation: str) -> None:
+    key = _v18246_crypto_symbol_key(symbol)
+    started = datetime.now(UTC).isoformat()
+    try:
+        print(f"V18.2.68 MANUAL CRYPTO SELL WORKER START | {symbol}", flush=True)
+        result = v18237_manual_crypto_sell(symbol, confirmation)
+        ok = bool(result.get("ok"))
+        message = str(result.get("message") or "")
+        with _v18268_manual_sell_guard:
+            _v18268_manual_sell_pending[key] = {
+                "symbol": symbol,
+                "status": "done" if ok else "error",
+                "ok": ok,
+                "message": message,
+                "startedAt": started,
+                "finishedAt": datetime.now(UTC).isoformat(),
+            }
+        print(
+            f"V18.2.68 MANUAL CRYPTO SELL WORKER {'DONE' if ok else 'ERROR'} | "
+            f"{symbol} message={message[:180]}",
+            flush=True,
+        )
+    except Exception as exc:
+        message = str(exc)[:500]
+        with _v18268_manual_sell_guard:
+            _v18268_manual_sell_pending[key] = {
+                "symbol": symbol,
+                "status": "error",
+                "ok": False,
+                "message": message,
+                "startedAt": started,
+                "finishedAt": datetime.now(UTC).isoformat(),
+            }
+        print(f"V18.2.68 MANUAL CRYPTO SELL WORKER ERROR | {symbol} {message}", flush=True)
+
+
 @app.post('/v18/crypto-bridge/manual-sell')
-def api_v18237_crypto_manual_sell(request: Request, payload: Dict[str, Any] = Body(default={})):
+def api_v18268_crypto_manual_sell(request: Request, payload: Dict[str, Any] = Body(default={})):
     verify_api_key(request)
-    return v18237_manual_crypto_sell(str(payload.get("symbol") or ""), str(payload.get("confirmation") or ""))
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    confirmation = str(payload.get("confirmation") or "")
+
+    if confirmation.strip().upper() != "SELL CRYPTO NOW":
+        return {"ok": False, "message": "Confirmation must be SELL CRYPTO NOW."}
+    if not symbol:
+        return {"ok": False, "message": "Crypto symbol is required."}
+
+    key = _v18246_crypto_symbol_key(symbol)
+    with _v18268_manual_sell_guard:
+        existing = _v18268_manual_sell_pending.get(key)
+        if isinstance(existing, dict) and existing.get("status") == "pending":
+            return {
+                "ok": True,
+                "accepted": True,
+                "pending": True,
+                "symbol": symbol,
+                "message": f"Sell for {symbol} is already in progress.",
+            }
+
+        _v18268_manual_sell_pending[key] = {
+            "symbol": symbol,
+            "status": "pending",
+            "ok": None,
+            "message": "Sell accepted and queued for execution.",
+            "startedAt": datetime.now(UTC).isoformat(),
+            "finishedAt": None,
+        }
+
+    threading.Thread(
+        target=_v18268_manual_sell_worker,
+        args=(symbol, confirmation),
+        daemon=True,
+        name=f"crypto-manual-sell-{key}",
+    ).start()
+
+    print(f"V18.2.68 MANUAL CRYPTO SELL ACCEPTED | {symbol}", flush=True)
+    return {
+        "ok": True,
+        "accepted": True,
+        "pending": True,
+        "symbol": symbol,
+        "message": f"Manual sell accepted for {symbol}. Execution is running independently.",
+    }
 
 
 def v18234_crypto_bridge_payload() -> Dict[str, Any]:
@@ -12315,7 +12403,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.67", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.68", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
@@ -12337,6 +12425,10 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "trackerBusy": bool(_v18267_tracker_runtime.get("busy")),
         "trackerSnapshotsWritten": int(_v18267_tracker_runtime.get("written") or 0),
         "trackerSnapshotsCoalesced": int(_v18267_tracker_runtime.get("skipped") or 0),
+        "manualSellNonBlocking": True,
+        "manualSellStates": {
+            k: dict(v) for k, v in list(_v18268_manual_sell_pending.items())[-20:]
+        },
         "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
         "liveMaxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS,
         "reentryCooldownMinutes": V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES,
@@ -12652,7 +12744,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.67 CRYPTO SAFETY ISOLATION | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.68 NON-BLOCKING CRYPTO SELL | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()

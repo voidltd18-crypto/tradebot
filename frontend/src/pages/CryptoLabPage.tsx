@@ -149,15 +149,34 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
     setSellBusySymbol(symbol);
     setSellMessage("");
     try {
-      const res = await fetch(`${API_URL}/v18/crypto-bridge/manual-sell`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Auth-Token": authToken, "x-api-key": authToken },
-        body: JSON.stringify({ symbol, confirmation: "SELL CRYPTO NOW" }),
-      });
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 8000);
+      let res: Response;
+      try {
+        res = await fetch(`${API_URL}/v18/crypto-bridge/manual-sell`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Auth-Token": authToken, "x-api-key": authToken },
+          body: JSON.stringify({ symbol, confirmation: "SELL CRYPTO NOW" }),
+          signal: controller.signal,
+        });
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
       const body = await res.json();
       if (!res.ok || body?.ok === false) throw new Error(body?.message || body?.detail || `HTTP ${res.status}`);
-      if (body?.bridge) setBridge({ ...body.bridge, __fetchedAt: Date.now() });
-      setSellMessage(body?.message || `Manual sell submitted for ${symbol}.`);
+      setSellMessage(body?.message || `Manual sell accepted for ${symbol}.`);
+      // V18.2.68: endpoint acknowledgement is immediate; the durable broker
+      // execution completes independently. Refresh the bridge shortly after so
+      // the position disappears as soon as Alpaca confirms the sell.
+      window.setTimeout(async () => {
+        try {
+          const refresh = await fetch(`${API_URL}/v18/crypto-bridge`, {
+            headers: { "X-Auth-Token": authToken, "x-api-key": authToken },
+          });
+          const freshBody = await refresh.json();
+          if (refresh.ok) setBridge({ ...freshBody, __fetchedAt: Date.now() });
+        } catch (_) {}
+      }, 1500);
     } catch (e: any) {
       setSellMessage(e?.message || `Manual sell failed for ${symbol}.`);
     } finally {
@@ -205,7 +224,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.67 · CRYPTO SAFETY ISOLATION</div>
+          <div className="eyebrow">V18.2.68 · NON-BLOCKING CRYPTO SELL</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
