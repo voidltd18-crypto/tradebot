@@ -86,25 +86,52 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
 
   useEffect(() => {
     let alive = true;
-    const load = async () => {
+
+    const fetchJson = async (url: string, timeoutMs: number) => {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), timeoutMs);
       try {
-        const res = await fetch(`${API_URL}/v18/crypto-shadow`, { headers: { "X-API-Key": authToken } });
+        const res = await fetch(url, {
+          headers: { "X-API-Key": authToken },
+          signal: controller.signal,
+        });
         const body = await res.json();
         if (!res.ok) throw new Error(body?.detail || body?.message || `HTTP ${res.status}`);
-        const bridgeRes = await fetch(`${API_URL}/v18/crypto-bridge`, { headers: { "X-API-Key": authToken } });
-        const bridgeBody = await bridgeRes.json();
-        const historyRes = await fetch(`${API_URL}/v18/crypto-history?limit=5000`, { headers: { "X-API-Key": authToken } });
-        const historyBody = await historyRes.json();
-        if (alive) {
-          setData(body);
-          setBridge(bridgeRes.ok ? { ...bridgeBody, __fetchedAt: Date.now() } : null);
-          if (historyRes.ok && Array.isArray(historyBody?.points)) setHistory(historyBody.points);
-          setError("");
-        }
-      } catch (e: any) {
-        if (alive) setError(e?.message || "Crypto Lab unavailable");
+        return body;
+      } finally {
+        window.clearTimeout(timer);
       }
     };
+
+    const load = async () => {
+      // V18.2.67: requests are independent. A slow history/bridge endpoint must
+      // never leave the entire 24/7 Crypto Lab stuck on the loading card.
+      const [shadowResult, bridgeResult, historyResult] = await Promise.allSettled([
+        fetchJson(`${API_URL}/v18/crypto-shadow`, 8000),
+        fetchJson(`${API_URL}/v18/crypto-bridge`, 8000),
+        fetchJson(`${API_URL}/v18/crypto-history?limit=5000`, 8000),
+      ]);
+      if (!alive) return;
+
+      const warnings: string[] = [];
+      if (shadowResult.status === "fulfilled") {
+        setData(shadowResult.value);
+      } else {
+        warnings.push(`scanner: ${shadowResult.reason?.name === "AbortError" ? "timeout" : shadowResult.reason?.message || "unavailable"}`);
+      }
+      if (bridgeResult.status === "fulfilled") {
+        setBridge({ ...bridgeResult.value, __fetchedAt: Date.now() });
+      } else {
+        warnings.push(`bridge: ${bridgeResult.reason?.name === "AbortError" ? "timeout" : bridgeResult.reason?.message || "unavailable"}`);
+      }
+      if (historyResult.status === "fulfilled" && Array.isArray(historyResult.value?.points)) {
+        setHistory(historyResult.value.points);
+      } else if (historyResult.status === "rejected") {
+        warnings.push(`history: ${historyResult.reason?.name === "AbortError" ? "timeout" : historyResult.reason?.message || "unavailable"}`);
+      }
+      setError(warnings.length ? `Partial refresh · ${warnings.join(" · ")}` : "");
+    };
+
     load();
     const id = window.setInterval(load, 30000);
     return () => {
@@ -178,7 +205,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.65 · CRYPTO STALL EXIT</div>
+          <div className="eyebrow">V18.2.67 · CRYPTO SAFETY ISOLATION</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -307,7 +334,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
     <section className="crypto-footer-strip">
       <span><b>Shadow:</b> {Number(bridge?.shadowEvidence?.closedTests || data.closedTrades || 0)} tests · {money(bridge?.shadowEvidence?.totalPnlUsd ?? data.totalPnlUsd)} · win {pct(bridge?.shadowEvidence?.winRate ?? data.winRate)}</span>
       <span><b>Safety:</b> Stop {pct(data.config?.stopPct)} · Trail {pct(data.config?.trailStartPct)} / {pct(data.config?.trailGivebackPct)}</span>
-      <span><b>Next live decision:</b> {fmtCountdown(nextDecisionSeconds)} · safety still checks every {Number(bridge?.safetyCheckIntervalSeconds || 15)}s</span>
+      <span><b>Next live decision:</b> {fmtCountdown(nextDecisionSeconds)} · safety still checks every {Number(bridge?.safetyCheckIntervalSeconds || 5)}s</span>
       <span><b>Re-entry:</b> {Number(bridge?.reentryCooldownMinutes || 30)} min after wins · {Number(bridge?.lossCooldownMinutes || 120)} min after losses</span>
       <span><b>Loss brake:</b> {Number(bridge?.consecutiveCryptoLosses || 0)}/{Number(bridge?.lossBrakeStreak || 2)} consecutive · daily {gbp(bridge?.dailyCryptoPnlGbp)} / -{gbp(bridge?.dailyLossLimitGbp)}</span>
       <span><b>Stock engine:</b> £900 baseline and MARA rules untouched</span>

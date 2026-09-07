@@ -11392,6 +11392,21 @@ V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES = max(1, int(os.getenv("TRADEBOT_CRYPTO_R
 _crypto_live_lock = threading.RLock()
 _crypto_live_runtime: Dict[str, Any] = {"lastError": None, "lastActionAt": None, "normalDecisionCycleCount": 0, "workerStartedAt": None}
 
+# V18.2.67 — safety isolation / dashboard resilience.
+# Non-critical tracker snapshots are requested by the 5s live loop but written
+# by a separate worker so a slow SQLite writer can never delay stop/trail checks.
+_v18267_tracker_event = threading.Event()
+_v18267_tracker_thread_started = False
+_v18267_tracker_runtime: Dict[str, Any] = {
+    "requested": 0, "written": 0, "skipped": 0, "lastRequestedAt": None,
+    "lastWrittenAt": None, "lastError": None, "busy": False,
+}
+
+# Crypto Lab reads a last-known-good scanner snapshot from memory. This keeps the
+# dashboard responsive even when unrelated DB/outcome workers are busy.
+_v18267_shadow_api_cache_lock = threading.RLock()
+_v18267_shadow_api_cache: Dict[str, Any] = {}
+
 
 def _v18266_account_equity_gbp() -> float:
     """Current Alpaca account equity in GBP, used only to split stock/crypto capital."""
@@ -12084,6 +12099,64 @@ def _v18252_record_crypto_movement() -> None:
         print(f"V18.2.52 CRYPTO TRACKER SNAPSHOT ERROR | {str(exc)[:300]}", flush=True)
 
 
+def _v18267_request_crypto_movement_snapshot() -> None:
+    """Queue one best-effort tracker snapshot without blocking the live safety loop."""
+    _v18267_tracker_runtime["requested"] = int(_v18267_tracker_runtime.get("requested") or 0) + 1
+    _v18267_tracker_runtime["lastRequestedAt"] = datetime.now(UTC).isoformat()
+    # Event coalescing is intentional: if the recorder is already busy, one pending
+    # snapshot is enough. Chart density is less important than live protection.
+    if _v18267_tracker_event.is_set() or bool(_v18267_tracker_runtime.get("busy")):
+        _v18267_tracker_runtime["skipped"] = int(_v18267_tracker_runtime.get("skipped") or 0) + 1
+    _v18267_tracker_event.set()
+
+
+def _v18267_crypto_tracker_worker() -> None:
+    """Dedicated low-priority DB writer for Crypto Record Tracker snapshots."""
+    while True:
+        _v18267_tracker_event.wait()
+        _v18267_tracker_event.clear()
+        _v18267_tracker_runtime["busy"] = True
+        started = time.monotonic()
+        try:
+            _v18252_record_crypto_movement()
+            _v18267_tracker_runtime["written"] = int(_v18267_tracker_runtime.get("written") or 0) + 1
+            _v18267_tracker_runtime["lastWrittenAt"] = datetime.now(UTC).isoformat()
+            _v18267_tracker_runtime["lastError"] = None
+        except Exception as exc:
+            # _v18252_record_crypto_movement already guards its DB work, but keep
+            # this outer guard so the recorder thread itself can never die.
+            _v18267_tracker_runtime["lastError"] = str(exc)[:300]
+        finally:
+            _v18267_tracker_runtime["busy"] = False
+            elapsed = time.monotonic() - started
+            if elapsed >= 2.0:
+                print(f"V18.2.67 CRYPTO TRACKER SLOW | duration={elapsed:.3f}s safety_loop_blocked=False", flush=True)
+
+
+def _v18267_cache_crypto_shadow_payload(payload: Dict[str, Any]) -> None:
+    if not isinstance(payload, dict) or not payload:
+        return
+    cached = dict(payload)
+    cached["servedFromMemory"] = True
+    cached["cacheUpdatedAt"] = datetime.now(UTC).isoformat()
+    cached["version"] = "V18.2.67"
+    with _v18267_shadow_api_cache_lock:
+        _v18267_shadow_api_cache.clear()
+        _v18267_shadow_api_cache.update(cached)
+
+
+def _v18267_get_crypto_shadow_snapshot() -> Dict[str, Any]:
+    with _v18267_shadow_api_cache_lock:
+        if _v18267_shadow_api_cache:
+            return dict(_v18267_shadow_api_cache)
+    # Startup fallback only. Once the shadow worker completes its first cycle, API
+    # requests no longer need to touch SQLite for the scanner payload.
+    payload = v18232_crypto_shadow_payload()
+    _v18267_cache_crypto_shadow_payload(payload)
+    return dict(payload)
+
+
+
 def _v18252_crypto_history_payload(limit: int = 5000) -> Dict[str, Any]:
     limit = max(50, min(int(limit or 5000), 20000))
     rows: List[Dict[str, Any]] = []
@@ -12127,8 +12200,11 @@ def v18242_crypto_live_worker() -> None:
                     _crypto_shadow_last_scans.extend(scans)
             now_mono = time.monotonic()
             allow_normal = now_mono >= next_normal_decision_at
+            safety_started = time.monotonic()
             result = v18234_crypto_live_cycle(scans, allow_normal_decisions=allow_normal)
-            _v18252_record_crypto_movement()
+            _crypto_live_runtime["lastSafetyCycleAt"] = datetime.now(UTC).isoformat()
+            _crypto_live_runtime["lastSafetyDurationMs"] = round((time.monotonic() - safety_started) * 1000.0, 1)
+            _v18267_request_crypto_movement_snapshot()
             if allow_normal and not result.get("busy") and result.get("armed", True) and not result.get("entriesPaused"):
                 next_normal_decision_at = now_mono + V18248_CRYPTO_DECISION_INTERVAL_SECONDS
                 _crypto_live_runtime["lastNormalDecisionAt"] = datetime.now(UTC).isoformat()
@@ -12198,7 +12274,7 @@ def api_v18237_crypto_manual_sell(request: Request, payload: Dict[str, Any] = Bo
 def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     state = _v18241_apply_vault_reserve(load_profit_vault_state(), save=True)
     vault = profit_vault_payload(); account = _v18234_crypto_account_status()
-    crypto = v18232_crypto_shadow_payload()
+    crypto = _v18267_get_crypto_shadow_snapshot()
     allocated = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
     piggy_bank = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
     reserve = max(0.0, float(state.get("cryptoVaultReserveGbp") or 0.0))
@@ -12239,7 +12315,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.66", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.67", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
@@ -12255,6 +12331,12 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "lastNormalDecisionAt": _crypto_live_runtime.get("lastNormalDecisionAt"),
         "normalDecisionCycleCount": int(_crypto_live_runtime.get("normalDecisionCycleCount") or 0),
         "workerStartedAt": _crypto_live_runtime.get("workerStartedAt"),
+        "lastSafetyCycleAt": _crypto_live_runtime.get("lastSafetyCycleAt"),
+        "lastSafetyDurationMs": float(_crypto_live_runtime.get("lastSafetyDurationMs") or 0.0),
+        "trackerIsolationEnabled": True,
+        "trackerBusy": bool(_v18267_tracker_runtime.get("busy")),
+        "trackerSnapshotsWritten": int(_v18267_tracker_runtime.get("written") or 0),
+        "trackerSnapshotsCoalesced": int(_v18267_tracker_runtime.get("skipped") or 0),
         "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
         "liveMaxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS,
         "reentryCooldownMinutes": V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES,
@@ -12358,7 +12440,7 @@ def api_v18234_crypto_live_disable(request: Request, payload: Dict[str, Any] = B
 @app.get('/v18/crypto-shadow')
 def api_v18232_crypto_shadow(request: Request):
     verify_api_key(request)
-    return v18232_crypto_shadow_payload()
+    return _v18267_get_crypto_shadow_snapshot()
 
 
 def v18232_crypto_shadow_worker() -> None:
@@ -12367,6 +12449,10 @@ def v18232_crypto_shadow_worker() -> None:
     while True:
         try:
             v18232_crypto_shadow_cycle()
+            try:
+                _v18267_cache_crypto_shadow_payload(v18232_crypto_shadow_payload())
+            except Exception as cache_exc:
+                print(f"V18.2.67 CRYPTO API CACHE WARNING | {str(cache_exc)[:300]}", flush=True)
         except Exception as exc:
             text = str(exc)[:1000]; now = datetime.now(UTC).isoformat()
             _crypto_shadow_runtime.update({"running": True, "lastError": text, "lastScanAt": now})
@@ -12508,7 +12594,7 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started, v18224_live_audit_thread_started, v18230_evidence_thread_started, v18232_crypto_shadow_thread_started, v18242_crypto_live_thread_started
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started, v18224_live_audit_thread_started, v18230_evidence_thread_started, v18232_crypto_shadow_thread_started, v18242_crypto_live_thread_started, _v18267_tracker_thread_started
     # Initialise the shared SQLite schema synchronously before any worker threads start.
     # This removes the startup race where multiple workers all tried to create tables.
     init_db()
@@ -12563,6 +12649,10 @@ def startup_event():
         v18242_crypto_live_thread_started = True
         threading.Thread(target=v18242_crypto_live_worker, daemon=True, name="v18-crypto-live").start()
         print(f"V18.2.51 CRYPTO LIVE EXECUTOR | safety_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s normal_decision_interval={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m independent_of_shadow=True", flush=True)
+    if not _v18267_tracker_thread_started:
+        _v18267_tracker_thread_started = True
+        threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
+        print("V18.2.67 CRYPTO SAFETY ISOLATION | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
