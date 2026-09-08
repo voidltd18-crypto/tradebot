@@ -11367,9 +11367,14 @@ def _v18276_health_snapshot() -> Dict[str, Any]:
 
     status="GOOD"
     reasons=[]
-    if safety_age is None or safety_age > 20:
+    if safety_age is None:
+        status="STARTING"; reasons.append("waiting for first safety cycle")
+    elif safety_age > 20:
         status="DEGRADED"; reasons.append("safety loop stale")
-    if scanner_age is None or scanner_age > 900:
+    if scanner_age is None:
+        if status != "DEGRADED": status="STARTING"
+        reasons.append("waiting for first scanner cycle")
+    elif scanner_age > 900:
         status="DEGRADED"; reasons.append("scanner stale")
     if int(h.get("exitPendingCount") or 0) > 0:
         reasons.append("exit pending")
@@ -11379,6 +11384,9 @@ def _v18276_health_snapshot() -> Dict[str, Any]:
         reasons.append("audit write errors")
     if (h.get("lastSafetyDurationMs") or 0) > 4000:
         status="DEGRADED"; reasons.append("slow safety cycle")
+    h["safetyObserved"]=safety_age is not None
+    h["scannerObserved"]=scanner_age is not None
+    h["decisionObserved"]=decision_age is not None
     h["status"]=status
     h["reasons"]=reasons
     return h
@@ -11594,7 +11602,15 @@ def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
     _crypto_shadow_runtime.update({"running": True, "lastError": None, "lastScanAt": now})
     # V18.2.34: same market scan can drive the separately permissioned live pilot.
     try:
-        v18234_crypto_live_cycle(scans, allow_normal_decisions=False)
+        (
+    (lambda _v182772_started: (
+        _v18276_engine_health.__setitem__("safetyCycles", int(_v18276_engine_health.get("safetyCycles") or 0) + 1),
+        v18234_crypto_live_cycle(scans, allow_normal_decisions=False),
+        _v18276_engine_health.__setitem__("lastSafetyCycleAt", datetime.now(UTC).isoformat()),
+        _v18276_engine_health.__setitem__("lastSafetyDurationMs", int((time.monotonic()-_v182772_started)*1000)),
+        _v18276_engine_health.__setitem__("safetyCycleMaxMs", max(int(_v18276_engine_health.get("safetyCycleMaxMs") or 0), int((time.monotonic()-_v182772_started)*1000)))
+    )[1])(time.monotonic())
+)
     except Exception as exc:
         _crypto_live_runtime["lastError"] = str(exc)[:500]
         print(f"V18.2.34 CRYPTO LIVE CYCLE ERROR | {exc}", flush=True)
@@ -12229,7 +12245,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
         if breakeven_armed and price < entry:
             reason = "CRYPTO BREAKEVEN CROSS"
             print(
-                f"V18.2.77 CRYPTO BREAKEVEN CROSS | {symbol} "
+                f"V18.2.77.2 CRYPTO BREAKEVEN CROSS | {symbol} "
                 f"entry={entry:.8f} price={price:.8f} pnl={pnl_pct:.3f}% "
                 f"high={high:.8f}",
                 flush=True,
@@ -12790,7 +12806,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.77", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.77.2", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
@@ -13138,7 +13154,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.77 TRADE LEDGER CLEANUP | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.77.2 HEALTH TELEMETRY FIX | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()

@@ -282,7 +282,7 @@ useEffect(() => {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.77.1 · DASHBOARD API HOTFIX</div>
+          <div className="eyebrow">V18.2.77.2 · HEALTH TELEMETRY FIX</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -391,7 +391,13 @@ useEffect(() => {
         <div className="crypto-section-heading">
           <div>
             <div className="crypto-kicker">♥ Engine Health</div>
-            <h2>{engineHealth?.status === "GOOD" ? "GOOD 🟢" : "DEGRADED 🟠"}</h2>
+            <h2>{
+              engineHealth?.status === "GOOD"
+                ? "GOOD 🟢"
+                : engineHealth?.status === "STARTING"
+                  ? "STARTING 🟡"
+                  : "DEGRADED 🟠"
+            }</h2>
             <p>Mechanical health only — this does not alter entries, exits or risk rules.</p>
           </div>
           <button type="button" className="crypto-secondary-button" onClick={loadEngineHealth}>Refresh Health</button>
