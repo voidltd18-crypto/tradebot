@@ -4,6 +4,7 @@ import time
 import secrets
 import hashlib
 import shutil
+import uuid
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "200") or 200)
 
 import sqlite3
@@ -10964,6 +10965,16 @@ _crypto_universe_runtime: Dict[str, Any] = {
 # 0.34 still requires the setup to rank near the top of the scanner while
 # allowing the live crypto pilot to participate earlier in positive momentum.
 V18232_CRYPTO_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_ENTRY_SCORE", "0.38") or 0.38)))
+# V18.2.73 — market-regime-aware crypto entry thresholds.
+# Strong markets stay permissive; mixed/weak markets demand better setups.
+V18273_CRYPTO_REGIME_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_REGIME_ENABLED", "true")).lower() in ("1","true","yes","on")
+V18273_CRYPTO_STRONG_ENTRY_SCORE = float(os.getenv("TRADEBOT_CRYPTO_STRONG_ENTRY_SCORE", "0.38") or 0.38)
+V18273_CRYPTO_MIXED_ENTRY_SCORE = float(os.getenv("TRADEBOT_CRYPTO_MIXED_ENTRY_SCORE", "0.42") or 0.42)
+V18273_CRYPTO_WEAK_ENTRY_SCORE = float(os.getenv("TRADEBOT_CRYPTO_WEAK_ENTRY_SCORE", "0.50") or 0.50)
+V18273_CRYPTO_WEAK_MIN_15M_PCT = float(os.getenv("TRADEBOT_CRYPTO_WEAK_MIN_15M_PCT", "0.20") or 0.20)
+V18273_CRYPTO_WEAK_MIN_60M_PCT = float(os.getenv("TRADEBOT_CRYPTO_WEAK_MIN_60M_PCT", "0.25") or 0.25)
+_v18273_last_regime = {"name":"mixed","entryScore":0.42,"min15mPct":0.0,"min60mPct":0.05}
+
 # V18.2.51 — balanced crypto entry gates. These do not affect stocks.
 # Momentum is now a deterioration guard rather than a requirement for an already-large move.
 # A candidate may consolidate slightly over 15m, but must not be materially falling and
@@ -11196,20 +11207,31 @@ def _v18232_fetch_scans() -> List[Dict[str, Any]]:
         )
         liquidity_mode = "adaptive-relative"
 
+    global _v18273_last_regime
+    regime = _v18273_crypto_market_regime(scans)
+    _v18273_last_regime = dict(regime)
     liquid_count = 0
+    qualified_count = 0
     for item in scans:
         notional = float(item.get("liquidity60mUsd") or 0.0)
         liquid = bool(notional >= effective_liquidity_floor and notional >= V18253_CRYPTO_MIN_ADAPTIVE_NOTIONAL_USD)
         item["liquid"] = liquid
         item["liquidityThreshold60mUsd"] = round(effective_liquidity_floor, 2)
         item["liquidityMode"] = liquidity_mode
+        item["marketRegime"] = regime["name"]
+        item["regimeEntryScore"] = regime["entryScore"]
+        item["regimeMin15mPct"] = regime["min15mPct"]
+        item["regimeMin60mPct"] = regime["min60mPct"]
         item["qualified"] = bool(
-            float(item.get("score") or 0.0) >= V18232_CRYPTO_ENTRY_SCORE
+            float(item.get("score") or 0.0) >= float(regime["entryScore"])
             and liquid
-            and bool(item.get("entryMomentumOk"))
+            and float(item.get("return15mPct") or 0.0) >= float(regime["min15mPct"])
+            and float(item.get("return60mPct") or 0.0) >= float(regime["min60mPct"])
         )
         if liquid:
             liquid_count += 1
+        if item["qualified"]:
+            qualified_count += 1
 
     scans.sort(key=lambda x: float(x.get("score") or 0), reverse=True)
     with _crypto_universe_lock:
@@ -11218,12 +11240,249 @@ def _v18232_fetch_scans() -> List[Dict[str, Any]]:
         _crypto_universe_runtime["liquidityMode"] = liquidity_mode
     if scans:
         print(
-            f"V18.2.71 CRYPTO LIQUIDITY | mode={liquidity_mode} "
+            f"V18.2.73 CRYPTO REGIME | {regime['name'].upper()} "
+            f"score>={regime['entryScore']:.2f} 15m>={regime['min15mPct']:.2f}% "
+            f"60m>={regime['min60mPct']:.2f}% breadth15={regime['positive15Pct']:.1f}% "
+            f"breadth60={regime['positive60Pct']:.1f}% median15={regime['median15']:.2f}% "
+            f"median60={regime['median60']:.2f}% qualified={qualified_count}",
+            flush=True,
+        )
+        print(
+            f"V18.2.73 CRYPTO LIQUIDITY | mode={liquidity_mode} "
             f"floor=${effective_liquidity_floor:.2f} liquid={liquid_count}/{len(scans)} "
             f"fixed_passes={fixed_passes} fixed_ceiling=${V18245_CRYPTO_MIN_60M_NOTIONAL_USD:.2f}",
             flush=True,
         )
     return scans
+
+
+# V18.2.74 — Crypto Decision Audit (observability only; no strategy changes).
+_v18274_crypto_entry_context: Dict[str, Dict[str, Any]] = {}
+_v18274_crypto_audit_lock = threading.Lock()
+V18274_CRYPTO_AUDIT_FILE = os.getenv("TRADEBOT_CRYPTO_AUDIT_FILE", "/tmp/tradebot_crypto_decision_audit.jsonl")
+
+def _v18274_audit_write(row: Dict[str, Any]) -> None:
+    try:
+        data=dict(row or {}); data["ts"]=datetime.now(UTC).isoformat(); data["version"]="V18.2.74"
+        with _v18274_crypto_audit_lock:
+            with open(V18274_CRYPTO_AUDIT_FILE,"a",encoding="utf-8") as fh:
+                fh.write(json.dumps(data,separators=(",",":"),default=str)+"\n")
+        _v18276_engine_health["lastAuditWriteAt"] = datetime.now(UTC).isoformat()
+    except Exception as exc:
+        _v18276_engine_health["auditWriteErrors"] = int(_v18276_engine_health.get("auditWriteErrors") or 0) + 1
+        print(f"V18.2.76 AUDIT WRITE ERROR | {exc}",flush=True)
+
+def _v18274_audit_summary(limit: int = 5000) -> Dict[str, Any]:
+    rows=[]
+    try:
+        if os.path.exists(V18274_CRYPTO_AUDIT_FILE):
+            with open(V18274_CRYPTO_AUDIT_FILE,"r",encoding="utf-8") as fh:
+                for line in fh:
+                    try: rows.append(json.loads(line))
+                    except Exception: pass
+    except Exception as exc:
+        return {"ok":False,"error":str(exc),"closedTrades":0}
+    rows=rows[-max(1,int(limit)):]
+    raw_exits=[r for r in rows if r.get("event")=="exit"]
+    deduped={}
+    legacy=[]
+    for r in raw_exits:
+        tid=r.get("tradeId")
+        if tid: deduped[str(tid)]=r
+        else: legacy.append(r)
+    exits=legacy+list(deduped.values())
+    def grouped(field):
+        out={}
+        for r in exits:
+            k=str(r.get(field) or "unknown"); pnl=float(r.get("pnlUsd") or 0)
+            b=out.setdefault(k,{"trades":0,"wins":0,"losses":0,"pnlUsd":0.0,"winRatePct":0.0,"avgWinUsd":0.0,"avgLossUsd":0.0})
+            b["trades"]+=1; b["pnlUsd"]+=pnl
+            if pnl>0:b["wins"]+=1
+            elif pnl<0:b["losses"]+=1
+        for k,b in out.items():
+            vals=[float(r.get("pnlUsd") or 0) for r in exits if str(r.get(field) or "unknown")==k]
+            pos=[v for v in vals if v>0]; neg=[v for v in vals if v<0]
+            b["pnlUsd"]=round(b["pnlUsd"],2)
+            b["winRatePct"]=round(100*b["wins"]/b["trades"],1) if b["trades"] else 0.0
+            b["avgWinUsd"]=round(sum(pos)/len(pos),2) if pos else 0.0
+            b["avgLossUsd"]=round(sum(neg)/len(neg),2) if neg else 0.0
+        return out
+    wins=sum(1 for r in exits if float(r.get("pnlUsd") or 0)>0)
+    losses=sum(1 for r in exits if float(r.get("pnlUsd") or 0)<0)
+    pnl_total=sum(float(r.get("pnlUsd") or 0) for r in exits)
+    avg_win=(sum(float(r.get("pnlUsd") or 0) for r in exits if float(r.get("pnlUsd") or 0)>0)/wins) if wins else 0.0
+    avg_loss=(sum(float(r.get("pnlUsd") or 0) for r in exits if float(r.get("pnlUsd") or 0)<0)/losses) if losses else 0.0
+    expectancy=(pnl_total/len(exits)) if exits else 0.0
+    return {"ok":True,"closedTrades":len(exits),"wins":wins,
+            "losses":losses,
+            "winRatePct":round(100*wins/len(exits),1) if exits else 0.0,
+            "pnlUsd":round(pnl_total,2),
+            "avgWinUsd":round(avg_win,2),
+            "avgLossUsd":round(avg_loss,2),
+            "expectancyUsd":round(expectancy,4),
+            "sampleTarget":30,
+            "sampleReady":bool(len(exits)>=20),
+            "sampleProgressPct":round(min(100.0,(len(exits)/30.0)*100.0),1),
+            "logicalLedger":_v18277_ledger_summary(),
+            "byRegime":grouped("entryRegime"),"bySymbol":grouped("symbol"),
+            "byExitReason":grouped("exitReason"),"recent":exits[-50:]}
+
+# V18.2.76 — Engine Health Monitor (observability only).
+_v18276_engine_health: Dict[str, Any] = {
+    "lastSafetyCycleAt": None,
+    "lastSafetyDurationMs": None,
+    "safetyCycleMaxMs": 0,
+    "safetyCycles": 0,
+    "lastDecisionCycleAt": None,
+    "lastDecisionDurationMs": None,
+    "decisionCycles": 0,
+    "lastScannerAt": None,
+    "lastScannerDurationMs": None,
+    "scannerErrors": 0,
+    "lastOrderLatencyMs": None,
+    "lastSellLatencyMs": None,
+    "lastAuditWriteAt": None,
+    "auditWriteErrors": 0,
+    "exitPendingCount": 0,
+}
+
+def _v18276_health_snapshot() -> Dict[str, Any]:
+    h=dict(_v18276_engine_health)
+    h["exitPendingCount"] = len(_v18268_manual_sell_pending) if "_v18268_manual_sell_pending" in globals() else int(h.get("exitPendingCount") or 0)
+    now=datetime.now(UTC)
+    def age_seconds(v):
+        if not v: return None
+        try:
+            dt=datetime.fromisoformat(str(v).replace("Z","+00:00"))
+            return max(0,int((now-dt).total_seconds()))
+        except Exception:
+            return None
+    h["safetyAgeSeconds"]=age_seconds(h.get("lastSafetyCycleAt"))
+    h["decisionAgeSeconds"]=age_seconds(h.get("lastDecisionCycleAt"))
+    h["scannerAgeSeconds"]=age_seconds(h.get("lastScannerAt"))
+
+    safety_age=h.get("safetyAgeSeconds")
+    decision_age=h.get("decisionAgeSeconds")
+    scanner_age=h.get("scannerAgeSeconds")
+
+    status="GOOD"
+    reasons=[]
+    if safety_age is None or safety_age > 20:
+        status="DEGRADED"; reasons.append("safety loop stale")
+    if scanner_age is None or scanner_age > 900:
+        status="DEGRADED"; reasons.append("scanner stale")
+    if int(h.get("exitPendingCount") or 0) > 0:
+        reasons.append("exit pending")
+    if int(h.get("scannerErrors") or 0) >= 3:
+        status="DEGRADED"; reasons.append("scanner errors")
+    if int(h.get("auditWriteErrors") or 0) >= 3:
+        reasons.append("audit write errors")
+    if (h.get("lastSafetyDurationMs") or 0) > 4000:
+        status="DEGRADED"; reasons.append("slow safety cycle")
+    h["status"]=status
+    h["reasons"]=reasons
+    return h
+
+# V18.2.77 — Logical Crypto Trade Ledger.
+# One bot-managed position receives one tradeId from entry to final exit.
+# Broker fills remain broker fills; analytics use the logical completed trade.
+_v18277_logical_trades: Dict[str, Dict[str, Any]] = {}
+_v18277_ledger_lock = threading.Lock()
+V18277_LEDGER_FILE = os.getenv("TRADEBOT_CRYPTO_LOGICAL_LEDGER_FILE", "/tmp/tradebot_crypto_logical_ledger.jsonl")
+
+def _v18277_trade_id(symbol: str) -> str:
+    key=_v18246_crypto_symbol_key(symbol)
+    return f"CT-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}-{key}-{uuid.uuid4().hex[:8]}"
+
+def _v18277_ledger_append(row: Dict[str, Any]) -> None:
+    try:
+        data=dict(row or {})
+        data["ledgerVersion"]="V18.2.77"
+        data["recordedAt"]=datetime.now(UTC).isoformat()
+        with _v18277_ledger_lock:
+            with open(V18277_LEDGER_FILE,"a",encoding="utf-8") as fh:
+                fh.write(json.dumps(data,separators=(",",":"),default=str)+"\n")
+    except Exception as exc:
+        print(f"V18.2.77 LEDGER WRITE ERROR | {exc}",flush=True)
+
+def _v18277_ledger_rows(limit: int = 10000) -> List[Dict[str, Any]]:
+    rows=[]
+    try:
+        if os.path.exists(V18277_LEDGER_FILE):
+            with open(V18277_LEDGER_FILE,"r",encoding="utf-8") as fh:
+                for line in fh:
+                    try: rows.append(json.loads(line))
+                    except Exception: pass
+    except Exception:
+        pass
+    return rows[-max(1,int(limit)):]
+
+def _v18277_ledger_summary() -> Dict[str, Any]:
+    rows=_v18277_ledger_rows()
+    entries=[r for r in rows if r.get("event")=="logical_entry"]
+    exits=[r for r in rows if r.get("event")=="logical_exit"]
+    ids={str(r.get("tradeId")) for r in rows if r.get("tradeId")}
+    completed={str(r.get("tradeId")) for r in exits if r.get("tradeId")}
+    open_ids=ids-completed
+    return {
+        "ok":True,
+        "logicalEntries":len(entries),
+        "completedTrades":len(exits),
+        "openLogicalTrades":len(open_ids),
+        "uniqueTradeIds":len(ids),
+        "duplicateCompletedTradeIds":max(0,len(exits)-len(completed)),
+        "ledgerHealthy":len(exits)==len(completed),
+        "recentCompleted":exits[-50:],
+    }
+
+def _v18273_median(values):
+    vals = sorted(float(v) for v in values)
+    if not vals:
+        return 0.0
+    n = len(vals)
+    mid = n // 2
+    return vals[mid] if n % 2 else (vals[mid-1] + vals[mid]) / 2.0
+
+
+def _v18273_crypto_market_regime(scans: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Classify breadth from the same completed 5-minute bars used by the scanner."""
+    rows = [x for x in (scans or []) if isinstance(x, dict)]
+    if not rows or not V18273_CRYPTO_REGIME_ENABLED:
+        return {"name":"strong","entryScore":V18232_CRYPTO_ENTRY_SCORE,
+                "min15mPct":V18250_CRYPTO_MIN_15M_MOMENTUM_PCT,
+                "min60mPct":V18250_CRYPTO_MIN_60M_MOMENTUM_PCT,
+                "positive15Pct":0.0,"positive60Pct":0.0,"median15":0.0,"median60":0.0}
+    r15=[float(x.get("return15mPct") or 0.0) for x in rows]
+    r60=[float(x.get("return60mPct") or 0.0) for x in rows]
+    p15=sum(1 for v in r15 if v > 0)/max(1,len(r15))
+    p60=sum(1 for v in r60 if v > 0)/max(1,len(r60))
+    m15=_v18273_median(r15); m60=_v18273_median(r60)
+
+    if p15 >= 0.58 and p60 >= 0.58 and m15 >= 0.05 and m60 >= 0.10:
+        name="strong"; score=V18273_CRYPTO_STRONG_ENTRY_SCORE; min15=-0.10; min60=0.00
+    elif p15 <= 0.35 or p60 <= 0.35 or (m15 < 0 and m60 < 0):
+        name="weak"; score=V18273_CRYPTO_WEAK_ENTRY_SCORE; min15=V18273_CRYPTO_WEAK_MIN_15M_PCT; min60=V18273_CRYPTO_WEAK_MIN_60M_PCT
+    else:
+        name="mixed"; score=V18273_CRYPTO_MIXED_ENTRY_SCORE; min15=0.00; min60=0.05
+
+    return {"name":name,"entryScore":score,"min15mPct":min15,"min60mPct":min60,
+            "positive15Pct":round(p15*100,1),"positive60Pct":round(p60*100,1),
+            "median15":round(m15,4),"median60":round(m60,4)}
+
+
+def _v18273_loss_brake_minutes(streak: int) -> int:
+    regime = str((_v18273_last_regime or {}).get("name") or "mixed")
+    if regime == "weak":
+        minutes = 30
+    elif regime == "strong":
+        minutes = 10
+    else:
+        minutes = 20
+    if streak >= 4:
+        minutes += 15
+    elif streak >= 3:
+        minutes += 5
+    return minutes
 
 
 def _v18232_load_state() -> Dict[str, Any]:
@@ -11750,6 +12009,7 @@ def _v18234_live_buy(scan: Dict[str, Any], allocation_gbp_override: Optional[flo
         return False
 
     try:
+        _v18276_order_started = time.monotonic()
         live_account = get_account()
         broker_cash_usd = max(0.0, float(getattr(live_account, "cash", 0.0) or 0.0))
     except Exception:
@@ -11767,17 +12027,46 @@ def _v18234_live_buy(scan: Dict[str, Any], allocation_gbp_override: Optional[flo
         try:
             req = MarketOrderRequest(symbol=symbol, notional=notional_usd, side=OrderSide.BUY, time_in_force=TimeInForce.GTC)
             order = trading_client.submit_order(order_data=req)
+            _v18276_engine_health["lastOrderLatencyMs"] = int((time.monotonic()-_v18276_order_started)*1000)
             fill_price, fill_qty = _v18234_poll_fill(order, price, notional_usd / price)
             _v18234_log_live_trade(symbol, "BUY", order, fill_qty, fill_price, notional_usd, None, None, score, "CRYPTO LIVE PILOT ENTRY")
             _crypto_live_runtime.update({"lastError": None, "lastActionAt": datetime.now(UTC).isoformat()})
-            print(f"V18.2.45 CRYPTO LIVE BUY | {symbol} notional=${notional_usd:.2f} fill={fill_price:.8f} qty={fill_qty:.8f} score={score:.3f}", flush=True)
+            print(f"V18.2.74 CRYPTO LIVE BUY | {symbol} notional=${notional_usd:.2f} fill={fill_price:.8f} qty={fill_qty:.8f} score={score:.3f}", flush=True)
+            try:
+                ctx={"event":"entry","symbol":symbol,
+                     "regime":str((_v18273_last_regime or {}).get("name") or "unknown"),
+                     "score":round(score,6),
+                     "return15mPct":round(float(scan.get("return15mPct") or 0),6),
+                     "return60mPct":round(float(scan.get("return60mPct") or 0),6),
+                     "range60mPct":round(float(scan.get("range60mPct") or 0),6),
+                     "liquidity60mUsd":round(float(scan.get("liquidity60mUsd") or 0),2),
+                     "liquidityFloorUsd":round(float(scan.get("liquidityThreshold60mUsd") or 0),2),
+                     "notionalUsd":round(notional_usd,2),"fillPrice":round(fill_price,8),"qty":round(fill_qty,12)}
+                _v18274_crypto_entry_context[_v18246_crypto_symbol_key(symbol)]=dict(ctx)
+                trade_id=_v18277_trade_id(symbol)
+                ctx["tradeId"]=trade_id
+                ctx["source"]="bot_managed"
+                _v18274_crypto_entry_context[_v18246_crypto_symbol_key(symbol)]=dict(ctx)
+                logical_entry={"event":"logical_entry","tradeId":trade_id,"symbol":symbol,"source":"bot_managed",
+                               "entryPrice":round(fill_price,8),"entryQty":round(fill_qty,12),
+                               "entryNotionalUsd":round(float(notional_usd or 0),6),
+                               "entryRegime":ctx.get("regime"),"entryScore":ctx.get("score"),
+                               "entry15mPct":ctx.get("return15mPct"),"entry60mPct":ctx.get("return60mPct"),
+                               "entryLiquidity60mUsd":ctx.get("liquidity60mUsd"),
+                               "openedAt":datetime.now(UTC).isoformat()}
+                _v18277_logical_trades[_v18246_crypto_symbol_key(symbol)]=dict(logical_entry)
+                threading.Thread(target=_v18277_ledger_append,args=(logical_entry,),daemon=True).start()
+                threading.Thread(target=_v18274_audit_write,args=(ctx,),daemon=True).start()
+                print(f"V18.2.74 CRYPTO AUDIT ENTRY | {symbol} regime={ctx['regime']} score={score:.3f} 15m={ctx['return15mPct']:.2f}% 60m={ctx['return60mPct']:.2f}%",flush=True)
+            except Exception as exc:
+                print(f"V18.2.74 AUDIT ENTRY ERROR | {symbol} {exc}",flush=True)
             return True
         except Exception as exc:
             _crypto_live_runtime["lastError"] = str(exc)[:500]
             print(f"V18.2.45 CRYPTO LIVE BUY ERROR | {symbol} {exc}", flush=True)
             return False
-
 def _v18234_live_sell(position: Dict[str, Any], price: float, score: float, reason: str) -> bool:
+    _v18273_exit_started = time.monotonic()
     symbol = str(position.get("symbol") or "").upper(); qty = float(position.get("qty") or 0); entry = float(position.get("entry") or 0)
     if not symbol or qty <= 0 or entry <= 0 or price <= 0:
         return False
@@ -11801,9 +12090,14 @@ def _v18234_live_sell(position: Dict[str, Any], price: float, score: float, reas
                 streak = int(state.get("cryptoConsecutiveLosses") or 0) + 1
                 state["cryptoConsecutiveLosses"] = streak
                 if streak >= V18250_CRYPTO_LOSS_BRAKE_STREAK:
-                    brake_until = datetime.now(UTC) + timedelta(minutes=V18250_CRYPTO_LOSS_BRAKE_MINUTES)
+                    brake_minutes = _v18273_loss_brake_minutes(streak)
+                    brake_until = datetime.now(UTC) + timedelta(minutes=brake_minutes)
                     state["cryptoLossBrakeUntil"] = brake_until.isoformat()
-                    print(f"V18.2.51 CRYPTO LOSS BRAKE | streak={streak} minutes={V18250_CRYPTO_LOSS_BRAKE_MINUTES} until={brake_until.isoformat()}", flush=True)
+                    print(
+                        f"V18.2.73 CRYPTO LOSS BRAKE | regime={_v18273_last_regime.get('name','mixed')} "
+                        f"streak={streak} minutes={brake_minutes} until={brake_until.isoformat()}",
+                        flush=True,
+                    )
             else:
                 state["cryptoConsecutiveLosses"] = 0
                 state["cryptoLossBrakeUntil"] = None
@@ -11822,7 +12116,38 @@ def _v18234_live_sell(position: Dict[str, Any], price: float, score: float, reas
             state = _v18241_apply_vault_reserve(state, save=False)
             save_profit_vault_state(state)
             _crypto_live_runtime.update({"lastError": None, "lastActionAt": datetime.now(UTC).isoformat()})
-            print(f"V18.2.34 CRYPTO LIVE SELL | {symbol} fill={fill_price:.8f} pnl=${pnl_usd:.2f} pnl_pct={pnl_pct:.2f}% reason={reason}", flush=True)
+            elapsed_ms = int((time.monotonic() - _v18273_exit_started) * 1000)
+            _v18276_engine_health["lastSellLatencyMs"] = elapsed_ms
+            print(f"V18.2.74 CRYPTO LIVE SELL | {symbol} fill={fill_price:.8f} pnl=${pnl_usd:.2f} pnl_pct={pnl_pct:.2f}% reason={reason}", flush=True)
+            print(f"V18.2.74 CRYPTO EXIT TIMING | {symbol} reason={reason} elapsed_ms={elapsed_ms}", flush=True)
+            try:
+                key=_v18246_crypto_symbol_key(symbol)
+                ctx=dict(_v18274_crypto_entry_context.pop(key,{}) or {})
+                trade_id=ctx.get("tradeId")
+                logical_open=_v18277_logical_trades.pop(key,{}) or {}
+                if not trade_id:
+                    trade_id=logical_open.get("tradeId")
+                audit={"event":"exit","symbol":symbol,"tradeId":trade_id,
+                       "source":ctx.get("source") or logical_open.get("source") or "bot_managed",
+                       "entryRegime":ctx.get("regime","unknown"),"entryScore":ctx.get("score"),
+                       "entry15mPct":ctx.get("return15mPct"),"entry60mPct":ctx.get("return60mPct"),
+                       "entryLiquidity60mUsd":ctx.get("liquidity60mUsd"),
+                       "entryPrice":round(entry,8),"exitPrice":round(fill_price,8),
+                       "pnlUsd":round(pnl_usd,6),"pnlPct":round(pnl_pct,6),
+                       "exitReason":str(reason or ""),"sellPathMs":elapsed_ms}
+                logical_exit={"event":"logical_exit","tradeId":trade_id or _v18277_trade_id(symbol),
+                              "symbol":symbol,"source":audit.get("source","bot_managed"),
+                              "entryPrice":audit.get("entryPrice"),"exitPrice":audit.get("exitPrice"),
+                              "qty":audit.get("qty"),"pnlUsd":audit.get("pnlUsd"),
+                              "pnlPct":audit.get("pnlPct"),"exitReason":audit.get("exitReason"),
+                              "sellPathMs":audit.get("sellPathMs"),
+                              "entryRegime":audit.get("entryRegime"),"entryScore":audit.get("entryScore"),
+                              "closedAt":datetime.now(UTC).isoformat()}
+                threading.Thread(target=_v18277_ledger_append,args=(logical_exit,),daemon=True).start()
+                threading.Thread(target=_v18274_audit_write,args=(audit,),daemon=True).start()
+                print(f"V18.2.74 CRYPTO AUDIT EXIT | {symbol} regime={audit['entryRegime']} reason={reason} pnl=${pnl_usd:.2f} sell_ms={elapsed_ms}",flush=True)
+            except Exception as exc:
+                print(f"V18.2.74 AUDIT EXIT ERROR | {symbol} {exc}",flush=True)
             return True
         except Exception as exc:
             _crypto_live_runtime["lastError"] = str(exc)[:500]
@@ -11844,6 +12169,9 @@ def _v18265_position_age_minutes(position: Dict[str, Any]) -> float:
 
 
 def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow_normal_decisions: bool = True) -> Dict[str, Any]:
+    _v18276_cycle_started = time.monotonic()
+
+    global _v18273_last_regime
     if not V18234_CRYPTO_LIVE_ENABLED or PAPER:
         return {"ok": True, "enabled": False}
     state = _v18241_apply_vault_reserve(load_profit_vault_state(), save=True)
@@ -11901,7 +12229,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
         if breakeven_armed and price < entry:
             reason = "CRYPTO BREAKEVEN CROSS"
             print(
-                f"V18.2.72 CRYPTO BREAKEVEN CROSS | {symbol} "
+                f"V18.2.77 CRYPTO BREAKEVEN CROSS | {symbol} "
                 f"entry={entry:.8f} price={price:.8f} pnl={pnl_pct:.3f}% "
                 f"high={high:.8f}",
                 flush=True,
@@ -11968,11 +12296,13 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
     if risk_blocked:
         print(f"V18.2.51 CRYPTO ENTRY BLOCK | {risk_reason}", flush=True)
     if allow_normal_decisions and slots > 0 and not risk_blocked:
+        regime = _v18273_crypto_market_regime(scans)
+        _v18273_last_regime = dict(regime)
         qualified = [
             x for x in scans
-            if float(x.get("score") or 0) >= V18234_CRYPTO_LIVE_ENTRY_SCORE
-            and float(x.get("return15mPct") or 0) >= V18250_CRYPTO_MIN_15M_MOMENTUM_PCT
-            and float(x.get("return60mPct") or 0) >= V18250_CRYPTO_MIN_60M_MOMENTUM_PCT
+            if float(x.get("score") or 0) >= float(regime["entryScore"])
+            and float(x.get("return15mPct") or 0) >= float(regime["min15mPct"])
+            and float(x.get("return60mPct") or 0) >= float(regime["min60mPct"])
             and bool(x.get("liquid", True))
             and _v18246_crypto_symbol_key(x.get("symbol")) not in held_symbols
             and _v18246_crypto_symbol_key(x.get("symbol")) not in active_cooldowns
@@ -11988,7 +12318,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
             rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
             deployed_gbp = sum(max(0.0, float(p.get("marketValueUsd") or 0.0)) * rate for p in positions)
             remaining_gbp = max(0.0, allocation_gbp - deployed_gbp)
-            weights = [max(V18234_CRYPTO_LIVE_ENTRY_SCORE, float(x.get("score") or 0)) for x in qualified]
+            weights = [max(float(regime["entryScore"]), float(x.get("score") or 0)) for x in qualified]
             score_total = sum(weights)
             planned_budgets = [
                 (remaining_gbp * (weight / score_total) if score_total > 0 else remaining_gbp / len(qualified))
@@ -12000,6 +12330,10 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
 
     final_positions = _v18234_raw_crypto_positions()
     final_managed = [p for p in final_positions if bool(p.get("managedByPilot"))]
+    if allow_normal_decisions:
+        _v18276_engine_health["lastDecisionCycleAt"] = datetime.now(UTC).isoformat()
+        _v18276_engine_health["lastDecisionDurationMs"] = int((time.monotonic()-_v18276_cycle_started)*1000)
+        _v18276_engine_health["decisionCycles"] = int(_v18276_engine_health.get("decisionCycles") or 0) + 1
     return {"ok": True, "enabled": True, "armed": True, "entriesPaused": False, "protectiveExitsActive": True, "positions": len(final_positions), "managedPositions": len(final_managed), "maxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS}
 
 
@@ -12212,6 +12546,21 @@ def _v18252_crypto_history_payload(limit: int = 5000) -> Dict[str, Any]:
         return {"ok": False, "version": "V18.2.53", "points": [], "message": str(exc)[:300]}
     return {"ok": True, "version": "V18.2.53", "points": rows, "count": len(rows),
             "samplingSeconds": V18242_CRYPTO_LIVE_INTERVAL_SECONDS}
+
+
+@app.get('/v18/crypto-ledger-health')
+def api_v18277_crypto_ledger_health():
+    return _v18277_ledger_summary()
+
+
+@app.get('/v18/engine-health')
+def api_v18276_engine_health():
+    return _v18276_health_snapshot()
+
+
+@app.get('/v18/crypto-decision-audit')
+def api_v18274_crypto_decision_audit(limit: int = 5000):
+    return _v18274_audit_summary(max(1,min(int(limit or 5000),20000)))
 
 
 @app.get('/v18/crypto-history')
@@ -12441,7 +12790,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.72", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.77", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
@@ -12480,6 +12829,10 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "min60mMomentumPct": V18250_CRYPTO_MIN_60M_MOMENTUM_PCT,
         "lossCooldownMinutes": V18250_CRYPTO_LOSS_COOLDOWN_MINUTES,
         "lossBrakeMinutes": V18250_CRYPTO_LOSS_BRAKE_MINUTES,
+        "adaptiveLossBrake": True,
+        "marketRegime": dict(_v18273_last_regime),
+        "regimeEnabled": bool(V18273_CRYPTO_REGIME_ENABLED),
+        "regimeScores": {"strong": V18273_CRYPTO_STRONG_ENTRY_SCORE, "mixed": V18273_CRYPTO_MIXED_ENTRY_SCORE, "weak": V18273_CRYPTO_WEAK_ENTRY_SCORE},
         "lossBrakeStreak": V18250_CRYPTO_LOSS_BRAKE_STREAK,
         "stallExitEnabled": V18265_CRYPTO_STALL_EXIT_ENABLED,
         "stallExitMinutes": V18265_CRYPTO_STALL_MINUTES,
@@ -12785,7 +13138,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.72 TEN CRYPTO POSITIONS | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.77 TRADE LEDGER CLEANUP | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()

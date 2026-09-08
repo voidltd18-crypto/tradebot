@@ -72,6 +72,13 @@ function CryptoRecordTracker({ points }: { points: AnyObj[] }) {
 
 export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [data, setData] = useState<AnyObj | null>(null);
+  const [decisionAudit, setDecisionAudit] = useState<any>(null);
+  const [decisionAuditError, setDecisionAuditError] = useState<string>("");
+  const [engineHealth, setEngineHealth] = useState<any>(null);
+  const [engineHealthError, setEngineHealthError] = useState<string>("");
+  const [ledgerHealth, setLedgerHealth] = useState<any>(null);
+
+
   const [error, setError] = useState("");
   const [bridge, setBridge] = useState<AnyObj | null>(null);
   const [sellBusySymbol, setSellBusySymbol] = useState("");
@@ -79,7 +86,51 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [history, setHistory] = useState<AnyObj[]>([]);
   const [clockTick, setClockTick] = useState(0);
 
-  useEffect(() => {
+    const loadDecisionAudit = async () => {
+    try {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 8000);
+      const res = await fetch(`${API_BASE}/v18/crypto-decision-audit?limit=5000`, {
+        signal: controller.signal,
+      });
+      window.clearTimeout(timer);
+      if (!res.ok) throw new Error(`Audit HTTP ${res.status}`);
+      const body = await res.json();
+      setDecisionAudit(body);
+      setDecisionAuditError("");
+    } catch (err: any) {
+      setDecisionAuditError(err?.message || "Decision audit unavailable");
+    }
+  };
+
+  const loadEngineHealth = async () => {
+    try {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(`${API_BASE}/v18/engine-health`, { signal: controller.signal });
+      window.clearTimeout(timer);
+      if (!res.ok) throw new Error(`Health HTTP ${res.status}`);
+      setEngineHealth(await res.json());
+      setEngineHealthError("");
+    } catch (err: any) {
+      setEngineHealthError(err?.message || "Engine health unavailable");
+    }
+  };
+
+  const loadLedgerHealth = async () => {
+    try {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(`${API_BASE}/v18/crypto-ledger-health`, { signal: controller.signal });
+      window.clearTimeout(timer);
+      if (res.ok) setLedgerHealth(await res.json());
+    } catch (_) {}
+  };
+
+useEffect(() => {
+    loadLedgerHealth();
+    loadEngineHealth();
+    loadDecisionAudit();
     const id = window.setInterval(() => setClockTick(v => v + 1), 1000);
     return () => window.clearInterval(id);
   }, []);
@@ -224,7 +275,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.72 · 10 CRYPTO POSITIONS</div>
+          <div className="eyebrow">V18.2.77 · TRADE LEDGER CLEANUP</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -327,7 +378,130 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
       {data.lastError && <div className="crypto-warning">Engine warning: {data.lastError}</div>}
     </section>
 
-    <section className="crypto-panel crypto-bridge-panel">
+    
+      
+      <section className="crypto-card">
+        <div className="crypto-section-heading">
+          <div>
+            <div className="crypto-kicker">♥ Engine Health</div>
+            <h2>{engineHealth?.status === "GOOD" ? "GOOD 🟢" : "DEGRADED 🟠"}</h2>
+            <p>Mechanical health only — this does not alter entries, exits or risk rules.</p>
+          </div>
+          <button type="button" className="crypto-secondary-button" onClick={loadEngineHealth}>Refresh Health</button>
+        </div>
+
+        {engineHealthError && <div className="crypto-warning">Health warning: {engineHealthError}</div>}
+
+        <div className="crypto-metric-grid">
+          <div className="crypto-metric"><span>Safety loop age</span><strong>{engineHealth?.safetyAgeSeconds ?? "—"}s</strong></div>
+          <div className="crypto-metric"><span>Last safety duration</span><strong>{engineHealth?.lastSafetyDurationMs ?? "—"} ms</strong></div>
+          <div className="crypto-metric"><span>Decision age</span><strong>{engineHealth?.decisionAgeSeconds ?? "—"}s</strong></div>
+          <div className="crypto-metric"><span>Decision duration</span><strong>{engineHealth?.lastDecisionDurationMs ?? "—"} ms</strong></div>
+          <div className="crypto-metric"><span>Scanner age</span><strong>{engineHealth?.scannerAgeSeconds ?? "—"}s</strong></div>
+          <div className="crypto-metric"><span>Scanner duration</span><strong>{engineHealth?.lastScannerDurationMs ?? "—"} ms</strong></div>
+          <div className="crypto-metric"><span>Last buy latency</span><strong>{engineHealth?.lastOrderLatencyMs ?? "—"} ms</strong></div>
+          <div className="crypto-metric"><span>Last sell latency</span><strong>{engineHealth?.lastSellLatencyMs ?? "—"} ms</strong></div>
+          <div className="crypto-metric"><span>Exit pending</span><strong>{engineHealth?.exitPendingCount ?? 0}</strong></div>
+          <div className="crypto-metric"><span>Audit errors</span><strong>{engineHealth?.auditWriteErrors ?? 0}</strong></div>
+        </div>
+
+        {Array.isArray(engineHealth?.reasons) && engineHealth.reasons.length > 0 && (
+          <div className="crypto-warning">Attention: {engineHealth.reasons.join(" · ")}</div>
+        )}
+      </section>
+
+<section className="crypto-card">
+        <div className="crypto-section-heading">
+          <div>
+            <div className="crypto-kicker">◎ Crypto Engine Analytics</div>
+            <h2>Decision Audit</h2>
+            <p>Live evidence from V18.2.74+ trades. Analytics only — this panel does not change trading rules.</p>
+          </div>
+          <button type="button" className="crypto-secondary-button" onClick={loadDecisionAudit}>Refresh Analytics</button>
+        </div>
+
+        {decisionAuditError && (
+          <div className="crypto-warning">Analytics warning: {decisionAuditError}</div>
+        )}
+
+        <div className="crypto-metric-grid">
+          <div className="crypto-metric"><span>Audited trades</span><strong>{decisionAudit?.closedTrades ?? 0}</strong></div>
+          <div className="crypto-metric"><span>Win rate</span><strong>{Number(decisionAudit?.winRatePct ?? 0).toFixed(1)}%</strong></div>
+          <div className="crypto-metric"><span>Expectancy / trade</span><strong>${Number(decisionAudit?.expectancyUsd ?? 0).toFixed(2)}</strong></div>
+          <div className="crypto-metric"><span>Audit P&amp;L</span><strong>${Number(decisionAudit?.pnlUsd ?? 0).toFixed(2)}</strong></div>
+          <div className="crypto-metric"><span>Average winner</span><strong>${Number(decisionAudit?.avgWinUsd ?? 0).toFixed(2)}</strong></div>
+          <div className="crypto-metric"><span>Average loser</span><strong>${Number(decisionAudit?.avgLossUsd ?? 0).toFixed(2)}</strong></div>
+        </div>
+
+        
+        <div className="crypto-metric-grid">
+          <div className="crypto-metric"><span>Ledger health</span><strong>{ledgerHealth?.ledgerHealthy === false ? "CHECK 🟠" : "CLEAN 🟢"}</strong></div>
+          <div className="crypto-metric"><span>Logical entries</span><strong>{ledgerHealth?.logicalEntries ?? 0}</strong></div>
+          <div className="crypto-metric"><span>Completed trades</span><strong>{ledgerHealth?.completedTrades ?? 0}</strong></div>
+          <div className="crypto-metric"><span>Open logical trades</span><strong>{ledgerHealth?.openLogicalTrades ?? 0}</strong></div>
+          <div className="crypto-metric"><span>Duplicate trade IDs</span><strong>{ledgerHealth?.duplicateCompletedTradeIds ?? 0}</strong></div>
+        </div>
+
+<div className="crypto-audit-progress">
+          <div className="crypto-audit-progress-head">
+            <span>Evidence sample</span>
+            <strong>{decisionAudit?.closedTrades ?? 0} / {decisionAudit?.sampleTarget ?? 30}</strong>
+          </div>
+          <div className="crypto-audit-progress-track">
+            <div className="crypto-audit-progress-fill" style={{ width: `${Math.min(100, Number(decisionAudit?.sampleProgressPct ?? 0))}%` }} />
+          </div>
+          <small>{decisionAudit?.sampleReady ? "Enough data to start comparing patterns cautiously." : "Collecting fresh closed trades before tuning the engine again."}</small>
+        </div>
+
+        <div className="crypto-audit-columns">
+          <div className="crypto-audit-table-wrap">
+            <h3>By market regime</h3>
+            <table className="crypto-table">
+              <thead><tr><th>Regime</th><th>Trades</th><th>Win %</th><th>P&amp;L</th><th>Avg W</th><th>Avg L</th></tr></thead>
+              <tbody>
+                {Object.entries(decisionAudit?.byRegime || {}).map(([name, raw]: any) => {
+                  const v:any = raw;
+                  return <tr key={name}><td>{String(name).toUpperCase()}</td><td>{v.trades}</td><td>{Number(v.winRatePct||0).toFixed(1)}%</td><td>${Number(v.pnlUsd||0).toFixed(2)}</td><td>${Number(v.avgWinUsd||0).toFixed(2)}</td><td>${Number(v.avgLossUsd||0).toFixed(2)}</td></tr>;
+                })}
+                {Object.keys(decisionAudit?.byRegime || {}).length === 0 && <tr><td colSpan={6}>No audited exits yet.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="crypto-audit-table-wrap">
+            <h3>By exit reason</h3>
+            <table className="crypto-table">
+              <thead><tr><th>Reason</th><th>Trades</th><th>Win %</th><th>P&amp;L</th></tr></thead>
+              <tbody>
+                {Object.entries(decisionAudit?.byExitReason || {}).map(([name, raw]: any) => {
+                  const v:any = raw;
+                  return <tr key={name}><td>{name}</td><td>{v.trades}</td><td>{Number(v.winRatePct||0).toFixed(1)}%</td><td>${Number(v.pnlUsd||0).toFixed(2)}</td></tr>;
+                })}
+                {Object.keys(decisionAudit?.byExitReason || {}).length === 0 && <tr><td colSpan={4}>No audited exits yet.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="crypto-audit-table-wrap">
+          <h3>By coin</h3>
+          <table className="crypto-table">
+            <thead><tr><th>Coin</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win %</th><th>P&amp;L</th><th>Avg W</th><th>Avg L</th></tr></thead>
+            <tbody>
+              {Object.entries(decisionAudit?.bySymbol || {})
+                .sort((a:any,b:any)=>Number((b[1] as any)?.trades||0)-Number((a[1] as any)?.trades||0))
+                .slice(0,20)
+                .map(([name, raw]: any) => {
+                  const v:any = raw;
+                  return <tr key={name}><td>{name}</td><td>{v.trades}</td><td>{v.wins}</td><td>{v.losses}</td><td>{Number(v.winRatePct||0).toFixed(1)}%</td><td>${Number(v.pnlUsd||0).toFixed(2)}</td><td>${Number(v.avgWinUsd||0).toFixed(2)}</td><td>${Number(v.avgLossUsd||0).toFixed(2)}</td></tr>;
+                })}
+              {Object.keys(decisionAudit?.bySymbol || {}).length === 0 && <tr><td colSpan={8}>No audited exits yet.</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+<section className="crypto-panel crypto-bridge-panel">
       <div className="crypto-panel-head">
         <div>
           <h3><span className="panel-icon">⌒</span> Crypto Bridge</h3>
