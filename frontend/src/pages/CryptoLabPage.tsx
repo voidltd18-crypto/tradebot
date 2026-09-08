@@ -90,7 +90,8 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
     try {
       const controller = new AbortController();
       const timer = window.setTimeout(() => controller.abort(), 8000);
-      const res = await fetch(`${API_BASE}/v18/crypto-decision-audit?limit=5000`, {
+      const res = await fetch(`${API_URL}/v18/crypto-decision-audit?limit=5000`, {
+        headers: { "X-API-Key": authToken },
         signal: controller.signal,
       });
       window.clearTimeout(timer);
@@ -107,7 +108,10 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
     try {
       const controller = new AbortController();
       const timer = window.setTimeout(() => controller.abort(), 5000);
-      const res = await fetch(`${API_BASE}/v18/engine-health`, { signal: controller.signal });
+      const res = await fetch(`${API_URL}/v18/engine-health`, {
+        headers: { "X-API-Key": authToken },
+        signal: controller.signal,
+      });
       window.clearTimeout(timer);
       if (!res.ok) throw new Error(`Health HTTP ${res.status}`);
       setEngineHealth(await res.json());
@@ -121,7 +125,10 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
     try {
       const controller = new AbortController();
       const timer = window.setTimeout(() => controller.abort(), 5000);
-      const res = await fetch(`${API_BASE}/v18/crypto-ledger-health`, { signal: controller.signal });
+      const res = await fetch(`${API_URL}/v18/crypto-ledger-health`, {
+        headers: { "X-API-Key": authToken },
+        signal: controller.signal,
+      });
       window.clearTimeout(timer);
       if (res.ok) setLedgerHealth(await res.json());
     } catch (_) {}
@@ -275,7 +282,7 @@ useEffect(() => {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.77 · TRADE LEDGER CLEANUP</div>
+          <div className="eyebrow">V18.2.77.1 · DASHBOARD API HOTFIX</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
