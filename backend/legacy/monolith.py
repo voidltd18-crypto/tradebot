@@ -11349,6 +11349,35 @@ _v18276_engine_health: Dict[str, Any] = {
 def _v18276_health_snapshot() -> Dict[str, Any]:
     h=dict(_v18276_engine_health)
     h["exitPendingCount"] = len(_v18268_manual_sell_pending) if "_v18268_manual_sell_pending" in globals() else int(h.get("exitPendingCount") or 0)
+
+    # V18.2.77.3: source health from the actual continuously-running workers.
+    # The live worker writes these values after every real safety pass.
+    live_rt = dict(_crypto_live_runtime) if "_crypto_live_runtime" in globals() else {}
+    shadow_rt = dict(_crypto_shadow_runtime) if "_crypto_shadow_runtime" in globals() else {}
+
+    if live_rt.get("lastSafetyCycleAt"):
+        h["lastSafetyCycleAt"] = live_rt.get("lastSafetyCycleAt")
+    if live_rt.get("lastSafetyDurationMs") is not None:
+        h["lastSafetyDurationMs"] = live_rt.get("lastSafetyDurationMs")
+    if live_rt.get("safetyCycleCount") is not None:
+        h["safetyCycles"] = int(live_rt.get("safetyCycleCount") or 0)
+    if live_rt.get("safetyCycleMaxMs") is not None:
+        h["safetyCycleMaxMs"] = live_rt.get("safetyCycleMaxMs")
+    if live_rt.get("lastNormalDecisionAt"):
+        h["lastDecisionCycleAt"] = live_rt.get("lastNormalDecisionAt")
+    if live_rt.get("normalDecisionCycleCount") is not None:
+        h["decisionCycles"] = int(live_rt.get("normalDecisionCycleCount") or 0)
+
+    # The shadow worker owns the actual market scanner cadence.
+    if shadow_rt.get("lastScanAt"):
+        h["lastScannerAt"] = shadow_rt.get("lastScanAt")
+    if shadow_rt.get("lastScanDurationMs") is not None:
+        h["lastScannerDurationMs"] = shadow_rt.get("lastScanDurationMs")
+
+    h["workerStartedAt"] = live_rt.get("workerStartedAt")
+    h["workerLastError"] = live_rt.get("lastError")
+    h["scannerLastError"] = shadow_rt.get("lastError")
+    h["telemetrySource"] = "active-workers"
     now=datetime.now(UTC)
     def age_seconds(v):
         if not v: return None
@@ -12245,7 +12274,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
         if breakeven_armed and price < entry:
             reason = "CRYPTO BREAKEVEN CROSS"
             print(
-                f"V18.2.77.2 CRYPTO BREAKEVEN CROSS | {symbol} "
+                f"V18.2.77.3 CRYPTO BREAKEVEN CROSS | {symbol} "
                 f"entry={entry:.8f} price={price:.8f} pnl={pnl_pct:.3f}% "
                 f"high={high:.8f}",
                 flush=True,
@@ -12607,6 +12636,11 @@ def v18242_crypto_live_worker() -> None:
             result = v18234_crypto_live_cycle(scans, allow_normal_decisions=allow_normal)
             _crypto_live_runtime["lastSafetyCycleAt"] = datetime.now(UTC).isoformat()
             _crypto_live_runtime["lastSafetyDurationMs"] = round((time.monotonic() - safety_started) * 1000.0, 1)
+            _crypto_live_runtime["safetyCycleCount"] = int(_crypto_live_runtime.get("safetyCycleCount") or 0) + 1
+            _crypto_live_runtime["safetyCycleMaxMs"] = max(
+                float(_crypto_live_runtime.get("safetyCycleMaxMs") or 0.0),
+                float(_crypto_live_runtime.get("lastSafetyDurationMs") or 0.0),
+            )
             _v18267_request_crypto_movement_snapshot()
             if allow_normal and not result.get("busy") and result.get("armed", True) and not result.get("entriesPaused"):
                 next_normal_decision_at = now_mono + V18248_CRYPTO_DECISION_INTERVAL_SECONDS
@@ -12806,7 +12840,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.77.2", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.77.3", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
@@ -12950,7 +12984,10 @@ def v18232_crypto_shadow_worker() -> None:
     time.sleep(5)
     while True:
         try:
+            _v182773_scan_started = time.monotonic()
             v18232_crypto_shadow_cycle()
+            _crypto_shadow_runtime["lastScanAt"] = datetime.now(UTC).isoformat()
+            _crypto_shadow_runtime["lastScanDurationMs"] = round((time.monotonic() - _v182773_scan_started) * 1000.0, 1)
             try:
                 _v18267_cache_crypto_shadow_payload(v18232_crypto_shadow_payload())
             except Exception as cache_exc:
@@ -13154,7 +13191,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.77.2 HEALTH TELEMETRY FIX | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.77.3 TRUE WORKER TELEMETRY | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
