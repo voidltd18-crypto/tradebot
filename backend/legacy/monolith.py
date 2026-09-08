@@ -9885,41 +9885,102 @@ def get_status():
     return payload
 
 
+# V18.2.77.6 — Fast control responses.
+# Pause/resume/manual-override must not wait for the expensive status payload rebuild.
+_v182776_status_refresh_guard = threading.Lock()
+_v182776_status_refresh_running = False
+
+def _v182776_publish_control_state() -> None:
+    """Publish cheap control flags immediately; no broker/network work."""
+    try:
+        with _STATUS_LOCK:
+            latest_status["botEnabled"] = bool(bot_enabled)
+            latest_status["manualOverride"] = bool(manual_override)
+            latest_status["emergencyStop"] = bool(emergency_stop)
+            latest_status["lastControlUpdateAt"] = datetime.now(UTC).isoformat()
+    except Exception as exc:
+        print(f"V18.2.77.6 CONTROL STATE PUBLISH ERROR | {exc}", flush=True)
+
+def _v182776_status_refresh_worker() -> None:
+    global _v182776_status_refresh_running
+    started=time.monotonic()
+    try:
+        update_status(BOT_NAME, latest_scans)
+        print(
+            f"V18.2.77.6 ASYNC STATUS REFRESH COMPLETE | "
+            f"duration_ms={int((time.monotonic()-started)*1000)}",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"V18.2.77.6 ASYNC STATUS REFRESH ERROR | {exc}", flush=True)
+    finally:
+        with _v182776_status_refresh_guard:
+            _v182776_status_refresh_running = False
+
+def _v182776_request_status_refresh() -> None:
+    global _v182776_status_refresh_running
+    with _v182776_status_refresh_guard:
+        if _v182776_status_refresh_running:
+            return
+        _v182776_status_refresh_running = True
+    threading.Thread(
+        target=_v182776_status_refresh_worker,
+        daemon=True,
+        name="async-status-refresh",
+    ).start()
+
+
 @app.post("/pause")
 def pause_bot(request: Request):
     verify_api_key(request)
     global bot_enabled
+    started=time.monotonic()
     bot_enabled = False
-    update_status(BOT_NAME, latest_scans)
-    return {"ok": True, "message": "Bot paused"}
+    _v182776_publish_control_state()
+    _v182776_request_status_refresh()
+    elapsed_ms=int((time.monotonic()-started)*1000)
+    print(f"V18.2.77.6 PAUSE ACCEPTED | elapsed_ms={elapsed_ms}", flush=True)
+    return {"ok": True, "accepted": True, "botEnabled": False, "message": "Bot paused", "elapsedMs": elapsed_ms}
 
 
 @app.post("/resume")
 def resume_bot(request: Request):
     verify_api_key(request)
     global bot_enabled, emergency_stop
+    started=time.monotonic()
     bot_enabled = True
     emergency_stop = False
-    update_status(BOT_NAME, latest_scans)
-    return {"ok": True, "message": "Bot resumed"}
+    _v182776_publish_control_state()
+    _v182776_request_status_refresh()
+    elapsed_ms=int((time.monotonic()-started)*1000)
+    print(f"V18.2.77.6 RESUME ACCEPTED | elapsed_ms={elapsed_ms}", flush=True)
+    return {"ok": True, "accepted": True, "botEnabled": True, "message": "Bot resumed", "elapsedMs": elapsed_ms}
 
 
 @app.post("/manual-override/on")
 def manual_override_on(request: Request):
     verify_api_key(request)
     global manual_override
+    started=time.monotonic()
     manual_override = True
-    update_status(BOT_NAME, latest_scans)
-    return {"ok": True, "message": "Manual override ON. Auto-buy paused."}
+    _v182776_publish_control_state()
+    _v182776_request_status_refresh()
+    elapsed_ms=int((time.monotonic()-started)*1000)
+    print(f"V18.2.77.6 MANUAL OVERRIDE ON ACCEPTED | elapsed_ms={elapsed_ms}", flush=True)
+    return {"ok": True, "accepted": True, "manualOverride": True, "message": "Manual override ON. Auto-buy paused.", "elapsedMs": elapsed_ms}
 
 
 @app.post("/manual-override/off")
 def manual_override_off(request: Request):
     verify_api_key(request)
     global manual_override
+    started=time.monotonic()
     manual_override = False
-    update_status(BOT_NAME, latest_scans)
-    return {"ok": True, "message": "Manual override OFF. Auto-buy active."}
+    _v182776_publish_control_state()
+    _v182776_request_status_refresh()
+    elapsed_ms=int((time.monotonic()-started)*1000)
+    print(f"V18.2.77.6 MANUAL OVERRIDE OFF ACCEPTED | elapsed_ms={elapsed_ms}", flush=True)
+    return {"ok": True, "accepted": True, "manualOverride": False, "message": "Manual override OFF. Auto-buy active.", "elapsedMs": elapsed_ms}
 
 
 @app.post("/manual-buy")
@@ -12382,7 +12443,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
         if breakeven_armed and price < entry:
             reason = "CRYPTO BREAKEVEN CROSS"
             print(
-                f"V18.2.77.5 CRYPTO BREAKEVEN CROSS | {symbol} "
+                f"V18.2.77.6 CRYPTO BREAKEVEN CROSS | {symbol} "
                 f"entry={entry:.8f} price={price:.8f} pnl={pnl_pct:.3f}% "
                 f"high={high:.8f}",
                 flush=True,
@@ -12995,7 +13056,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.77.5", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.77.6", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
@@ -13346,7 +13407,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.77.5 NONBLOCKING STOCK MANUAL SELL | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.77.6 FAST CONTROL RESPONSE | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
