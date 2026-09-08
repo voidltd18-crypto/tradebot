@@ -12274,7 +12274,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
         if breakeven_armed and price < entry:
             reason = "CRYPTO BREAKEVEN CROSS"
             print(
-                f"V18.2.77.3 CRYPTO BREAKEVEN CROSS | {symbol} "
+                f"V18.2.77.4 CRYPTO BREAKEVEN CROSS | {symbol} "
                 f"entry={entry:.8f} price={price:.8f} pnl={pnl_pct:.3f}% "
                 f"high={high:.8f}",
                 flush=True,
@@ -12339,7 +12339,33 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
     _crypto_live_runtime["riskBlocked"] = risk_blocked
     _crypto_live_runtime["riskReason"] = risk_reason or None
     if risk_blocked:
-        print(f"V18.2.51 CRYPTO ENTRY BLOCK | {risk_reason}", flush=True)
+        try:
+            _v182774_regime = _v18273_crypto_market_regime(scans)
+            _v182774_qualified = [
+                x for x in (scans or [])
+                if float(x.get("score") or 0) >= float(_v182774_regime["entryScore"])
+                and float(x.get("return15mPct") or 0) >= float(_v182774_regime["min15mPct"])
+                and float(x.get("return60mPct") or 0) >= float(_v182774_regime["min60mPct"])
+                and bool(x.get("liquid", True))
+                and _v18246_crypto_symbol_key(x.get("symbol")) not in held_symbols
+                and _v18246_crypto_symbol_key(x.get("symbol")) not in active_cooldowns
+            ]
+            _v182774_qualified.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+            _v182774_names = ", ".join(
+                f"{str(x.get('symbol') or '').replace('/','')} {float(x.get('score') or 0.0):.3f}"
+                for x in _v182774_qualified[:10]
+            ) or "none"
+            print(
+                f"V18.2.77.4 CRYPTO ENTRY BLOCK | {risk_reason} | "
+                f"qualified={len(_v182774_qualified)} | {_v182774_names}",
+                flush=True,
+            )
+        except Exception as _v182774_exc:
+            print(
+                f"V18.2.77.4 CRYPTO ENTRY BLOCK | {risk_reason} | "
+                f"qualified=unknown | visibility_error={_v182774_exc}",
+                flush=True,
+            )
     if allow_normal_decisions and slots > 0 and not risk_blocked:
         regime = _v18273_crypto_market_regime(scans)
         _v18273_last_regime = dict(regime)
@@ -12352,6 +12378,27 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
             and _v18246_crypto_symbol_key(x.get("symbol")) not in held_symbols
             and _v18246_crypto_symbol_key(x.get("symbol")) not in active_cooldowns
         ]
+        if qualified:
+            try:
+                _v182774_ranked = sorted(
+                    qualified,
+                    key=lambda x: float(x.get("score") or 0.0),
+                    reverse=True,
+                )
+                print(
+                    "V18.2.77.4 QUALIFIED SNAPSHOT | "
+                    + ", ".join(
+                        f"{str(x.get('symbol') or '').replace('/','')} "
+                        f"score={float(x.get('score') or 0.0):.3f} "
+                        f"15m={float(x.get('return15mPct') or 0.0):.2f}% "
+                        f"60m={float(x.get('return60mPct') or 0.0):.2f}% "
+                        f"liq=${float(x.get('liquidity60mUsd') or 0.0):.2f}"
+                        for x in _v182774_ranked[:10]
+                    ),
+                    flush=True,
+                )
+            except Exception:
+                pass
         # V18.2.63: rank eligible entries from strongest to weakest. Available
         # crypto capital is split proportionally by score, so rank #1 receives
         # the largest allocation and the lowest-ranked qualified entry receives
@@ -12840,7 +12887,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.77.3", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.77.4", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
@@ -13191,7 +13238,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.77.3 TRUE WORKER TELEMETRY | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.77.4 QUALIFIED BLOCK VISIBILITY | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
