@@ -9951,13 +9951,121 @@ def manual_sell(request: Request):
         return result
 
 
+# V18.2.77.5 — Non-blocking stock manual sell.
+# The HTTP endpoint acknowledges immediately. The existing close_position_by_symbol()
+# path still performs the actual broker exit/accounting under bot_lock in a daemon worker.
+_v182775_stock_sell_guard = threading.Lock()
+_v182775_stock_sell_pending: Dict[str, Dict[str, Any]] = {}
+
+
+def _v182775_stock_manual_sell_worker(symbol: str) -> None:
+    key = str(symbol or "").upper().strip()
+    started_mono = time.monotonic()
+    started_at = datetime.now(UTC).isoformat()
+    try:
+        print(f"V18.2.77.5 STOCK SELL WORKER START | {key}", flush=True)
+        lock_started = time.monotonic()
+        with bot_lock:
+            lock_wait_ms = int((time.monotonic() - lock_started) * 1000)
+            broker_started = time.monotonic()
+            result = close_position_by_symbol(key, reason="MANUAL SYMBOL SELL")
+            close_path_ms = int((time.monotonic() - broker_started) * 1000)
+            try:
+                update_status(BOT_NAME, latest_scans)
+            except Exception as status_exc:
+                print(f"V18.2.77.5 STOCK SELL STATUS REFRESH ERROR | {key} {status_exc}", flush=True)
+
+        total_ms = int((time.monotonic() - started_mono) * 1000)
+        ok = bool(result.get("ok", True)) if isinstance(result, dict) else True
+        message = str(result.get("message") or result.get("status") or "") if isinstance(result, dict) else str(result)
+
+        with _v182775_stock_sell_guard:
+            _v182775_stock_sell_pending[key] = {
+                "symbol": key,
+                "status": "done" if ok else "error",
+                "ok": ok,
+                "message": message[:500],
+                "startedAt": started_at,
+                "finishedAt": datetime.now(UTC).isoformat(),
+                "lockWaitMs": lock_wait_ms,
+                "closePathMs": close_path_ms,
+                "totalMs": total_ms,
+            }
+
+        print(
+            f"V18.2.77.5 STOCK SELL {'COMPLETE' if ok else 'ERROR'} | {key} "
+            f"lock_wait_ms={lock_wait_ms} close_path_ms={close_path_ms} total_ms={total_ms} "
+            f"message={message[:180]}",
+            flush=True,
+        )
+    except Exception as exc:
+        total_ms = int((time.monotonic() - started_mono) * 1000)
+        message = str(exc)[:500]
+        with _v182775_stock_sell_guard:
+            _v182775_stock_sell_pending[key] = {
+                "symbol": key,
+                "status": "error",
+                "ok": False,
+                "message": message,
+                "startedAt": started_at,
+                "finishedAt": datetime.now(UTC).isoformat(),
+                "totalMs": total_ms,
+            }
+        print(f"V18.2.77.5 STOCK SELL WORKER ERROR | {key} total_ms={total_ms} {message}", flush=True)
+
+
 @app.post("/sell/{symbol}")
 def sell_symbol(symbol: str, request: Request):
     verify_api_key(request)
-    with bot_lock:
-        result = close_position_by_symbol(symbol.upper(), reason="MANUAL SYMBOL SELL")
-        update_status(BOT_NAME, latest_scans)
-        return result
+    key = str(symbol or "").upper().strip()
+    if not key:
+        return {"ok": False, "accepted": False, "message": "Symbol is required."}
+
+    with _v182775_stock_sell_guard:
+        existing = _v182775_stock_sell_pending.get(key)
+        if isinstance(existing, dict) and existing.get("status") == "pending":
+            return {
+                "ok": True,
+                "accepted": True,
+                "pending": True,
+                "symbol": key,
+                "message": f"Sell for {key} is already in progress.",
+            }
+
+        _v182775_stock_sell_pending[key] = {
+            "symbol": key,
+            "status": "pending",
+            "ok": None,
+            "message": "Sell accepted and queued for execution.",
+            "startedAt": datetime.now(UTC).isoformat(),
+            "finishedAt": None,
+        }
+
+    threading.Thread(
+        target=_v182775_stock_manual_sell_worker,
+        args=(key,),
+        daemon=True,
+        name=f"stock-manual-sell-{key}",
+    ).start()
+
+    print(f"V18.2.77.5 STOCK SELL ACCEPTED | {key}", flush=True)
+    return {
+        "ok": True,
+        "accepted": True,
+        "pending": True,
+        "symbol": key,
+        "message": f"Manual sell accepted for {key}. Execution is running independently.",
+    }
+
+
+@app.get("/sell-status/{symbol}")
+def sell_symbol_status(symbol: str, request: Request):
+    verify_api_key(request)
+    key = str(symbol or "").upper().strip()
+    with _v182775_stock_sell_guard:
+        row = dict(_v182775_stock_sell_pending.get(key) or {})
+    return {"ok": True, "symbol": key, "sell": row or None}
+
 
 
 @app.post("/emergency-sell")
@@ -12274,7 +12382,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
         if breakeven_armed and price < entry:
             reason = "CRYPTO BREAKEVEN CROSS"
             print(
-                f"V18.2.77.4 CRYPTO BREAKEVEN CROSS | {symbol} "
+                f"V18.2.77.5 CRYPTO BREAKEVEN CROSS | {symbol} "
                 f"entry={entry:.8f} price={price:.8f} pnl={pnl_pct:.3f}% "
                 f"high={high:.8f}",
                 flush=True,
@@ -12887,7 +12995,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.77.4", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.77.5", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
@@ -13238,7 +13346,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.77.4 QUALIFIED BLOCK VISIBILITY | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.77.5 NONBLOCKING STOCK MANUAL SELL | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
