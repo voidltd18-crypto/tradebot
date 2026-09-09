@@ -11428,7 +11428,11 @@ def _v18232_fetch_scans() -> List[Dict[str, Any]]:
 # V18.2.74 — Crypto Decision Audit (observability only; no strategy changes).
 _v18274_crypto_entry_context: Dict[str, Dict[str, Any]] = {}
 _v18274_crypto_audit_lock = threading.Lock()
-V18274_CRYPTO_AUDIT_FILE = os.getenv("TRADEBOT_CRYPTO_AUDIT_FILE", "/tmp/tradebot_crypto_decision_audit.jsonl")
+V18274_CRYPTO_AUDIT_FILE = os.getenv(
+    "TRADEBOT_CRYPTO_AUDIT_FILE",
+    os.path.join("/var/data" if os.path.isdir("/var/data") else os.getenv("RENDER_DISK_PATH", "backend/state"),
+                 "tradebot_crypto_decision_audit.jsonl"),
+)
 
 def _v18274_audit_write(row: Dict[str, Any]) -> None:
     try:
@@ -11594,7 +11598,11 @@ def _v18276_health_snapshot() -> Dict[str, Any]:
 # Broker fills remain broker fills; analytics use the logical completed trade.
 _v18277_logical_trades: Dict[str, Dict[str, Any]] = {}
 _v18277_ledger_lock = threading.Lock()
-V18277_LEDGER_FILE = os.getenv("TRADEBOT_CRYPTO_LOGICAL_LEDGER_FILE", "/tmp/tradebot_crypto_logical_ledger.jsonl")
+V18277_LEDGER_FILE = os.getenv(
+    "TRADEBOT_CRYPTO_LOGICAL_LEDGER_FILE",
+    os.path.join("/var/data" if os.path.isdir("/var/data") else os.getenv("RENDER_DISK_PATH", "backend/state"),
+                 "tradebot_crypto_logical_ledger.jsonl"),
+)
 
 def _v18277_trade_id(symbol: str) -> str:
     key=_v18246_crypto_symbol_key(symbol)
@@ -11926,7 +11934,8 @@ def _v18241_crypto_pool_gbp(state: Dict[str, Any]) -> float:
         allocated = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
         ceiling = max(0.0, float(state.get("cryptoEngineCapitalCeilingGbp") or 0.0))
         return min(max(allocated, ceiling), V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
-    surplus = max(0.0, equity_gbp - piggy - V18266_STOCK_CAP_GBP)
+    stock_reserve = _v18278_effective_stock_reserve_gbp() if "_v18278_effective_stock_reserve_gbp" in globals() else V18266_STOCK_CAP_GBP
+    surplus = max(0.0, equity_gbp - piggy - stock_reserve)
     return min(surplus, V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
 
 
@@ -11950,7 +11959,9 @@ def _v18241_apply_vault_reserve(state: Dict[str, Any], *, save: bool = False) ->
     state["cryptoEngineCapitalCeilingGbp"] = new_alloc
     state["cryptoLivePilotEnabled"] = new_alloc > 0
     state["cryptoCapitalMode"] = "AUTO_SURPLUS_ABOVE_STOCK_CAP"
-    state["stockCapitalReservedGbp"] = round(V18266_STOCK_CAP_GBP, 2)
+    state["stockCapitalReservedGbp"] = round(
+        _v18278_effective_stock_reserve_gbp() if "_v18278_effective_stock_reserve_gbp" in globals() else V18266_STOCK_CAP_GBP, 2
+    )
     if save and changed:
         save_profit_vault_state(state)
     return state
@@ -12443,7 +12454,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
         if breakeven_armed and price < entry:
             reason = "CRYPTO BREAKEVEN CROSS"
             print(
-                f"V18.2.77.6 CRYPTO BREAKEVEN CROSS | {symbol} "
+                f"V18.2.78 CRYPTO BREAKEVEN CROSS | {symbol} "
                 f"entry={entry:.8f} price={price:.8f} pnl={pnl_pct:.3f}% "
                 f"high={high:.8f}",
                 flush=True,
@@ -13056,11 +13067,12 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.77.6", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.78", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
-        "capitalMode": "AUTO_900_STOCK_SURPLUS_CRYPTO",
-        "stockCapitalReservedGbp": round(V18266_STOCK_CAP_GBP, 2),
+        "capitalMode": "NIGHT_SHIFT_DYNAMIC_SPLIT",
+        "nightShift": dict(_v18278_refresh_mode()) if "_v18278_refresh_mode" in globals() else {},
+        "stockCapitalReservedGbp": round(_v18278_effective_stock_reserve_gbp() if "_v18278_effective_stock_reserve_gbp" in globals() else V18266_STOCK_CAP_GBP, 2),
         "surplusAutomaticallyAssignedToCrypto": True,
         "cryptoProfitAutomaticallyBanked": True,
         "allocationLockedByPosition": bool(live_positions),
@@ -13269,6 +13281,11 @@ def run_bot_loop():
                     print(f"AUTO REPORT LOOP SYNC ERROR: {e}")
                 market_state = get_effective_market_status_payload()
                 try:
+                    night_plan = _v18278_night_shift_tick()
+                except Exception as e:
+                    print(f"V18.2.78 NIGHT SHIFT TICK ERROR: {e}")
+                    night_plan = {}
+                try:
                     record_trade_replay_snapshot(bool(market_state.get("isOpen")))
                 except Exception as e:
                     print(f"V17.1 TRADE REPLAY LOOP ERROR: {e}")
@@ -13332,8 +13349,11 @@ def run_bot_loop():
                         rr = maybe_rotate_weakest_into_best(scans)
                         if rr:
                             print(rr)
-                    if not manual_override:
+                    if not manual_override and not _v18278_stock_entries_blocked():
                         result = money_mode_buy(scans, manual=False)
+                    elif _v18278_stock_entries_blocked():
+                        print("V18.2.78 STOCK ENTRY BLOCK | PRE-CLOSE NIGHT SHIFT", flush=True)
+                        result = None
                         if result:
                             print(result)
                 update_status(BOT_NAME, scans)
@@ -13407,7 +13427,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.77.6 FAST CONTROL RESPONSE | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.78 NIGHT SHIFT CAPITAL ROTATION | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
@@ -15097,6 +15117,206 @@ PROFIT_VAULT_VERSION = "V17.6.2"
 PROFIT_VAULT_ENABLED = os.getenv("PROFIT_VAULT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 PROFIT_VAULT_DEFAULT_BASELINE_GBP = 900.00  # starting protected baseline
 V18266_STOCK_CAP_GBP = max(0.0, float(os.getenv("TRADEBOT_STOCK_CAP_GBP", "900") or 900))
+
+# V18.2.78 — Night Shift Capital Rotation.
+# Uses Alpaca's actual next_open/next_close, so weekends, holidays and early closes
+# follow the broker calendar rather than hard-coded clock times.
+V18278_NIGHT_SHIFT_ENABLED = str(os.getenv("TRADEBOT_NIGHT_SHIFT_ENABLED", "true")).lower() in ("1","true","yes","on")
+V18278_WINDOW_MINUTES = max(5, int(os.getenv("TRADEBOT_NIGHT_SHIFT_WINDOW_MINUTES", "30") or 30))
+_v18278_runtime: Dict[str, Any] = {
+    "mode": "DAY",
+    "stockReserveGbp": V18266_STOCK_CAP_GBP,
+    "lastUpdatedAt": None,
+    "nextOpen": None,
+    "nextClose": None,
+    "minutesToOpen": None,
+    "minutesToClose": None,
+    "preCloseFlattenRunning": False,
+    "preOpenRebalanceRunning": False,
+    "lastFlattenSession": None,
+    "lastPreOpenRebalance": None,
+    "lastError": None,
+}
+_v18278_lock = threading.RLock()
+
+def _v18278_dt(value: Any) -> Optional[datetime]:
+    try:
+        if isinstance(value, datetime):
+            dt=value
+        else:
+            raw=str(value or "").strip()
+            if not raw:
+                return None
+            if raw.endswith("Z"): raw=raw[:-1] + "+00:00"
+            dt=datetime.fromisoformat(raw)
+        if dt.tzinfo is None: dt=dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+    except Exception:
+        return None
+
+def _v18278_refresh_mode() -> Dict[str, Any]:
+    if not V18278_NIGHT_SHIFT_ENABLED:
+        with _v18278_lock:
+            _v18278_runtime.update({
+                "mode":"DAY","stockReserveGbp":V18266_STOCK_CAP_GBP,
+                "lastUpdatedAt":datetime.now(UTC).isoformat()
+            })
+            return dict(_v18278_runtime)
+    try:
+        clock=trading_client.get_clock()
+        now=_v18278_dt(getattr(clock,"timestamp",None)) or datetime.now(UTC)
+        next_open=_v18278_dt(getattr(clock,"next_open",None))
+        next_close=_v18278_dt(getattr(clock,"next_close",None))
+        is_open=bool(getattr(clock,"is_open",False))
+        to_open=((next_open-now).total_seconds()/60.0) if next_open else None
+        to_close=((next_close-now).total_seconds()/60.0) if next_close else None
+
+        if is_open and to_close is not None and 0 <= to_close <= V18278_WINDOW_MINUTES:
+            mode="PRE_CLOSE"
+            reserve=0.0
+        elif not is_open and to_open is not None and 0 <= to_open <= V18278_WINDOW_MINUTES:
+            mode="PRE_OPEN"
+            reserve=V18266_STOCK_CAP_GBP
+        elif not is_open:
+            mode="OVERNIGHT"
+            reserve=0.0
+        else:
+            mode="DAY"
+            reserve=V18266_STOCK_CAP_GBP
+
+        with _v18278_lock:
+            _v18278_runtime.update({
+                "mode":mode,
+                "stockReserveGbp":round(reserve,2),
+                "lastUpdatedAt":datetime.now(UTC).isoformat(),
+                "nextOpen":next_open.isoformat() if next_open else None,
+                "nextClose":next_close.isoformat() if next_close else None,
+                "minutesToOpen":round(to_open,2) if to_open is not None else None,
+                "minutesToClose":round(to_close,2) if to_close is not None else None,
+                "lastError":None,
+            })
+            return dict(_v18278_runtime)
+    except Exception as exc:
+        with _v18278_lock:
+            _v18278_runtime["lastError"]=str(exc)[:500]
+            _v18278_runtime["lastUpdatedAt"]=datetime.now(UTC).isoformat()
+            return dict(_v18278_runtime)
+
+def _v18278_effective_stock_reserve_gbp() -> float:
+    state=_v18278_refresh_mode()
+    return max(0.0, float(state.get("stockReserveGbp") or 0.0))
+
+def _v18278_stock_entries_blocked() -> bool:
+    return str(_v18278_refresh_mode().get("mode") or "DAY") == "PRE_CLOSE"
+
+def _v18278_preclose_flatten_worker(session_key: str) -> None:
+    try:
+        print(f"V18.2.78 NIGHT SHIFT FLATTEN START | session={session_key}", flush=True)
+        while True:
+            positions=get_all_positions()
+            if not positions:
+                break
+            submitted=0
+            for pos in positions:
+                try:
+                    result=close_position(pos, reason="V18.2.78 PRE-CLOSE NIGHT SHIFT")
+                    if isinstance(result,dict) and result.get("ok"):
+                        submitted += 1
+                except Exception as exc:
+                    print(f"V18.2.78 NIGHT SHIFT STOCK SELL ERROR | {pos.get('symbol')} {exc}", flush=True)
+            if submitted <= 0:
+                break
+            time.sleep(2)
+        with _v18278_lock:
+            _v18278_runtime["lastFlattenSession"]=session_key
+        print(f"V18.2.78 NIGHT SHIFT FLATTEN COMPLETE | session={session_key} remaining={len(get_all_positions())}", flush=True)
+    except Exception as exc:
+        with _v18278_lock:
+            _v18278_runtime["lastError"]=str(exc)[:500]
+        print(f"V18.2.78 NIGHT SHIFT FLATTEN ERROR | {exc}", flush=True)
+    finally:
+        with _v18278_lock:
+            _v18278_runtime["preCloseFlattenRunning"]=False
+
+def _v18278_preopen_crypto_rebalance_worker(open_key: str) -> None:
+    try:
+        state=load_profit_vault_state()
+        piggy=max(0.0,float(state.get("bankedProfitGbp") or 0.0))
+        rate=float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
+        try:
+            account=get_account()
+            cash_gbp=max(0.0,float(getattr(account,"cash",0.0) or 0.0)*rate)
+        except Exception:
+            cash_gbp=0.0
+        usable_cash=max(0.0,cash_gbp-piggy)
+        need=max(0.0,V18266_STOCK_CAP_GBP-usable_cash)
+        if need > 0.01:
+            positions=[p for p in _v18234_raw_crypto_positions() if bool(p.get("managedByPilot"))]
+            positions.sort(key=lambda p: float(p.get("marketValueUsd") or 0.0), reverse=True)
+            released=0.0
+            for pos in positions:
+                if released >= need:
+                    break
+                price=float(pos.get("price") or 0.0)
+                if price <= 0:
+                    continue
+                value_gbp=max(0.0,float(pos.get("marketValueUsd") or 0.0)*rate)
+                ok=_v18234_live_sell(pos, price, 0.0, "V18.2.78 PRE-OPEN STOCK RESERVE RESTORE")
+                if ok:
+                    released += value_gbp
+            print(
+                f"V18.2.78 PRE-OPEN REBALANCE | need=£{need:.2f} released_est=£{released:.2f} "
+                f"target_stock=£{V18266_STOCK_CAP_GBP:.2f}",
+                flush=True,
+            )
+        else:
+            print(f"V18.2.78 PRE-OPEN REBALANCE | stock reserve already funded £{usable_cash:.2f}", flush=True)
+        with _v18278_lock:
+            _v18278_runtime["lastPreOpenRebalance"]=open_key
+    except Exception as exc:
+        with _v18278_lock:
+            _v18278_runtime["lastError"]=str(exc)[:500]
+        print(f"V18.2.78 PRE-OPEN REBALANCE ERROR | {exc}", flush=True)
+    finally:
+        with _v18278_lock:
+            _v18278_runtime["preOpenRebalanceRunning"]=False
+
+def _v18278_night_shift_tick() -> Dict[str, Any]:
+    plan=_v18278_refresh_mode()
+    mode=str(plan.get("mode") or "DAY")
+    if mode == "PRE_CLOSE":
+        session_key=str(plan.get("nextClose") or datetime.now(UTC).date().isoformat())
+        with _v18278_lock:
+            should_start=(not _v18278_runtime.get("preCloseFlattenRunning")
+                          and _v18278_runtime.get("lastFlattenSession") != session_key)
+            if should_start:
+                _v18278_runtime["preCloseFlattenRunning"]=True
+        if should_start:
+            threading.Thread(
+                target=_v18278_preclose_flatten_worker,
+                args=(session_key,), daemon=True, name="night-shift-stock-flatten"
+            ).start()
+    elif mode == "PRE_OPEN":
+        open_key=str(plan.get("nextOpen") or "")
+        with _v18278_lock:
+            should_start=(not _v18278_runtime.get("preOpenRebalanceRunning")
+                          and _v18278_runtime.get("lastPreOpenRebalance") != open_key)
+            if should_start:
+                _v18278_runtime["preOpenRebalanceRunning"]=True
+        if should_start:
+            threading.Thread(
+                target=_v18278_preopen_crypto_rebalance_worker,
+                args=(open_key,), daemon=True, name="night-shift-preopen-rebalance"
+            ).start()
+
+    # Recalculate crypto allocation immediately after every mode decision.
+    try:
+        st=_v18241_apply_vault_reserve(load_profit_vault_state(), save=True)
+        plan["cryptoAllocatedGbp"]=float(st.get("cryptoAllocatedGbp") or 0.0)
+    except Exception as exc:
+        plan["allocationError"]=str(exc)[:300]
+    return plan
+
 CAPITAL_MILESTONE_STEP_GBP = 100.00
 CAPITAL_MILESTONE_CUSHION_GBP = 25.00
 CAPITAL_MILESTONE_STABILITY_REQUIRED = 5
@@ -15306,7 +15526,8 @@ def profit_vault_deployable_usd(account_equity: float, buying_power: Optional[fl
     working = max(0.0, equity - reserved)
     # V18.2.66: stocks can never deploy more than the fixed £900 stock pot.
     rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
-    stock_cap_usd = V18266_STOCK_CAP_GBP / max(rate, 0.0001)
+    effective_stock_cap_gbp = _v18278_effective_stock_reserve_gbp() if "_v18278_effective_stock_reserve_gbp" in globals() else V18266_STOCK_CAP_GBP
+    stock_cap_usd = effective_stock_cap_gbp / max(rate, 0.0001)
     working = min(working, stock_cap_usd)
     if buying_power is not None:
         try:
