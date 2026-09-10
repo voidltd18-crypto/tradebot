@@ -11173,6 +11173,37 @@ V18269_CRYPTO_BREAKEVEN_GUARD_ENABLED = str(
     os.getenv("TRADEBOT_CRYPTO_BREAKEVEN_GUARD_ENABLED", "true")
 ).lower() in ("1", "true", "yes", "on")
 
+# V18.2.79 — Evidence-tuned crypto controls.
+# Based on the first 53 completed logical live trades:
+# overall expectancy was negative and STRONG-regime entries materially
+# underperformed MIXED-regime entries. These are conservative quality/risk
+# changes only; the stock engine is untouched.
+V18279_CRYPTO_STRONG_SCORE_FLOOR = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_STRONG_SCORE", "0.46") or 0.46)
+V18279_CRYPTO_MIXED_SCORE_FLOOR = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_MIXED_SCORE", "0.45") or 0.45)
+V18279_CRYPTO_WEAK_SCORE_FLOOR = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_WEAK_SCORE", "0.52") or 0.52)
+
+V18279_CRYPTO_STRONG_MIN_15M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_STRONG_MIN_15M_PCT", "0.10") or 0.10)
+V18279_CRYPTO_STRONG_MIN_60M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_STRONG_MIN_60M_PCT", "0.15") or 0.15)
+V18279_CRYPTO_MIXED_MIN_15M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_MIXED_MIN_15M_PCT", "0.10") or 0.10)
+V18279_CRYPTO_MIXED_MIN_60M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_MIXED_MIN_60M_PCT", "0.10") or 0.10)
+V18279_CRYPTO_WEAK_MIN_15M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_WEAK_MIN_15M_PCT", "0.25") or 0.25)
+V18279_CRYPTO_WEAK_MIN_60M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_WEAK_MIN_60M_PCT", "0.35") or 0.35)
+
+# Prevent one isolated qualifier from consuming the whole overnight crypto pool.
+# With several qualifiers the normal rank-weighted allocator still works.
+V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT = max(
+    5.0, min(100.0, float(os.getenv("TRADEBOT_CRYPTO_MAX_ENTRY_ALLOCATION_PCT", "20") or 20))
+)
+
+# The old breakeven guard armed after merely touching entry. Evidence showed too
+# much churn around entry, so require a genuine move first.
+V18279_CRYPTO_BREAKEVEN_ARM_PCT = max(
+    0.10, float(os.getenv("TRADEBOT_CRYPTO_BREAKEVEN_ARM_PCT", "0.40") or 0.40)
+)
+V18279_CRYPTO_BREAKEVEN_LOCK_PCT = max(
+    0.0, float(os.getenv("TRADEBOT_CRYPTO_BREAKEVEN_LOCK_PCT", "0.05") or 0.05)
+)
+
 # V18.2.48 — separate fast safety monitoring from normal trading cadence.
 # Protective stop/trail checks now run every 5 seconds, while new entries and
 # normal entry/momentum-exit decisions are evaluated no more than once every 5 minutes.
@@ -11673,11 +11704,20 @@ def _v18273_crypto_market_regime(scans: List[Dict[str, Any]]) -> Dict[str, Any]:
     m15=_v18273_median(r15); m60=_v18273_median(r60)
 
     if p15 >= 0.58 and p60 >= 0.58 and m15 >= 0.05 and m60 >= 0.10:
-        name="strong"; score=V18273_CRYPTO_STRONG_ENTRY_SCORE; min15=-0.10; min60=0.00
+        name="strong"
+        score=max(V18273_CRYPTO_STRONG_ENTRY_SCORE, V18279_CRYPTO_STRONG_SCORE_FLOOR)
+        min15=max(-0.10, V18279_CRYPTO_STRONG_MIN_15M_PCT)
+        min60=max(0.00, V18279_CRYPTO_STRONG_MIN_60M_PCT)
     elif p15 <= 0.35 or p60 <= 0.35 or (m15 < 0 and m60 < 0):
-        name="weak"; score=V18273_CRYPTO_WEAK_ENTRY_SCORE; min15=V18273_CRYPTO_WEAK_MIN_15M_PCT; min60=V18273_CRYPTO_WEAK_MIN_60M_PCT
+        name="weak"
+        score=max(V18273_CRYPTO_WEAK_ENTRY_SCORE, V18279_CRYPTO_WEAK_SCORE_FLOOR)
+        min15=max(V18273_CRYPTO_WEAK_MIN_15M_PCT, V18279_CRYPTO_WEAK_MIN_15M_PCT)
+        min60=max(V18273_CRYPTO_WEAK_MIN_60M_PCT, V18279_CRYPTO_WEAK_MIN_60M_PCT)
     else:
-        name="mixed"; score=V18273_CRYPTO_MIXED_ENTRY_SCORE; min15=0.00; min60=0.05
+        name="mixed"
+        score=max(V18273_CRYPTO_MIXED_ENTRY_SCORE, V18279_CRYPTO_MIXED_SCORE_FLOOR)
+        min15=max(0.00, V18279_CRYPTO_MIXED_MIN_15M_PCT)
+        min60=max(0.05, V18279_CRYPTO_MIXED_MIN_60M_PCT)
 
     return {"name":name,"entryScore":score,"min15mPct":min15,"min60mPct":min60,
             "positive15Pct":round(p15*100,1),"positive60Pct":round(p60*100,1),
@@ -12446,17 +12486,20 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
         #
         # Important: this cannot guarantee a non-red realised fill because crypto
         # can move between observation and execution and market orders can slip.
+        peak_pct = ((high / entry) - 1.0) * 100.0 if entry > 0 and high > 0 else 0.0
+        breakeven_floor = entry * (1.0 + V18279_CRYPTO_BREAKEVEN_LOCK_PCT / 100.0) if entry > 0 else 0.0
         breakeven_armed = bool(
             V18269_CRYPTO_BREAKEVEN_GUARD_ENABLED
             and entry > 0
-            and high >= entry
+            and peak_pct >= V18279_CRYPTO_BREAKEVEN_ARM_PCT
         )
-        if breakeven_armed and price < entry:
+        if breakeven_armed and price <= breakeven_floor:
             reason = "CRYPTO BREAKEVEN CROSS"
             print(
-                f"V18.2.78 CRYPTO BREAKEVEN CROSS | {symbol} "
+                f"V18.2.79 CRYPTO BREAKEVEN CROSS | {symbol} "
                 f"entry={entry:.8f} price={price:.8f} pnl={pnl_pct:.3f}% "
-                f"high={high:.8f}",
+                f"peak={peak_pct:.3f}% arm={V18279_CRYPTO_BREAKEVEN_ARM_PCT:.2f}% "
+                f"lock={V18279_CRYPTO_BREAKEVEN_LOCK_PCT:.2f}%",
                 flush=True,
             )
         elif pnl_pct <= -V18234_CRYPTO_LIVE_STOP_PCT:
@@ -12592,10 +12635,19 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
             remaining_gbp = max(0.0, allocation_gbp - deployed_gbp)
             weights = [max(float(regime["entryScore"]), float(x.get("score") or 0)) for x in qualified]
             score_total = sum(weights)
-            planned_budgets = [
+            raw_budgets = [
                 (remaining_gbp * (weight / score_total) if score_total > 0 else remaining_gbp / len(qualified))
                 for weight in weights
             ]
+            per_entry_cap_gbp = max(1.0, allocation_gbp * (V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT / 100.0))
+            planned_budgets = [min(budget, per_entry_cap_gbp) for budget in raw_budgets]
+            if qualified:
+                print(
+                    f"V18.2.79 EVIDENCE ALLOCATION | allocation=£{allocation_gbp:.2f} "
+                    f"remaining=£{remaining_gbp:.2f} max_per_entry=£{per_entry_cap_gbp:.2f} "
+                    f"cap={V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT:.1f}%",
+                    flush=True,
+                )
             for scan, budget in zip(qualified, planned_budgets):
                 if budget >= 1.0 and _v18234_live_buy(scan, budget):
                     held_symbols.add(_v18246_crypto_symbol_key(scan.get("symbol")))
@@ -13067,7 +13119,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.78", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.79", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "NIGHT_SHIFT_DYNAMIC_SPLIT",
@@ -13092,6 +13144,15 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "trackerSnapshotsCoalesced": int(_v18267_tracker_runtime.get("skipped") or 0),
         "manualSellNonBlocking": True,
         "breakevenGuardEnabled": bool(V18269_CRYPTO_BREAKEVEN_GUARD_ENABLED),
+        "evidenceTuning": {
+            "version": "V18.2.79",
+            "strongScoreFloor": V18279_CRYPTO_STRONG_SCORE_FLOOR,
+            "mixedScoreFloor": V18279_CRYPTO_MIXED_SCORE_FLOOR,
+            "weakScoreFloor": V18279_CRYPTO_WEAK_SCORE_FLOOR,
+            "breakevenArmPct": V18279_CRYPTO_BREAKEVEN_ARM_PCT,
+            "breakevenLockPct": V18279_CRYPTO_BREAKEVEN_LOCK_PCT,
+            "maxEntryAllocationPct": V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT,
+        },
         "breakevenGuardTriggerPct": 0.0,
         "breakevenGuardCheckIntervalSeconds": int(V18242_CRYPTO_LIVE_INTERVAL_SECONDS),
         "manualSellStates": {
@@ -13427,7 +13488,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.78 NIGHT SHIFT CAPITAL ROTATION | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.79 EVIDENCE TUNED CRYPTO | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
