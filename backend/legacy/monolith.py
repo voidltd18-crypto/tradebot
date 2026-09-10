@@ -210,6 +210,18 @@ PARTIAL_PROFIT_TRIGGER_PCT = 8.00
 PARTIAL_PROFIT_SELL_PCT = 0.00
 POST_PARTIAL_TRAIL_GIVEBACK = 0.980
 FAST_STOP_LOSS_PCT = -4.00
+
+# V18.2.80 — Stock Downside Guard.
+# Absolute live-stock loss ceiling. AI risk profiles may tighten this further,
+# but may never widen a stock beyond this percentage loss.
+V18280_STOCK_ABSOLUTE_STOP_PCT = max(
+    0.50,
+    min(4.00, float(os.getenv("TRADEBOT_STOCK_ABSOLUTE_STOP_PCT", "1.50") or 1.50)),
+)
+V18280_STOCK_GUARD_ENABLED = str(
+    os.getenv("TRADEBOT_STOCK_DOWNSIDE_GUARD_ENABLED", "true")
+).lower() in ("1","true","yes","on")
+
 STALL_EXIT_ENABLED = True
 STALL_EXIT_AFTER_MINUTES = 4320
 STALL_EXIT_MIN_PNL_PCT = -1.00
@@ -1302,6 +1314,8 @@ def get_all_positions():
             trail_start_pct = abs(float(risk_profile.get("trailStartPct") or ((TRAIL_START - 1.0) * 100.0)))
             trail_giveback_pct = abs(float(risk_profile.get("trailGivebackPct") or ((1.0 - TRAIL_GIVEBACK) * 100.0)))
             stop_loss_pct = abs(float(risk_profile.get("stopLossPct") or ((1.0 - STOP_LOSS) * 100.0)))
+            if "V18280_STOCK_GUARD_ENABLED" in globals() and V18280_STOCK_GUARD_ENABLED:
+                stop_loss_pct = min(stop_loss_pct, V18280_STOCK_ABSOLUTE_STOP_PCT)
             emergency_stop_pct = abs(float(risk_profile.get("emergencyStopPct") or (globals().get("AI_RISK_EMERGENCY_STOP_PCT", 10.0))))
             trail_start_price = entry * (1.0 + trail_start_pct / 100.0) if entry > 0 else 0.0
             trail_floor = (state[symbol].get("highest_since_entry") or 0.0) * (1.0 - trail_giveback_pct / 100.0)
@@ -2176,6 +2190,30 @@ def should_partial_profit(position: Dict[str, Any]):
         return False, "partial sell notional too small"
 
     return True, "partial profit trigger"
+
+
+def _v18280_stock_loss_guard(position: Dict[str, Any]):
+    """Non-AI-overridable stock loss ceiling.
+
+    This is deliberately evaluated before adaptive AI stops. It does not alter
+    stock entry selection, scoring, position sizing, profit exits or crypto.
+    """
+    if not V18280_STOCK_GUARD_ENABLED:
+        return False, "stock downside guard disabled"
+
+    symbol=str(position.get("symbol") or "").upper()
+    pnl_pct=float(position.get("pnlPct") or 0.0)
+    qty=float(position.get("qty") or 0.0)
+    price=float(position.get("price") or 0.0)
+    entry=float(position.get("entry") or 0.0)
+
+    if not symbol or qty <= DUST_THRESHOLD or price <= 0 or entry <= 0:
+        return False, "invalid stock position"
+
+    threshold=-abs(V18280_STOCK_ABSOLUTE_STOP_PCT)
+    return pnl_pct <= threshold, (
+        f"pnl={pnl_pct:.2f}% absolute_limit={threshold:.2f}%"
+    )
 
 
 def should_fast_stop(position: Dict[str, Any]):
@@ -4504,6 +4542,30 @@ def manage_money_mode_positions():
         if price <= 0 or entry <= 0 or qty <= DUST_THRESHOLD:
             continue
 
+        # V18.2.80: absolute stock downside guard is checked BEFORE AI/adaptive
+        # exits, so a wide AI risk profile can never allow another -3%/-4% stock
+        # position to keep drifting simply because its thesis is still "healthy".
+        guard_stop, guard_reason = _v18280_stock_loss_guard(p)
+        if guard_stop:
+            try:
+                market_sell_qty(
+                    symbol, qty, entry=entry, price=price,
+                    reason="V18.2.80 STOCK ABSOLUTE LOSS GUARD"
+                )
+                state[symbol]["highest_since_entry"] = None
+                _v17_reset_peak_exhaustion(symbol)
+                _v17_reset_runner_trail(symbol)
+                print(
+                    f"V18.2.80 STOCK LOSS GUARD SELL | {symbol} qty={qty:.6f} "
+                    f"pnl={float(p.get('pnlPct') or 0.0):.2f}% "
+                    f"limit=-{V18280_STOCK_ABSOLUTE_STOP_PCT:.2f}% "
+                    f"entry={entry:.4f} price={price:.4f}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"V18.2.80 STOCK LOSS GUARD ERROR | {symbol} {e}", flush=True)
+            continue
+
         fast_stop, fast_stop_reason = should_fast_stop(p)
         if fast_stop:
             try:
@@ -4520,6 +4582,8 @@ def manage_money_mode_positions():
 
         risk_profile = _ai_risk_effective_profile(symbol) if "_ai_risk_effective_profile" in globals() else {}
         adaptive_stop_pct = abs(float(risk_profile.get("stopLossPct") or ((1.0 - STOP_LOSS) * 100.0)))
+        if V18280_STOCK_GUARD_ENABLED:
+            adaptive_stop_pct = min(adaptive_stop_pct, V18280_STOCK_ABSOLUTE_STOP_PCT)
         emergency_stop_pct = abs(float(risk_profile.get("emergencyStopPct") or AI_RISK_EMERGENCY_STOP_PCT if "AI_RISK_EMERGENCY_STOP_PCT" in globals() else 10.0))
         stop_price = entry * (1.0 - adaptive_stop_pct / 100.0)
         emergency_stop_price = entry * (1.0 - emergency_stop_pct / 100.0)
@@ -13119,7 +13183,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.79", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.80", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "NIGHT_SHIFT_DYNAMIC_SPLIT",
@@ -13145,7 +13209,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "manualSellNonBlocking": True,
         "breakevenGuardEnabled": bool(V18269_CRYPTO_BREAKEVEN_GUARD_ENABLED),
         "evidenceTuning": {
-            "version": "V18.2.79",
+            "version": "V18.2.80",
             "strongScoreFloor": V18279_CRYPTO_STRONG_SCORE_FLOOR,
             "mixedScoreFloor": V18279_CRYPTO_MIXED_SCORE_FLOOR,
             "weakScoreFloor": V18279_CRYPTO_WEAK_SCORE_FLOOR,
@@ -13488,7 +13552,7 @@ def startup_event():
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
-        print("V18.2.79 EVIDENCE TUNED CRYPTO | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
+        print("V18.2.80 STOCK DOWNSIDE GUARD | tracker_db_worker=separate api_cache=enabled safety_loop_db_snapshot_blocking=False", flush=True)
     if AI_SUMMARY_LOG_ENABLED and not ai_summary_thread_started:
         ai_summary_thread_started = True
         threading.Thread(target=ai_periodic_summary_worker, daemon=True).start()
