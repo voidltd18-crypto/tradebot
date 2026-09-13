@@ -282,7 +282,7 @@ useEffect(() => {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.77.6 · FAST CONTROL RESPONSE</div>
+          <div className="eyebrow">V18.2.80 · STOCK DOWNSIDE GUARD</div>
           <h2>Crypto Lab</h2>
           <p>Live crypto trading pilot — real capital, real trades, real results.</p>
         </div>
@@ -518,7 +518,7 @@ useEffect(() => {
       <div className="crypto-panel-head">
         <div>
           <h3><span className="panel-icon">⌒</span> Crypto Bridge</h3>
-          <p>Capital split is automatic: £900 is reserved for stocks, everything else outside the Piggy Bank is crypto. Crypto profits are banked one-way. Safety exits check every 5 seconds; normal decisions run every 5 minutes.</p>
+          <p>Capital split is automatic: £900 is reserved for stocks in the day. From 30 minutes before the close until 30 minutes before the next open, non-Piggy capital is assigned to crypto. Crypto profits are banked one-way. Safety exits check every 5 seconds; normal decisions run every 5 minutes.</p>
         </div>
         <span className={`crypto-chip ${armed ? "live" : accountActive ? "building" : ""}`}>{armed ? "LIVE PILOT ARMED" : accountActive ? "READY TO ARM" : "CRYPTO NOT ACTIVE"}</span>
       </div>

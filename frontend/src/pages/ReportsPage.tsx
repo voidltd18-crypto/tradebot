@@ -4,6 +4,7 @@ import { Card } from "../components/Card";
 import { TradeReplayModal, type ReplayTarget } from "../components/TradeReplayModal";
 import { Stat } from "../components/Stat";
 import { gbp, pct, tone, tradeDate, tradeTime, usd } from "../lib/format";
+import { API_URL, readJson } from "../lib/api";
 import type { AnyObj, Currency } from "../lib/types";
 
 type RangeKey = "today" | "week" | "month" | "year";
@@ -53,6 +54,8 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const chartHoverRef = useRef<{ts:number; equity:number} | null>(null);
   const chartShellRef = useRef<HTMLDivElement | null>(null);
   const [momentFilter, setMomentFilter] = useState<{from:number; to:number; label:string} | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyMessage, setHistoryMessage] = useState("");
   const totalDeposited = Number(reports?.totalDeposited || 0);
   const totalGainLoss = Number(reports?.totalGainLoss || 0);
   const earned = Number(reports?.earnedSinceDeposit || 0);
@@ -193,12 +196,38 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
     window.setTimeout(() => document.getElementById("closed-trade-history")?.scrollIntoView({ behavior:"smooth", block:"start" }), 50);
   };
 
+
+  const backfillFullHistory = async () => {
+    if (!authToken || historyLoading) return;
+    setHistoryLoading(true);
+    setHistoryMessage("Fetching older Alpaca orders and rebuilding Closed Trade History…");
+    try {
+      const response = await fetch(`${API_URL}/reports/backfill-full-history`, {
+        method: "POST",
+        cache: "no-store",
+        headers: { "X-Auth-Token": authToken, "x-api-key": authToken },
+      });
+      const json = await readJson(response);
+      if (!response.ok || json?.ok === false) throw new Error(json?.detail || json?.message || `Backfill failed (${response.status})`);
+      setHistoryMessage(json?.message || `Full history rebuilt. ${Number(json?.ordersFetched || 0)} Alpaca orders checked.`);
+      await loadReports(true);
+    } catch (error: any) {
+      setHistoryMessage(error?.message || "Full-history backfill failed.");
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
   return <main className="grid two reports-page">
     <Card title="Reports Status" wide>
-      <div className="actions"><button onClick={() => loadReports(true)} disabled={reportsLoading}>{reportsLoading ? "Loading Reports..." : "Refresh Reports"}</button></div>
+      <div className="actions">
+        <button onClick={() => loadReports(true)} disabled={reportsLoading || historyLoading}>{reportsLoading ? "Loading Reports..." : "Refresh Reports"}</button>
+        <button onClick={backfillFullHistory} disabled={historyLoading || reportsLoading}>{historyLoading ? "Backfilling Older Trades..." : "Backfill Older Trades"}</button>
+      </div>
       {reportsLoading && <p className="notice">Reports are loading separately. Live trading, positions and AI remain available.</p>}
+      {historyMessage && <p className="notice">{historyMessage}</p>}
       {reportsError && <p className="notice loss">{reportsError}</p>}
-      {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })}</p>}
+      {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })} · {Number(reports?.closedTradeRowsReturned || closedTrades.length).toLocaleString("en-GB")} closed rows loaded</p>}
     </Card>
 
     <Card title="Performance Summary" wide><section className="stats"><Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={usd(totalDeposited)}/><Stat label="Earned" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)}/><Stat label="Lost" value={gbp(lost * rate)} sub={usd(lost)} className="loss"/><Stat label="Current Equity" value={gbp(Number(reports?.currentEquity ?? data?.account?.equity ?? 0) * rate)} sub={usd(reports?.currentEquity ?? data?.account?.equity ?? 0)}/></section><p className={tone(totalGainLoss)}>Total gain/loss: {gbp(totalGainLoss * rate)}</p></Card>

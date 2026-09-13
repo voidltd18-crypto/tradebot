@@ -429,6 +429,9 @@ SQLITE_DB_FILE = os.getenv("SQLITE_DB_FILE", "").strip() or persistent_file("tra
 BACKFILL_ORDER_LIMIT = 500
 BACKFILL_CHUNK_SIZE = 500
 BACKFILL_MAX_PAGES = 50
+# V18.2.81: Reports used to expose only the newest 200 closed rows, which made
+# older history appear to be missing even when it was already in SQLite.
+REPORTS_CLOSED_TRADES_LIMIT = max(200, min(int(os.getenv("REPORTS_CLOSED_TRADES_LIMIT", "5000") or 5000), 25000))
 
 TRADE_HISTORY_FILE = "trade_history.json"
 STOCK_MEMORY_FILE = "stock_memory.json"
@@ -10246,6 +10249,24 @@ def backfill_trades(request: Request):
         return result
 
 
+@app.post("/reports/backfill-full-history")
+def reports_backfill_full_history(request: Request):
+    """V18.2.81 manual reporting repair.
+
+    Fetches Alpaca order history backwards in pages, stores any orders not already
+    present, rebuilds FIFO closed trades, and invalidates the Reports cache. This
+    changes reporting data only; it does not submit, cancel, or alter live orders.
+    """
+    verify_api_key(request)
+    global _reports_payload_cache
+    with bot_lock:
+        result = backfill_trades_from_alpaca_full()
+        with _reports_payload_lock:
+            _reports_payload_cache.update({"at": 0.0, "value": None})
+        update_status(BOT_NAME, latest_scans)
+        return {**result, "reportsClosedTradeLimit": REPORTS_CLOSED_TRADES_LIMIT}
+
+
 # =========================
 # TRADEBOT V18.2.15 — CYCLE MONITOR
 # Persistent operational counters. Read-only visibility; no trading decisions.
@@ -13928,7 +13949,7 @@ def _build_reports_payload() -> Dict[str, Any]:
     total_withdrawn = _safe_num(performance.get("totalWithdrawn"))
     total_deposited = _safe_num(performance.get("totalDeposited"))
     total_gain_loss = _safe_num(performance.get("totalGainLoss"))
-    closed = closed_trades_from_db(200) if "closed_trades_from_db" in globals() else (status.get("closedTrades") or [])
+    closed = closed_trades_from_db(REPORTS_CLOSED_TRADES_LIMIT) if "closed_trades_from_db" in globals() else (status.get("closedTrades") or [])
 
     # V18.2.18: newest historical trade-equity points + a live current-equity point.
     # This guarantees Today can render even on a no-trade day, while Week/Month/Year
@@ -13958,7 +13979,9 @@ def _build_reports_payload() -> Dict[str, Any]:
         "totalGainLoss": total_gain_loss, "earnedSinceDeposit": max(total_gain_loss, 0.0),
         "lostSinceDeposit": abs(min(total_gain_loss, 0.0)), "dayPnl": _safe_num(account.get("pnlDay")),
         "realisedNet": _safe_num(performance.get("lifetimeRealisedPnl", db.get("totalPnl"))),
-        "performanceEngine": performance, "closedTrades": closed[:200] if isinstance(closed, list) else [],
+        "performanceEngine": performance, "closedTrades": closed if isinstance(closed, list) else [],
+        "closedTradeRowsReturned": len(closed) if isinstance(closed, list) else 0,
+        "closedTradeRowsLimit": REPORTS_CLOSED_TRADES_LIMIT,
         "equityHistory": equity_history[-500:], "winRate": _safe_num(performance.get("winRate", db.get("winRate"))) * 100.0,
         "totalTrades": int(_safe_num(performance.get("totalClosedTrades", db.get("totalTrades")))),
     }
