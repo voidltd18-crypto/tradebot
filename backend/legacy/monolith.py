@@ -11355,6 +11355,30 @@ V18282_CRYPTO_PERF_MAX_PNL_USD = float(os.getenv("TRADEBOT_CRYPTO_PERF_MAX_PNL_U
 V18282_CRYPTO_PERF_LOOKBACK_TRADES = max(5, int(os.getenv("TRADEBOT_CRYPTO_PERF_LOOKBACK_TRADES", "12") or 12))
 V18282_CRYPTO_PERF_QUARANTINE_HOURS = max(1.0, float(os.getenv("TRADEBOT_CRYPTO_PERF_QUARANTINE_HOURS", "24") or 24))
 
+# V18.2.85 — LIVE EVIDENCE RESET.
+# 90 completed logical trades still showed negative expectancy (-$0.80/trade).
+# This gate is deliberately independent of older Render tuning env vars: live money
+# must now clear a stronger multi-factor threshold before an order can be submitted.
+V18285_CRYPTO_LIVE_GATE_ENABLED = True
+V18285_CRYPTO_MIN_SCORE = 0.50
+V18285_CRYPTO_MIN_15M_PCT = 0.20
+V18285_CRYPTO_MIN_60M_PCT = 0.40
+V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT = 10.0
+
+def _v18285_crypto_live_evidence_gate(candidate: Dict[str, Any]) -> Tuple[bool, str]:
+    if not V18285_CRYPTO_LIVE_GATE_ENABLED:
+        return True, "disabled"
+    score = float(candidate.get("score") or 0.0)
+    ret15 = float(candidate.get("return15mPct") or 0.0)
+    ret60 = float(candidate.get("return60mPct") or 0.0)
+    if score < V18285_CRYPTO_MIN_SCORE:
+        return False, f"score {score:.3f} < {V18285_CRYPTO_MIN_SCORE:.2f}"
+    if ret15 < V18285_CRYPTO_MIN_15M_PCT:
+        return False, f"15m {ret15:.2f}% < {V18285_CRYPTO_MIN_15M_PCT:.2f}%"
+    if ret60 < V18285_CRYPTO_MIN_60M_PCT:
+        return False, f"60m {ret60:.2f}% < {V18285_CRYPTO_MIN_60M_PCT:.2f}%"
+    return True, "passed"
+
 # V18.2.48 — separate fast safety monitoring from normal trading cadence.
 # Protective stop/trail checks now run every 5 seconds, while new entries and
 # normal entry/momentum-exit decisions are evaluated no more than once every 5 minutes.
@@ -12775,6 +12799,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
                 and _v18246_crypto_symbol_key(x.get("symbol")) not in held_symbols
                 and _v18246_crypto_symbol_key(x.get("symbol")) not in active_cooldowns
                 and not _v18282_crypto_symbol_block(x.get("symbol"), perf_snapshot)[0]
+                and _v18285_crypto_live_evidence_gate(x)[0]
             ]
             _v182774_qualified.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
             _v182774_names = ", ".join(
@@ -12803,7 +12828,17 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
             and bool(x.get("liquid", True))
             and _v18246_crypto_symbol_key(x.get("symbol")) not in held_symbols
             and _v18246_crypto_symbol_key(x.get("symbol")) not in active_cooldowns
+            and not _v18282_crypto_symbol_block(x.get("symbol"), perf_snapshot)[0]
+            and _v18285_crypto_live_evidence_gate(x)[0]
         ]
+        # V18.2.85: log candidates rejected by the new live-money evidence gate.
+        _v18285_rejected = []
+        for _cand in scans:
+            _ok, _why = _v18285_crypto_live_evidence_gate(_cand)
+            if not _ok and bool(_cand.get("liquid", True)):
+                _v18285_rejected.append(f"{str(_cand.get('symbol') or '').replace('/','')} ({_why})")
+        if _v18285_rejected:
+            print("V18.2.85 LIVE EVIDENCE GATE | " + "; ".join(_v18285_rejected[:12]), flush=True)
         if V18282_CRYPTO_PERFORMANCE_GUARD_ENABLED and perf_snapshot:
             perf_blocked = []
             for candidate in scans:
@@ -12850,13 +12885,14 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
                 (remaining_gbp * (weight / score_total) if score_total > 0 else remaining_gbp / len(qualified))
                 for weight in weights
             ]
-            per_entry_cap_gbp = max(1.0, allocation_gbp * (V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT / 100.0))
+            effective_entry_cap_pct = min(V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT)
+            per_entry_cap_gbp = max(1.0, allocation_gbp * (effective_entry_cap_pct / 100.0))
             planned_budgets = [min(budget, per_entry_cap_gbp) for budget in raw_budgets]
             if qualified:
                 print(
                     f"V18.2.79 EVIDENCE ALLOCATION | allocation=£{allocation_gbp:.2f} "
                     f"remaining=£{remaining_gbp:.2f} max_per_entry=£{per_entry_cap_gbp:.2f} "
-                    f"cap={V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT:.1f}%",
+                    f"cap={effective_entry_cap_pct:.1f}%",
                     flush=True,
                 )
             for scan, budget in zip(qualified, planned_budgets):
@@ -13362,7 +13398,12 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
             "weakScoreFloor": V18279_CRYPTO_WEAK_SCORE_FLOOR,
             "breakevenArmPct": V18279_CRYPTO_BREAKEVEN_ARM_PCT,
             "breakevenLockPct": V18279_CRYPTO_BREAKEVEN_LOCK_PCT,
-            "maxEntryAllocationPct": V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT,
+            "maxEntryAllocationPct": min(V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT),
+            "liveEvidenceGateVersion": "V18.2.85",
+            "liveEvidenceGateEnabled": V18285_CRYPTO_LIVE_GATE_ENABLED,
+            "liveEvidenceMinScore": V18285_CRYPTO_MIN_SCORE,
+            "liveEvidenceMin15mPct": V18285_CRYPTO_MIN_15M_PCT,
+            "liveEvidenceMin60mPct": V18285_CRYPTO_MIN_60M_PCT,
             "performanceGuardEnabled": V18282_CRYPTO_PERFORMANCE_GUARD_ENABLED,
             "performanceMinTrades": V18282_CRYPTO_PERF_MIN_TRADES,
             "performanceMaxWinRatePct": V18282_CRYPTO_PERF_MAX_WIN_RATE_PCT,
