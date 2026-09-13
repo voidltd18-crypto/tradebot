@@ -1,7 +1,7 @@
 import type { AnyObj } from "./types";
 
 export const API_URL = import.meta.env.VITE_API_BASE || "https://tradebot-0myo.onrender.com";
-export const BOT_VERSION = "V18.2.81 Full Report History";
+export const BOT_VERSION = "V18.2.82 Performance-Led Engine";
 
 export async function readJson(res: Response): Promise<AnyObj> {
   const text = await res.text();

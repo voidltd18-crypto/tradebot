@@ -108,13 +108,13 @@ AI_POSITION_HARD_CAP = max(1, min(10, int(os.getenv("AI_POSITION_HARD_CAP", "10"
 AI_POSITION_MIN_NOTIONAL_USD = max(10.0, float(os.getenv("AI_POSITION_MIN_NOTIONAL_USD", "25") or 25))
 AI_PORTFOLIO_MANAGER_ENABLED = os.getenv("AI_PORTFOLIO_MANAGER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 AI_PORTFOLIO_MANAGER_VERSION = "V16.0"
-AI_PORTFOLIO_MAX_SINGLE_WEIGHT = max(0.10, min(0.60, float(os.getenv("AI_PORTFOLIO_MAX_SINGLE_WEIGHT", "0.45") or 0.45)))
+AI_PORTFOLIO_MAX_SINGLE_WEIGHT = max(0.10, min(0.60, float(os.getenv("AI_PORTFOLIO_MAX_SINGLE_WEIGHT", "0.48") or 0.48)))
 AI_PORTFOLIO_MIN_CASH_RESERVE_PCT = max(0.02, min(0.50, float(os.getenv("AI_PORTFOLIO_MIN_CASH_RESERVE_PCT", "0.08") or 0.08)))
 AI_PORTFOLIO_MAX_CASH_RESERVE_PCT = max(AI_PORTFOLIO_MIN_CASH_RESERVE_PCT, min(0.80, float(os.getenv("AI_PORTFOLIO_MAX_CASH_RESERVE_PCT", "0.45") or 0.45)))
 AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE = max(1, min(10, int(os.getenv("AI_PORTFOLIO_MAX_ORDERS_PER_CYCLE", "10") or 10)))
 AI_PORTFOLIO_MIN_SCORE = max(0.0, min(1.0, float(os.getenv("AI_PORTFOLIO_MIN_SCORE", "0.55") or 0.55)))
 AI_PORTFOLIO_ADAPTIVE_SCORE_ENABLED = os.getenv("AI_PORTFOLIO_ADAPTIVE_SCORE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR = max(0.0, min(AI_PORTFOLIO_MIN_SCORE, float(os.getenv("AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR", "0.52") or 0.52)))
+AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR = max(0.0, min(AI_PORTFOLIO_MIN_SCORE, float(os.getenv("AI_PORTFOLIO_ADAPTIVE_SCORE_FLOOR", "0.55") or 0.55)))
 AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT = max(1, min(5, int(os.getenv("AI_PORTFOLIO_ADAPTIVE_TARGET_COUNT", "2") or 2)))
 AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT = max(0.0, min(0.40, float(os.getenv("AI_PORTFOLIO_RELATIVE_SCORE_WEIGHT", "0.22") or 0.22)))
 AI_PORTFOLIO_PLAN_FILE = os.getenv("AI_PORTFOLIO_PLAN_FILE", "/var/data/ai_portfolio_plan.json")
@@ -319,7 +319,7 @@ V7_ENABLED = os.getenv("V7_ENABLED", "true").lower() == "true"
 V7_AUTOMATIC_EVOLUTION = os.getenv("V7_AUTOMATIC_EVOLUTION", "true").lower() == "true"
 V7_POPULATION_LIMIT = max(6, min(int(os.getenv("V7_POPULATION_LIMIT", "30") or 30), 200))
 V7_CHILDREN_PER_RUN = max(1, min(int(os.getenv("V7_CHILDREN_PER_RUN", "12") or 12), 50))
-V7_MIN_PARENT_SAMPLES = max(V6_MIN_SAMPLES, int(os.getenv("V7_MIN_PARENT_SAMPLES", "20") or 20))
+V7_MIN_PARENT_SAMPLES = max(V6_MIN_SAMPLES, int(os.getenv("V7_MIN_PARENT_SAMPLES", "15") or 15))
 V7_MUTATION_RATE = max(0.01, min(float(os.getenv("V7_MUTATION_RATE", "0.12") or 0.12), 0.50))
 V7_WEEKEND_MAINTENANCE_ENABLED = os.getenv("V7_WEEKEND_MAINTENANCE_ENABLED", "true").lower() == "true"
 V7_WEEKEND_DAY = max(0, min(int(os.getenv("V7_WEEKEND_DAY", "6") or 6), 6))  # Monday=0, Sunday=6
@@ -11263,16 +11263,16 @@ V18269_CRYPTO_BREAKEVEN_GUARD_ENABLED = str(
 # overall expectancy was negative and STRONG-regime entries materially
 # underperformed MIXED-regime entries. These are conservative quality/risk
 # changes only; the stock engine is untouched.
-V18279_CRYPTO_STRONG_SCORE_FLOOR = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_STRONG_SCORE", "0.46") or 0.46)
+V18279_CRYPTO_STRONG_SCORE_FLOOR = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_STRONG_SCORE", "0.50") or 0.50)
 V18279_CRYPTO_MIXED_SCORE_FLOOR = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_MIXED_SCORE", "0.45") or 0.45)
 V18279_CRYPTO_WEAK_SCORE_FLOOR = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_WEAK_SCORE", "0.52") or 0.52)
 
-V18279_CRYPTO_STRONG_MIN_15M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_STRONG_MIN_15M_PCT", "0.10") or 0.10)
-V18279_CRYPTO_STRONG_MIN_60M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_STRONG_MIN_60M_PCT", "0.15") or 0.15)
-V18279_CRYPTO_MIXED_MIN_15M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_MIXED_MIN_15M_PCT", "0.10") or 0.10)
-V18279_CRYPTO_MIXED_MIN_60M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_MIXED_MIN_60M_PCT", "0.10") or 0.10)
-V18279_CRYPTO_WEAK_MIN_15M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_WEAK_MIN_15M_PCT", "0.25") or 0.25)
-V18279_CRYPTO_WEAK_MIN_60M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_WEAK_MIN_60M_PCT", "0.35") or 0.35)
+V18279_CRYPTO_STRONG_MIN_15M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_STRONG_MIN_15M_PCT", "0.20") or 0.20)
+V18279_CRYPTO_STRONG_MIN_60M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_STRONG_MIN_60M_PCT", "0.30") or 0.30)
+V18279_CRYPTO_MIXED_MIN_15M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_MIXED_MIN_15M_PCT", "0.15") or 0.15)
+V18279_CRYPTO_MIXED_MIN_60M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_MIXED_MIN_60M_PCT", "0.20") or 0.20)
+V18279_CRYPTO_WEAK_MIN_15M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_WEAK_MIN_15M_PCT", "0.30") or 0.30)
+V18279_CRYPTO_WEAK_MIN_60M_PCT = float(os.getenv("TRADEBOT_CRYPTO_EVIDENCE_WEAK_MIN_60M_PCT", "0.50") or 0.50)
 
 # Prevent one isolated qualifier from consuming the whole overnight crypto pool.
 # With several qualifiers the normal rank-weighted allocator still works.
@@ -11283,11 +11283,25 @@ V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT = max(
 # The old breakeven guard armed after merely touching entry. Evidence showed too
 # much churn around entry, so require a genuine move first.
 V18279_CRYPTO_BREAKEVEN_ARM_PCT = max(
-    0.10, float(os.getenv("TRADEBOT_CRYPTO_BREAKEVEN_ARM_PCT", "0.40") or 0.40)
+    0.10, float(os.getenv("TRADEBOT_CRYPTO_BREAKEVEN_ARM_PCT", "0.75") or 0.75)
 )
 V18279_CRYPTO_BREAKEVEN_LOCK_PCT = max(
-    0.0, float(os.getenv("TRADEBOT_CRYPTO_BREAKEVEN_LOCK_PCT", "0.05") or 0.05)
+    0.0, float(os.getenv("TRADEBOT_CRYPTO_BREAKEVEN_LOCK_PCT", "0.15") or 0.15)
 )
+
+# V18.2.82 — performance-led crypto guard.
+# The expanded live audit showed negative expectancy across 82 completed trades.
+# Rather than permanently hard-code losing coins, the engine now learns from its own
+# logical ledger and temporarily quarantines symbols with a sufficiently bad recent
+# live record. A quarantine expires, allowing the symbol to prove itself again.
+V18282_CRYPTO_PERFORMANCE_GUARD_ENABLED = str(
+    os.getenv("TRADEBOT_CRYPTO_PERFORMANCE_GUARD_ENABLED", "true")
+).lower() in ("1", "true", "yes", "on")
+V18282_CRYPTO_PERF_MIN_TRADES = max(3, int(os.getenv("TRADEBOT_CRYPTO_PERF_MIN_TRADES", "5") or 5))
+V18282_CRYPTO_PERF_MAX_WIN_RATE_PCT = max(0.0, min(100.0, float(os.getenv("TRADEBOT_CRYPTO_PERF_MAX_WIN_RATE_PCT", "15") or 15)))
+V18282_CRYPTO_PERF_MAX_PNL_USD = float(os.getenv("TRADEBOT_CRYPTO_PERF_MAX_PNL_USD", "-3.0") or -3.0)
+V18282_CRYPTO_PERF_LOOKBACK_TRADES = max(5, int(os.getenv("TRADEBOT_CRYPTO_PERF_LOOKBACK_TRADES", "12") or 12))
+V18282_CRYPTO_PERF_QUARANTINE_HOURS = max(1.0, float(os.getenv("TRADEBOT_CRYPTO_PERF_QUARANTINE_HOURS", "24") or 24))
 
 # V18.2.48 — separate fast safety monitoring from normal trading cadence.
 # Protective stop/trail checks now run every 5 seconds, while new entries and
@@ -11746,6 +11760,56 @@ def _v18277_ledger_rows(limit: int = 10000) -> List[Dict[str, Any]]:
     except Exception:
         pass
     return rows[-max(1,int(limit)):]
+
+def _v18282_crypto_performance_snapshot() -> Dict[str, Dict[str, Any]]:
+    """Summarise recent completed live trades per symbol from the logical ledger."""
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in _v18277_ledger_rows(limit=10000):
+        if row.get("event") != "logical_exit":
+            continue
+        key = _v18246_crypto_symbol_key(row.get("symbol"))
+        if not key:
+            continue
+        grouped.setdefault(key, []).append(row)
+    out: Dict[str, Dict[str, Any]] = {}
+    for key, rows in grouped.items():
+        recent = rows[-V18282_CRYPTO_PERF_LOOKBACK_TRADES:]
+        pnls = [float(r.get("pnlUsd") or 0.0) for r in recent]
+        wins = sum(1 for x in pnls if x > 0)
+        last_closed = str((recent[-1] if recent else {}).get("closedAt") or "")
+        out[key] = {
+            "trades": len(recent),
+            "wins": wins,
+            "winRatePct": (wins / len(recent) * 100.0) if recent else 0.0,
+            "pnlUsd": sum(pnls),
+            "lastClosedAt": last_closed,
+        }
+    return out
+
+def _v18282_crypto_symbol_block(symbol: str, snapshot: Optional[Dict[str, Dict[str, Any]]] = None) -> Tuple[bool, str]:
+    if not V18282_CRYPTO_PERFORMANCE_GUARD_ENABLED:
+        return False, ""
+    key = _v18246_crypto_symbol_key(symbol)
+    stats = (snapshot or _v18282_crypto_performance_snapshot()).get(key)
+    if not stats or int(stats.get("trades") or 0) < V18282_CRYPTO_PERF_MIN_TRADES:
+        return False, ""
+    win_rate = float(stats.get("winRatePct") or 0.0)
+    pnl = float(stats.get("pnlUsd") or 0.0)
+    if win_rate > V18282_CRYPTO_PERF_MAX_WIN_RATE_PCT or pnl > V18282_CRYPTO_PERF_MAX_PNL_USD:
+        return False, ""
+    last_raw = str(stats.get("lastClosedAt") or "")
+    try:
+        last_dt = datetime.fromisoformat(last_raw.replace("Z", "+00:00"))
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=UTC)
+        age_h = (datetime.now(UTC) - last_dt.astimezone(UTC)).total_seconds() / 3600.0
+        if age_h >= V18282_CRYPTO_PERF_QUARANTINE_HOURS:
+            return False, ""
+        remaining = max(0.0, V18282_CRYPTO_PERF_QUARANTINE_HOURS - age_h)
+    except Exception:
+        remaining = V18282_CRYPTO_PERF_QUARANTINE_HOURS
+    return True, (f"recent={int(stats['trades'])} win={win_rate:.1f}% "
+                  f"pnl=${pnl:.2f} retry={remaining:.1f}h")
 
 def _v18277_ledger_summary() -> Dict[str, Any]:
     rows=_v18277_ledger_rows()
@@ -12642,6 +12706,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
     cooldown_state = load_profit_vault_state()
     active_cooldowns = _v18247_prune_crypto_cooldowns(cooldown_state, save=True)
     slots = max(0, V18234_CRYPTO_LIVE_MAX_POSITIONS - len(positions))
+    perf_snapshot = _v18282_crypto_performance_snapshot() if V18282_CRYPTO_PERFORMANCE_GUARD_ENABLED else {}
     risk_state = _v18250_refresh_crypto_risk_state(load_profit_vault_state(), allocation_gbp, save=True)
     risk_blocked, risk_reason = _v18250_crypto_entry_risk_block(risk_state, allocation_gbp)
     _crypto_live_runtime["riskBlocked"] = risk_blocked
@@ -12657,6 +12722,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
                 and bool(x.get("liquid", True))
                 and _v18246_crypto_symbol_key(x.get("symbol")) not in held_symbols
                 and _v18246_crypto_symbol_key(x.get("symbol")) not in active_cooldowns
+                and not _v18282_crypto_symbol_block(x.get("symbol"), perf_snapshot)[0]
             ]
             _v182774_qualified.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
             _v182774_names = ", ".join(
@@ -12686,6 +12752,14 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
             and _v18246_crypto_symbol_key(x.get("symbol")) not in held_symbols
             and _v18246_crypto_symbol_key(x.get("symbol")) not in active_cooldowns
         ]
+        if V18282_CRYPTO_PERFORMANCE_GUARD_ENABLED and perf_snapshot:
+            perf_blocked = []
+            for candidate in scans:
+                blocked, why = _v18282_crypto_symbol_block(candidate.get("symbol"), perf_snapshot)
+                if blocked:
+                    perf_blocked.append(f"{str(candidate.get('symbol') or '').replace('/','')} ({why})")
+            if perf_blocked:
+                print("V18.2.82 PERFORMANCE QUARANTINE | " + "; ".join(perf_blocked[:12]), flush=True)
         if qualified:
             try:
                 _v182774_ranked = sorted(
@@ -13230,13 +13304,19 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "manualSellNonBlocking": True,
         "breakevenGuardEnabled": bool(V18269_CRYPTO_BREAKEVEN_GUARD_ENABLED),
         "evidenceTuning": {
-            "version": "V18.2.80",
+            "version": "V18.2.82",
             "strongScoreFloor": V18279_CRYPTO_STRONG_SCORE_FLOOR,
             "mixedScoreFloor": V18279_CRYPTO_MIXED_SCORE_FLOOR,
             "weakScoreFloor": V18279_CRYPTO_WEAK_SCORE_FLOOR,
             "breakevenArmPct": V18279_CRYPTO_BREAKEVEN_ARM_PCT,
             "breakevenLockPct": V18279_CRYPTO_BREAKEVEN_LOCK_PCT,
             "maxEntryAllocationPct": V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT,
+            "performanceGuardEnabled": V18282_CRYPTO_PERFORMANCE_GUARD_ENABLED,
+            "performanceMinTrades": V18282_CRYPTO_PERF_MIN_TRADES,
+            "performanceMaxWinRatePct": V18282_CRYPTO_PERF_MAX_WIN_RATE_PCT,
+            "performanceMaxPnlUsd": V18282_CRYPTO_PERF_MAX_PNL_USD,
+            "performanceLookbackTrades": V18282_CRYPTO_PERF_LOOKBACK_TRADES,
+            "performanceQuarantineHours": V18282_CRYPTO_PERF_QUARANTINE_HOURS,
         },
         "breakevenGuardTriggerPct": 0.0,
         "breakevenGuardCheckIntervalSeconds": int(V18242_CRYPTO_LIVE_INTERVAL_SECONDS),
