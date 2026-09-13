@@ -501,3 +501,6 @@
 @media (max-width: 800px) {
   .crypto-audit-columns { grid-template-columns:1fr; }
 }
+
+/* V18.2.84 Recovery Goal Dashboard */
+.recovery-goal-head{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}.recovery-goal-head>div{background:rgba(2,6,23,.45);border:1px solid rgba(148,163,184,.16);border-radius:14px;padding:13px}.recovery-goal-head span{display:block;color:var(--muted);font-size:13px;margin-bottom:5px}.recovery-goal-head b{font-size:20px}.recovery-goal-track{height:14px;border-radius:999px;overflow:hidden;background:rgba(127,127,127,.18);border:1px solid rgba(148,163,184,.12)}.recovery-goal-track span{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#38bdf8,#22c55e);transition:width .35s ease}.recovery-milestones{display:flex;justify-content:space-between;gap:8px;margin-top:10px;color:var(--muted);font-size:12px;font-weight:700}.recovery-milestones .reached{color:#22c55e}@media(max-width:760px){.recovery-goal-head{grid-template-columns:1fr 1fr}.recovery-milestones{overflow-x:auto;justify-content:flex-start}.recovery-milestones span{min-width:52px;text-align:center}}

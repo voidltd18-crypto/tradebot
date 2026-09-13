@@ -9,6 +9,9 @@ import type { AnyObj, Currency } from "../lib/types";
 
 type RangeKey = "today" | "week" | "month" | "year";
 
+const RECOVERY_START_GBP = 905;
+const RECOVERY_GOAL_GBP = 1075;
+
 function parseReportTimestamp(entry: AnyObj): number {
   const raw = entry?.timestamp || entry?.time || entry?.t || entry?.date || entry?.closedAt || entry?.exitTime || "";
   if (raw) {
@@ -61,6 +64,12 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const earned = Number(reports?.earnedSinceDeposit || 0);
   const lost = Number(reports?.lostSinceDeposit || 0);
   const equityHistory = Array.isArray(reports?.equityHistory) ? reports.equityHistory : Array.isArray(data?.tradeTimeline) ? data.tradeTimeline : [];
+  const currentEquityUsd = Number(reports?.currentEquity ?? data?.account?.equity ?? 0);
+  const currentEquityGbp = currentEquityUsd * rate;
+  const recoveryRemainingGbp = Math.max(0, RECOVERY_GOAL_GBP - currentEquityGbp);
+  const recoverySpanGbp = Math.max(1, RECOVERY_GOAL_GBP - RECOVERY_START_GBP);
+  const recoveryProgressPct = Math.max(0, Math.min(100, ((currentEquityGbp - RECOVERY_START_GBP) / recoverySpanGbp) * 100));
+  const recoveryReached = currentEquityGbp >= RECOVERY_GOAL_GBP;
 
   const reportChart = useMemo(() => {
     const start = rangeStart(range);
@@ -231,6 +240,20 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
     </Card>
 
     <Card title="Performance Summary" wide><section className="stats"><Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={usd(totalDeposited)}/><Stat label="Earned" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)}/><Stat label="Lost" value={gbp(lost * rate)} sub={usd(lost)} className="loss"/><Stat label="Current Equity" value={gbp(Number(reports?.currentEquity ?? data?.account?.equity ?? 0) * rate)} sub={usd(reports?.currentEquity ?? data?.account?.equity ?? 0)}/></section><p className={tone(totalGainLoss)}>Total gain/loss: {gbp(totalGainLoss * rate)}</p></Card>
+
+    <Card title="Recovery Goal" wide>
+      <div className="recovery-goal-head">
+        <div><span>Current account value</span><b>{gbp(currentEquityGbp)}</b></div>
+        <div><span>Target</span><b>{gbp(RECOVERY_GOAL_GBP)}</b></div>
+        <div><span>{recoveryReached ? "Goal reached" : "Remaining"}</span><b className={recoveryReached ? "profit" : ""}>{recoveryReached ? `+${gbp(currentEquityGbp - RECOVERY_GOAL_GBP)}` : gbp(recoveryRemainingGbp)}</b></div>
+        <div><span>Recovery completed</span><b>{recoveryProgressPct.toFixed(1)}%</b></div>
+      </div>
+      <div className="recovery-goal-track" aria-label={`Recovery progress ${recoveryProgressPct.toFixed(1)}%`}><span style={{width:`${recoveryProgressPct}%`}} /></div>
+      <div className="recovery-milestones">
+        {[925,950,975,1000,1025,1050,1075].map(level => <span key={level} className={currentEquityGbp >= level ? "reached" : ""}>£{level.toLocaleString("en-GB")}</span>)}
+      </div>
+      <p className="muted">Recovery Mode tracks progress only — it does not increase position sizes, loosen entry rules or change risk limits.</p>
+    </Card>
 
     <Card title="Account Value" wide>
       <div className="report-toolbar">
