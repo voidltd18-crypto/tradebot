@@ -70,6 +70,8 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const recoverySpanGbp = Math.max(1, RECOVERY_GOAL_GBP - RECOVERY_START_GBP);
   const recoveryProgressPct = Math.max(0, Math.min(100, ((currentEquityGbp - RECOVERY_START_GBP) / recoverySpanGbp) * 100));
   const recoveryReached = currentEquityGbp >= RECOVERY_GOAL_GBP;
+  const equityFloor = Number(data?.equityFloorKillSwitch?.floorGbp ?? 800);
+  const equityFloorLatched = Boolean(data?.equityFloorKillSwitch?.latched);
 
   const reportChart = useMemo(() => {
     const start = rangeStart(range);
@@ -253,6 +255,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
         {[925,950,975,1000,1025,1050,1075].map(level => <span key={level} className={currentEquityGbp >= level ? "reached" : ""}>£{level.toLocaleString("en-GB")}</span>)}
       </div>
       <p className="muted">Recovery Mode tracks progress only — it does not increase position sizes, loosen entry rules or change risk limits.</p>
+      <p className={equityFloorLatched ? "notice loss" : "notice"}>🛑 Equity safety floor: {gbp(equityFloor)} · {equityFloorLatched ? "TRIPPED — BOT OFF" : "ARMED"}. Below this level the bot latches off and exits bot-managed exposure.</p>
     </Card>
 
     <Card title="Account Value" wide>

@@ -539,6 +539,29 @@ equity_curve: List[Dict[str, Any]] = []
 bot_enabled = True
 manual_override = False
 emergency_stop = False
+
+# V18.2.86 — account-level equity floor kill switch.
+# This is deliberately independent of strategy logic: if total account equity
+# falls below the GBP floor, new trading is latched OFF and bot-managed
+# exposure is flattened. The latch survives restarts and must be manually
+# resumed after equity is restored above the floor.
+V18286_EQUITY_FLOOR_ENABLED = str(os.getenv("TRADEBOT_EQUITY_FLOOR_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
+V18286_EQUITY_FLOOR_GBP = max(100.0, float(os.getenv("TRADEBOT_EQUITY_FLOOR_GBP", "800") or 800))
+V18286_EQUITY_FLOOR_POLL_SECONDS = max(5, int(os.getenv("TRADEBOT_EQUITY_FLOOR_POLL_SECONDS", "10") or 10))
+_v18286_equity_floor_runtime: Dict[str, Any] = {
+    "enabled": V18286_EQUITY_FLOOR_ENABLED,
+    "floorGbp": V18286_EQUITY_FLOOR_GBP,
+    "latched": False,
+    "triggeredAt": None,
+    "triggerEquityGbp": None,
+    "lastEquityGbp": None,
+    "lastCheckAt": None,
+    "lastError": None,
+    "liquidation": None,
+}
+_v18286_equity_floor_guard = threading.Lock()
+v18286_equity_floor_thread_started = False
+
 bot_thread_started = False
 v6_sync_thread_started = False
 v7_weekend_thread_started = False
@@ -8379,6 +8402,7 @@ def build_status_payload(bot_name, scans):
         "botEnabled": bot_enabled,
         "manualOverride": manual_override,
         "emergencyStop": emergency_stop,
+        "equityFloorKillSwitch": dict(_v18286_equity_floor_runtime),
         "riskBlocked": blocked,
         "riskReason": risk_reason,
         "mode": "SNIPER_CONFIDENCE_MEMORY_TIMELINE_GBP",
@@ -9932,6 +9956,7 @@ def _quick_live_status_payload() -> Dict[str, Any]:
         "botEnabled": bot_enabled,
         "manualOverride": manual_override,
         "emergencyStop": emergency_stop,
+        "equityFloorKillSwitch": dict(_v18286_equity_floor_runtime),
         "market": market_status,
         "account": {
             "equity": float(account.equity),
@@ -10049,6 +10074,129 @@ def _v182776_request_status_refresh() -> None:
     ).start()
 
 
+def _v18286_equity_floor_state_update(**changes) -> None:
+    _v18286_equity_floor_runtime.update(changes)
+    try:
+        state = load_profit_vault_state()
+        if "latched" in changes:
+            state["equityFloorKillSwitchLatched"] = bool(changes.get("latched"))
+        if "triggeredAt" in changes:
+            state["equityFloorTriggeredAt"] = changes.get("triggeredAt")
+        if "triggerEquityGbp" in changes:
+            state["equityFloorTriggerEquityGbp"] = changes.get("triggerEquityGbp")
+        if "liquidation" in changes:
+            state["equityFloorLastLiquidation"] = changes.get("liquidation")
+        save_profit_vault_state(state)
+    except Exception as exc:
+        _v18286_equity_floor_runtime["lastError"] = f"state:{exc}"[:300]
+
+
+def _v18286_restore_equity_floor_latch() -> bool:
+    global bot_enabled, emergency_stop
+    if not V18286_EQUITY_FLOOR_ENABLED:
+        return False
+    try:
+        state = load_profit_vault_state()
+        latched = bool(state.get("equityFloorKillSwitchLatched"))
+        _v18286_equity_floor_runtime.update({
+            "latched": latched,
+            "triggeredAt": state.get("equityFloorTriggeredAt"),
+            "triggerEquityGbp": state.get("equityFloorTriggerEquityGbp"),
+            "liquidation": state.get("equityFloorLastLiquidation"),
+        })
+        if latched:
+            bot_enabled = False
+            emergency_stop = True
+            print("V18.2.86 EQUITY FLOOR LATCH RESTORED | bot remains OFF", flush=True)
+        return latched
+    except Exception as exc:
+        _v18286_equity_floor_runtime["lastError"] = f"restore:{exc}"[:300]
+        return False
+
+
+def _v18286_flatten_bot_managed_exposure(trigger_equity_gbp: float) -> Dict[str, Any]:
+    summary: Dict[str, Any] = {"stocks": None, "crypto": [], "triggerEquityGbp": round(trigger_equity_gbp, 2)}
+    try:
+        summary["stocks"] = close_all_positions(reason="V18.2.86 EQUITY FLOOR KILL SWITCH")
+    except Exception as exc:
+        summary["stocks"] = {"ok": False, "message": str(exc)[:300]}
+    try:
+        for pos in _v18234_raw_crypto_positions():
+            if not bool(pos.get("managedByPilot")):
+                continue
+            symbol = str(pos.get("symbol") or "")
+            price = float(pos.get("price") or 0.0)
+            if price <= 0:
+                summary["crypto"].append({"ok": False, "symbol": symbol, "message": "No current price"})
+                continue
+            try:
+                ok = bool(_v18234_live_sell(pos, price, 0.0, "V18.2.86 EQUITY FLOOR KILL SWITCH"))
+                summary["crypto"].append({"ok": ok, "symbol": symbol})
+            except Exception as exc:
+                summary["crypto"].append({"ok": False, "symbol": symbol, "message": str(exc)[:300]})
+    except Exception as exc:
+        summary["cryptoError"] = str(exc)[:300]
+    return summary
+
+
+def _v18286_trip_equity_floor(equity_gbp: float) -> bool:
+    global bot_enabled, emergency_stop
+    if not V18286_EQUITY_FLOOR_ENABLED or equity_gbp >= V18286_EQUITY_FLOOR_GBP:
+        return False
+    with _v18286_equity_floor_guard:
+        if bool(_v18286_equity_floor_runtime.get("latched")):
+            bot_enabled = False
+            emergency_stop = True
+            return True
+        triggered_at = datetime.now(UTC).isoformat()
+        # Latch OFF before submitting any sell so no worker can create fresh exposure.
+        bot_enabled = False
+        emergency_stop = True
+        _v18286_equity_floor_runtime.update({
+            "latched": True,
+            "triggeredAt": triggered_at,
+            "triggerEquityGbp": round(equity_gbp, 2),
+            "lastEquityGbp": round(equity_gbp, 2),
+            "lastCheckAt": triggered_at,
+            "lastError": None,
+        })
+        _v18286_equity_floor_state_update(
+            latched=True, triggeredAt=triggered_at, triggerEquityGbp=round(equity_gbp, 2)
+        )
+        print(
+            f"V18.2.86 EQUITY FLOOR TRIPPED | equity=£{equity_gbp:.2f} floor=£{V18286_EQUITY_FLOOR_GBP:.2f} | BOT OFF + FLATTEN",
+            flush=True,
+        )
+        liquidation = _v18286_flatten_bot_managed_exposure(equity_gbp)
+        _v18286_equity_floor_runtime["liquidation"] = liquidation
+        _v18286_equity_floor_state_update(liquidation=liquidation)
+        _v182776_publish_control_state()
+        _v182776_request_status_refresh()
+        return True
+
+
+def _v18286_equity_floor_worker() -> None:
+    time.sleep(3)
+    while True:
+        try:
+            if V18286_EQUITY_FLOOR_ENABLED:
+                account = get_account()
+                equity_usd = float(account.equity)
+                equity_gbp = float(money_gbp(equity_usd))
+                now_iso = datetime.now(UTC).isoformat()
+                _v18286_equity_floor_runtime.update({
+                    "lastEquityGbp": round(equity_gbp, 2),
+                    "lastCheckAt": now_iso,
+                    "lastError": None,
+                })
+                if equity_gbp < V18286_EQUITY_FLOOR_GBP:
+                    _v18286_trip_equity_floor(equity_gbp)
+        except Exception as exc:
+            _v18286_equity_floor_runtime["lastError"] = str(exc)[:300]
+            print(f"V18.2.86 EQUITY FLOOR CHECK ERROR | {exc}", flush=True)
+        time.sleep(V18286_EQUITY_FLOOR_POLL_SECONDS)
+
+
 @app.post("/pause")
 def pause_bot(request: Request):
     verify_api_key(request)
@@ -10067,12 +10215,29 @@ def resume_bot(request: Request):
     verify_api_key(request)
     global bot_enabled, emergency_stop
     started=time.monotonic()
+    if V18286_EQUITY_FLOOR_ENABLED:
+        try:
+            live_equity_gbp = float(money_gbp(float(get_account().equity)))
+        except Exception as exc:
+            return {"ok": False, "accepted": False, "botEnabled": False, "message": f"Resume blocked: cannot verify equity floor ({exc})"}
+        if live_equity_gbp < V18286_EQUITY_FLOOR_GBP:
+            bot_enabled = False
+            emergency_stop = True
+            _v18286_equity_floor_runtime.update({"latched": True, "lastEquityGbp": round(live_equity_gbp, 2)})
+            _v18286_equity_floor_state_update(latched=True)
+            return {
+                "ok": False, "accepted": False, "botEnabled": False,
+                "message": f"Resume blocked: equity £{live_equity_gbp:.2f} is below the £{V18286_EQUITY_FLOOR_GBP:.2f} safety floor.",
+                "equityFloorGbp": V18286_EQUITY_FLOOR_GBP, "equityGbp": round(live_equity_gbp, 2),
+            }
+        _v18286_equity_floor_runtime.update({"latched": False, "triggeredAt": None, "triggerEquityGbp": None, "lastEquityGbp": round(live_equity_gbp, 2)})
+        _v18286_equity_floor_state_update(latched=False, triggeredAt=None, triggerEquityGbp=None)
     bot_enabled = True
     emergency_stop = False
     _v182776_publish_control_state()
     _v182776_request_status_refresh()
     elapsed_ms=int((time.monotonic()-started)*1000)
-    print(f"V18.2.77.6 RESUME ACCEPTED | elapsed_ms={elapsed_ms}", flush=True)
+    print(f"V18.2.86 RESUME ACCEPTED | elapsed_ms={elapsed_ms}", flush=True)
     return {"ok": True, "accepted": True, "botEnabled": True, "message": "Bot resumed", "elapsedMs": elapsed_ms}
 
 
@@ -13688,10 +13853,18 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started, v18224_live_audit_thread_started, v18230_evidence_thread_started, v18232_crypto_shadow_thread_started, v18242_crypto_live_thread_started, _v18267_tracker_thread_started
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started, v18224_live_audit_thread_started, v18230_evidence_thread_started, v18232_crypto_shadow_thread_started, v18242_crypto_live_thread_started, _v18267_tracker_thread_started, v18286_equity_floor_thread_started, bot_enabled, emergency_stop
     # Initialise the shared SQLite schema synchronously before any worker threads start.
     # This removes the startup race where multiple workers all tried to create tables.
     init_db()
+    # V18.2.86: restore the account safety latch before any live worker can trade.
+    try:
+        _v18286_restore_equity_floor_latch()
+    except Exception as exc:
+        print(f"V18.2.86 STARTUP LATCH ERROR | {exc}", flush=True)
+    if V18286_EQUITY_FLOOR_ENABLED and not v18286_equity_floor_thread_started:
+        v18286_equity_floor_thread_started = True
+        threading.Thread(target=_v18286_equity_floor_worker, daemon=True, name="v18286-equity-floor").start()
     # V17.0.11: restore persisted daily SELL locks synchronously before the live
     # bot thread starts. This closes the restart/redeploy eligibility window.
     try:
