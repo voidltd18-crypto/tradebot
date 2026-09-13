@@ -234,6 +234,15 @@ ONE_HOUR_PROFIT_EXIT_ENABLED = str(os.getenv("TRADEBOT_ONE_HOUR_PROFIT_EXIT_ENAB
 ONE_HOUR_PROFIT_EXIT_MINUTES = max(1, int(os.getenv("TRADEBOT_ONE_HOUR_PROFIT_EXIT_MINUTES", "60") or 60))
 ONE_HOUR_PROFIT_EXIT_MIN_PNL_PCT = float(os.getenv("TRADEBOT_ONE_HOUR_PROFIT_EXIT_MIN_PNL_PCT", "0.0") or 0.0)
 
+# V18.2.83 — Intelligent One-Hour Stock Review.
+# After the timer, a green stock is reviewed rather than sold mechanically.
+# Strong/rising winners may continue; fading or peak-rejecting winners are banked.
+V18283_ONE_HOUR_INTELLIGENT_ENABLED = str(os.getenv("TRADEBOT_ONE_HOUR_INTELLIGENT_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+V18283_ONE_HOUR_RUNNER_MIN_PNL_PCT = max(0.10, float(os.getenv("TRADEBOT_ONE_HOUR_RUNNER_MIN_PNL_PCT", "0.75") or 0.75))
+V18283_ONE_HOUR_SMALL_GREEN_MIN_PNL_PCT = max(0.0, float(os.getenv("TRADEBOT_ONE_HOUR_SMALL_GREEN_MIN_PNL_PCT", "0.25") or 0.25))
+V18283_ONE_HOUR_RISING_MOMENTUM = float(os.getenv("TRADEBOT_ONE_HOUR_RISING_MOMENTUM", "0.0005") or 0.0005)
+V18283_ONE_HOUR_PEAK_GIVEBACK_PCT = max(0.05, float(os.getenv("TRADEBOT_ONE_HOUR_PEAK_GIVEBACK_PCT", "0.30") or 0.30))
+
 # Swing Hold AI: learns from closed-trade history and avoids quick exits.
 SWING_SNIPER_SAFE_MODE = True
 HOLD_AI_ENABLED = True
@@ -2231,11 +2240,13 @@ def should_fast_stop(position: Dict[str, Any]):
 
 
 def should_one_hour_profit_exit(position: Dict[str, Any]):
-    """V18.2.28: bank a positive position once it has been held >= configured minutes.
+    """V18.2.83: intelligent one-hour stock profit review.
 
-    This is intentionally additive: hard stops and Peak Exhaustion are evaluated
-    before this rule. It does not require HOLD AI approval because this rule is
-    the explicit time-based profit override requested by the operator.
+    The old V18.2.28 rule sold every positive stock after the timer. V18.2.83
+    keeps the timer as a review point, but lets a genuine runner continue when
+    short momentum is still positive. A fading winner or a material rejection
+    from its post-entry peak is banked. Existing hard stops and Peak Exhaustion
+    still run before this rule.
     """
     if not ONE_HOUR_PROFIT_EXIT_ENABLED:
         return False, "one-hour profit exit disabled"
@@ -2244,8 +2255,9 @@ def should_one_hour_profit_exit(position: Dict[str, Any]):
     pnl_pct = float(position.get("pnlPct") or 0.0)
     qty = float(position.get("qty") or 0.0)
     price = float(position.get("price") or 0.0)
+    entry = float(position.get("entry") or 0.0)
+    highest = float(position.get("highest") or 0.0)
 
-    # Unknown/invalid age must never cause an immediate sell after a restart.
     if minutes <= 0 or minutes >= 999999:
         return False, "position age unavailable"
     if minutes < ONE_HOUR_PROFIT_EXIT_MINUTES:
@@ -2255,7 +2267,47 @@ def should_one_hour_profit_exit(position: Dict[str, Any]):
     if qty <= DUST_THRESHOLD or price <= 0 or not sell_notional_ok(qty, price):
         return False, "position too small for full profit exit"
 
-    return True, f"held {minutes}m and positive pnl={pnl_pct:.2f}%"
+    # Compatibility switch: disabling intelligence restores the original timer.
+    if not V18283_ONE_HOUR_INTELLIGENT_ENABLED:
+        return True, f"legacy timer: held {minutes}m positive pnl={pnl_pct:.2f}%"
+
+    symbol = str(position.get("symbol") or "").upper()
+    try:
+        momentum = float(compute_short_momentum(symbol, price))
+    except Exception:
+        momentum = 0.0
+
+    peak_pnl_pct = ((highest / entry) - 1.0) * 100.0 if highest > 0 and entry > 0 else pnl_pct
+    giveback_pct = max(0.0, peak_pnl_pct - pnl_pct)
+
+    # A winner that has materially rejected its peak gets banked even if its
+    # latest momentum tick is temporarily positive. This protects green P&L.
+    if giveback_pct >= V18283_ONE_HOUR_PEAK_GIVEBACK_PCT:
+        return True, (
+            f"intelligent bank: peak rejection {giveback_pct:.2f}% "
+            f"(peak={peak_pnl_pct:.2f}% now={pnl_pct:.2f}%)"
+        )
+
+    # Strong winners are allowed to run while momentum remains non-negative.
+    if pnl_pct >= V18283_ONE_HOUR_RUNNER_MIN_PNL_PCT and momentum >= 0.0:
+        return False, (
+            f"intelligent hold runner: pnl={pnl_pct:.2f}% peak={peak_pnl_pct:.2f}% "
+            f"momentum={momentum:.4f}"
+        )
+
+    # Smaller winners get extra room only when they are actively accelerating.
+    if pnl_pct >= V18283_ONE_HOUR_SMALL_GREEN_MIN_PNL_PCT and momentum >= V18283_ONE_HOUR_RISING_MOMENTUM:
+        return False, (
+            f"intelligent hold rising: pnl={pnl_pct:.2f}% peak={peak_pnl_pct:.2f}% "
+            f"momentum={momentum:.4f}"
+        )
+
+    # Otherwise the one-hour review does what it was originally intended to do:
+    # bank a green position that is no longer proving continuation.
+    return True, (
+        f"intelligent bank fading: held={minutes}m pnl={pnl_pct:.2f}% "
+        f"peak={peak_pnl_pct:.2f}% giveback={giveback_pct:.2f}% momentum={momentum:.4f}"
+    )
 
 
 def should_stall_exit(position: Dict[str, Any]):
@@ -4648,7 +4700,7 @@ def manage_money_mode_positions():
                 print(
                     f"V18.2.28 ONE HOUR PROFIT EXIT | {symbol} qty={qty:.6f} "
                     f"held={int(p.get('minutesSinceBuy') or 0)}m pnl={float(p.get('pnlPct') or 0.0):.2f}% "
-                    f"price={price:.2f} entry={entry:.2f}"
+                    f"price={price:.2f} entry={entry:.2f} | {one_hour_profit_reason}"
                 )
             except Exception as e:
                 print(f"ONE HOUR PROFIT EXIT ERROR {symbol}: {e}")
