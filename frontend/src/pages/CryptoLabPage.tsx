@@ -294,15 +294,16 @@ useEffect(() => {
       <div className="crypto-hero-main">
         <div className="crypto-hero-icon">₿</div>
         <div>
-          <div className="eyebrow">V18.2.80 · STOCK DOWNSIDE GUARD</div>
+          <div className="eyebrow">V18.2.89 · AUTONOMOUS CRYPTO GOVERNOR</div>
           <h2>Crypto Lab</h2>
-          <p>Live crypto trading pilot — real capital, real trades, real results.</p>
+          <p>{shadowOnly ? "Shadow Research active — no real crypto buys while the strategy proves itself." : bridge?.cryptoGovernor?.pilot ? "Pilot Live — reduced-size real trades validating the Shadow winner." : "Live crypto — performance governor watching for deterioration."}</p>
         </div>
       </div>
-      <div className={`crypto-live-badge ${armed ? "armed" : "idle"}`}><span>●</span>{armed ? (entriesPaused ? "PAUSED · EXITS ARMED" : "LIVE PILOT ARMED") : "LIVE PILOT OFF"}</div>
+      <div className={`crypto-live-badge ${shadowOnly ? "idle" : "armed"}`}><span>●</span>{shadowOnly ? "🟣 SHADOW RESEARCH" : bridge?.cryptoGovernor?.pilot ? "🟠 PILOT LIVE" : "🟢 LIVE · GOVERNED"}</div>
     </section>
 
-    {entriesPaused && <div className="crypto-notice">New crypto entries are paused with the main bot. Existing bot-managed crypto positions keep stop-loss and trailing protection active.</div>}
+    {shadowOnly && <div className="crypto-notice"><b>🟣 AUTO SHADOW:</b> Real crypto buys are OFF. The governor is testing <b>{bridge?.cryptoGovernor?.preset?.name || "research strategy"}</b> (generation {Number(bridge?.cryptoGovernor?.generation || 1)}). It can only return through reduced-size Pilot Live after the Shadow graduation rules pass.</div>}
+    {!shadowOnly && entriesPaused && <div className="crypto-notice">New crypto entries are paused by a safety control. Existing bot-managed crypto positions keep stop-loss and trailing protection active.</div>}
 
     <section className="crypto-summary-grid">
       <div className="crypto-summary-card"><div className="crypto-summary-icon vault">▣</div><div><span>Piggy Bank</span><strong>{gbp(bridge?.piggyBankGbp ?? bridge?.vaultAvailableGbp)}</strong><small>Banked · never reused</small></div></div>
@@ -530,16 +531,16 @@ useEffect(() => {
       <div className="crypto-panel-head">
         <div>
           <h3><span className="panel-icon">⌒</span> Crypto Bridge</h3>
-          <p>{shadowOnly ? "Crypto live entries are paused while we rebuild the strategy. Scanner + Shadow continue collecting evidence without spending live capital. Any existing bot-managed crypto position keeps 5-second protective exits." : "Capital split is automatic: £900 is reserved for stocks in the day. From 30 minutes before the close until 30 minutes before the next open, non-Piggy capital is assigned to crypto. Crypto profits are banked one-way. Safety exits check every 5 seconds; normal decisions run every 5 minutes."}</p>
+          <p>{shadowOnly ? `Autonomous Research is active. ${bridge?.cryptoGovernor?.reason || "Live crypto is paused."} Scanner + Shadow keep testing without spending live capital.` : bridge?.cryptoGovernor?.pilot ? "Pilot Live is active at reduced sizing. Poor live evidence automatically sends crypto back to Shadow Research." : "Live crypto is active under the autonomous performance governor. Poor rolling performance automatically returns it to Shadow Research."}</p>
         </div>
-        <span className={`crypto-chip ${armed ? "live" : accountActive ? "building" : ""}`}>{shadowOnly ? "SHADOW ONLY · LIVE BUYS OFF" : armed ? "LIVE PILOT ARMED" : accountActive ? "READY TO ARM" : "CRYPTO NOT ACTIVE"}</span>
+        <span className={`crypto-chip ${armed ? "live" : accountActive ? "building" : ""}`}>{shadowOnly ? "🟣 AUTO SHADOW · LIVE OFF" : bridge?.cryptoGovernor?.pilot ? "🟠 PILOT LIVE · 5% MAX" : "🟢 LIVE · AUTO GOVERNED"}</span>
       </div>
 
       <div className="crypto-bridge-grid">
         <div className="bridge-metric"><span className="crypto-summary-icon vault">▣</span><div><small>Piggy Bank</small><strong>{gbp(bridge?.piggyBankGbp ?? bridge?.vaultAvailableGbp)}</strong></div></div>
         <div className="bridge-metric"><span className="crypto-summary-icon allocation">●</span><div><small>Crypto Allocation</small><strong>{gbp(bridge?.cryptoAllocatedGbp)}</strong></div></div>
         <div className="bridge-metric"><span className="crypto-summary-icon pnl">◇</span><div><small>Protected Pool</small><strong>{gbp(bridge?.cryptoPoolGbp)}</strong></div></div>
-        <div className="bridge-metric"><span className="crypto-summary-icon returned">◎</span><div><small>Status</small><strong className={armed ? "gain" : ""}>{shadowOnly ? "◌ Shadow Only" : armed ? "● Armed" : "Off"}</strong></div></div>
+        <div className="bridge-metric"><span className="crypto-summary-icon returned">◎</span><div><small>Status</small><strong className={armed ? "gain" : ""}>{shadowOnly ? "◌ Shadow Research" : bridge?.cryptoGovernor?.pilot ? "◐ Pilot Live" : "● Live"}</strong></div></div>
         <div className={`bridge-action ${armed ? "allocated" : ""}`}>
           <div className="crypto-allocation-editor">
             <strong>AUTOMATIC CAPITAL SPLIT</strong>
@@ -559,6 +560,7 @@ useEffect(() => {
         : lossBrakeActive
           ? <>ACTIVE · {fmtCountdown(lossBrakeRemainingSeconds)} remaining · eligible {lossBrakeEligibleAt} · {Number(bridge?.consecutiveCryptoLosses || 0)}/{Number(bridge?.lossBrakeStreak || 2)} consecutive · daily {gbp(bridge?.dailyCryptoPnlGbp)} / -{gbp(bridge?.dailyLossLimitGbp)}</>
           : <>READY · {Number(bridge?.consecutiveCryptoLosses || 0)}/{Number(bridge?.lossBrakeStreak || 2)} consecutive · daily {gbp(bridge?.dailyCryptoPnlGbp)} / -{gbp(bridge?.dailyLossLimitGbp)}</>}</span>
+      <span><b>Governor:</b> {String(bridge?.cryptoGovernor?.mode || "SHADOW_RESEARCH").replaceAll("_", " ")} · Gen {Number(bridge?.cryptoGovernor?.generation || 1)} · {bridge?.cryptoGovernor?.preset?.name || "—"} · research {Number(bridge?.cryptoGovernor?.research?.trades || 0)}/{Number(bridge?.cryptoGovernor?.researchTargetTrades || 50)} · exp ${Number(bridge?.cryptoGovernor?.research?.expectancyUsd || 0).toFixed(2)}</span>
       <span><b>Stock engine:</b> £900 baseline and MARA rules untouched</span>
     </section>
   </div>;

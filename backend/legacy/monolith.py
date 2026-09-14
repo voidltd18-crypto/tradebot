@@ -11542,6 +11542,13 @@ def _v18285_crypto_live_evidence_gate(candidate: Dict[str, Any]) -> Tuple[bool, 
         return False, f"15m {ret15:.2f}% < {V18285_CRYPTO_MIN_15M_PCT:.2f}%"
     if ret60 < V18285_CRYPTO_MIN_60M_PCT:
         return False, f"60m {ret60:.2f}% < {V18285_CRYPTO_MIN_60M_PCT:.2f}%"
+    try:
+        preset=_v18289_preset()
+        if score < float(preset["score"]): return False, f"governor score {score:.3f} < {float(preset['score']):.2f}"
+        if ret15 < float(preset["ret15"]): return False, f"governor 15m {ret15:.2f}% < {float(preset['ret15']):.2f}%"
+        if ret60 < float(preset["ret60"]): return False, f"governor 60m {ret60:.2f}% < {float(preset['ret60']):.2f}%"
+    except Exception:
+        pass
     return True, "passed"
 
 # V18.2.48 — separate fast safety monitoring from normal trading cadence.
@@ -12146,14 +12153,17 @@ def _v18232_load_state() -> Dict[str, Any]:
 
 def _v18232_shadow_buy(scan: Dict[str, Any]) -> bool:
     symbol = str(scan.get("symbol") or "").upper(); price = float(scan.get("price") or 0); score = float(scan.get("score") or 0)
-    if not symbol or price <= 0 or score < V18232_CRYPTO_ENTRY_SCORE:
+    preset=_v18289_preset() if V18289_GOVERNOR_ENABLED else {"score":V18232_CRYPTO_ENTRY_SCORE,"ret15":-999,"ret60":-999}
+    if (not symbol or price <= 0 or score < float(preset.get("score", V18232_CRYPTO_ENTRY_SCORE))
+        or float(scan.get("return15mPct") or 0.0) < float(preset.get("ret15", -999))
+        or float(scan.get("return60mPct") or 0.0) < float(preset.get("ret60", -999))):
         return False
     with _crypto_shadow_lock:
         data = _v18232_load_state(); positions = data["positions"]
         if len(positions) >= V18232_CRYPTO_MAX_POSITIONS or any(str(p.get("symbol")) == symbol for p in positions):
             return False
         cash = float(data["state"].get("virtual_cash_usd") or 0)
-        notional = min(cash, max(0.0, cash * V18232_CRYPTO_POSITION_PCT))
+        notional = min(cash, max(0.0, cash * min(V18232_CRYPTO_POSITION_PCT, 0.10)))
         if notional < 1.0:
             return False
         qty = notional / price; now = datetime.now(UTC).isoformat(); conn = db_connect()
@@ -12210,9 +12220,10 @@ def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
         peak_pct = ((high / entry) - 1.0) * 100.0 if entry > 0 else 0.0
         giveback_pct = ((high - price) / high) * 100.0 if high > 0 else 0.0
         reason = None
-        if pnl_pct <= -V18232_CRYPTO_STOP_PCT:
+        preset=_v18289_preset() if V18289_GOVERNOR_ENABLED else {"stop":V18232_CRYPTO_STOP_PCT,"trailStart":V18232_CRYPTO_TRAIL_START_PCT,"trailGiveback":V18232_CRYPTO_TRAIL_GIVEBACK_PCT}
+        if pnl_pct <= -float(preset.get("stop", V18232_CRYPTO_STOP_PCT)):
             reason = "CRYPTO SHADOW STOP"
-        elif peak_pct >= V18232_CRYPTO_TRAIL_START_PCT and giveback_pct >= V18232_CRYPTO_TRAIL_GIVEBACK_PCT:
+        elif peak_pct >= float(preset.get("trailStart", V18232_CRYPTO_TRAIL_START_PCT)) and giveback_pct >= float(preset.get("trailGiveback", V18232_CRYPTO_TRAIL_GIVEBACK_PCT)):
             reason = "CRYPTO SHADOW TRAIL"
         elif pnl_pct > 0 and score <= V18232_CRYPTO_EXIT_SCORE:
             reason = "CRYPTO SHADOW MOMENTUM EXIT"
@@ -12236,6 +12247,8 @@ def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
     finally:
         conn.close()
     _crypto_shadow_runtime.update({"running": True, "lastError": None, "lastScanAt": now})
+    try: _v18289_governor_refresh(save=True)
+    except Exception as _gov_exc: print(f"V18.2.89 GOVERNOR ERROR | {_gov_exc}", flush=True)
     # V18.2.34: same market scan can drive the separately permissioned live pilot.
     try:
         (
@@ -12313,7 +12326,108 @@ def v18232_crypto_shadow_payload() -> Dict[str, Any]:
 V18234_CRYPTO_LIVE_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_LIVE_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
 # V18.2.88 — live crypto evidence pause. Scanner/shadow and protective exits stay active,
 # but no new live-money crypto entries are permitted until the strategy is deliberately re-enabled in code.
-V18288_CRYPTO_SHADOW_ONLY = True
+V18288_CRYPTO_SHADOW_ONLY = True  # legacy marker; V18.2.89 governor now owns the live/shadow decision.
+
+# V18.2.89 — AUTONOMOUS LIVE ↔ SHADOW GOVERNOR
+# The governor can only move inside bounded modes/presets. It cannot weaken the
+# account equity floor, emergency stop, Piggy protection or hard safety exits.
+V18289_GOVERNOR_ENABLED = True
+V18289_RESEARCH_MIN_TRADES = 50
+V18289_RESEARCH_MIN_EXPECTANCY_USD = 0.10
+V18289_RESEARCH_MIN_PNL_USD = 5.00
+V18289_RESEARCH_MIN_WIN_RATE_PCT = 35.0
+V18289_RESEARCH_MAX_DRAWDOWN_USD = 15.0
+V18289_REDESIGN_CHECK_TRADES = 25
+V18289_PILOT_MIN_TRADES = 15
+V18289_PILOT_MAX_ENTRY_ALLOCATION_PCT = 5.0
+V18289_LIVE_ROLLING_TRADES = 12
+V18289_LIVE_MIN_SAMPLE = 5
+V18289_LIVE_FAIL_EXPECTANCY_USD = -0.25
+V18289_LIVE_FAIL_PNL_USD = -3.0
+
+V18289_RESEARCH_PRESETS = [
+    {"name":"Evidence Reset", "score":0.50, "ret15":0.20, "ret60":0.40, "stop":1.50, "trailStart":1.50, "trailGiveback":0.60},
+    {"name":"Trend Selective", "score":0.55, "ret15":0.30, "ret60":0.50, "stop":1.25, "trailStart":1.25, "trailGiveback":0.50},
+    {"name":"High Conviction", "score":0.60, "ret15":0.40, "ret60":0.60, "stop":1.00, "trailStart":1.00, "trailGiveback":0.45},
+]
+
+def _v18289_shadow_closed_rows() -> List[Dict[str, Any]]:
+    try:
+        conn=db_connect()
+        try:
+            return [dict(r) for r in conn.execute("SELECT * FROM v18232_crypto_trades WHERE side='SELL' ORDER BY id ASC").fetchall()]
+        finally: conn.close()
+    except Exception:
+        return []
+
+def _v18289_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    pnls=[float(r.get("pnl_usd") if r.get("pnl_usd") is not None else r.get("pnlUsd") or 0.0) for r in rows]
+    n=len(pnls); wins=sum(1 for x in pnls if x>0); total=sum(pnls)
+    avg_win=(sum(x for x in pnls if x>0)/wins) if wins else 0.0
+    losses=[x for x in pnls if x<0]; avg_loss=(sum(losses)/len(losses)) if losses else 0.0
+    equity=0.0; peak=0.0; max_dd=0.0
+    for x in pnls:
+        equity += x; peak=max(peak,equity); max_dd=max(max_dd,peak-equity)
+    return {"trades":n,"wins":wins,"winRatePct":(wins/n*100.0 if n else 0.0),"pnlUsd":total,
+            "expectancyUsd":(total/n if n else 0.0),"avgWinUsd":avg_win,"avgLossUsd":avg_loss,"maxDrawdownUsd":max_dd}
+
+def _v18289_live_exit_rows() -> List[Dict[str, Any]]:
+    return [r for r in _v18277_ledger_rows(limit=10000) if r.get("event")=="logical_exit"]
+
+def _v18289_preset(state: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
+    st=state or load_profit_vault_state(); idx=int(st.get("cryptoGovernorPresetIndex") or 0) % len(V18289_RESEARCH_PRESETS)
+    return dict(V18289_RESEARCH_PRESETS[idx])
+
+def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
+    st=load_profit_vault_state(); shadow=_v18289_shadow_closed_rows(); live=_v18289_live_exit_rows()
+    if not st.get("cryptoGovernorMode"):
+        st["cryptoGovernorMode"]="SHADOW_RESEARCH"
+        st["cryptoGovernorPresetIndex"]=0
+        st["cryptoGovernorShadowBaseline"]=len(shadow)
+        st["cryptoGovernorLiveBaseline"]=len(live)
+        st["cryptoGovernorGeneration"]=1
+        st["cryptoGovernorChangedAt"]=datetime.now(UTC).isoformat()
+        st["cryptoGovernorReason"]="V18.2.89 starts safely in Shadow Research"
+    mode=str(st.get("cryptoGovernorMode") or "SHADOW_RESEARCH")
+    sb=max(0,int(st.get("cryptoGovernorShadowBaseline") or 0)); lb=max(0,int(st.get("cryptoGovernorLiveBaseline") or 0))
+    research=_v18289_stats(shadow[sb:]); pilot=_v18289_stats(live[lb:]); rolling=_v18289_stats(live[-V18289_LIVE_ROLLING_TRADES:])
+    changed=False; reason=str(st.get("cryptoGovernorReason") or "")
+    if mode=="SHADOW_RESEARCH":
+        passed=(research["trades"]>=V18289_RESEARCH_MIN_TRADES and research["expectancyUsd"]>=V18289_RESEARCH_MIN_EXPECTANCY_USD
+                and research["pnlUsd"]>=V18289_RESEARCH_MIN_PNL_USD and research["winRatePct"]>=V18289_RESEARCH_MIN_WIN_RATE_PCT
+                and research["maxDrawdownUsd"]<=V18289_RESEARCH_MAX_DRAWDOWN_USD)
+        if passed:
+            mode="PILOT_LIVE"; st["cryptoGovernorLiveBaseline"]=len(live); changed=True
+            reason=f"Shadow graduated: {research['trades']} trades, expectancy ${research['expectancyUsd']:.2f}, P&L ${research['pnlUsd']:.2f}"
+        elif research["trades"]>=V18289_REDESIGN_CHECK_TRADES and research["expectancyUsd"]<=0:
+            st["cryptoGovernorPresetIndex"]=(int(st.get("cryptoGovernorPresetIndex") or 0)+1)%len(V18289_RESEARCH_PRESETS)
+            st["cryptoGovernorGeneration"]=int(st.get("cryptoGovernorGeneration") or 1)+1
+            st["cryptoGovernorShadowBaseline"]=len(shadow); research=_v18289_stats([]); changed=True
+            reason=f"Research redesign triggered after negative expectancy; switched to {_v18289_preset(st)['name']}"
+    elif mode=="PILOT_LIVE":
+        # Pilot fails fast on meaningful negative evidence; otherwise needs 15 real exits to graduate.
+        if pilot["trades"]>=5 and (pilot["expectancyUsd"]<0 or pilot["pnlUsd"]<=V18289_LIVE_FAIL_PNL_USD):
+            mode="SHADOW_RESEARCH"; st["cryptoGovernorShadowBaseline"]=len(shadow); changed=True
+            reason=f"Pilot failed: expectancy ${pilot['expectancyUsd']:.2f}, P&L ${pilot['pnlUsd']:.2f}; returned to Shadow"
+        elif pilot["trades"]>=V18289_PILOT_MIN_TRADES and pilot["expectancyUsd"]>0 and pilot["pnlUsd"]>0:
+            mode="LIVE"; changed=True; reason=f"Pilot graduated after {pilot['trades']} profitable live trades"
+    elif mode=="LIVE":
+        if rolling["trades"]>=V18289_LIVE_MIN_SAMPLE and (rolling["expectancyUsd"]<=V18289_LIVE_FAIL_EXPECTANCY_USD or rolling["pnlUsd"]<=V18289_LIVE_FAIL_PNL_USD):
+            mode="SHADOW_RESEARCH"; st["cryptoGovernorShadowBaseline"]=len(shadow); changed=True
+            reason=f"Live performance deteriorated: rolling expectancy ${rolling['expectancyUsd']:.2f}, P&L ${rolling['pnlUsd']:.2f}"
+    st["cryptoGovernorMode"]=mode; st["cryptoGovernorReason"]=reason
+    if changed: st["cryptoGovernorChangedAt"]=datetime.now(UTC).isoformat()
+    if save: save_profit_vault_state(st)
+    preset=_v18289_preset(st)
+    return {"enabled":True,"mode":mode,"shadowOnly":mode=="SHADOW_RESEARCH","pilot":mode=="PILOT_LIVE","live":mode=="LIVE",
+            "reason":reason,"generation":int(st.get("cryptoGovernorGeneration") or 1),"preset":preset,
+            "research":research,"pilotStats":pilot,"liveRolling":rolling,
+            "researchTargetTrades":V18289_RESEARCH_MIN_TRADES,"pilotTargetTrades":V18289_PILOT_MIN_TRADES}
+
+def _v18289_governor_shadow_only() -> bool:
+    try: return bool(_v18289_governor_refresh(save=False).get("shadowOnly"))
+    except Exception: return True
+
 V18234_CRYPTO_LIVE_PILOT_MAX_GBP = max(25.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_PILOT_MAX_GBP", "10000") or 10000))
 V18234_CRYPTO_LIVE_MAX_POSITIONS = max(1, min(10, int(os.getenv("TRADEBOT_CRYPTO_LIVE_MAX_POSITIONS", "10") or 10)))
 V18234_CRYPTO_LIVE_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_ENTRY_SCORE", str(V18232_CRYPTO_ENTRY_SCORE)) or V18232_CRYPTO_ENTRY_SCORE)))
@@ -12947,13 +13061,13 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
     # This check deliberately sits AFTER protective exit management above, so an
     # existing bot-managed crypto position still receives 5-second stop/trail safety.
     # Shadow/scanner workers are separate and continue collecting evidence.
-    if V18288_CRYPTO_SHADOW_ONLY:
+    if _v18289_governor_shadow_only():
         final_positions = _v18234_raw_crypto_positions()
         final_managed = [p for p in final_positions if bool(p.get("managedByPilot"))]
         _crypto_live_runtime["entriesPaused"] = True
         _crypto_live_runtime["pauseReason"] = "CRYPTO_SHADOW_ONLY"
         _crypto_live_runtime["riskBlocked"] = True
-        _crypto_live_runtime["riskReason"] = "V18.2.88 SHADOW ONLY — live crypto entries disabled"
+        _crypto_live_runtime["riskReason"] = "V18.2.89 SHADOW RESEARCH — live crypto entries disabled"
         return {"ok": True, "enabled": True, "armed": True, "entriesPaused": True,
                 "pauseReason": "CRYPTO_SHADOW_ONLY", "shadowOnly": True,
                 "protectiveExitsActive": True, "positions": len(final_positions),
@@ -13069,7 +13183,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
                 (remaining_gbp * (weight / score_total) if score_total > 0 else remaining_gbp / len(qualified))
                 for weight in weights
             ]
-            effective_entry_cap_pct = min(V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT)
+            effective_entry_cap_pct = min(V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18289_PILOT_MAX_ENTRY_ALLOCATION_PCT if _v18289_governor_refresh(save=False).get("pilot") else V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT)
             per_entry_cap_gbp = max(1.0, allocation_gbp * (effective_entry_cap_pct / 100.0))
             planned_budgets = [min(budget, per_entry_cap_gbp) for budget in raw_budgets]
             if qualified:
@@ -13550,7 +13664,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         except Exception:
             continue
     return {
-        "ok": True, "version": "V18.2.80", "manualOnly": False, "automaticRelease": True,
+        "ok": True, "version": "V18.2.89", "manualOnly": False, "automaticRelease": True,
         "allocationAdjustable": False, "vaultReserveAdjustable": False,
         "profitIsolationEnabled": True,
         "capitalMode": "NIGHT_SHIFT_DYNAMIC_SPLIT",
@@ -13582,7 +13696,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
             "weakScoreFloor": V18279_CRYPTO_WEAK_SCORE_FLOOR,
             "breakevenArmPct": V18279_CRYPTO_BREAKEVEN_ARM_PCT,
             "breakevenLockPct": V18279_CRYPTO_BREAKEVEN_LOCK_PCT,
-            "maxEntryAllocationPct": min(V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT),
+            "maxEntryAllocationPct": min(V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18289_PILOT_MAX_ENTRY_ALLOCATION_PCT if _v18289_governor_refresh(save=False).get("pilot") else V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT),
             "liveEvidenceGateVersion": "V18.2.85",
             "liveEvidenceGateEnabled": V18285_CRYPTO_LIVE_GATE_ENABLED,
             "liveEvidenceMinScore": V18285_CRYPTO_MIN_SCORE,
@@ -13601,9 +13715,10 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
             k: dict(v) for k, v in list(_v18268_manual_sell_pending.items())[-20:]
         },
         "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
-        "liveEntriesEnabled": not bool(V18288_CRYPTO_SHADOW_ONLY),
-        "shadowOnly": bool(V18288_CRYPTO_SHADOW_ONLY),
-        "shadowOnlyReason": "Live crypto paused after negative 97-trade evidence; scanner and Shadow remain active." if V18288_CRYPTO_SHADOW_ONLY else None,
+        "liveEntriesEnabled": not bool(_v18289_governor_refresh(save=False).get("shadowOnly")),
+        "shadowOnly": bool(_v18289_governor_refresh(save=False).get("shadowOnly")),
+        "shadowOnlyReason": _v18289_governor_refresh(save=False).get("reason") if _v18289_governor_refresh(save=False).get("shadowOnly") else None,
+        "cryptoGovernor": _v18289_governor_refresh(save=False),
         "liveMaxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS,
         "reentryCooldownMinutes": V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES,
         "activeReentryCooldowns": active_cooldowns,
@@ -13629,8 +13744,8 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "lossBrakeUntil": state.get("cryptoLossBrakeUntil"),
         "riskBlocked": bool(_crypto_live_runtime.get("riskBlocked")),
         "riskReason": _crypto_live_runtime.get("riskReason"),
-        "newEntriesPaused": bool(V18288_CRYPTO_SHADOW_ONLY) or (not bool(bot_enabled)) or bool(manual_override) or bool(emergency_stop),
-        "pauseReason": ("CRYPTO_SHADOW_ONLY" if V18288_CRYPTO_SHADOW_ONLY else "BOT_PAUSED" if not bool(bot_enabled) else "MANUAL_OVERRIDE" if bool(manual_override) else "EMERGENCY_STOP" if bool(emergency_stop) else None),
+        "newEntriesPaused": bool(_v18289_governor_refresh(save=False).get("shadowOnly")) or (not bool(bot_enabled)) or bool(manual_override) or bool(emergency_stop),
+        "pauseReason": ("CRYPTO_SHADOW_RESEARCH" if _v18289_governor_refresh(save=False).get("shadowOnly") else "BOT_PAUSED" if not bool(bot_enabled) else "MANUAL_OVERRIDE" if bool(manual_override) else "EMERGENCY_STOP" if bool(emergency_stop) else None),
         "protectiveExitsActiveWhilePaused": True,
         "accountCrypto": account, "vaultAvailableGbp": round(piggy_bank,2),
         "piggyBankGbp": round(piggy_bank,2),
