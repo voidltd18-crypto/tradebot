@@ -11461,6 +11461,12 @@ V18232_CRYPTO_STOP_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_STOP_PCT", "
 V18232_CRYPTO_TRAIL_START_PCT = max(0.25, float(os.getenv("TRADEBOT_CRYPTO_TRAIL_START_PCT", "1.5") or 1.5))
 V18232_CRYPTO_TRAIL_GIVEBACK_PCT = max(0.10, float(os.getenv("TRADEBOT_CRYPTO_TRAIL_GIVEBACK_PCT", "0.6") or 0.6))
 V18232_CRYPTO_EXIT_SCORE = max(0.0, min(V18232_CRYPTO_ENTRY_SCORE, float(os.getenv("TRADEBOT_CRYPTO_EXIT_SCORE", "0.34") or 0.34)))
+
+# V18.2.91 — Accelerated Shadow Research. Research-only virtual positions are
+# time-boxed so the autonomous governor can collect completed evidence without
+# waiting indefinitely for a stop/trail/momentum exit. Live crypto and stocks
+# are untouched.
+V18291_SHADOW_RESEARCH_MAX_HOLD_MINUTES = max(15, min(120, int(os.getenv("TRADEBOT_SHADOW_RESEARCH_MAX_HOLD_MINUTES", "45") or 45)))
 V18242_CRYPTO_LIVE_INTERVAL_SECONDS = max(5, int(os.getenv("TRADEBOT_CRYPTO_LIVE_INTERVAL_SECONDS", "5") or 5))
 V18265_CRYPTO_STALL_EXIT_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_STALL_EXIT_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
 V18265_CRYPTO_STALL_MINUTES = max(15, int(os.getenv("TRADEBOT_CRYPTO_STALL_MINUTES", "45") or 45))
@@ -12219,6 +12225,14 @@ def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
         pnl_pct = ((price / entry) - 1.0) * 100.0 if entry > 0 else 0.0
         peak_pct = ((high / entry) - 1.0) * 100.0 if entry > 0 else 0.0
         giveback_pct = ((high - price) / high) * 100.0 if high > 0 else 0.0
+        held_minutes = 0.0
+        try:
+            opened_dt = datetime.fromisoformat(str(position.get("opened_at") or "").replace("Z", "+00:00"))
+            if opened_dt.tzinfo is None:
+                opened_dt = opened_dt.replace(tzinfo=UTC)
+            held_minutes = max(0.0, (datetime.now(UTC) - opened_dt.astimezone(UTC)).total_seconds() / 60.0)
+        except Exception:
+            held_minutes = 0.0
         reason = None
         preset=_v18289_preset() if V18289_GOVERNOR_ENABLED else {"stop":V18232_CRYPTO_STOP_PCT,"trailStart":V18232_CRYPTO_TRAIL_START_PCT,"trailGiveback":V18232_CRYPTO_TRAIL_GIVEBACK_PCT}
         if pnl_pct <= -float(preset.get("stop", V18232_CRYPTO_STOP_PCT)):
@@ -12227,6 +12241,8 @@ def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
             reason = "CRYPTO SHADOW TRAIL"
         elif pnl_pct > 0 and score <= V18232_CRYPTO_EXIT_SCORE:
             reason = "CRYPTO SHADOW MOMENTUM EXIT"
+        elif V18289_GOVERNOR_ENABLED and _v18289_governor_shadow_only() and held_minutes >= V18291_SHADOW_RESEARCH_MAX_HOLD_MINUTES:
+            reason = "V18.2.91 SHADOW RESEARCH TIMEBOX"
         if reason:
             _v18232_shadow_sell(position, price, score, reason)
         elif high > float(position.get("high_price") or 0):
@@ -12312,7 +12328,8 @@ def v18232_crypto_shadow_payload() -> Dict[str, Any]:
                    "liquidityPercentile": V18253_CRYPTO_LIQUIDITY_PERCENTILE,
                    "positionPct": V18232_CRYPTO_POSITION_PCT, "maxPositions": V18232_CRYPTO_MAX_POSITIONS,
                    "entryScore": V18232_CRYPTO_ENTRY_SCORE, "stopPct": V18232_CRYPTO_STOP_PCT,
-                   "trailStartPct": V18232_CRYPTO_TRAIL_START_PCT, "trailGivebackPct": V18232_CRYPTO_TRAIL_GIVEBACK_PCT},
+                   "trailStartPct": V18232_CRYPTO_TRAIL_START_PCT, "trailGivebackPct": V18232_CRYPTO_TRAIL_GIVEBACK_PCT,
+                   "researchMaxHoldMinutes": V18291_SHADOW_RESEARCH_MAX_HOLD_MINUTES},
     }
 
 
@@ -12422,7 +12439,8 @@ def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
     return {"enabled":True,"mode":mode,"shadowOnly":mode=="SHADOW_RESEARCH","pilot":mode=="PILOT_LIVE","live":mode=="LIVE",
             "reason":reason,"generation":int(st.get("cryptoGovernorGeneration") or 1),"preset":preset,
             "research":research,"pilotStats":pilot,"liveRolling":rolling,
-            "researchTargetTrades":V18289_RESEARCH_MIN_TRADES,"pilotTargetTrades":V18289_PILOT_MIN_TRADES}
+            "researchTargetTrades":V18289_RESEARCH_MIN_TRADES,"pilotTargetTrades":V18289_PILOT_MIN_TRADES,
+            "researchMaxHoldMinutes":V18291_SHADOW_RESEARCH_MAX_HOLD_MINUTES}
 
 def _v18289_governor_shadow_only() -> bool:
     try: return bool(_v18289_governor_refresh(save=False).get("shadowOnly"))
