@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Card } from "../components/Card";
+import { TradeReplayModal, type ReplayTarget } from "../components/TradeReplayModal";
 import { Meter } from "../components/Meter";
 import { gbp, pct, tone, usd } from "../lib/format";
 import { API_URL } from "../lib/api";
@@ -7,6 +8,7 @@ import type { ActionFn, AnyObj, PositionStyleFn } from "../lib/types";
 
 export function OverviewPage({ data, banking, message, positions, trades, rate, bestCandidate, aiConfidence, marketRegime, riskLabel, currentAction, botHealth, aiReasons, positionSettings, fetchData, action, positionGlowStyle, onExportFullBot, exportBusy, authToken }: { data: AnyObj; banking: AnyObj; message: string; positions: AnyObj[]; trades: AnyObj[]; rate: number; bestCandidate?: AnyObj; aiConfidence: number; marketRegime: string; riskLabel: string; currentAction: string; botHealth: number; aiReasons: string[]; positionSettings: AnyObj; fetchData: (force?: boolean) => Promise<void>; action: ActionFn; positionGlowStyle: PositionStyleFn; onExportFullBot: () => void; exportBusy: boolean; authToken: string }) {
   const [taxCentre, setTaxCentre] = useState<AnyObj | null>(null);
+  const [replay, setReplay] = useState<ReplayTarget | null>(null);
   const maxPositions = Number(data?.maxPositions || positionSettings?.maxPositions || 0);
   const vault = banking?.profitVault || data?.banking?.profitVault || {};
   const piggyBankGbp = Number(vault?.piggyBankGbp ?? vault?.bankedProfitGbp ?? 0);
@@ -80,7 +82,7 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
 
       <Card title="Open Positions" className="command-panel positions-panel">
         <div className="panel-count">{positions.length}</div>
-        {positions.length ? <div className="position-list compact-positions">{positions.slice(0, 3).map((p) => <article className="position" key={p.symbol} style={positionGlowStyle(p)}><div><h3>{p.symbol}</h3><p>{usd(p.price)} · Qty {Number(p.qty || 0).toFixed(4)}</p></div><div className="position-side"><b className={tone(p.pnl)}>{gbp(p.pnlGbp ?? Number(p.pnl || 0) * rate)}<br />{pct(p.pnlPct)}</b></div></article>)}</div> : <div className="empty-position"><span>▣</span><b>No Open Positions</b><small>The bot is ready to find opportunities</small></div>}
+        {positions.length ? <div className="position-list compact-positions">{positions.slice(0, 3).map((p) => <article className="position" key={p.symbol} style={positionGlowStyle(p)}><div><h3>{p.symbol}</h3><p>{usd(p.price)} · Qty {Number(p.qty || 0).toFixed(4)}</p></div><div className="position-side"><b className={tone(p.pnl)}>{gbp(p.pnlGbp ?? Number(p.pnl || 0) * rate)}<br />{pct(p.pnlPct)}</b><div className="position-actions"><button onClick={() => setReplay({ mode: "live", symbol: String(p.symbol) })}>View Chart</button></div></div></article>)}</div> : <div className="empty-position"><span>▣</span><b>No Open Positions</b><small>The bot is ready to find opportunities</small></div>}
       </Card>
 
       <Card title="AI System Overview" className="command-panel systems-panel">
@@ -115,5 +117,6 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
       <Card title={`UK Tax Centre · ${taxCentre?.taxYear || "Current tax year"}`} className="decision-card"><div className="final-gate-head"><span className="gate-pill ready">ACCOUNT-WIDE</span><span className="muted">Stocks + crypto</span></div><div className="summary"><div><span>Stock net gains</span><b className={Number(taxCentre?.stockNetGainGbp || 0) >= 0 ? "positive" : "negative"}>{gbp(Number(taxCentre?.stockNetGainGbp || 0))}</b></div><div><span>Crypto net gains</span><b className={Number(taxCentre?.cryptoNetGainGbp || 0) >= 0 ? "positive" : "negative"}>{gbp(Number(taxCentre?.cryptoNetGainGbp || 0))}</b></div><div><span>Combined net gains</span><b>{gbp(Number(taxCentre?.netTrackedGainGbp || 0))}</b></div><div><span>CGT allowance</span><b>{gbp(Number(taxCentre?.annualExemptAmountGbp || 3000))}</b></div><div><span>Estimated taxable gain</span><b>{gbp(Number(taxCentre?.estimatedTaxableGainGbp || 0))}</b></div><div><span>Suggested HMRC reserve</span><b className={Number(taxCentre?.suggestedHmrcReserveGbp || 0) > 0 ? "negative" : ""}>{gbp(Number(taxCentre?.suggestedHmrcReserveGbp || 0))}</b></div></div><p className="muted" style={{marginTop:10}}>Planning estimate using ~£30,069 annual gross employment income. Tracks future bot disposals in GBP across the whole Alpaca account. Final HMRC figures can differ because of matching/pooling rules and other gains or losses.</p></Card>
       <Card title="Recent AI Activity" wide><div className="log-list">{trades.slice(-8).reverse().map((trade, index) => <div key={index}>{trade.time || "—"} · <b>{trade.side} {trade.symbol}</b> · {trade.reason || "Decision recorded"}</div>)}{!trades.length && <p className="muted">No recent trading activity.</p>}</div></Card>
     </section>
+    <TradeReplayModal target={replay} authToken={authToken} onClose={() => setReplay(null)} />
   </main>;
 }
