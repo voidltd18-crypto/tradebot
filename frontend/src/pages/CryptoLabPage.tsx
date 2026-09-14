@@ -266,6 +266,17 @@ useEffect(() => {
     const ss = total % 60;
     return `${mm}:${String(ss).padStart(2, "0")}`;
   };
+  const lossBrakeUntilMs = bridge?.lossBrakeUntil ? new Date(String(bridge.lossBrakeUntil)).getTime() : 0;
+  const lossBrakeRemainingSeconds = Number.isFinite(lossBrakeUntilMs) && lossBrakeUntilMs > 0
+    ? Math.max(0, Math.floor((lossBrakeUntilMs - Date.now()) / 1000))
+    : 0;
+  const lossBrakeActive = lossBrakeRemainingSeconds > 0;
+  const lossBrakeEligibleAt = lossBrakeActive
+    ? new Date(lossBrakeUntilMs).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+    : "";
+  const dailyCryptoPnl = Number(bridge?.dailyCryptoPnlGbp || 0);
+  const dailyLossLimit = Math.abs(Number(bridge?.dailyLossLimitGbp || 0));
+  const dailyLossBrakeActive = dailyLossLimit > 0 && dailyCryptoPnl <= -dailyLossLimit;
   void clockTick;
   const liveKeys = new Set(livePositions.map((p: AnyObj) => String(p?.symbol || "").replace("/", "").toUpperCase()));
   const cooldowns = bridge?.activeReentryCooldowns && typeof bridge.activeReentryCooldowns === "object" ? bridge.activeReentryCooldowns : {};
@@ -542,7 +553,11 @@ useEffect(() => {
       <span><b>Safety:</b> Stop {pct(data.config?.stopPct)} · Trail {pct(data.config?.trailStartPct)} / {pct(data.config?.trailGivebackPct)}</span>
       <span><b>Next live decision:</b> {fmtCountdown(nextDecisionSeconds)} · safety still checks every {Number(bridge?.safetyCheckIntervalSeconds || 5)}s</span>
       <span><b>Re-entry:</b> {Number(bridge?.reentryCooldownMinutes || 30)} min after wins · {Number(bridge?.lossCooldownMinutes || 120)} min after losses</span>
-      <span><b>Loss brake:</b> {Number(bridge?.consecutiveCryptoLosses || 0)}/{Number(bridge?.lossBrakeStreak || 2)} consecutive · daily {gbp(bridge?.dailyCryptoPnlGbp)} / -{gbp(bridge?.dailyLossLimitGbp)}</span>
+      <span><b>Loss brake:</b> {dailyLossBrakeActive
+        ? <>DAILY LIMIT ACTIVE · entries blocked until UTC reset · {Number(bridge?.consecutiveCryptoLosses || 0)}/{Number(bridge?.lossBrakeStreak || 2)} consecutive · daily {gbp(bridge?.dailyCryptoPnlGbp)} / -{gbp(bridge?.dailyLossLimitGbp)}</>
+        : lossBrakeActive
+          ? <>ACTIVE · {fmtCountdown(lossBrakeRemainingSeconds)} remaining · eligible {lossBrakeEligibleAt} · {Number(bridge?.consecutiveCryptoLosses || 0)}/{Number(bridge?.lossBrakeStreak || 2)} consecutive · daily {gbp(bridge?.dailyCryptoPnlGbp)} / -{gbp(bridge?.dailyLossLimitGbp)}</>
+          : <>READY · {Number(bridge?.consecutiveCryptoLosses || 0)}/{Number(bridge?.lossBrakeStreak || 2)} consecutive · daily {gbp(bridge?.dailyCryptoPnlGbp)} / -{gbp(bridge?.dailyLossLimitGbp)}</>}</span>
       <span><b>Stock engine:</b> £900 baseline and MARA rules untouched</span>
     </section>
   </div>;
