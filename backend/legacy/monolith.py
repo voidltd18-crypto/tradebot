@@ -243,6 +243,24 @@ V18283_ONE_HOUR_SMALL_GREEN_MIN_PNL_PCT = max(0.0, float(os.getenv("TRADEBOT_ONE
 V18283_ONE_HOUR_RISING_MOMENTUM = float(os.getenv("TRADEBOT_ONE_HOUR_RISING_MOMENTUM", "0.0005") or 0.0005)
 V18283_ONE_HOUR_PEAK_GIVEBACK_PCT = max(0.05, float(os.getenv("TRADEBOT_ONE_HOUR_PEAK_GIVEBACK_PCT", "0.30") or 0.30))
 
+# V18.2.93 — Intraday Peak Profit Lock.
+# Protect a meaningful stock winner as soon as it has proved itself, rather than
+# waiting for the one-hour review. The lock is based on percentage-point
+# giveback from the best price observed since entry, so clean runners still get
+# room to continue. It does not alter stock selection, sizing or downside risk.
+V18293_STOCK_PEAK_PROFIT_LOCK_ENABLED = str(
+    os.getenv("TRADEBOT_STOCK_PEAK_PROFIT_LOCK_ENABLED", "true")
+).strip().lower() in {"1", "true", "yes", "on"}
+V18293_STOCK_PEAK_PROFIT_ARM_PCT = max(0.50, float(
+    os.getenv("TRADEBOT_STOCK_PEAK_PROFIT_ARM_PCT", "2.00") or 2.00
+))
+V18293_STOCK_PEAK_PROFIT_MAX_GIVEBACK_PCT = max(0.10, float(
+    os.getenv("TRADEBOT_STOCK_PEAK_PROFIT_MAX_GIVEBACK_PCT", "0.60") or 0.60
+))
+V18293_STOCK_PEAK_PROFIT_MIN_RETAINED_PCT = float(
+    os.getenv("TRADEBOT_STOCK_PEAK_PROFIT_MIN_RETAINED_PCT", "-0.50") or -0.50
+)
+
 # Swing Hold AI: learns from closed-trade history and avoids quick exits.
 SWING_SNIPER_SAFE_MODE = True
 HOLD_AI_ENABLED = True
@@ -2260,6 +2278,57 @@ def should_fast_stop(position: Dict[str, Any]):
     profile = _ai_risk_effective_profile(symbol) if "_ai_risk_effective_profile" in globals() else {}
     threshold = -abs(float(profile.get("fastStopLossPct") or abs(FAST_STOP_LOSS_PCT)))
     return pnl_pct <= threshold, f"adaptive fast stop pnl={pnl_pct:.2f}% threshold={threshold:.2f}%"
+
+
+def _v18293_stock_peak_profit_lock(position: Dict[str, Any]):
+    """Protect intraday stock profit before the one-hour review.
+
+    Arms only after the position has reached a meaningful peak. Once armed, a
+    material percentage-point giveback causes a full profit exit while there is
+    still useful green P&L left to bank. This is deliberately independent of the
+    AI's much wider volatility trail; it is a profit-retention backstop.
+    """
+    if not V18293_STOCK_PEAK_PROFIT_LOCK_ENABLED:
+        return False, "peak profit lock disabled"
+
+    symbol = str(position.get("symbol") or "").upper()
+    pnl_pct = float(position.get("pnlPct") or 0.0)
+    qty = float(position.get("qty") or 0.0)
+    price = float(position.get("price") or 0.0)
+    entry = float(position.get("entry") or 0.0)
+    highest = float(position.get("highest") or 0.0)
+
+    if not symbol or qty <= DUST_THRESHOLD or price <= 0 or entry <= 0:
+        return False, "invalid stock position"
+    if not sell_notional_ok(qty, price):
+        return False, "position too small for peak profit lock"
+
+    peak_pnl_pct = ((highest / entry) - 1.0) * 100.0 if highest > 0 else pnl_pct
+    if peak_pnl_pct < V18293_STOCK_PEAK_PROFIT_ARM_PCT:
+        return False, (
+            f"peak={peak_pnl_pct:.2f}% below arm={V18293_STOCK_PEAK_PROFIT_ARM_PCT:.2f}%"
+        )
+
+    giveback_pct = max(0.0, peak_pnl_pct - pnl_pct)
+    if giveback_pct < V18293_STOCK_PEAK_PROFIT_MAX_GIVEBACK_PCT:
+        return False, (
+            f"armed peak={peak_pnl_pct:.2f}% giveback={giveback_pct:.2f}% "
+            f"below trigger={V18293_STOCK_PEAK_PROFIT_MAX_GIVEBACK_PCT:.2f}%"
+        )
+
+    # If a very fast reversal jumps through zero before the next safety check,
+    # still allow the lock to protect the trade down to a small bounded loss.
+    # Beyond that point the existing V18.2.80 downside guard remains in charge.
+    if pnl_pct < V18293_STOCK_PEAK_PROFIT_MIN_RETAINED_PCT:
+        return False, (
+            f"reversal={pnl_pct:.2f}% below peak-lock floor="
+            f"{V18293_STOCK_PEAK_PROFIT_MIN_RETAINED_PCT:.2f}%"
+        )
+
+    return True, (
+        f"peak={peak_pnl_pct:.2f}% now={pnl_pct:.2f}% "
+        f"giveback={giveback_pct:.2f}% trigger={V18293_STOCK_PEAK_PROFIT_MAX_GIVEBACK_PCT:.2f}%"
+    )
 
 
 def should_one_hour_profit_exit(position: Dict[str, Any]):
@@ -4684,6 +4753,28 @@ def manage_money_mode_positions():
                 _v17_reset_peak_exhaustion(symbol)
             except Exception as e:
                 print(f"SELL ERROR {symbol}: {e}")
+            continue
+
+        # V18.2.93: do not wait for the one-hour review after a stock has
+        # already produced a meaningful intraday winner. If the best observed
+        # gain reaches the arm threshold and then gives back too much, bank the
+        # remaining green P&L. Broker-side account/PDT restrictions remain
+        # authoritative if an order is not permitted.
+        peak_lock, peak_lock_reason = _v18293_stock_peak_profit_lock(p)
+        if peak_lock:
+            try:
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason="V18.2.93 PEAK PROFIT LOCK")
+                state[symbol]["highest_since_entry"] = None
+                _v17_reset_peak_exhaustion(symbol)
+                _v17_reset_runner_trail(symbol)
+                print(
+                    f"V18.2.93 PEAK PROFIT LOCK SELL | {symbol} qty={qty:.6f} "
+                    f"pnl={float(p.get('pnlPct') or 0.0):.2f}% price={price:.4f} entry={entry:.4f} | "
+                    f"{peak_lock_reason}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"V18.2.93 PEAK PROFIT LOCK ERROR | {symbol} {e}", flush=True)
             continue
 
         peak_exit = _v17_peak_exhaustion_decision(p)
