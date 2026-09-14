@@ -12311,6 +12311,9 @@ def v18232_crypto_shadow_payload() -> Dict[str, Any]:
 # engine remains isolated from stock capital. V18.2.63 allows up to four live crypto positions.
 # =========================
 V18234_CRYPTO_LIVE_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_LIVE_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
+# V18.2.88 — live crypto evidence pause. Scanner/shadow and protective exits stay active,
+# but no new live-money crypto entries are permitted until the strategy is deliberately re-enabled in code.
+V18288_CRYPTO_SHADOW_ONLY = True
 V18234_CRYPTO_LIVE_PILOT_MAX_GBP = max(25.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_PILOT_MAX_GBP", "10000") or 10000))
 V18234_CRYPTO_LIVE_MAX_POSITIONS = max(1, min(10, int(os.getenv("TRADEBOT_CRYPTO_LIVE_MAX_POSITIONS", "10") or 10)))
 V18234_CRYPTO_LIVE_ENTRY_SCORE = max(0.0, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_LIVE_ENTRY_SCORE", str(V18232_CRYPTO_ENTRY_SCORE)) or V18232_CRYPTO_ENTRY_SCORE)))
@@ -12939,6 +12942,22 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
                 "managedPositions": len(final_managed), "maxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS}
     _crypto_live_runtime["entriesPaused"] = False
     _crypto_live_runtime["pauseReason"] = None
+
+    # V18.2.88: stop spending live capital while the crypto edge is rebuilt.
+    # This check deliberately sits AFTER protective exit management above, so an
+    # existing bot-managed crypto position still receives 5-second stop/trail safety.
+    # Shadow/scanner workers are separate and continue collecting evidence.
+    if V18288_CRYPTO_SHADOW_ONLY:
+        final_positions = _v18234_raw_crypto_positions()
+        final_managed = [p for p in final_positions if bool(p.get("managedByPilot"))]
+        _crypto_live_runtime["entriesPaused"] = True
+        _crypto_live_runtime["pauseReason"] = "CRYPTO_SHADOW_ONLY"
+        _crypto_live_runtime["riskBlocked"] = True
+        _crypto_live_runtime["riskReason"] = "V18.2.88 SHADOW ONLY — live crypto entries disabled"
+        return {"ok": True, "enabled": True, "armed": True, "entriesPaused": True,
+                "pauseReason": "CRYPTO_SHADOW_ONLY", "shadowOnly": True,
+                "protectiveExitsActive": True, "positions": len(final_positions),
+                "managedPositions": len(final_managed), "maxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS}
 
     # Refresh after exits. External/manual crypto positions count toward the four-position
     # safety cap but remain visible-only: the bot never auto-sells them.
@@ -13582,6 +13601,9 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
             k: dict(v) for k, v in list(_v18268_manual_sell_pending.items())[-20:]
         },
         "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
+        "liveEntriesEnabled": not bool(V18288_CRYPTO_SHADOW_ONLY),
+        "shadowOnly": bool(V18288_CRYPTO_SHADOW_ONLY),
+        "shadowOnlyReason": "Live crypto paused after negative 97-trade evidence; scanner and Shadow remain active." if V18288_CRYPTO_SHADOW_ONLY else None,
         "liveMaxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS,
         "reentryCooldownMinutes": V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES,
         "activeReentryCooldowns": active_cooldowns,
@@ -13607,8 +13629,8 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "lossBrakeUntil": state.get("cryptoLossBrakeUntil"),
         "riskBlocked": bool(_crypto_live_runtime.get("riskBlocked")),
         "riskReason": _crypto_live_runtime.get("riskReason"),
-        "newEntriesPaused": (not bool(bot_enabled)) or bool(manual_override) or bool(emergency_stop),
-        "pauseReason": ("BOT_PAUSED" if not bool(bot_enabled) else "MANUAL_OVERRIDE" if bool(manual_override) else "EMERGENCY_STOP" if bool(emergency_stop) else None),
+        "newEntriesPaused": bool(V18288_CRYPTO_SHADOW_ONLY) or (not bool(bot_enabled)) or bool(manual_override) or bool(emergency_stop),
+        "pauseReason": ("CRYPTO_SHADOW_ONLY" if V18288_CRYPTO_SHADOW_ONLY else "BOT_PAUSED" if not bool(bot_enabled) else "MANUAL_OVERRIDE" if bool(manual_override) else "EMERGENCY_STOP" if bool(emergency_stop) else None),
         "protectiveExitsActiveWhilePaused": True,
         "accountCrypto": account, "vaultAvailableGbp": round(piggy_bank,2),
         "piggyBankGbp": round(piggy_bank,2),

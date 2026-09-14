@@ -254,7 +254,8 @@ useEffect(() => {
   const positions = Array.isArray(data.positions) ? data.positions : [];
   const livePositions = Array.isArray(bridge?.livePositions) ? bridge.livePositions : [];
   const entryScore = Number(data.config?.entryScore || 0.34);
-  const armed = Boolean(bridge?.livePilotEnabled);
+  const shadowOnly = Boolean(bridge?.shadowOnly);
+  const armed = Boolean(bridge?.livePilotEnabled) && !shadowOnly;
   const accountActive = Boolean(bridge?.accountCrypto?.active);
   const entriesPaused = Boolean(bridge?.newEntriesPaused);
   const bridgeFetchedAt = Number(bridge?.__fetchedAt || 0);
@@ -529,16 +530,16 @@ useEffect(() => {
       <div className="crypto-panel-head">
         <div>
           <h3><span className="panel-icon">⌒</span> Crypto Bridge</h3>
-          <p>Capital split is automatic: £900 is reserved for stocks in the day. From 30 minutes before the close until 30 minutes before the next open, non-Piggy capital is assigned to crypto. Crypto profits are banked one-way. Safety exits check every 5 seconds; normal decisions run every 5 minutes.</p>
+          <p>{shadowOnly ? "Crypto live entries are paused while we rebuild the strategy. Scanner + Shadow continue collecting evidence without spending live capital. Any existing bot-managed crypto position keeps 5-second protective exits." : "Capital split is automatic: £900 is reserved for stocks in the day. From 30 minutes before the close until 30 minutes before the next open, non-Piggy capital is assigned to crypto. Crypto profits are banked one-way. Safety exits check every 5 seconds; normal decisions run every 5 minutes."}</p>
         </div>
-        <span className={`crypto-chip ${armed ? "live" : accountActive ? "building" : ""}`}>{armed ? "LIVE PILOT ARMED" : accountActive ? "READY TO ARM" : "CRYPTO NOT ACTIVE"}</span>
+        <span className={`crypto-chip ${armed ? "live" : accountActive ? "building" : ""}`}>{shadowOnly ? "SHADOW ONLY · LIVE BUYS OFF" : armed ? "LIVE PILOT ARMED" : accountActive ? "READY TO ARM" : "CRYPTO NOT ACTIVE"}</span>
       </div>
 
       <div className="crypto-bridge-grid">
         <div className="bridge-metric"><span className="crypto-summary-icon vault">▣</span><div><small>Piggy Bank</small><strong>{gbp(bridge?.piggyBankGbp ?? bridge?.vaultAvailableGbp)}</strong></div></div>
         <div className="bridge-metric"><span className="crypto-summary-icon allocation">●</span><div><small>Crypto Allocation</small><strong>{gbp(bridge?.cryptoAllocatedGbp)}</strong></div></div>
         <div className="bridge-metric"><span className="crypto-summary-icon pnl">◇</span><div><small>Protected Pool</small><strong>{gbp(bridge?.cryptoPoolGbp)}</strong></div></div>
-        <div className="bridge-metric"><span className="crypto-summary-icon returned">◎</span><div><small>Status</small><strong className={armed ? "gain" : ""}>{armed ? "● Armed" : "Off"}</strong></div></div>
+        <div className="bridge-metric"><span className="crypto-summary-icon returned">◎</span><div><small>Status</small><strong className={armed ? "gain" : ""}>{shadowOnly ? "◌ Shadow Only" : armed ? "● Armed" : "Off"}</strong></div></div>
         <div className={`bridge-action ${armed ? "allocated" : ""}`}>
           <div className="crypto-allocation-editor">
             <strong>AUTOMATIC CAPITAL SPLIT</strong>
@@ -551,7 +552,7 @@ useEffect(() => {
     <section className="crypto-footer-strip">
       <span><b>Shadow:</b> {Number(bridge?.shadowEvidence?.closedTests || data.closedTrades || 0)} tests · {money(bridge?.shadowEvidence?.totalPnlUsd ?? data.totalPnlUsd)} · win {pct(bridge?.shadowEvidence?.winRate ?? data.winRate)}</span>
       <span><b>Safety:</b> Stop {pct(data.config?.stopPct)} · Trail {pct(data.config?.trailStartPct)} / {pct(data.config?.trailGivebackPct)}</span>
-      <span><b>Next live decision:</b> {fmtCountdown(nextDecisionSeconds)} · safety still checks every {Number(bridge?.safetyCheckIntervalSeconds || 5)}s</span>
+      <span><b>Live crypto:</b> {shadowOnly ? "PAUSED — Shadow evidence only" : `next decision ${fmtCountdown(nextDecisionSeconds)}`} · safety still checks every {Number(bridge?.safetyCheckIntervalSeconds || 5)}s</span>
       <span><b>Re-entry:</b> {Number(bridge?.reentryCooldownMinutes || 30)} min after wins · {Number(bridge?.lossCooldownMinutes || 120)} min after losses</span>
       <span><b>Loss brake:</b> {dailyLossBrakeActive
         ? <>DAILY LIMIT ACTIVE · entries blocked until UTC reset · {Number(bridge?.consecutiveCryptoLosses || 0)}/{Number(bridge?.lossBrakeStreak || 2)} consecutive · daily {gbp(bridge?.dailyCryptoPnlGbp)} / -{gbp(bridge?.dailyLossLimitGbp)}</>
