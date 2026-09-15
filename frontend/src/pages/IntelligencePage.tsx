@@ -196,7 +196,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     operationsStatus: "/v15/operations/status",
     operationsComponents: "/v15/operations/components",
     operationsAlerts: "/v15/operations/alerts?limit=100&status=ACTIVE",
-    operationsHistory: "/v15/operations/history?limit=100",
+    operationsHistory: "/v15/operations/history?limit=30",
     operationsConstitution: "/v15/operations/constitution",
     operationsDependencies: "/v15/operations/dependencies",
     operationsWatchdogs: "/v15/operations/watchdogs",
@@ -668,9 +668,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       let cursor = 0;
       let completed = 0;
 
-      // V18.2.96: collect one endpoint at a time. The previous two-way fan-out could
-      // overlap expensive Advisor/Research/Operations SQLite work and make Render
-      // shed otherwise healthy requests as "Failed to fetch".
+      // V18.2.97: use two controlled collectors. Logs proved the endpoints are healthy,
+      // but fully sequential collection makes the complete snapshot unnecessarily slow.
+      // Two workers reduce wall-clock time without returning to the old request storm.
       const worker = async () => {
         while (cursor < entries.length) {
           const index = cursor++;
@@ -684,7 +684,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         }
       };
 
-      await worker();
+      await Promise.all(Array.from({ length: Math.min(2, Math.max(1, entries.length)) }, () => worker()));
 
       const failedCritical = [...criticalKeys]
         .filter((key) => results[key]?.error)
@@ -705,7 +705,10 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         const started = Date.now();
         let stableFrames = 0;
         let previousHeight = 0;
-        while (Date.now() - started < 10000) {
+        // V18.2.97: a large 21-section report can take more than 10 seconds for React
+        // to mount/layout on a busy browser. Give the render phase a real completion
+        // window instead of aborting a healthy snapshot prematurely.
+        while (Date.now() - started < 60000) {
           await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
           const root = reportRef.current;
           const count = root?.querySelectorAll(".pdf-section").length ?? 0;
