@@ -11495,7 +11495,7 @@ V18232_CRYPTO_SHADOW_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_SHADOW_ENABLED", "
 V18232_CRYPTO_INTERVAL_SECONDS = max(60, int(os.getenv("TRADEBOT_CRYPTO_SHADOW_INTERVAL_SECONDS", "300") or 300))
 V18232_CRYPTO_CAPITAL_USD = max(10.0, float(os.getenv("TRADEBOT_CRYPTO_SHADOW_CAPITAL_USD", "250") or 250))
 V18232_CRYPTO_POSITION_PCT = max(0.05, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_SHADOW_POSITION_PCT", "0.95") or 0.95)))
-V18232_CRYPTO_MAX_POSITIONS = max(1, min(5, int(os.getenv("TRADEBOT_CRYPTO_SHADOW_MAX_POSITIONS", "1") or 1)))
+V18232_CRYPTO_MAX_POSITIONS = max(1, min(5, int(os.getenv("TRADEBOT_CRYPTO_SHADOW_MAX_POSITIONS", "5") or 5)))
 V18232_CRYPTO_LOCATION = str(os.getenv("TRADEBOT_CRYPTO_LOCATION", "us") or "us").strip().lower()
 V18232_CRYPTO_SYMBOLS = [x.strip().upper() for x in str(os.getenv(
     "TRADEBOT_CRYPTO_SYMBOLS", "BTC/USD,ETH/USD,SOL/USD,XRP/USD,DOGE/USD,LINK/USD,LTC/USD,AVAX/USD"
@@ -12342,12 +12342,25 @@ def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
                 conn.execute("UPDATE v18232_crypto_positions SET high_price=?,updated_at=? WHERE symbol=?", (high, now, position["symbol"])); conn.commit()
             finally:
                 conn.close()
-    # Re-load after exits, then allow at most one new shadow entry per cycle.
+    # V18.2.94: parallel Shadow Research. Re-load after exits and fill every
+    # available *virtual* research slot from independently qualified scans.
+    # This accelerates evidence collection only; live crypto permissions,
+    # graduation standards and all stock logic remain unchanged.
     data = _v18232_load_state()
-    if len(data["positions"]) < V18232_CRYPTO_MAX_POSITIONS:
+    shadow_slots = max(0, V18232_CRYPTO_MAX_POSITIONS - len(data["positions"]))
+    shadow_opened = 0
+    if shadow_slots > 0:
         for scan in scans:
-            if scan.get("qualified") and _v18232_shadow_buy(scan):
+            if shadow_opened >= shadow_slots:
                 break
+            if scan.get("qualified") and _v18232_shadow_buy(scan):
+                shadow_opened += 1
+    if shadow_opened:
+        print(
+            f"V18.2.94 PARALLEL SHADOW RESEARCH | opened={shadow_opened} "
+            f"slots={V18232_CRYPTO_MAX_POSITIONS} live_orders=False",
+            flush=True,
+        )
     conn = db_connect()
     try:
         conn.execute("UPDATE v18232_crypto_state SET last_scan_at=?,last_error=NULL,updated_at=? WHERE id=1", (now, now)); conn.commit()
