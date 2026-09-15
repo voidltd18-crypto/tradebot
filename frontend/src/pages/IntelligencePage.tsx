@@ -739,91 +739,142 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       await new Promise((resolve) => window.setTimeout(resolve, 850));
       setExportProgress("Capturing PDF pages…");
 
-      // V18.2.99 RELIABLE PDF ENGINE
-      // Do not rasterise the dashboard with html2canvas. Large/off-screen React reports can
-      // exceed browser canvas/memory limits and fail after all backend data was collected.
-      // Build the PDF directly from the already-rendered report DOM instead. This keeps the
-      // export deterministic and works from Home, Intelligence and mobile layouts.
+      // V18.3.00 PROFESSIONAL PDF REPORT
+      // Keep the reliable direct-DOM PDF engine from V18.2.99, but render the report as a
+      // structured dashboard: section banners, cards, KPI tiles, labelled summaries and
+      // proper tables. No trading, scoring, sizing or risk logic is touched here.
       exportStage = "loading PDF library";
       const jsPdfModule = await import("jspdf");
       const JsPDF = (jsPdfModule as any).jsPDF || (jsPdfModule as any).default;
       const pdf = new JsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
       const pageWidth = pdf.internal.pageSize.getWidth();
       const pageHeight = pdf.internal.pageSize.getHeight();
-      const margin = 14;
+      const margin = 12;
       const usableWidth = pageWidth - margin * 2;
-      const bottom = pageHeight - 14;
+      const bottom = pageHeight - 12;
       const sections = Array.from(element.querySelectorAll<HTMLElement>(".pdf-section"));
       if (!sections.length) throw new Error("No TradeBot report sections were available for export.");
 
       const cleanPdfText = (value: string) => value
-        .replace(/\u00a0/g, " ")
-        .replace(/[\u2018\u2019]/g, "'")
-        .replace(/[\u201c\u201d]/g, '"')
-        .replace(/[\u2013\u2014]/g, "-")
-        .replace(/\u2026/g, "...")
-        .replace(/[^\x20-\x7E\xA0-\xFF\n]/g, " ")
-        .replace(/[ \t]+/g, " ")
-        .replace(/\n[ \t]+/g, "\n")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
+        .replace(/\u00a0/g, " ").replace(/[\u2018\u2019]/g, "'").replace(/[\u201c\u201d]/g, '"')
+        .replace(/[\u2013\u2014]/g, "-").replace(/\u2026/g, "...")
+        .replace(/[^\x20-\x7E\xA0-\xFF\n]/g, " ").replace(/[ \t]+/g, " ")
+        .replace(/\n[ \t]+/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+      const txt = (node: Element | null | undefined) => cleanPdfText(node?.textContent || "");
+      const toneOf = (node: Element | null, value = "") => {
+        const cls = node?.className ? String(node.className).toLowerCase() : "";
+        if (cls.includes("positive") || /^\s*\+/.test(value)) return "positive";
+        if (cls.includes("negative") || /^\s*-/.test(value)) return "negative";
+        return "neutral";
+      };
 
       let y = margin;
       let pageNo = 1;
-      const addHeader = () => {
-        pdf.setFont("helvetica", "bold");
-        pdf.setFontSize(15);
-        pdf.text("TRADEBOT - FULL BOT REPORT", margin, y);
-        pdf.setFont("helvetica", "normal");
-        pdf.setFontSize(8);
-        pdf.text(`Generated ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })} · Page ${pageNo}`, margin, y + 5);
-        y += 12;
+      const drawPageHeader = () => {
+        pdf.setFillColor(20, 27, 38); pdf.rect(0, 0, pageWidth, 18, "F");
+        pdf.setTextColor(255, 255, 255); pdf.setFont("helvetica", "bold"); pdf.setFontSize(14);
+        pdf.text("TRADEBOT", margin, 8);
+        pdf.setFontSize(7.5); pdf.setFont("helvetica", "normal");
+        pdf.text("FULL BOT REPORT", margin, 13);
+        pdf.text(`Generated ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })}`, pageWidth - margin, 8, { align: "right" });
+        pdf.text(`Page ${pageNo}`, pageWidth - margin, 13, { align: "right" });
+        pdf.setTextColor(32, 38, 46); y = 24;
       };
-      const newPage = () => {
-        pdf.addPage("a4", "portrait");
-        pageNo += 1;
-        y = margin;
-        addHeader();
-      };
+      const newPage = () => { pdf.addPage("a4", "portrait"); pageNo += 1; drawPageHeader(); };
       const ensureSpace = (needed = 12) => { if (y + needed > bottom) newPage(); };
-      const writeLines = (raw: string, fontSize = 9, lineHeight = 4.2) => {
-        const value = cleanPdfText(raw);
-        if (!value) return;
-        pdf.setFont("helvetica", "normal");
-        pdf.setFontSize(fontSize);
-        const paragraphs = value.split(/\n+/).filter(Boolean);
-        for (const paragraph of paragraphs) {
-          const lines = pdf.splitTextToSize(paragraph, usableWidth);
-          for (const line of lines) {
-            ensureSpace(lineHeight + 1);
-            pdf.text(String(line), margin, y);
-            y += lineHeight;
-          }
-          y += 1.2;
+      const writeWrapped = (value: string, x: number, width: number, fontSize = 8.2, lineHeight = 3.7, tone = "neutral") => {
+        const clean = cleanPdfText(value); if (!clean) return 0;
+        pdf.setFont("helvetica", "normal"); pdf.setFontSize(fontSize);
+        if (tone === "positive") pdf.setTextColor(18, 128, 73);
+        else if (tone === "negative") pdf.setTextColor(190, 48, 48);
+        else pdf.setTextColor(45, 52, 61);
+        const lines = pdf.splitTextToSize(clean, width);
+        lines.forEach((line: string) => { ensureSpace(lineHeight + 1); pdf.text(String(line), x, y); y += lineHeight; });
+        pdf.setTextColor(45, 52, 61); return lines.length * lineHeight;
+      };
+      const sectionBanner = (title: string, index: number) => {
+        ensureSpace(17); if (index > 0) y += 2;
+        pdf.setFillColor(232, 237, 244); pdf.roundedRect(margin, y, usableWidth, 11, 2, 2, "F");
+        pdf.setTextColor(25, 37, 52); pdf.setFont("helvetica", "bold"); pdf.setFontSize(11);
+        pdf.text(title, margin + 4, y + 7.2); y += 15; pdf.setTextColor(45, 52, 61);
+      };
+      const cardTitle = (title: string) => {
+        ensureSpace(11); pdf.setFillColor(247, 249, 252); pdf.roundedRect(margin, y, usableWidth, 9, 1.5, 1.5, "F");
+        pdf.setFont("helvetica", "bold"); pdf.setFontSize(9.5); pdf.setTextColor(33, 43, 54);
+        pdf.text(title || "Details", margin + 3, y + 6); y += 12;
+      };
+      const renderStats = (tiles: Element[]) => {
+        if (!tiles.length) return;
+        const cols = Math.min(4, tiles.length); const gap = 2.5; const w = (usableWidth - gap * (cols - 1)) / cols;
+        for (let i = 0; i < tiles.length; i += cols) {
+          ensureSpace(22); const batch = tiles.slice(i, i + cols);
+          batch.forEach((tile, j) => {
+            const x = margin + j * (w + gap); const label = txt(tile.querySelector("span")); const value = txt(tile.querySelector("strong")); const sub = txt(tile.querySelector("small"));
+            const tone = toneOf(tile, value); pdf.setFillColor(250, 251, 253); pdf.setDrawColor(222, 227, 234); pdf.roundedRect(x, y, w, 19, 1.5, 1.5, "FD");
+            pdf.setFont("helvetica", "normal"); pdf.setFontSize(6.8); pdf.setTextColor(100, 109, 120); pdf.text(label, x + 2.5, y + 4.5);
+            pdf.setFont("helvetica", "bold"); pdf.setFontSize(10);
+            if (tone === "positive") pdf.setTextColor(18, 128, 73); else if (tone === "negative") pdf.setTextColor(190, 48, 48); else pdf.setTextColor(31, 40, 50);
+            pdf.text(value || "-", x + 2.5, y + 10.5);
+            if (sub) { pdf.setFont("helvetica", "normal"); pdf.setFontSize(5.8); pdf.setTextColor(116, 124, 135); const sl = pdf.splitTextToSize(sub, w - 5).slice(0, 2); pdf.text(sl, x + 2.5, y + 14.2); }
+          }); y += 22;
         }
+        pdf.setTextColor(45, 52, 61);
+      };
+      const renderSummary = (summary: Element) => {
+        const rows = Array.from(summary.children).filter((n) => n.querySelector("span") || n.querySelector("b")); if (!rows.length) return;
+        rows.forEach((row, idx) => {
+          ensureSpace(6.5); const label = txt(row.querySelector("span")); const value = txt(row.querySelector("b"));
+          if (idx % 2 === 0) { pdf.setFillColor(250, 251, 253); pdf.rect(margin, y - 1.2, usableWidth, 6.2, "F"); }
+          pdf.setFont("helvetica", "normal"); pdf.setFontSize(7.6); pdf.setTextColor(94, 103, 114); pdf.text(label, margin + 2.5, y + 2.6);
+          pdf.setFont("helvetica", "bold"); pdf.setTextColor(39, 47, 57); const valLines = pdf.splitTextToSize(value || "-", usableWidth * .55).slice(0, 2);
+          pdf.text(valLines, pageWidth - margin - 2.5, y + 2.6, { align: "right" }); y += Math.max(6.2, valLines.length * 3.2 + 1);
+        }); y += 2;
+      };
+      const renderTable = (table: HTMLTableElement) => {
+        const headers = Array.from(table.querySelectorAll("thead th")).map((h) => txt(h));
+        const rows = Array.from(table.querySelectorAll("tbody tr")); if (!headers.length) return;
+        const colW = usableWidth / headers.length; const headerH = 7;
+        const drawTableHeader = () => {
+          ensureSpace(headerH + 5); pdf.setFillColor(42, 54, 69); pdf.rect(margin, y, usableWidth, headerH, "F");
+          pdf.setFont("helvetica", "bold"); pdf.setFontSize(headers.length > 8 ? 5.3 : 6.3); pdf.setTextColor(255,255,255);
+          headers.forEach((h, i) => { const clipped = pdf.splitTextToSize(h, colW - 2).slice(0, 2); pdf.text(clipped, margin + i * colW + 1, y + 3); }); y += headerH; pdf.setTextColor(45,52,61);
+        };
+        drawTableHeader();
+        rows.forEach((row, rIdx) => {
+          const cells = Array.from(row.querySelectorAll("td")).map((c) => txt(c));
+          pdf.setFont("helvetica", "normal"); pdf.setFontSize(headers.length > 8 ? 5.1 : 6.2);
+          const wrapped = cells.map((c) => pdf.splitTextToSize(c || "-", colW - 2).slice(0, 3));
+          const rowH = Math.max(6, ...wrapped.map((lines) => lines.length * 2.7 + 1.5));
+          if (y + rowH > bottom) { newPage(); drawTableHeader(); }
+          if (rIdx % 2 === 0) { pdf.setFillColor(248, 250, 252); pdf.rect(margin, y, usableWidth, rowH, "F"); }
+          wrapped.forEach((lines, i) => {
+            const value = cells[i] || ""; const tone = /^\s*\+/.test(value) ? "positive" : /^\s*-/.test(value) ? "negative" : "neutral";
+            if (tone === "positive") pdf.setTextColor(18,128,73); else if (tone === "negative") pdf.setTextColor(190,48,48); else pdf.setTextColor(48,56,66);
+            pdf.text(lines, margin + i * colW + 1, y + 3.1);
+          }); y += rowH;
+        }); pdf.setTextColor(45,52,61); y += 3;
       };
 
-      addHeader();
+      drawPageHeader();
       for (let sectionIndex = 0; sectionIndex < sections.length; sectionIndex += 1) {
         const sectionElement = sections[sectionIndex];
         const title = cleanPdfText(sectionElement.dataset.pdfTitle || `SECTION ${sectionIndex + 1}`);
-        setExportProgress(`Writing section ${sectionIndex + 1}/${sections.length}…`);
-        exportStage = `writing section ${sectionIndex + 1}/${sections.length}`;
-        ensureSpace(18);
-        if (sectionIndex > 0) y += 2;
-        pdf.setFont("helvetica", "bold");
-        pdf.setFontSize(12);
-        pdf.text(title, margin, y);
-        y += 6;
-        pdf.setDrawColor(180);
-        pdf.line(margin, y, pageWidth - margin, y);
-        y += 4;
-
-        // innerText preserves the visible labels/values and table/log ordering without
-        // requiring a giant browser screenshot. aria-hidden controls are ignored.
-        const clone = sectionElement.cloneNode(true) as HTMLElement;
-        clone.querySelectorAll("button, script, style, svg, canvas, [aria-hidden='true']").forEach((node) => node.remove());
-        writeLines(clone.innerText || clone.textContent || "No printable content.");
+        setExportProgress(`Writing section ${sectionIndex + 1}/${sections.length}...`); exportStage = `writing section ${sectionIndex + 1}/${sections.length}`;
+        sectionBanner(title, sectionIndex);
+        const cards = Array.from(sectionElement.querySelectorAll<HTMLElement>(":scope > .card"));
+        const targets = cards.length ? cards : [sectionElement];
+        targets.forEach((card) => {
+          const heading = txt(card.querySelector(":scope > h2")); if (heading) cardTitle(heading);
+          const stats = Array.from(card.querySelectorAll(":scope .intelligence-stat-grid .intelligence-stat")); renderStats(stats);
+          const summaries = Array.from(card.querySelectorAll(":scope > .summary, :scope > * > .summary")); summaries.forEach(renderSummary);
+          const tables = Array.from(card.querySelectorAll<HTMLTableElement>(":scope table")); tables.forEach(renderTable);
+          const empties = Array.from(card.querySelectorAll<HTMLElement>(":scope .intelligence-empty")); empties.forEach((empty) => { ensureSpace(12); pdf.setFillColor(252,248,238); pdf.roundedRect(margin,y,usableWidth,10,1.5,1.5,"F"); y += 3; writeWrapped(txt(empty), margin+3, usableWidth-6, 7.2, 3.2); y += 3; });
+          if (!stats.length && !summaries.length && !tables.length && !empties.length) {
+            const clone = card.cloneNode(true) as HTMLElement; clone.querySelectorAll("h2, button, script, style, svg, canvas, [aria-hidden='true']").forEach((n) => n.remove());
+            const body = cleanPdfText(clone.innerText || clone.textContent || ""); if (body) { writeWrapped(body, margin + 2, usableWidth - 4, 7.5, 3.5); y += 3; }
+          }
+          y += 2;
+        });
       }
 
       exportStage = "saving PDF";
@@ -839,7 +890,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       exportSucceeded = true;
     } catch (error: unknown) {
       const detail = describeExportError(error);
-      console.error("V18.2.98 PDF EXPORT FAILURE", { stage: exportStage, error });
+      console.error("V18.3.00 PDF EXPORT FAILURE", { stage: exportStage, error });
       window.alert(`Full bot PDF export failed during ${exportStage}: ${detail}`);
     } finally {
       setExportingPdf(false);
