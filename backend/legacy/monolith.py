@@ -252,7 +252,7 @@ V18293_STOCK_PEAK_PROFIT_LOCK_ENABLED = str(
     os.getenv("TRADEBOT_STOCK_PEAK_PROFIT_LOCK_ENABLED", "true")
 ).strip().lower() in {"1", "true", "yes", "on"}
 V18293_STOCK_PEAK_PROFIT_ARM_PCT = max(0.50, float(
-    os.getenv("TRADEBOT_STOCK_PEAK_PROFIT_ARM_PCT", "2.00") or 2.00
+    os.getenv("TRADEBOT_STOCK_PEAK_PROFIT_ARM_PCT", "1.25") or 1.25
 ))
 V18293_STOCK_PEAK_PROFIT_MAX_GIVEBACK_PCT = max(0.10, float(
     os.getenv("TRADEBOT_STOCK_PEAK_PROFIT_MAX_GIVEBACK_PCT", "0.60") or 0.60
