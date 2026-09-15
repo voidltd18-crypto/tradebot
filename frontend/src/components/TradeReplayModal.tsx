@@ -74,6 +74,10 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
   const peakLockTriggered = peakLockArmed && peakLockGivebackPct > 0 && peakLockGivebackNow >= peakLockGivebackPct;
   const peakLockTriggerPrice = peakLockArmed && entry > 0 ? entry * (1 + (recordedPeakPct - peakLockGivebackPct) / 100) : 0;
   const peakLockState = !peakLockEnabled ? "DISABLED" : peakLockTriggered ? "SELL TRIGGER" : peakLockArmed ? `ARMED · ${peakLockGivebackNow.toFixed(2)}pp/${peakLockGivebackPct.toFixed(2)}pp giveback` : `NOT ARMED · arms ${pct(peakLockArmPct)}`;
+  const newsRisk = payload?.stockNewsIntelligence || {};
+  const newsScore = Number(newsRisk.score || 0);
+  const newsLevel = String(newsRisk.level || "LOW");
+  const newsState = newsRisk.available === false ? "FEED UNAVAILABLE" : `${newsLevel} · ${newsScore.toFixed(0)}/100`;
 
   // V17.1.1: auto-zoom to the movement that matters while still keeping the
   // trade's entry/risk/profit reference levels visible. This avoids a tiny
@@ -103,6 +107,7 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
         <div><span>PnL</span><b className={pnlPct >= 0 ? "profit" : "loss"}>{pct(pnlPct)}</b></div>
         <div><span>Peak Profit Lock</span><b className={peakLockTriggered ? "loss" : (peakLockArmed ? "profit" : "")}>{peakLockState}</b></div>
         <div><span>Adaptive trail</span><b>{runnerGrace ? `RUNNER GRACE ${usd(trailFloor)}` : (peakExhaustion ? `PEAK EXHAUSTION ARMED` : (trailingActive ? `ACTIVE ${usd(trailFloor)}` : `Starts ${usd(trailStart)}`))}</b></div>
+        <div title={String(newsRisk.headline || "")}><span>AI News Risk</span><b className={newsLevel === "HIGH" ? "loss" : (newsLevel === "LOW" ? "profit" : "")}>{newsState}</b></div>
       </div>
 
       {loading && !chart.length && <p className="muted">Loading recorded movement…</p>}
@@ -110,6 +115,7 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
       {!loading && !error && !chart.length && <p className="notice">{payload?.message || "No recorded price points yet. Recording begins automatically while positions are open."}</p>}
 
       {chart.length > 0 && <>
+        {newsRisk?.headline && <p className={`notice ${newsLevel === "HIGH" ? "loss" : ""}`}><b>AI News:</b> {String(newsRisk.headline)}{Number.isFinite(Number(newsRisk.ageMinutes)) ? ` · ${Number(newsRisk.ageMinutes).toFixed(0)}m ago` : ""}</p>}
         <div className="replay-chart">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={chart} margin={{ top: 12, right: 24, bottom: 8, left: 8 }}>

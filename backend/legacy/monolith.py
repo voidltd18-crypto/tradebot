@@ -261,6 +261,115 @@ V18293_STOCK_PEAK_PROFIT_MIN_RETAINED_PCT = float(
     os.getenv("TRADEBOT_STOCK_PEAK_PROFIT_MIN_RETAINED_PCT", "-0.50") or -0.50
 )
 
+
+# V18.3.03 — AI Stock News Intelligence.
+# Uses Alpaca/Benzinga news already available through the account's market-data
+# credentials. News is a protection signal, not an oracle: HIGH risk blocks new
+# automatic entries, while an open position is only exited when severe fresh
+# news is corroborated by actual price weakness.
+V18303_STOCK_NEWS_ENABLED = str(os.getenv("TRADEBOT_STOCK_NEWS_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+V18303_STOCK_NEWS_CACHE_SECONDS = max(30, int(os.getenv("TRADEBOT_STOCK_NEWS_CACHE_SECONDS", "60") or 60))
+V18303_STOCK_NEWS_LOOKBACK_MINUTES = max(30, int(os.getenv("TRADEBOT_STOCK_NEWS_LOOKBACK_MINUTES", "360") or 360))
+V18303_STOCK_NEWS_BUY_BLOCK_SCORE = max(50.0, min(100.0, float(os.getenv("TRADEBOT_STOCK_NEWS_BUY_BLOCK_SCORE", "70") or 70)))
+V18303_STOCK_NEWS_EXIT_SCORE = max(V18303_STOCK_NEWS_BUY_BLOCK_SCORE, min(100.0, float(os.getenv("TRADEBOT_STOCK_NEWS_EXIT_SCORE", "80") or 80)))
+V18303_STOCK_NEWS_EXIT_GIVEBACK_PCT = max(0.05, float(os.getenv("TRADEBOT_STOCK_NEWS_EXIT_GIVEBACK_PCT", "0.25") or 0.25))
+_V18303_NEWS_CACHE: Dict[str, Dict[str, Any]] = {}
+_V18303_NEWS_LOCK = threading.RLock()
+
+_V18303_NEGATIVE_NEWS_TERMS = {
+    "bankruptcy": 100, "chapter 11": 100, "fraud": 95, "accounting irregular": 95,
+    "sec investigation": 92, "criminal investigation": 95, "default": 95,
+    "guidance cut": 88, "cuts guidance": 88, "lowers guidance": 88, "withdraws guidance": 90,
+    "offering": 72, "public offering": 78, "dilution": 82, "dilutive": 82,
+    "recall": 78, "data breach": 78, "cyberattack": 82, "lawsuit": 68,
+    "downgrade": 62, "misses estimates": 72, "earnings miss": 76, "revenue miss": 72,
+    "ceo resign": 75, "cfo resign": 75, "layoffs": 58, "job cuts": 58,
+    "halts": 90, "trading halt": 90, "delisting": 95, "going concern": 95,
+}
+_V18303_POSITIVE_NEWS_TERMS = {
+    "raises guidance": 28, "guidance raised": 28, "beats estimates": 22, "earnings beat": 22,
+    "upgrade": 18, "record revenue": 18, "contract award": 15, "approval": 18,
+}
+
+def _v18303_news_age_minutes(value: Any) -> float:
+    try:
+        dt = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        if dt.tzinfo is None: dt = dt.replace(tzinfo=UTC)
+        return max(0.0, (datetime.now(UTC) - dt.astimezone(UTC)).total_seconds() / 60.0)
+    except Exception:
+        return 999999.0
+
+def _v18303_stock_news_risk(symbol: str, force: bool = False) -> Dict[str, Any]:
+    sym = str(symbol or "").upper().strip()
+    empty = {"enabled": V18303_STOCK_NEWS_ENABLED, "symbol": sym, "score": 0.0, "level": "LOW", "articles": [], "headline": "No material negative news detected", "ageMinutes": None, "source": "Alpaca News / Benzinga", "fresh": False}
+    if not V18303_STOCK_NEWS_ENABLED or not sym or not API_KEY or not API_SECRET:
+        return {**empty, "available": False}
+    now_epoch = time.time()
+    with _V18303_NEWS_LOCK:
+        cached = _V18303_NEWS_CACHE.get(sym)
+        if cached and not force and now_epoch - float(cached.get("_cachedAt") or 0) < V18303_STOCK_NEWS_CACHE_SECONDS:
+            return {k:v for k,v in cached.items() if k != "_cachedAt"}
+    try:
+        start = (datetime.now(UTC) - timedelta(minutes=V18303_STOCK_NEWS_LOOKBACK_MINUTES)).isoformat().replace("+00:00", "Z")
+        response = requests.get(
+            "https://data.alpaca.markets/v1beta1/news",
+            headers={"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET, "Accept": "application/json"},
+            params={"symbols": sym, "start": start, "sort": "desc", "limit": 20, "include_content": "false"},
+            timeout=8,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Alpaca news HTTP {response.status_code}: {(response.text or '')[:180]}")
+        raw = response.json() if response.content else {}
+        articles = raw.get("news") if isinstance(raw, dict) else []
+        if not isinstance(articles, list): articles = []
+        scored=[]
+        for a in articles:
+            headline=str(a.get("headline") or "").strip(); summary=str(a.get("summary") or "").strip()
+            text=(headline+" "+summary).lower(); age=_v18303_news_age_minutes(a.get("updated_at") or a.get("created_at"))
+            severity=0.0; reasons=[]
+            for term, val in _V18303_NEGATIVE_NEWS_TERMS.items():
+                if term in text and val > severity: severity=float(val); reasons.append(term)
+            for term, val in _V18303_POSITIVE_NEWS_TERMS.items():
+                if term in text: severity=max(0.0, severity-float(val))
+            # Fresh news matters more; stale headlines decay rather than permanently poisoning a ticker.
+            freshness=max(0.35, 1.0 - (age / max(1.0, V18303_STOCK_NEWS_LOOKBACK_MINUTES)) * 0.65)
+            severity*=freshness
+            if severity > 0:
+                scored.append({"headline": headline, "summary": summary[:240], "score": round(severity,1), "ageMinutes": round(age,1), "source": str(a.get("source") or "Benzinga"), "url": str(a.get("url") or ""), "reasons": reasons[:3]})
+        scored.sort(key=lambda x: (-float(x["score"]), float(x["ageMinutes"])))
+        top=float(scored[0]["score"]) if scored else 0.0
+        # Independent matching headlines add confirmation without allowing repetition to exceed 100.
+        corroboration=sum(1 for x in scored[1:5] if float(x["score"]) >= 55.0)
+        score=min(100.0, top + min(15.0, corroboration * 5.0))
+        level="HIGH" if score >= V18303_STOCK_NEWS_BUY_BLOCK_SCORE else ("MEDIUM" if score >= 40 else "LOW")
+        result={**empty, "available": True, "score": round(score,1), "level": level, "articles": scored[:5], "headline": scored[0]["headline"] if scored else empty["headline"], "ageMinutes": scored[0]["ageMinutes"] if scored else None, "fresh": bool(scored), "corroboratingArticles": corroboration}
+    except Exception as exc:
+        result={**empty, "available": False, "error": str(exc), "headline": "News feed temporarily unavailable"}
+    with _V18303_NEWS_LOCK:
+        _V18303_NEWS_CACHE[sym]={**result, "_cachedAt": now_epoch}
+    return result
+
+def _v18303_news_buy_allowed(symbol: str) -> Tuple[bool, str, Dict[str, Any]]:
+    risk=_v18303_stock_news_risk(symbol)
+    score=float(risk.get("score") or 0.0)
+    if risk.get("available") and score >= V18303_STOCK_NEWS_BUY_BLOCK_SCORE:
+        return False, f"AI NEWS HIGH RISK {score:.0f}/100 | {risk.get('headline')}", risk
+    return True, f"AI NEWS {risk.get('level','LOW')} {score:.0f}/100", risk
+
+def _v18303_news_exit_signal(position: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    symbol=str(position.get("symbol") or "").upper(); risk=_v18303_stock_news_risk(symbol)
+    score=float(risk.get("score") or 0.0); pnl=float(position.get("pnlPct") or 0.0)
+    entry=float(position.get("entry") or 0.0); highest=float(position.get("highest") or 0.0)
+    peak=((highest/entry)-1.0)*100.0 if entry>0 and highest>0 else pnl
+    giveback=max(0.0, peak-pnl)
+    corroborated_price_weakness = pnl <= 0.0 or giveback >= V18303_STOCK_NEWS_EXIT_GIVEBACK_PCT
+    fire=bool(risk.get("available") and score >= V18303_STOCK_NEWS_EXIT_SCORE and corroborated_price_weakness)
+    reason=f"news={score:.0f}/100 pnl={pnl:.2f}% peakGiveback={giveback:.2f}pp | {risk.get('headline')}"
+    return fire, reason, risk
+
+
+print(f"V18.3.03 AI STOCK NEWS | enabled={V18303_STOCK_NEWS_ENABLED} provider=Alpaca/Benzinga cache={V18303_STOCK_NEWS_CACHE_SECONDS}s lookback={V18303_STOCK_NEWS_LOOKBACK_MINUTES}m buy_block={V18303_STOCK_NEWS_BUY_BLOCK_SCORE:.0f}/100 exit={V18303_STOCK_NEWS_EXIT_SCORE:.0f}/100 price_confirmation=true", flush=True)
+
 # Swing Hold AI: learns from closed-trade history and avoids quick exits.
 SWING_SNIPER_SAFE_MODE = True
 HOLD_AI_ENABLED = True
@@ -4755,6 +4864,21 @@ def manage_money_mode_positions():
                 print(f"SELL ERROR {symbol}: {e}")
             continue
 
+        # V18.3.03: severe fresh company news can accelerate protection, but
+        # never sells on headline sentiment alone. A sell requires both an >=80
+        # news-risk score and corroborating live price weakness/giveback.
+        news_exit, news_reason, news_risk = _v18303_news_exit_signal(p)
+        if news_exit:
+            try:
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason="V18.3.03 AI NEWS RISK EXIT")
+                state[symbol]["highest_since_entry"] = None
+                _v17_reset_peak_exhaustion(symbol)
+                _v17_reset_runner_trail(symbol)
+                print(f"V18.3.03 AI NEWS RISK EXIT | {symbol} {news_reason}", flush=True)
+            except Exception as e:
+                print(f"V18.3.03 AI NEWS EXIT ERROR | {symbol} {e}", flush=True)
+            continue
+
         # V18.2.93: do not wait for the one-hour review after a stock has
         # already produced a meaningful intraday winner. If the best observed
         # gain reaches the arm threshold and then gives back too much, bank the
@@ -5733,6 +5857,15 @@ def money_mode_buy(scans, manual=False):
         if notional < MIN_ORDER_NOTIONAL:
             messages.append(f"SKIP {symbol} | portfolio allocation too small {notional:.2f}")
             continue
+        # V18.3.03 final news gate: checked immediately before a live automatic order.
+        # Manual/custom buys remain user-authoritative; the autonomous engine will not
+        # enter a ticker carrying fresh HIGH-risk company news.
+        if not manual:
+            news_ok, news_reason, news_risk = _v18303_news_buy_allowed(symbol)
+            if not news_ok:
+                print(f"V18.3.03 AI NEWS BUY BLOCK | {symbol} {news_reason}", flush=True)
+                messages.append(f"SKIP {symbol} | {news_reason}")
+                continue
         confidence, label = calculate_confidence(c)
         reason = f"{'MANUAL' if manual else 'AUTO'} V16 PORTFOLIO #{allocation.get('rank', bought + 1)} {label} BUY"
         try:
@@ -11283,6 +11416,7 @@ def _trade_replay_payload(session_row, limit: int = TRADE_REPLAY_MAX_POINTS, clo
             "maxGivebackPct": float(V18293_STOCK_PEAK_PROFIT_MAX_GIVEBACK_PCT),
             "minRetainedPct": float(V18293_STOCK_PEAK_PROFIT_MIN_RETAINED_PCT),
         },
+        "stockNewsIntelligence": _v18303_stock_news_risk(str(session.get("symbol") or "")),
     }
 
 
@@ -14639,6 +14773,12 @@ def api_trade_replay_live(symbol: str, limit: int = TRADE_REPLAY_MAX_POINTS):
 @app.get("/trade-replay/closed/{trade_id}")
 def api_trade_replay_closed(trade_id: int, limit: int = TRADE_REPLAY_MAX_POINTS):
     return trade_replay_closed_payload(trade_id, limit)
+
+
+@app.get("/stock-news/{symbol}")
+def api_stock_news(symbol: str, request: Request):
+    verify_api_key(request)
+    return _v18303_stock_news_risk(symbol, force=True)
 
 
 @app.get("/trade-replay/status")
