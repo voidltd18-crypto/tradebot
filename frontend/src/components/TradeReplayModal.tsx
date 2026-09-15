@@ -60,12 +60,26 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
   const trailingActive = Boolean(last.trailingActive);
   const runnerGrace = Boolean(last.runnerGrace || last.source === "runner-grace");
   const peakExhaustion = Boolean(last.peakExhaustion || last.source === "peak-exhaustion");
+  // V18.3.02: this comes from the live backend settings, so Render env
+  // overrides and future tuning are reflected automatically in the chart.
+  const peakLock = payload?.stockPeakProfitLock || {};
+  const peakLockEnabled = Boolean(peakLock.enabled);
+  const peakLockArmPct = Number(peakLock.armPct || 0);
+  const peakLockGivebackPct = Number(peakLock.maxGivebackPct || 0);
+  const recordedPeak = Number(stats.peak || 0);
+  const peakLockArmPrice = entry > 0 && peakLockArmPct > 0 ? entry * (1 + peakLockArmPct / 100) : 0;
+  const recordedPeakPct = entry > 0 && recordedPeak > 0 ? ((recordedPeak / entry) - 1) * 100 : 0;
+  const peakLockArmed = peakLockEnabled && recordedPeakPct >= peakLockArmPct;
+  const peakLockGivebackNow = peakLockArmed ? Math.max(0, recordedPeakPct - pnlPct) : 0;
+  const peakLockTriggered = peakLockArmed && peakLockGivebackPct > 0 && peakLockGivebackNow >= peakLockGivebackPct;
+  const peakLockTriggerPrice = peakLockArmed && entry > 0 ? entry * (1 + (recordedPeakPct - peakLockGivebackPct) / 100) : 0;
+  const peakLockState = !peakLockEnabled ? "DISABLED" : peakLockTriggered ? "SELL TRIGGER" : peakLockArmed ? `ARMED · ${peakLockGivebackNow.toFixed(2)}pp/${peakLockGivebackPct.toFixed(2)}pp giveback` : `NOT ARMED · arms ${pct(peakLockArmPct)}`;
 
   // V17.1.1: auto-zoom to the movement that matters while still keeping the
   // trade's entry/risk/profit reference levels visible. This avoids a tiny
   // $0.02 move being flattened inside an arbitrary multi-dollar axis.
   const yValues: number[] = chart.map((p: AnyObj) => Number(p.price || 0)).filter((v: number) => Number.isFinite(v) && v > 0);
-  [entry, stop, trailStart, trailingActive ? trailFloor : 0].forEach((v) => { if (Number.isFinite(v) && v > 0) yValues.push(v); });
+  [entry, stop, trailStart, trailingActive ? trailFloor : 0, peakLockArmPrice, peakLockArmed ? peakLockTriggerPrice : 0].forEach((v) => { if (Number.isFinite(v) && v > 0) yValues.push(v); });
   let yDomain: [number, number] | [string, string] = ["auto", "auto"];
   if (yValues.length) {
     const low = Math.min(...yValues);
@@ -87,7 +101,8 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
         <div><span>{target.mode === "live" ? "Current" : "Exit"}</span><b>{usd(current)}</b></div>
         <div><span>Peak recorded</span><b>{usd(stats.peak)}</b></div>
         <div><span>PnL</span><b className={pnlPct >= 0 ? "profit" : "loss"}>{pct(pnlPct)}</b></div>
-        <div><span>Exit state</span><b>{runnerGrace ? `RUNNER GRACE ${usd(trailFloor)}` : (peakExhaustion ? `PEAK EXHAUSTION ARMED` : (trailingActive ? `TRAIL ACTIVE ${usd(trailFloor)}` : `Trail starts ${usd(trailStart)}`))}</b></div>
+        <div><span>Peak Profit Lock</span><b className={peakLockTriggered ? "loss" : (peakLockArmed ? "profit" : "")}>{peakLockState}</b></div>
+        <div><span>Adaptive trail</span><b>{runnerGrace ? `RUNNER GRACE ${usd(trailFloor)}` : (peakExhaustion ? `PEAK EXHAUSTION ARMED` : (trailingActive ? `ACTIVE ${usd(trailFloor)}` : `Starts ${usd(trailStart)}`))}</b></div>
       </div>
 
       {loading && !chart.length && <p className="muted">Loading recorded movement…</p>}
@@ -103,7 +118,9 @@ export function TradeReplayModal({ target, authToken, onClose }: { target: Repla
               <YAxis stroke="#94a3b8" domain={yDomain as any} allowDataOverflow={false} tickFormatter={(v) => `$${Number(v).toFixed(2)}`} />
               <Tooltip labelFormatter={(label) => `Time ${label}`} formatter={(value: any, name: any) => [usd(value), name === "price" ? "Price" : name]} />
               {entry > 0 && <ReferenceLine y={entry} stroke="#38bdf8" strokeDasharray="6 5" label={{ value: `Entry ${usd(entry)}`, fill: "#7dd3fc", position: "insideTopLeft" }} />}
-              {trailStart > 0 && <ReferenceLine y={trailStart} stroke="#facc15" strokeDasharray="6 5" label={{ value: `Trail start ${usd(trailStart)}`, fill: "#fde047", position: "insideTopRight" }} />}
+              {peakLockArmPrice > 0 && <ReferenceLine y={peakLockArmPrice} stroke="#a78bfa" strokeDasharray="6 5" label={{ value: `Peak lock arms ${usd(peakLockArmPrice)} (${peakLockArmPct.toFixed(2)}%)`, fill: "#c4b5fd", position: "insideTopRight" }} />}
+              {peakLockArmed && peakLockTriggerPrice > 0 && <ReferenceLine y={peakLockTriggerPrice} stroke="#fb923c" strokeDasharray="4 4" label={{ value: `Peak lock sell ${usd(peakLockTriggerPrice)} (${peakLockGivebackPct.toFixed(2)}pp giveback)`, fill: "#fdba74", position: "insideBottomRight" }} />}
+              {trailStart > 0 && <ReferenceLine y={trailStart} stroke="#facc15" strokeDasharray="6 5" label={{ value: `Adaptive trail starts ${usd(trailStart)}`, fill: "#fde047", position: "insideTopRight" }} />}
               {stop > 0 && <ReferenceLine y={stop} stroke="#fb7185" strokeDasharray="5 5" label={{ value: `Stop ${usd(stop)}`, fill: "#fda4af", position: "insideBottomLeft" }} />}
               {trailingActive && trailFloor > 0 && <ReferenceLine y={trailFloor} stroke="#22c55e" strokeDasharray="4 4" label={{ value: `Trail floor ${usd(trailFloor)}`, fill: "#4ade80", position: "insideBottomRight" }} />}
               <Line type="monotone" dataKey="price" stroke="#22c55e" strokeWidth={3} dot={false} isAnimationActive={false} />

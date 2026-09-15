@@ -11274,6 +11274,15 @@ def _trade_replay_payload(session_row, limit: int = TRADE_REPLAY_MAX_POINTS, clo
                   "maxGainPct": (((peak / entry) - 1.0) * 100.0) if entry > 0 and peak > 0 else 0.0,
                   "maxDrawdownFromEntryPct": (((trough / entry) - 1.0) * 100.0) if entry > 0 and trough > 0 else 0.0},
         "sampleSeconds": TRADE_REPLAY_SAMPLE_SECONDS,
+        # V18.3.02: expose the active backend profit-protection settings so the
+        # replay UI shows the rule that can actually sell the position, rather
+        # than presenting the older adaptive volatility trail as the only exit.
+        "stockPeakProfitLock": {
+            "enabled": bool(V18293_STOCK_PEAK_PROFIT_LOCK_ENABLED),
+            "armPct": float(V18293_STOCK_PEAK_PROFIT_ARM_PCT),
+            "maxGivebackPct": float(V18293_STOCK_PEAK_PROFIT_MAX_GIVEBACK_PCT),
+            "minRetainedPct": float(V18293_STOCK_PEAK_PROFIT_MIN_RETAINED_PCT),
+        },
     }
 
 
