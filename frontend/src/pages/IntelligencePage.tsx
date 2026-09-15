@@ -739,73 +739,101 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       await new Promise((resolve) => window.setTimeout(resolve, 850));
       setExportProgress("Capturing PDF pages…");
 
-      exportStage = "loading PDF libraries";
-      const [{ default: html2canvas }, jsPdfModule] = await Promise.all([
-        import("html2canvas"),
-        import("jspdf"),
-      ]);
+      // V18.2.99 RELIABLE PDF ENGINE
+      // Do not rasterise the dashboard with html2canvas. Large/off-screen React reports can
+      // exceed browser canvas/memory limits and fail after all backend data was collected.
+      // Build the PDF directly from the already-rendered report DOM instead. This keeps the
+      // export deterministic and works from Home, Intelligence and mobile layouts.
+      exportStage = "loading PDF library";
+      const jsPdfModule = await import("jspdf");
       const JsPDF = (jsPdfModule as any).jsPDF || (jsPdfModule as any).default;
-      const pdf = new JsPDF({ orientation: "landscape", unit: "mm", format: "a4", compress: true });
+      const pdf = new JsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
       const pageWidth = pdf.internal.pageSize.getWidth();
       const pageHeight = pdf.internal.pageSize.getHeight();
-      const margin = 7;
+      const margin = 14;
       const usableWidth = pageWidth - margin * 2;
-      const usableHeight = pageHeight - margin * 2;
-
+      const bottom = pageHeight - 14;
       const sections = Array.from(element.querySelectorAll<HTMLElement>(".pdf-section"));
       if (!sections.length) throw new Error("No TradeBot report sections were available for export.");
 
-      let firstPage = true;
+      const cleanPdfText = (value: string) => value
+        .replace(/\u00a0/g, " ")
+        .replace(/[\u2018\u2019]/g, "'")
+        .replace(/[\u201c\u201d]/g, '"')
+        .replace(/[\u2013\u2014]/g, "-")
+        .replace(/\u2026/g, "...")
+        .replace(/[^\x20-\x7E\xA0-\xFF\n]/g, " ")
+        .replace(/[ \t]+/g, " ")
+        .replace(/\n[ \t]+/g, "\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+
+      let y = margin;
+      let pageNo = 1;
+      const addHeader = () => {
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(15);
+        pdf.text("TRADEBOT - FULL BOT REPORT", margin, y);
+        pdf.setFont("helvetica", "normal");
+        pdf.setFontSize(8);
+        pdf.text(`Generated ${new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })} · Page ${pageNo}`, margin, y + 5);
+        y += 12;
+      };
+      const newPage = () => {
+        pdf.addPage("a4", "portrait");
+        pageNo += 1;
+        y = margin;
+        addHeader();
+      };
+      const ensureSpace = (needed = 12) => { if (y + needed > bottom) newPage(); };
+      const writeLines = (raw: string, fontSize = 9, lineHeight = 4.2) => {
+        const value = cleanPdfText(raw);
+        if (!value) return;
+        pdf.setFont("helvetica", "normal");
+        pdf.setFontSize(fontSize);
+        const paragraphs = value.split(/\n+/).filter(Boolean);
+        for (const paragraph of paragraphs) {
+          const lines = pdf.splitTextToSize(paragraph, usableWidth);
+          for (const line of lines) {
+            ensureSpace(lineHeight + 1);
+            pdf.text(String(line), margin, y);
+            y += lineHeight;
+          }
+          y += 1.2;
+        }
+      };
+
+      addHeader();
       for (let sectionIndex = 0; sectionIndex < sections.length; sectionIndex += 1) {
         const sectionElement = sections[sectionIndex];
-        setExportProgress(`Capturing section ${sectionIndex + 1}/${sections.length}…`);
-        exportStage = `capturing section ${sectionIndex + 1}/${sections.length}`;
-        const canvas = await html2canvas(sectionElement, {
-          scale: 1.25,
-          useCORS: true,
-          backgroundColor: "#07111f",
-          logging: false,
-          scrollX: 0,
-          scrollY: -window.scrollY,
-          windowWidth: 1500,
-        });
+        const title = cleanPdfText(sectionElement.dataset.pdfTitle || `SECTION ${sectionIndex + 1}`);
+        setExportProgress(`Writing section ${sectionIndex + 1}/${sections.length}…`);
+        exportStage = `writing section ${sectionIndex + 1}/${sections.length}`;
+        ensureSpace(18);
+        if (sectionIndex > 0) y += 2;
+        pdf.setFont("helvetica", "bold");
+        pdf.setFontSize(12);
+        pdf.text(title, margin, y);
+        y += 6;
+        pdf.setDrawColor(180);
+        pdf.line(margin, y, pageWidth - margin, y);
+        y += 4;
 
-        if (!canvas.width || !canvas.height) continue;
-        const pxPerMm = canvas.width / usableWidth;
-        const sliceHeightPx = Math.max(1, Math.floor(usableHeight * pxPerMm));
-
-        for (let y = 0; y < canvas.height; y += sliceHeightPx) {
-          const currentSliceHeight = Math.min(sliceHeightPx, canvas.height - y);
-          const slice = document.createElement("canvas");
-          slice.width = canvas.width;
-          slice.height = currentSliceHeight;
-          const context = slice.getContext("2d");
-          if (!context) continue;
-          context.drawImage(canvas, 0, y, canvas.width, currentSliceHeight, 0, 0, canvas.width, currentSliceHeight);
-
-          exportStage = `encoding section ${sectionIndex + 1}/${sections.length}`;
-          const imageData = slice.toDataURL("image/jpeg", 0.90);
-          const imageHeightMm = currentSliceHeight / pxPerMm;
-          if (!firstPage) pdf.addPage("a4", "landscape");
-          firstPage = false;
-          exportStage = `assembling section ${sectionIndex + 1}/${sections.length}`;
-          pdf.addImage(imageData, "JPEG", margin, margin, usableWidth, imageHeightMm, undefined, "FAST");
-        }
+        // innerText preserves the visible labels/values and table/log ordering without
+        // requiring a giant browser screenshot. aria-hidden controls are ignored.
+        const clone = sectionElement.cloneNode(true) as HTMLElement;
+        clone.querySelectorAll("button, script, style, svg, canvas, [aria-hidden='true']").forEach((node) => node.remove());
+        writeLines(clone.innerText || clone.textContent || "No printable content.");
       }
 
-      if (firstPage) throw new Error("Full bot report capture returned no printable content.");
-
+      exportStage = "saving PDF";
+      setExportProgress("Saving PDF…");
       const now = new Date();
       const stamp = [
         String(now.getDate()).padStart(2, "0"),
         String(now.getMonth() + 1).padStart(2, "0"),
         now.getFullYear(),
       ].join("-") + "_" + [String(now.getHours()).padStart(2, "0"), String(now.getMinutes()).padStart(2, "0")].join("-");
-
-      exportStage = "saving PDF";
-      setExportProgress("Saving PDF…");
-      // Yield one paint so the capture DOM stays mounted until jsPDF has fully assembled the document.
-      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       pdf.save(`TradeBot_FULL_BOT_REPORT_${stamp}.pdf`);
       await new Promise((resolve) => window.setTimeout(resolve, 250));
       exportSucceeded = true;
