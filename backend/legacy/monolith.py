@@ -234,9 +234,9 @@ ONE_HOUR_PROFIT_EXIT_ENABLED = str(os.getenv("TRADEBOT_ONE_HOUR_PROFIT_EXIT_ENAB
 ONE_HOUR_PROFIT_EXIT_MINUTES = max(1, int(os.getenv("TRADEBOT_ONE_HOUR_PROFIT_EXIT_MINUTES", "60") or 60))
 ONE_HOUR_PROFIT_EXIT_MIN_PNL_PCT = float(os.getenv("TRADEBOT_ONE_HOUR_PROFIT_EXIT_MIN_PNL_PCT", "0.0") or 0.0)
 
-# V18.2.83 — Intelligent One-Hour Stock Review.
-# After the timer, a green stock is reviewed rather than sold mechanically.
-# Strong/rising winners may continue; fading or peak-rejecting winners are banked.
+# V18.3.04 — One-Hour Stock Health Review.
+# 60 minutes is a health checkpoint, not an expiry. Healthy green positions keep
+# running; only genuinely stagnant/fading sub-peak-lock positions are released.
 V18283_ONE_HOUR_INTELLIGENT_ENABLED = str(os.getenv("TRADEBOT_ONE_HOUR_INTELLIGENT_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
 V18283_ONE_HOUR_RUNNER_MIN_PNL_PCT = max(0.10, float(os.getenv("TRADEBOT_ONE_HOUR_RUNNER_MIN_PNL_PCT", "0.75") or 0.75))
 V18283_ONE_HOUR_SMALL_GREEN_MIN_PNL_PCT = max(0.0, float(os.getenv("TRADEBOT_ONE_HOUR_SMALL_GREEN_MIN_PNL_PCT", "0.25") or 0.25))
@@ -2441,16 +2441,16 @@ def _v18293_stock_peak_profit_lock(position: Dict[str, Any]):
 
 
 def should_one_hour_profit_exit(position: Dict[str, Any]):
-    """V18.2.83: intelligent one-hour stock profit review.
+    """V18.3.04: one-hour stock *health review*, not a timed profit exit.
 
-    The old V18.2.28 rule sold every positive stock after the timer. V18.2.83
-    keeps the timer as a review point, but lets a genuine runner continue when
-    short momentum is still positive. A fading winner or a material rejection
-    from its post-entry peak is banked. Existing hard stops and Peak Exhaustion
-    still run before this rule.
+    Reaching 60 minutes no longer makes a healthy green position sell-eligible.
+    Peak Profit Lock, downside protection, Peak Exhaustion and News Intelligence
+    remain the primary exit mechanisms. The time review only releases capital
+    when a green position is genuinely stagnant/fading or has materially
+    deteriorated from its observed peak.
     """
     if not ONE_HOUR_PROFIT_EXIT_ENABLED:
-        return False, "one-hour profit exit disabled"
+        return False, "one-hour health review disabled"
 
     minutes = int(position.get("minutesSinceBuy") or 0)
     pnl_pct = float(position.get("pnlPct") or 0.0)
@@ -2462,13 +2462,13 @@ def should_one_hour_profit_exit(position: Dict[str, Any]):
     if minutes <= 0 or minutes >= 999999:
         return False, "position age unavailable"
     if minutes < ONE_HOUR_PROFIT_EXIT_MINUTES:
-        return False, f"held {minutes}m below {ONE_HOUR_PROFIT_EXIT_MINUTES}m profit timer"
+        return False, f"held {minutes}m below {ONE_HOUR_PROFIT_EXIT_MINUTES}m health review"
     if pnl_pct <= ONE_HOUR_PROFIT_EXIT_MIN_PNL_PCT:
-        return False, f"pnl {pnl_pct:.2f}% not above {ONE_HOUR_PROFIT_EXIT_MIN_PNL_PCT:.2f}%"
+        return False, f"pnl {pnl_pct:.2f}% not positive; other risk controls remain authoritative"
     if qty <= DUST_THRESHOLD or price <= 0 or not sell_notional_ok(qty, price):
-        return False, "position too small for full profit exit"
+        return False, "position too small for health-review exit"
 
-    # Compatibility switch: disabling intelligence restores the original timer.
+    # Compatibility switch: disabling intelligence restores the legacy timer.
     if not V18283_ONE_HOUR_INTELLIGENT_ENABLED:
         return True, f"legacy timer: held {minutes}m positive pnl={pnl_pct:.2f}%"
 
@@ -2481,32 +2481,41 @@ def should_one_hour_profit_exit(position: Dict[str, Any]):
     peak_pnl_pct = ((highest / entry) - 1.0) * 100.0 if highest > 0 and entry > 0 else pnl_pct
     giveback_pct = max(0.0, peak_pnl_pct - pnl_pct)
 
-    # A winner that has materially rejected its peak gets banked even if its
-    # latest momentum tick is temporarily positive. This protects green P&L.
+    # Once a stock has proved enough strength to arm Peak Profit Lock, the
+    # dedicated lock owns profit protection. Do not impose a second 60m clock.
+    if V18293_STOCK_PEAK_PROFIT_LOCK_ENABLED and peak_pnl_pct >= V18293_STOCK_PEAK_PROFIT_ARM_PCT:
+        return False, (
+            f"health review hold: peak lock owns winner peak={peak_pnl_pct:.2f}% "
+            f"now={pnl_pct:.2f}% giveback={giveback_pct:.2f}% momentum={momentum:.4f}"
+        )
+
+    # Any green position that is still stable/rising is healthy regardless of
+    # whether it has reached the old +0.25%/+0.75% buckets.
+    if momentum >= 0.0:
+        return False, (
+            f"health review hold: green/stable pnl={pnl_pct:.2f}% peak={peak_pnl_pct:.2f}% "
+            f"giveback={giveback_pct:.2f}% momentum={momentum:.4f}"
+        )
+
+    # Below the Peak Lock arm threshold, a material rejection plus negative
+    # momentum is genuine deterioration and can free the capital.
     if giveback_pct >= V18283_ONE_HOUR_PEAK_GIVEBACK_PCT:
         return True, (
-            f"intelligent bank: peak rejection {giveback_pct:.2f}% "
-            f"(peak={peak_pnl_pct:.2f}% now={pnl_pct:.2f}%)"
+            f"health review exit: deteriorating peak rejection={giveback_pct:.2f}% "
+            f"peak={peak_pnl_pct:.2f}% now={pnl_pct:.2f}% momentum={momentum:.4f}"
         )
 
-    # Strong winners are allowed to run while momentum remains non-negative.
-    if pnl_pct >= V18283_ONE_HOUR_RUNNER_MIN_PNL_PCT and momentum >= 0.0:
-        return False, (
-            f"intelligent hold runner: pnl={pnl_pct:.2f}% peak={peak_pnl_pct:.2f}% "
-            f"momentum={momentum:.4f}"
+    # A tiny green position that is still going backwards after an hour is
+    # treated as stagnant. Larger greens get more time unless another exit
+    # mechanism finds stronger evidence to close them.
+    if pnl_pct < V18283_ONE_HOUR_SMALL_GREEN_MIN_PNL_PCT:
+        return True, (
+            f"health review exit: stagnant green held={minutes}m pnl={pnl_pct:.2f}% "
+            f"peak={peak_pnl_pct:.2f}% momentum={momentum:.4f}"
         )
 
-    # Smaller winners get extra room only when they are actively accelerating.
-    if pnl_pct >= V18283_ONE_HOUR_SMALL_GREEN_MIN_PNL_PCT and momentum >= V18283_ONE_HOUR_RISING_MOMENTUM:
-        return False, (
-            f"intelligent hold rising: pnl={pnl_pct:.2f}% peak={peak_pnl_pct:.2f}% "
-            f"momentum={momentum:.4f}"
-        )
-
-    # Otherwise the one-hour review does what it was originally intended to do:
-    # bank a green position that is no longer proving continuation.
-    return True, (
-        f"intelligent bank fading: held={minutes}m pnl={pnl_pct:.2f}% "
+    return False, (
+        f"health review hold: no material deterioration held={minutes}m pnl={pnl_pct:.2f}% "
         f"peak={peak_pnl_pct:.2f}% giveback={giveback_pct:.2f}% momentum={momentum:.4f}"
     )
 
@@ -4926,7 +4935,7 @@ def manage_money_mode_positions():
                 # intentionally allowed after the timer, even when the legacy
                 # PDT-aware soft-profit hold would normally defer it. Broker-side
                 # PDT/account restrictions still remain authoritative.
-                market_sell_qty(symbol, qty, entry=entry, price=price, reason="ONE HOUR PROFIT EXIT")
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason="V18.3.04 ONE HOUR HEALTH REVIEW")
                 try:
                     if "v18230_record_one_hour_exit" in globals():
                         v18230_record_one_hour_exit(symbol, entry, price, qty)
@@ -4936,12 +4945,12 @@ def manage_money_mode_positions():
                 _v17_reset_peak_exhaustion(symbol)
                 _v17_reset_runner_trail(symbol)
                 print(
-                    f"V18.2.28 ONE HOUR PROFIT EXIT | {symbol} qty={qty:.6f} "
+                    f"V18.3.04 ONE HOUR HEALTH REVIEW EXIT | {symbol} qty={qty:.6f} "
                     f"held={int(p.get('minutesSinceBuy') or 0)}m pnl={float(p.get('pnlPct') or 0.0):.2f}% "
                     f"price={price:.2f} entry={entry:.2f} | {one_hour_profit_reason}"
                 )
             except Exception as e:
-                print(f"ONE HOUR PROFIT EXIT ERROR {symbol}: {e}")
+                print(f"V18.3.04 ONE HOUR HEALTH REVIEW ERROR {symbol}: {e}")
             continue
 
         partial_ok, partial_reason = should_partial_profit(p)
@@ -8751,7 +8760,7 @@ def build_status_payload(bot_name, scans):
             f"A+ GATE | enabled={A_PLUS_GATE_ENABLED} | min_conf={A_PLUS_MIN_CONFIDENCE} | min_quality={A_PLUS_MIN_QUALITY} | blacklist={len(temp_blacklist)}",
             f"PDT AWARE | enabled={PDT_AWARE_MODE_ENABLED} | today_buys={today_buy_count()}/{MAX_NEW_BUYS_PER_DAY_PDT_AWARE} | warnings={len(pdt_warning_events)}",
             f"FAST EXIT | enabled={FAST_EXIT_MODE_ENABLED} | partial={PARTIAL_PROFIT_TRIGGER_PCT}%/{int(PARTIAL_PROFIT_SELL_PCT*100)}% | stop={FAST_STOP_LOSS_PCT}% | stall={STALL_EXIT_AFTER_MINUTES}m",
-            f"1H PROFIT EXIT | enabled={ONE_HOUR_PROFIT_EXIT_ENABLED} | after={ONE_HOUR_PROFIT_EXIT_MINUTES}m | min_pnl=>{ONE_HOUR_PROFIT_EXIT_MIN_PNL_PCT:.2f}%",
+            f"V18.3.04 1H HEALTH REVIEW | enabled={ONE_HOUR_PROFIT_EXIT_ENABLED} | after={ONE_HOUR_PROFIT_EXIT_MINUTES}m | healthy_green=HOLD | stagnant_or_deteriorating=EXIT",
             f"MARKET | {market_status.get('label', 'UNKNOWN')}",
             f"ACCOUNT | equity={float(account.equity):.2f} | buying_power={float(account.buying_power):.2f}",
             f"POSITIONS | {len(positions)}",
