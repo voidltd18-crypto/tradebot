@@ -12248,12 +12248,26 @@ def _v18232_load_state() -> Dict[str, Any]:
         conn.close()
 
 
-def _v18232_shadow_buy(scan: Dict[str, Any]) -> bool:
+def _v18232_shadow_buy(scan: Dict[str, Any], research_explore: bool = False) -> bool:
     symbol = str(scan.get("symbol") or "").upper(); price = float(scan.get("price") or 0); score = float(scan.get("score") or 0)
     preset=_v18289_preset() if V18289_GOVERNOR_ENABLED else {"score":V18232_CRYPTO_ENTRY_SCORE,"ret15":-999,"ret60":-999}
-    if (not symbol or price <= 0 or score < float(preset.get("score", V18232_CRYPTO_ENTRY_SCORE))
-        or float(scan.get("return15mPct") or 0.0) < float(preset.get("ret15", -999))
-        or float(scan.get("return60mPct") or 0.0) < float(preset.get("ret60", -999))):
+    # V18.2.95: normal Shadow entries keep the governor preset. Exploratory
+    # research is Shadow-only and deliberately samples near-miss liquid markets
+    # without changing the live scanner/gates. It still rejects materially weak
+    # candidates so the lab does not manufacture random trades.
+    if research_explore:
+        explore_score = max(0.42, float(preset.get("score", V18232_CRYPTO_ENTRY_SCORE)) - 0.08)
+        explore_ret15 = max(-0.25, float(preset.get("ret15", -999)) - 0.45)
+        explore_ret60 = max(-0.25, float(preset.get("ret60", -999)) - 0.65)
+        gate_ok = (score >= explore_score
+                   and float(scan.get("return15mPct") or 0.0) >= explore_ret15
+                   and float(scan.get("return60mPct") or 0.0) >= explore_ret60
+                   and bool(scan.get("liquid")))
+    else:
+        gate_ok = (score >= float(preset.get("score", V18232_CRYPTO_ENTRY_SCORE))
+                   and float(scan.get("return15mPct") or 0.0) >= float(preset.get("ret15", -999))
+                   and float(scan.get("return60mPct") or 0.0) >= float(preset.get("ret60", -999)))
+    if not symbol or price <= 0 or not gate_ok:
         return False
     with _crypto_shadow_lock:
         data = _v18232_load_state(); positions = data["positions"]
@@ -12272,11 +12286,11 @@ def _v18232_shadow_buy(scan: Dict[str, Any]) -> bool:
                 VALUES (?,?,?,?,?,?,?,?)""", (symbol, qty, price, price, now, score, notional, now))
             conn.execute("""INSERT INTO v18232_crypto_trades
                 (timestamp,symbol,side,qty,price,notional_usd,pnl_usd,pnl_pct,score,reason,shadow_only)
-                VALUES (?,?,?,?,?,?,NULL,NULL,?,'CRYPTO SHADOW ENTRY',1)""", (now, symbol, "BUY", qty, price, notional, score))
+                VALUES (?,?,?,?,?,?,NULL,NULL,?,?,1)""", (now, symbol, "BUY", qty, price, notional, score, 'V18.2.95 RESEARCH EXPLORE ENTRY' if research_explore else 'CRYPTO SHADOW ENTRY'))
             conn.commit()
         finally:
             conn.close()
-        print(f"V18.2.32 CRYPTO SHADOW BUY | {symbol} price={price:.8f} notional=${notional:.2f} score={score:.3f} live_orders=False")
+        print(f"V18.2.32 CRYPTO SHADOW BUY | {symbol} price={price:.8f} notional=${notional:.2f} score={score:.3f} mode={'RESEARCH_EXPLORE' if research_explore else 'QUALIFIED'} live_orders=False")
         return True
 
 
@@ -12350,11 +12364,27 @@ def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
     shadow_slots = max(0, V18232_CRYPTO_MAX_POSITIONS - len(data["positions"]))
     shadow_opened = 0
     if shadow_slots > 0:
+        # Qualified candidates always get first priority.
         for scan in scans:
             if shadow_opened >= shadow_slots:
                 break
             if scan.get("qualified") and _v18232_shadow_buy(scan):
                 shadow_opened += 1
+        # V18.2.95: while the autonomous governor is in Shadow Research, use
+        # remaining virtual slots for near-miss liquid candidates. These are
+        # simulations only; live crypto entry qualification is untouched.
+        if V18289_GOVERNOR_ENABLED and _v18289_governor_shadow_only() and shadow_opened < shadow_slots:
+            explore_opened = 0
+            for scan in scans:
+                if shadow_opened >= shadow_slots:
+                    break
+                if scan.get("qualified"):
+                    continue
+                if _v18232_shadow_buy(scan, research_explore=True):
+                    shadow_opened += 1
+                    explore_opened += 1
+            if explore_opened:
+                print(f"V18.2.95 EXPLORATORY SHADOW SAMPLING | opened={explore_opened} total_opened={shadow_opened} slots={V18232_CRYPTO_MAX_POSITIONS} live_orders=False", flush=True)
     if shadow_opened:
         print(
             f"V18.2.94 PARALLEL SHADOW RESEARCH | opened={shadow_opened} "

@@ -614,14 +614,16 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     ]);
 
     const timeoutFor = (key: string) => {
-      if (key === "reports") return 90000;
-      if (["operationsDoctor", "operationsEngineHealth", "operator", "ceoStatus", "boardStatus"].includes(key)) return 45000;
-      if (["memoryKnowledge", "scientistHypotheses", "scientistExperiments", "operationsHistory"].includes(key)) return 30000;
-      return 22000;
+      if (key === "reports") return 120000;
+      // V18.2.96: Render can be busy with scanner/research/SQLite work. Intelligence
+      // endpoints are allowed a full minute so a healthy-but-busy service is not
+      // incorrectly reported as offline during PDF collection.
+      if (["advisor", "research", "operationsDoctor", "operationsEngineHealth", "operator", "ceoStatus", "ceoReviews", "boardStatus", "boardHistory", "memoryKnowledge", "scientistHypotheses", "scientistExperiments", "operationsComponents", "operationsHistory", "v8Status"].includes(key)) return 60000;
+      return 35000;
     };
 
     const fetchReportEndpoint = async (key: string, endpoint: string): Promise<EndpointState> => {
-      const maxAttempts = criticalKeys.has(key) ? 3 : 2;
+      const maxAttempts = criticalKeys.has(key) ? 4 : 2;
       let lastMessage = "Failed to load";
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         const controller = new AbortController();
@@ -666,8 +668,9 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       let cursor = 0;
       let completed = 0;
 
-      // Only two concurrent report requests. This avoids starving Render/SQLite while still
-      // collecting the complete report reasonably quickly.
+      // V18.2.96: collect one endpoint at a time. The previous two-way fan-out could
+      // overlap expensive Advisor/Research/Operations SQLite work and make Render
+      // shed otherwise healthy requests as "Failed to fetch".
       const worker = async () => {
         while (cursor < entries.length) {
           const index = cursor++;
@@ -681,7 +684,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         }
       };
 
-      await Promise.all(Array.from({ length: 2 }, () => worker()));
+      await worker();
 
       const failedCritical = [...criticalKeys]
         .filter((key) => results[key]?.error)
