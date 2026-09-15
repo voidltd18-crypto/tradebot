@@ -598,6 +598,16 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const exportFullBotReport = async () => {
     if (!authToken || exportBusy) return;
     let exportSucceeded = false;
+    let exportStage = "starting export";
+    const describeExportError = (error: unknown) => {
+      if (error instanceof Error && error.message) return error.message;
+      if (typeof error === "string" && error.trim()) return error;
+      try {
+        const text = JSON.stringify(error);
+        if (text && text !== "{}") return text;
+      } catch {}
+      return String(error || "Unknown browser error");
+    };
     setExportBusy(true);
     setExportProgress("Preparing report snapshot…");
     const headers = { "X-Auth-Token": authToken, "x-api-key": authToken };
@@ -653,6 +663,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     };
 
     try {
+      exportStage = "collecting report endpoints";
       // Put the account/governance truth first, then the heavier evidence/history endpoints.
       const priority = [
         "status", "banking", "reports", "advisor", "operator", "promotion",
@@ -722,11 +733,13 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         throw new Error("The complete report snapshot did not finish rendering in time.");
       };
 
+      exportStage = "rendering complete report";
       const element = await waitForReport();
       if (document.fonts?.ready) await document.fonts.ready;
       await new Promise((resolve) => window.setTimeout(resolve, 850));
       setExportProgress("Capturing PDF pages…");
 
+      exportStage = "loading PDF libraries";
       const [{ default: html2canvas }, jsPdfModule] = await Promise.all([
         import("html2canvas"),
         import("jspdf"),
@@ -746,6 +759,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       for (let sectionIndex = 0; sectionIndex < sections.length; sectionIndex += 1) {
         const sectionElement = sections[sectionIndex];
         setExportProgress(`Capturing section ${sectionIndex + 1}/${sections.length}…`);
+        exportStage = `capturing section ${sectionIndex + 1}/${sections.length}`;
         const canvas = await html2canvas(sectionElement, {
           scale: 1.25,
           useCORS: true,
@@ -769,10 +783,12 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           if (!context) continue;
           context.drawImage(canvas, 0, y, canvas.width, currentSliceHeight, 0, 0, canvas.width, currentSliceHeight);
 
-          const imageData = slice.toDataURL("image/jpeg", 0.92);
+          exportStage = `encoding section ${sectionIndex + 1}/${sections.length}`;
+          const imageData = slice.toDataURL("image/jpeg", 0.90);
           const imageHeightMm = currentSliceHeight / pxPerMm;
           if (!firstPage) pdf.addPage("a4", "landscape");
           firstPage = false;
+          exportStage = `assembling section ${sectionIndex + 1}/${sections.length}`;
           pdf.addImage(imageData, "JPEG", margin, margin, usableWidth, imageHeightMm, undefined, "FAST");
         }
       }
@@ -786,10 +802,17 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         now.getFullYear(),
       ].join("-") + "_" + [String(now.getHours()).padStart(2, "0"), String(now.getMinutes()).padStart(2, "0")].join("-");
 
+      exportStage = "saving PDF";
+      setExportProgress("Saving PDF…");
+      // Yield one paint so the capture DOM stays mounted until jsPDF has fully assembled the document.
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
       pdf.save(`TradeBot_FULL_BOT_REPORT_${stamp}.pdf`);
+      await new Promise((resolve) => window.setTimeout(resolve, 250));
       exportSucceeded = true;
-    } catch (error: any) {
-      window.alert(`Full bot PDF export failed: ${error?.message || "Unknown error"}`);
+    } catch (error: unknown) {
+      const detail = describeExportError(error);
+      console.error("V18.2.98 PDF EXPORT FAILURE", { stage: exportStage, error });
+      window.alert(`Full bot PDF export failed during ${exportStage}: ${detail}`);
     } finally {
       setExportingPdf(false);
       setExportBusy(false);
