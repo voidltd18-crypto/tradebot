@@ -11644,7 +11644,10 @@ def v18230_evidence_worker():
 # brokerage positions.
 # =========================
 V18232_CRYPTO_SHADOW_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_SHADOW_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
-V18232_CRYPTO_INTERVAL_SECONDS = max(60, int(os.getenv("TRADEBOT_CRYPTO_SHADOW_INTERVAL_SECONDS", "300") or 300))
+# V18.3.08 — high-speed Shadow Research cadence. This controls only the
+# evidence-only Shadow worker. Live crypto entry cadence remains separately
+# controlled by V18242_CRYPTO_LIVE_INTERVAL_SECONDS.
+V18232_CRYPTO_INTERVAL_SECONDS = max(60, int(os.getenv("TRADEBOT_CRYPTO_SHADOW_INTERVAL_SECONDS", "60") or 60))
 V18232_CRYPTO_CAPITAL_USD = max(10.0, float(os.getenv("TRADEBOT_CRYPTO_SHADOW_CAPITAL_USD", "250") or 250))
 V18232_CRYPTO_POSITION_PCT = max(0.05, min(1.0, float(os.getenv("TRADEBOT_CRYPTO_SHADOW_POSITION_PCT", "0.95") or 0.95)))
 V18232_CRYPTO_MAX_POSITIONS = max(1, min(100, int(os.getenv("TRADEBOT_CRYPTO_SHADOW_MAX_POSITIONS", "100") or 100)))
@@ -12643,6 +12646,25 @@ def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
             f"slots={V18232_CRYPTO_MAX_POSITIONS} live_orders=False",
             flush=True,
         )
+    # V18.3.08: explicit per-cycle research telemetry so Render shows whether
+    # cadence, candidate quality, liquidity or occupied symbols are the bottleneck.
+    # This is observational only and does not relax any governor threshold.
+    try:
+        _preset = _v18289_preset() if V18289_GOVERNOR_ENABLED else {"score":V18232_CRYPTO_ENTRY_SCORE,"ret15":-999,"ret60":-999}
+        _es = max(0.42, float(_preset.get("score", V18232_CRYPTO_ENTRY_SCORE)) - 0.08)
+        _e15 = max(-0.25, float(_preset.get("ret15", -999)) - 0.45)
+        _e60 = max(-0.25, float(_preset.get("ret60", -999)) - 0.65)
+        _qualified = sum(1 for x in scans if bool(x.get("qualified")))
+        _explore = sum(1 for x in scans if (not bool(x.get("qualified"))) and bool(x.get("liquid")) and float(x.get("score") or 0.0) >= _es and float(x.get("return15mPct") or 0.0) >= _e15 and float(x.get("return60mPct") or 0.0) >= _e60)
+        _active = len(_v18232_load_state()["positions"])
+        print(
+            f"V18.3.08 FAST SHADOW | universe={len(scans)} scanned={len(scans)} "
+            f"qualified={_qualified} exploratory={_explore} opened={shadow_opened} "
+            f"active={_active}/{V18232_CRYPTO_MAX_POSITIONS} next={V18232_CRYPTO_INTERVAL_SECONDS}s live_orders=False",
+            flush=True,
+        )
+    except Exception as _fast_shadow_log_exc:
+        print(f"V18.3.08 FAST SHADOW TELEMETRY DEFERRED | error={str(_fast_shadow_log_exc)[:300]} live_orders=False", flush=True)
     conn = db_connect()
     try:
         conn.execute("UPDATE v18232_crypto_state SET last_scan_at=?,last_error=NULL,updated_at=? WHERE id=1", (now, now)); conn.commit()
