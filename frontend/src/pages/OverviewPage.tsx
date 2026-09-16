@@ -8,6 +8,7 @@ import type { ActionFn, AnyObj, PositionStyleFn } from "../lib/types";
 
 export function OverviewPage({ data, banking, message, positions, trades, rate, bestCandidate, aiConfidence, marketRegime, riskLabel, currentAction, botHealth, aiReasons, positionSettings, fetchData, action, positionGlowStyle, onExportFullBot, exportBusy, authToken }: { data: AnyObj; banking: AnyObj; message: string; positions: AnyObj[]; trades: AnyObj[]; rate: number; bestCandidate?: AnyObj; aiConfidence: number; marketRegime: string; riskLabel: string; currentAction: string; botHealth: number; aiReasons: string[]; positionSettings: AnyObj; fetchData: (force?: boolean) => Promise<void>; action: ActionFn; positionGlowStyle: PositionStyleFn; onExportFullBot: () => void; exportBusy: boolean; authToken: string }) {
   const [taxCentre, setTaxCentre] = useState<AnyObj | null>(null);
+  const [cryptoBridge, setCryptoBridge] = useState<AnyObj | null>(null);
   const [replay, setReplay] = useState<ReplayTarget | null>(null);
   const maxPositions = Number(data?.maxPositions || positionSettings?.maxPositions || 0);
   const vault = banking?.profitVault || data?.banking?.profitVault || {};
@@ -23,6 +24,19 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
     };
     loadTax();
     const id = window.setInterval(loadTax, 30000);
+    return () => { alive = false; window.clearInterval(id); };
+  }, [authToken]);
+  useEffect(() => {
+    let alive = true;
+    const loadBridge = async () => {
+      try {
+        const res = await fetch(`${API_URL}/v18/crypto-bridge`, { cache: "no-store", headers: { "X-API-Key": authToken, "X-Auth-Token": authToken } });
+        const body = await res.json();
+        if (alive && res.ok && body?.ok !== false) setCryptoBridge(body);
+      } catch { /* home research cards keep their last good snapshot */ }
+    };
+    loadBridge();
+    const id = window.setInterval(loadBridge, 10000);
     return () => { alive = false; window.clearInterval(id); };
   }, [authToken]);
   const market = data?.market || {};
@@ -57,6 +71,22 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
         <span className="report-icon">▤</span>
         <span><strong>{exportBusy ? "BUILDING FULL BOT REPORT..." : "EXPORT FULL BOT REPORT PDF"}</strong><small>Everything included · V17.9 · V18 · V18.1 · all AI systems</small></span>
       </button>
+    </section>
+
+    <section className="home-research-showcase">
+      <div className="home-shadow-card">
+        <div className="home-research-title"><span className="home-research-icon">◒</span><div><small>CRYPTO LAB</small><h2>Shadow Research</h2><p>Real-market paper testing · live crypto remains {cryptoBridge?.shadowOnly === false ? "governed" : "paused"}</p></div><span className="home-research-pill">{cryptoBridge?.shadowOnly === false ? "LIVE STAGE" : "SHADOW ONLY"}</span></div>
+        <div className="home-research-kpis">
+          <div><strong>{Number(cryptoBridge?.shadowEvidence?.closedTests || 0)}</strong><span>Total tests</span></div>
+          <div><strong className={Number(cryptoBridge?.shadowEvidence?.totalPnlUsd || 0) >= 0 ? "positive" : "negative"}>${Number(cryptoBridge?.shadowEvidence?.totalPnlUsd || 0).toFixed(2)}</strong><span>Total P&amp;L</span></div>
+          <div><strong>{Number(cryptoBridge?.shadowEvidence?.winRate || 0).toFixed(2)}%</strong><span>Win rate</span></div>
+        </div>
+      </div>
+      <div className="home-governor-card">
+        <div className="home-research-title"><span className="home-research-icon governor">⚙</span><div><small>AUTONOMOUS GOVERNOR</small><h2>Governor</h2><p>Tests, rejects and promotes crypto strategies from evidence</p></div><span className="home-research-pill governor">GEN {Number(cryptoBridge?.cryptoGovernor?.generation || 1)}</span></div>
+        <div className="home-governor-generation"><span>Current generation</span><strong>Gen {Number(cryptoBridge?.cryptoGovernor?.generation || 1)} · {cryptoBridge?.cryptoGovernor?.preset?.name || "Research"}</strong><div className="home-governor-progress"><i style={{width:`${Math.min(100, (Number(cryptoBridge?.cryptoGovernor?.research?.trades || 0) / Math.max(1, Number(cryptoBridge?.cryptoGovernor?.researchTargetTrades || 50))) * 100)}%`}} /></div><small>{Number(cryptoBridge?.cryptoGovernor?.research?.trades || 0)} / {Number(cryptoBridge?.cryptoGovernor?.researchTargetTrades || 50)} research trades</small></div>
+        <div className="home-governor-kpis"><div><strong className={Number(cryptoBridge?.cryptoGovernor?.research?.expectancyUsd || 0) >= 0 ? "positive" : "negative"}>${Number(cryptoBridge?.cryptoGovernor?.research?.expectancyUsd || 0).toFixed(2)}</strong><span>Expectancy / trade</span></div><div><strong>{Number(cryptoBridge?.cryptoGovernor?.researchMaxHoldMinutes || 45)}m</strong><span>Max hold</span></div><div><strong>{String(cryptoBridge?.cryptoGovernor?.mode || "SHADOW_RESEARCH").replaceAll("_", " ")}</strong><span>Mode</span></div></div>
+      </div>
     </section>
 
     <Card title="Quick Actions" wide className="quick-actions-card">
