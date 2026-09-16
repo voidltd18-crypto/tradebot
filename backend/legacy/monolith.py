@@ -11660,6 +11660,16 @@ V18245_CRYPTO_DYNAMIC_UNIVERSE = str(os.getenv("TRADEBOT_CRYPTO_DYNAMIC_UNIVERSE
 V18245_CRYPTO_UNIVERSE_REFRESH_SECONDS = max(300, int(os.getenv("TRADEBOT_CRYPTO_UNIVERSE_REFRESH_SECONDS", "900") or 900))
 V18245_CRYPTO_SCAN_BATCH_SIZE = max(5, min(50, int(os.getenv("TRADEBOT_CRYPTO_SCAN_BATCH_SIZE", "20") or 20)))
 V18245_CRYPTO_MIN_60M_NOTIONAL_USD = max(0.0, float(os.getenv("TRADEBOT_CRYPTO_MIN_60M_NOTIONAL_USD", "5000") or 5000))
+
+# V18.3.07 — 100-market Shadow Research expansion.
+# Alpaca currently exposes far fewer than 100 directly tradable USD crypto pairs.
+# Shadow Research can therefore supplement the Alpaca scan with public Kraken USD
+# market data. These extra markets are simulation-only: they are never passed to
+# the live crypto execution cycle and cannot place real orders.
+V18307_SHADOW_RESEARCH_UNIVERSE_TARGET = max(36, min(100, int(os.getenv("TRADEBOT_CRYPTO_SHADOW_UNIVERSE_TARGET", "100") or 100)))
+V18307_SHADOW_EXTERNAL_MARKETS_ENABLED = str(os.getenv("TRADEBOT_CRYPTO_SHADOW_EXTERNAL_MARKETS", "true")).lower() in ("1", "true", "yes", "on")
+V18307_KRAKEN_MARKET_REFRESH_SECONDS = max(900, int(os.getenv("TRADEBOT_CRYPTO_SHADOW_MARKET_REFRESH_SECONDS", "1800") or 1800))
+_v18307_kraken_market_cache = {"at": 0.0, "pairs": []}
 # V18.2.53 — Adaptive crypto liquidity gate. Alpaca bar-volume estimates vary a lot
 # between pairs and can make a single fixed $5k gate reject the entire market.
 # Keep the hard $5k safety target, but when the whole market is below it allow only
@@ -12467,10 +12477,100 @@ def _v18232_shadow_sell(position: Dict[str, Any], price: float, score: float, re
     return True
 
 
+def _v18307_kraken_shadow_scans(existing_symbols: set, needed: int) -> List[Dict[str, Any]]:
+    """Return up to `needed` extra USD crypto scans from Kraken public data.
+
+    V18.3.07 research-only expansion. No Kraken credentials are used and these
+    scans are never handed to the live execution engine.
+    """
+    if not V18307_SHADOW_EXTERNAL_MARKETS_ENABLED or needed <= 0:
+        return []
+    try:
+        now_epoch = time.time()
+        cached_pairs = list(_v18307_kraken_market_cache.get("pairs") or [])
+        if not cached_pairs or now_epoch - float(_v18307_kraken_market_cache.get("at") or 0.0) >= V18307_KRAKEN_MARKET_REFRESH_SECONDS:
+            r = requests.get("https://api.kraken.com/0/public/AssetPairs", timeout=15)
+            r.raise_for_status()
+            payload = r.json() if r.content else {}
+            result = payload.get("result") or {}
+            pairs = []
+            for api_pair, meta in result.items():
+                if not isinstance(meta, dict):
+                    continue
+                ws = str(meta.get("wsname") or "").upper().strip()
+                if not ws.endswith("/USD"):
+                    continue
+                base = ws.split("/", 1)[0]
+                if base in ("USD", "USDT", "USDC", "DAI", "PYUSD", "EUR", "GBP"):
+                    continue
+                display_base = "BTC" if base == "XBT" else base
+                symbol = f"{display_base}/USD"
+                if symbol in existing_symbols:
+                    continue
+                pairs.append((symbol, str(api_pair)))
+            pairs.sort(key=lambda x: x[0])
+            _v18307_kraken_market_cache.update({"at": now_epoch, "pairs": pairs})
+            cached_pairs = pairs
+        selected = [(sym, pair) for sym, pair in cached_pairs if sym not in existing_symbols][:needed]
+        if not selected:
+            return []
+
+        def fetch_one(item):
+            symbol, api_pair = item
+            rr = requests.get("https://api.kraken.com/0/public/OHLC", params={"pair": api_pair, "interval": 5}, timeout=12)
+            rr.raise_for_status()
+            body = rr.json() if rr.content else {}
+            result = body.get("result") or {}
+            rows = next((v for k, v in result.items() if k != "last" and isinstance(v, list)), [])
+            rows = rows[-20:]
+            if len(rows) < 4:
+                return None
+            def close(row): return float(row[4] or 0.0)
+            price = close(rows[-1]); close15 = close(rows[-4]); close60 = close(rows[-13]) if len(rows) >= 13 else close(rows[0])
+            if price <= 0 or close15 <= 0 or close60 <= 0:
+                return None
+            ret15 = ((price / close15) - 1.0) * 100.0
+            ret60 = ((price / close60) - 1.0) * 100.0
+            recent = rows[-12:]
+            highs = [float(x[2] or price) for x in recent]; lows = [float(x[3] or price) for x in recent]
+            hi = max(highs); lo = min(lows); range60 = ((hi / lo) - 1.0) * 100.0 if lo > 0 else 0.0
+            notional60 = sum(max(0.0, float(x[6] or 0.0)) * max(0.0, float(x[4] or price)) for x in recent)
+            last6 = rows[-6:]; avg6 = sum(close(x) for x in last6) / max(1, len(last6)); trend = 1.0 if price >= avg6 else 0.0
+            momentum15 = _v18232_clamp((ret15 + 0.35) / 2.50); momentum60 = _v18232_clamp((ret60 + 0.75) / 5.00)
+            range_quality = _v18232_clamp(1.0 - abs(range60 - 2.0) / 5.0)
+            score = _v18232_clamp(0.38 * momentum15 + 0.34 * momentum60 + 0.18 * trend + 0.10 * range_quality)
+            liquid = bool(notional60 >= V18253_CRYPTO_MIN_ADAPTIVE_NOTIONAL_USD)
+            regime = _v18273_last_regime or {"name":"mixed", "entryScore":V18232_CRYPTO_ENTRY_SCORE, "min15mPct":0.0, "min60mPct":0.05}
+            qualified = bool(score >= float(regime.get("entryScore") or V18232_CRYPTO_ENTRY_SCORE) and liquid and ret15 >= float(regime.get("min15mPct") or 0.0) and ret60 >= float(regime.get("min60mPct") or 0.0))
+            return {"symbol":symbol,"price":round(price,8),"score":round(score,4),"return15mPct":round(ret15,4),"return60mPct":round(ret60,4),"range60mPct":round(range60,4),"liquidity60mUsd":round(notional60,2),"liquid":liquid,"entryMomentumOk":True,"qualified":qualified,"bars":len(rows),"source":"kraken_shadow_research_5min","marketRegime":str(regime.get("name") or "mixed"),"shadowResearchOnly":True}
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        scans = []
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = [pool.submit(fetch_one, item) for item in selected]
+            for fut in as_completed(futures):
+                try:
+                    row = fut.result()
+                    if row:
+                        scans.append(row)
+                except Exception:
+                    continue
+        scans.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+        print(f"V18.3.07 SHADOW RESEARCH UNIVERSE | alpaca={len(existing_symbols)} external={len(scans)} total={len(existing_symbols)+len(scans)} target={V18307_SHADOW_RESEARCH_UNIVERSE_TARGET} live_orders=False", flush=True)
+        return scans
+    except Exception as exc:
+        print(f"V18.3.07 SHADOW RESEARCH UNIVERSE DEFERRED | error={str(exc)[:300]} live_orders=False", flush=True)
+        return []
+
+
 def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
     if not V18232_CRYPTO_SHADOW_ENABLED:
         return {"ok": True, "enabled": False, "scans": 0}
-    _v18232_ensure_state(); scans = _v18232_fetch_scans(); scan_map = {s["symbol"]: s for s in scans}; now = datetime.now(UTC).isoformat()
+    _v18232_ensure_state(); live_scans = _v18232_fetch_scans(); scans = list(live_scans)
+    if V18289_GOVERNOR_ENABLED and _v18289_governor_shadow_only() and len(scans) < V18307_SHADOW_RESEARCH_UNIVERSE_TARGET:
+        scans.extend(_v18307_kraken_shadow_scans({str(x.get("symbol") or "").upper() for x in scans}, V18307_SHADOW_RESEARCH_UNIVERSE_TARGET - len(scans)))
+        scans.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+    scan_map = {s["symbol"]: s for s in scans}; now = datetime.now(UTC).isoformat()
     with _crypto_shadow_lock:
         _crypto_shadow_last_scans.clear(); _crypto_shadow_last_scans.extend(scans)
     data = _v18232_load_state()
@@ -12556,7 +12656,7 @@ def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
         (
     (lambda _v182772_started: (
         _v18276_engine_health.__setitem__("safetyCycles", int(_v18276_engine_health.get("safetyCycles") or 0) + 1),
-        v18234_crypto_live_cycle(scans, allow_normal_decisions=False),
+        v18234_crypto_live_cycle(live_scans, allow_normal_decisions=False),
         _v18276_engine_health.__setitem__("lastSafetyCycleAt", datetime.now(UTC).isoformat()),
         _v18276_engine_health.__setitem__("lastSafetyDurationMs", int((time.monotonic()-_v182772_started)*1000)),
         _v18276_engine_health.__setitem__("safetyCycleMaxMs", max(int(_v18276_engine_health.get("safetyCycleMaxMs") or 0), int((time.monotonic()-_v182772_started)*1000)))
