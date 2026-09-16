@@ -12763,6 +12763,19 @@ V18289_RESEARCH_MIN_PNL_USD = 5.00
 V18289_RESEARCH_MIN_WIN_RATE_PCT = 35.0
 V18289_RESEARCH_MAX_DRAWDOWN_USD = 15.0
 V18289_REDESIGN_CHECK_TRADES = 25
+# V18.3.09 — adaptive research checkpoint. Keep Gen 4 on the original 25-trade
+# redesign checkpoint for a clean comparison. From Gen 5 onward, clearly negative
+# generations can redesign after 15 completed Shadow exits; borderline/positive
+# generations continue toward the unchanged 50-trade promotion evidence target.
+V18309_ADAPTIVE_REDESIGN_FROM_GENERATION = 5
+V18309_ADAPTIVE_REDESIGN_CHECK_TRADES = 15
+
+def _v18309_research_redesign_check_trades(state: Optional[Dict[str, Any]]=None) -> int:
+    st = state or load_profit_vault_state()
+    generation = max(1, int(st.get("cryptoGovernorGeneration") or 1))
+    if generation >= V18309_ADAPTIVE_REDESIGN_FROM_GENERATION:
+        return V18309_ADAPTIVE_REDESIGN_CHECK_TRADES
+    return V18289_REDESIGN_CHECK_TRADES
 V18289_PILOT_MIN_TRADES = 15
 V18289_PILOT_MAX_ENTRY_ALLOCATION_PCT = 5.0
 V18289_LIVE_ROLLING_TRADES = 12
@@ -12824,7 +12837,7 @@ def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
         if passed:
             mode="PILOT_LIVE"; st["cryptoGovernorLiveBaseline"]=len(live); changed=True
             reason=f"Shadow graduated: {research['trades']} trades, expectancy ${research['expectancyUsd']:.2f}, P&L ${research['pnlUsd']:.2f}"
-        elif research["trades"]>=V18289_REDESIGN_CHECK_TRADES and research["expectancyUsd"]<=0:
+        elif research["trades"]>=_v18309_research_redesign_check_trades(st) and research["expectancyUsd"]<=0:
             st["cryptoGovernorPresetIndex"]=(int(st.get("cryptoGovernorPresetIndex") or 0)+1)%len(V18289_RESEARCH_PRESETS)
             st["cryptoGovernorGeneration"]=int(st.get("cryptoGovernorGeneration") or 1)+1
             st["cryptoGovernorShadowBaseline"]=len(shadow); research=_v18289_stats([]); changed=True
@@ -12848,6 +12861,7 @@ def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
             "reason":reason,"generation":int(st.get("cryptoGovernorGeneration") or 1),"preset":preset,
             "research":research,"pilotStats":pilot,"liveRolling":rolling,
             "researchTargetTrades":V18289_RESEARCH_MIN_TRADES,"pilotTargetTrades":V18289_PILOT_MIN_TRADES,
+            "redesignCheckTrades":_v18309_research_redesign_check_trades(st),
             "researchMaxHoldMinutes":V18291_SHADOW_RESEARCH_MAX_HOLD_MINUTES}
 
 def _v18289_governor_shadow_only() -> bool:
