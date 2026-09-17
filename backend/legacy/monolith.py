@@ -12837,6 +12837,28 @@ def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
         if passed:
             mode="PILOT_LIVE"; st["cryptoGovernorLiveBaseline"]=len(live); changed=True
             reason=f"Shadow graduated: {research['trades']} trades, expectancy ${research['expectancyUsd']:.2f}, P&L ${research['pnlUsd']:.2f}"
+        # V18.3.12 — hard decision at the full research target. Once a generation
+        # reaches 50 completed Shadow exits it must either graduate or redesign;
+        # it may not drift indefinitely beyond the evidence target waiting for
+        # its averages to improve. The earlier Gen-5+ 15-trade negative checkpoint
+        # remains in force as a fast-fail path.
+        elif research["trades"]>=V18289_RESEARCH_MIN_TRADES:
+            failed=[]
+            if research["expectancyUsd"] < V18289_RESEARCH_MIN_EXPECTANCY_USD:
+                failed.append(f"expectancy ${research['expectancyUsd']:.2f} < ${V18289_RESEARCH_MIN_EXPECTANCY_USD:.2f}")
+            if research["pnlUsd"] < V18289_RESEARCH_MIN_PNL_USD:
+                failed.append(f"P&L ${research['pnlUsd']:.2f} < ${V18289_RESEARCH_MIN_PNL_USD:.2f}")
+            if research["winRatePct"] < V18289_RESEARCH_MIN_WIN_RATE_PCT:
+                failed.append(f"win rate {research['winRatePct']:.1f}% < {V18289_RESEARCH_MIN_WIN_RATE_PCT:.1f}%")
+            if research["maxDrawdownUsd"] > V18289_RESEARCH_MAX_DRAWDOWN_USD:
+                failed.append(f"drawdown ${research['maxDrawdownUsd']:.2f} > ${V18289_RESEARCH_MAX_DRAWDOWN_USD:.2f}")
+            old_generation=int(st.get("cryptoGovernorGeneration") or 1)
+            st["cryptoGovernorPresetIndex"]=(int(st.get("cryptoGovernorPresetIndex") or 0)+1)%len(V18289_RESEARCH_PRESETS)
+            st["cryptoGovernorGeneration"]=old_generation+1
+            st["cryptoGovernorShadowBaseline"]=len(shadow); research=_v18289_stats([]); changed=True
+            reason=(f"Gen {old_generation} reached {V18289_RESEARCH_MIN_TRADES} trades without graduation "
+                    f"({'; '.join(failed) if failed else 'graduation criteria not met'}); "
+                    f"redesigned to {_v18289_preset(st)['name']}")
         elif research["trades"]>=_v18309_research_redesign_check_trades(st) and research["expectancyUsd"]<=0:
             st["cryptoGovernorPresetIndex"]=(int(st.get("cryptoGovernorPresetIndex") or 0)+1)%len(V18289_RESEARCH_PRESETS)
             st["cryptoGovernorGeneration"]=int(st.get("cryptoGovernorGeneration") or 1)+1
