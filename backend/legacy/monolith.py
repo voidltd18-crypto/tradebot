@@ -12812,8 +12812,64 @@ def _v18289_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 def _v18289_live_exit_rows() -> List[Dict[str, Any]]:
     return [r for r in _v18277_ledger_rows(limit=10000) if r.get("event")=="logical_exit"]
 
+# V18.3.13 — ADAPTIVE / EVOLUTIONARY CRYPTO GOVERNOR
+# Failed Shadow generations now produce a bounded child strategy instead of
+# endlessly rotating the same three static presets. Promotion evidence and all
+# account/live safety controls remain unchanged.
+V18313_EVOLUTION_ENABLED = True
+V18313_SCORE_BOUNDS = (0.48, 0.72)
+V18313_RET15_BOUNDS = (0.15, 0.75)
+V18313_RET60_BOUNDS = (0.30, 1.10)
+V18313_STOP_BOUNDS = (0.75, 1.50)
+V18313_TRAIL_START_BOUNDS = (0.75, 1.50)
+V18313_TRAIL_GIVEBACK_BOUNDS = (0.30, 0.60)
+
+def _v18313_clip(value: float, bounds) -> float:
+    return max(float(bounds[0]), min(float(bounds[1]), float(value)))
+
+def _v18313_evolve_preset(parent: Dict[str, Any], stats: Dict[str, Any], generation: int, fast_fail: bool=False):
+    child=dict(parent or V18289_RESEARCH_PRESETS[0])
+    changes=[]
+    exp=float(stats.get("expectancyUsd") or 0.0); pnl=float(stats.get("pnlUsd") or 0.0)
+    win=float(stats.get("winRatePct") or 0.0); dd=float(stats.get("maxDrawdownUsd") or 0.0)
+
+    # Poor hit-rate: demand stronger momentum/quality before entering.
+    if win < V18289_RESEARCH_MIN_WIN_RATE_PCT:
+        child["score"]=_v18313_clip(float(child["score"])+0.025, V18313_SCORE_BOUNDS)
+        child["ret15"]=_v18313_clip(float(child["ret15"])+0.05, V18313_RET15_BOUNDS)
+        child["ret60"]=_v18313_clip(float(child["ret60"])+0.05, V18313_RET60_BOUNDS)
+        changes.append("higher entry quality")
+
+    # Negative expectancy/P&L: reduce tolerated loss and lock winners sooner.
+    if exp < V18289_RESEARCH_MIN_EXPECTANCY_USD or pnl < V18289_RESEARCH_MIN_PNL_USD:
+        child["stop"]=_v18313_clip(float(child["stop"])-0.10, V18313_STOP_BOUNDS)
+        child["trailStart"]=_v18313_clip(float(child["trailStart"])-0.10, V18313_TRAIL_START_BOUNDS)
+        child["trailGiveback"]=_v18313_clip(float(child["trailGiveback"])-0.025, V18313_TRAIL_GIVEBACK_BOUNDS)
+        changes.append("tighter loss/profit capture")
+
+    # Excess drawdown gets an additional defensive mutation.
+    if dd > V18289_RESEARCH_MAX_DRAWDOWN_USD:
+        child["score"]=_v18313_clip(float(child["score"])+0.02, V18313_SCORE_BOUNDS)
+        child["stop"]=_v18313_clip(float(child["stop"])-0.10, V18313_STOP_BOUNDS)
+        changes.append("drawdown defence")
+
+    # If hit-rate is already respectable but edge is weak, improve selectivity
+    # without changing the fixed graduation bar.
+    if win >= V18289_RESEARCH_MIN_WIN_RATE_PCT and exp <= 0:
+        child["score"]=_v18313_clip(float(child["score"])+0.015, V18313_SCORE_BOUNDS)
+        child["ret15"]=_v18313_clip(float(child["ret15"])+0.025, V18313_RET15_BOUNDS)
+        changes.append("selectivity nudge")
+
+    child["name"]=f"Adaptive Gen {generation}"
+    reason=("fast-fail" if fast_fail else "50-trade decision") + ": " + (", ".join(changes) if changes else "bounded refinement")
+    return child, reason
+
 def _v18289_preset(state: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
-    st=state or load_profit_vault_state(); idx=int(st.get("cryptoGovernorPresetIndex") or 0) % len(V18289_RESEARCH_PRESETS)
+    st=state or load_profit_vault_state()
+    adaptive=st.get("cryptoGovernorAdaptivePreset")
+    if V18313_EVOLUTION_ENABLED and isinstance(adaptive, dict) and adaptive:
+        return dict(adaptive)
+    idx=int(st.get("cryptoGovernorPresetIndex") or 0) % len(V18289_RESEARCH_PRESETS)
     return dict(V18289_RESEARCH_PRESETS[idx])
 
 def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
@@ -12853,17 +12909,28 @@ def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
             if research["maxDrawdownUsd"] > V18289_RESEARCH_MAX_DRAWDOWN_USD:
                 failed.append(f"drawdown ${research['maxDrawdownUsd']:.2f} > ${V18289_RESEARCH_MAX_DRAWDOWN_USD:.2f}")
             old_generation=int(st.get("cryptoGovernorGeneration") or 1)
-            st["cryptoGovernorPresetIndex"]=(int(st.get("cryptoGovernorPresetIndex") or 0)+1)%len(V18289_RESEARCH_PRESETS)
-            st["cryptoGovernorGeneration"]=old_generation+1
+            parent=_v18289_preset(st)
+            next_generation=old_generation+1
+            child, evolution_reason=_v18313_evolve_preset(parent, research, next_generation, fast_fail=False)
+            st["cryptoGovernorAdaptivePreset"]=child
+            st["cryptoGovernorEvolutionParent"]={"generation":old_generation,"preset":parent,"stats":dict(research)}
+            st["cryptoGovernorEvolutionReason"]=evolution_reason
+            st["cryptoGovernorGeneration"]=next_generation
             st["cryptoGovernorShadowBaseline"]=len(shadow); research=_v18289_stats([]); changed=True
             reason=(f"Gen {old_generation} reached {V18289_RESEARCH_MIN_TRADES} trades without graduation "
                     f"({'; '.join(failed) if failed else 'graduation criteria not met'}); "
-                    f"redesigned to {_v18289_preset(st)['name']}")
+                    f"evolved to {child['name']} ({evolution_reason})")
         elif research["trades"]>=_v18309_research_redesign_check_trades(st) and research["expectancyUsd"]<=0:
-            st["cryptoGovernorPresetIndex"]=(int(st.get("cryptoGovernorPresetIndex") or 0)+1)%len(V18289_RESEARCH_PRESETS)
-            st["cryptoGovernorGeneration"]=int(st.get("cryptoGovernorGeneration") or 1)+1
+            old_generation=int(st.get("cryptoGovernorGeneration") or 1)
+            parent=_v18289_preset(st)
+            next_generation=old_generation+1
+            child, evolution_reason=_v18313_evolve_preset(parent, research, next_generation, fast_fail=True)
+            st["cryptoGovernorAdaptivePreset"]=child
+            st["cryptoGovernorEvolutionParent"]={"generation":old_generation,"preset":parent,"stats":dict(research)}
+            st["cryptoGovernorEvolutionReason"]=evolution_reason
+            st["cryptoGovernorGeneration"]=next_generation
             st["cryptoGovernorShadowBaseline"]=len(shadow); research=_v18289_stats([]); changed=True
-            reason=f"Research redesign triggered after negative expectancy; switched to {_v18289_preset(st)['name']}"
+            reason=f"Research redesign triggered after negative expectancy; evolved to {child['name']} ({evolution_reason})"
     elif mode=="PILOT_LIVE":
         # Pilot fails fast on meaningful negative evidence; otherwise needs 15 real exits to graduate.
         if pilot["trades"]>=5 and (pilot["expectancyUsd"]<0 or pilot["pnlUsd"]<=V18289_LIVE_FAIL_PNL_USD):
@@ -12884,7 +12951,10 @@ def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
             "research":research,"pilotStats":pilot,"liveRolling":rolling,
             "researchTargetTrades":V18289_RESEARCH_MIN_TRADES,"pilotTargetTrades":V18289_PILOT_MIN_TRADES,
             "redesignCheckTrades":_v18309_research_redesign_check_trades(st),
-            "researchMaxHoldMinutes":V18291_SHADOW_RESEARCH_MAX_HOLD_MINUTES}
+            "researchMaxHoldMinutes":V18291_SHADOW_RESEARCH_MAX_HOLD_MINUTES,
+            "evolutionEnabled":V18313_EVOLUTION_ENABLED,
+            "evolutionReason":st.get("cryptoGovernorEvolutionReason"),
+            "evolutionParent":st.get("cryptoGovernorEvolutionParent")}
 
 def _v18289_governor_shadow_only() -> bool:
     try: return bool(_v18289_governor_refresh(save=False).get("shadowOnly"))
