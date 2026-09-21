@@ -1,7 +1,11 @@
 import type { AnyObj } from "../lib/types";
 import { BOT_VERSION } from "../lib/api";
+import { ThemePicker, type ThemeId } from "./ThemePicker";
 
-export function Header({ status, data, marketLabel, onLogout }: { status: string; data: AnyObj; marketLabel: string; onLogout: () => void }) {
+export function Header({ status, data, marketLabel, onLogout, theme, setTheme }: {
+  status: string; data: AnyObj; marketLabel: string; onLogout: () => void;
+  theme: ThemeId; setTheme: (theme: ThemeId) => void;
+}) {
   return <header className="topbar command-topbar">
     <div>
       <p className="eyebrow">TRADEBOT · {BOT_VERSION}</p>
@@ -9,6 +13,7 @@ export function Header({ status, data, marketLabel, onLogout }: { status: string
       <p className="topbar-subtitle">AI-powered trading, research and autonomous governance</p>
     </div>
     <div className="pills command-pills">
+      <ThemePicker theme={theme} setTheme={setTheme} />
       <span className={`pill ${status === "Connected" ? "ok" : "warn"}`}>{status}</span>
       <span className={`pill ${data?.market?.isOpen ? "ok" : "warn"}`}>US Market {marketLabel}</span>
       <span className={`pill ${data?.botEnabled ? "ok" : "bad"}`}>Bot {data?.botEnabled ? "ON" : "OFF"}</span>

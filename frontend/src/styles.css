@@ -579,3 +579,44 @@ select,input,pre{background:#061b2a;border-color:rgba(73,166,196,.28)}
 .mobile-more-grid button.active{border-color:#59d0e8;background:linear-gradient(135deg,rgba(12,150,181,.42),rgba(8,38,58,.96))!important}
 .home-export-host .intelligence-page{background:#071b2a}
 ::selection{background:rgba(53,198,232,.32);color:#fff}
+
+/* V18.3.22 — THEME ENGINE · frontend only */
+.theme-picker{display:flex;align-items:center;gap:7px;padding:4px 7px 4px 10px;border:1px solid var(--line);border-radius:999px;background:rgba(7,29,44,.82);box-shadow:0 8px 24px rgba(0,0,0,.12)}
+.theme-picker-icon{font-size:15px}.theme-picker select{min-width:164px;padding:6px 28px 6px 8px;border:0;background:transparent;color:inherit;font-size:12px;font-weight:850;outline:none;cursor:pointer}.theme-picker option{color:#eaf8ff;background:#0a2234}
+@media(max-width:560px){.theme-picker{order:-1}.theme-picker select{min-width:145px}.command-pills{gap:6px!important}}
+
+html[data-theme="classic-dark"]{--bg:#070b18;--line:#263450;--muted:#94a3b8;--blue:#38bdf8;--green:#22c55e;--red:#fb7185;--yellow:#facc15;--purple:#8b5cf6;--ocean-edge:#263450;--ocean-text:#f8fafc}
+html[data-theme="classic-dark"],html[data-theme="classic-dark"] body{background:#070b18}html[data-theme="classic-dark"] body{background:radial-gradient(circle at top left,#13203c,#070b18 45%)}
+html[data-theme="classic-dark"] .card,html[data-theme="classic-dark"] .card.stat{background:linear-gradient(180deg,#0f172a,#09101f);border-color:#263450}html[data-theme="classic-dark"] .command-stats .card.stat{background:linear-gradient(160deg,#0f1c33,#0a1325)}
+html[data-theme="classic-dark"] .sidebar{background:linear-gradient(180deg,rgba(9,20,43,.98),rgba(5,13,30,.98));border-color:#1d2a44}html[data-theme="classic-dark"] .theme-picker{background:#111827}
+
+html[data-theme="arctic-glass"]{--bg:#dcebf3;--line:#a8c6d5;--muted:#5d7482;--blue:#087ea4;--green:#0b9b70;--red:#d9465f;--yellow:#b7791f;--purple:#6d5bd0;--ocean-edge:rgba(45,105,130,.22);--ocean-text:#102a3a}
+html[data-theme="arctic-glass"],html[data-theme="arctic-glass"] body{background:#dcebf3;color:#102a3a}html[data-theme="arctic-glass"] body{background:radial-gradient(circle at 12% 0,#f8fdff 0,transparent 32%),linear-gradient(145deg,#eaf5fa,#d4e8f1)}
+html[data-theme="arctic-glass"] .card,html[data-theme="arctic-glass"] .card.stat,html[data-theme="arctic-glass"] .command-stats .card.stat{background:rgba(247,252,255,.78);border-color:rgba(74,128,151,.24);box-shadow:0 18px 42px rgba(48,87,105,.12);backdrop-filter:blur(18px)}
+html[data-theme="arctic-glass"] .sidebar{background:rgba(236,247,251,.9);border-color:#b8d3df;box-shadow:0 20px 55px rgba(52,91,109,.14)}
+html[data-theme="arctic-glass"] h1,html[data-theme="arctic-glass"] h2,html[data-theme="arctic-glass"] h3,html[data-theme="arctic-glass"] .card strong{color:#102a3a}html[data-theme="arctic-glass"] .sidebar-tabs button{color:#294858!important}html[data-theme="arctic-glass"] .sidebar-tabs button.active{color:#fff!important;background:linear-gradient(90deg,#1189aa,#397fbd)!important}
+html[data-theme="arctic-glass"] .pill,html[data-theme="arctic-glass"] .theme-picker{background:rgba(247,252,255,.86);color:#17394a;border-color:#b5cfdb}html[data-theme="arctic-glass"] .theme-picker option,html[data-theme="arctic-glass"] select,html[data-theme="arctic-glass"] input,html[data-theme="arctic-glass"] pre{background:#f7fcff;color:#17394a}
+html[data-theme="arctic-glass"] .notice,html[data-theme="arctic-glass"] .universe-counts div,html[data-theme="arctic-glass"] .scan,html[data-theme="arctic-glass"] .position,html[data-theme="arctic-glass"] .search-card,html[data-theme="arctic-glass"] .log-list div{background:rgba(245,251,254,.82);color:#17394a;border-color:#c0d6df}
+html[data-theme="arctic-glass"] .position p,html[data-theme="arctic-glass"] td,html[data-theme="arctic-glass"] .scan p{color:#294858}html[data-theme="arctic-glass"] .mobile-nav-dock{background:rgba(239,249,252,.96)!important}
+
+html[data-theme="aurora"]{--bg:#100f2b;--line:#4b3d78;--muted:#a8a3c5;--blue:#5ee7f2;--green:#4adea8;--red:#fb7185;--yellow:#f7d36d;--purple:#c084fc;--ocean-edge:rgba(147,113,229,.32);--ocean-text:#f4f0ff}
+html[data-theme="aurora"],html[data-theme="aurora"] body{background:#100f2b}html[data-theme="aurora"] body{background:radial-gradient(circle at 12% -5%,rgba(28,214,198,.22),transparent 30%),radial-gradient(circle at 88% 4%,rgba(177,74,238,.26),transparent 34%),linear-gradient(145deg,#17143b,#0d132b 55%,#0a1825)}
+html[data-theme="aurora"] .card,html[data-theme="aurora"] .card.stat,html[data-theme="aurora"] .command-stats .card.stat{background:linear-gradient(155deg,rgba(34,27,70,.95),rgba(14,24,47,.97));border-color:rgba(139,105,213,.28)}html[data-theme="aurora"] .sidebar{background:linear-gradient(180deg,rgba(31,24,67,.98),rgba(12,20,42,.98));border-color:#49396f}
+html[data-theme="aurora"] .sidebar-tabs button.active{background:linear-gradient(90deg,rgba(132,65,210,.72),rgba(18,163,184,.40))!important}html[data-theme="aurora"] .theme-picker{background:rgba(35,27,70,.88)}html[data-theme="aurora"] .theme-picker option{background:#211a45}
+
+html[data-theme="trading-floor"]{--bg:#edf1f4;--line:#c7d0d8;--muted:#63717d;--blue:#1e5f8f;--green:#16845f;--red:#c94354;--yellow:#a56b13;--purple:#6657b8;--ocean-edge:#ccd5dc;--ocean-text:#17242d}
+html[data-theme="trading-floor"],html[data-theme="trading-floor"] body{background:#edf1f4;color:#17242d}html[data-theme="trading-floor"] body{background:linear-gradient(145deg,#f8fafb,#e8edf1)}
+html[data-theme="trading-floor"] .card,html[data-theme="trading-floor"] .card.stat,html[data-theme="trading-floor"] .command-stats .card.stat{background:#fff;border-color:#d0d8de;box-shadow:0 12px 30px rgba(31,49,61,.08)}
+html[data-theme="trading-floor"] .sidebar{background:linear-gradient(180deg,#15354b,#0e283b);border-color:#284c62;color:#fff}html[data-theme="trading-floor"] .sidebar-tabs button{color:#d8e7ef!important}html[data-theme="trading-floor"] .brand strong{color:#fff}
+html[data-theme="trading-floor"] h1,html[data-theme="trading-floor"] h2,html[data-theme="trading-floor"] h3,html[data-theme="trading-floor"] .card strong{color:#17242d}html[data-theme="trading-floor"] .pill,html[data-theme="trading-floor"] .theme-picker{background:#fff;color:#213743;border-color:#cbd5dc}
+html[data-theme="trading-floor"] .theme-picker option,html[data-theme="trading-floor"] select,html[data-theme="trading-floor"] input,html[data-theme="trading-floor"] pre{background:#fff;color:#17242d}
+html[data-theme="trading-floor"] .notice,html[data-theme="trading-floor"] .universe-counts div,html[data-theme="trading-floor"] .scan,html[data-theme="trading-floor"] .position,html[data-theme="trading-floor"] .search-card,html[data-theme="trading-floor"] .log-list div{background:#f8fafb;color:#17242d;border-color:#d5dde3}
+html[data-theme="trading-floor"] .position p,html[data-theme="trading-floor"] td,html[data-theme="trading-floor"] .scan p{color:#40535f}html[data-theme="trading-floor"] .mobile-nav-dock{background:rgba(21,53,75,.97)!important}
+
+html[data-theme="mission-control"]{--bg:#111a22;--line:#3c5363;--muted:#91a4b1;--blue:#5fb4d8;--green:#47c990;--red:#ef6d72;--yellow:#ffb547;--purple:#8f8adf;--ocean-edge:rgba(95,180,216,.24);--ocean-text:#eef5f8}
+html[data-theme="mission-control"],html[data-theme="mission-control"] body{background:#111a22}html[data-theme="mission-control"] body{background:linear-gradient(145deg,#1c2933,#111a22 55%,#0d151c)}
+html[data-theme="mission-control"] .card,html[data-theme="mission-control"] .card.stat,html[data-theme="mission-control"] .command-stats .card.stat{background:linear-gradient(160deg,#22313c,#17232c);border-color:#3a5262;box-shadow:0 15px 38px rgba(0,0,0,.22)}
+html[data-theme="mission-control"] .sidebar{background:linear-gradient(180deg,#1b2a35,#111c24);border-color:#415968}html[data-theme="mission-control"] .sidebar-tabs button.active{background:linear-gradient(90deg,rgba(25,110,143,.72),rgba(171,103,24,.32))!important;border-color:#5fb4d8!important}
+html[data-theme="mission-control"] .brand-mark{background:linear-gradient(135deg,#1683a8,#e28a2b)}html[data-theme="mission-control"] .theme-picker{background:#1b2a35}html[data-theme="mission-control"] .theme-picker option{background:#1b2a35}
+
+html[data-theme] .gain,html[data-theme] .positive{color:var(--green)!important}html[data-theme] .loss{color:var(--red)!important}

@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { DashboardStyles } from "./components/DashboardStyles";
 import { Header } from "./components/Header";
+import type { ThemeId } from "./components/ThemePicker";
 import { Login } from "./components/Login";
 import { Nav } from "./components/Nav";
 import { Stat } from "./components/Stat";
@@ -52,6 +53,15 @@ function PageLoading() {
 export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
   const [exportRequested, setExportRequested] = useState(false);
+  const [theme, setTheme] = useState<ThemeId>(() => {
+    if (typeof window === "undefined") return "midnight-ocean";
+    const saved = window.localStorage.getItem("tradebot-theme");
+    return (["midnight-ocean","classic-dark","arctic-glass","aurora","trading-floor","mission-control"].includes(saved || "") ? saved : "midnight-ocean") as ThemeId;
+  });
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem("tradebot-theme", theme);
+  }, [theme]);
   const isPhone = usePhoneLayout();
   const bot = useTradeBot(tab);
 
@@ -81,7 +91,7 @@ export default function App() {
     <div className="dashboard-shell">
       <Nav tab={tab} setTab={setTab} isPhone={isPhone} />
       <div className="dashboard-content">
-        <Header status={bot.status} data={bot.data} marketLabel={bot.marketLabel} onLogout={bot.secureLogout} />
+        <Header status={bot.status} data={bot.data} marketLabel={bot.marketLabel} onLogout={bot.secureLogout} theme={theme} setTheme={setTheme} />
 
         {tab !== "crypto" && <section className="stats command-stats">
           <Stat label="Equity" value={gbp(accountEquityGbp)} sub={usd(bot.data?.account?.equity)} />
