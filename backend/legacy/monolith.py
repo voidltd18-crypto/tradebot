@@ -12694,6 +12694,7 @@ def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
 
 def v18232_crypto_shadow_payload() -> Dict[str, Any]:
     _v18232_ensure_state(); data = _v18232_load_state(); state = data["state"]
+    governor = _v18289_governor_refresh(save=False)
     with _crypto_shadow_lock:
         scans = [dict(x) for x in _crypto_shadow_last_scans]
     price_map = {str(x.get("symbol")): float(x.get("price") or 0) for x in scans}
@@ -12814,6 +12815,7 @@ def _v18289_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 def _v18289_live_exit_rows() -> List[Dict[str, Any]]:
     return [r for r in _v18277_ledger_rows(limit=10000) if r.get("event")=="logical_exit"]
 
+# V18.3.16 — DB + EVIDENCE RECOVERY
 # V18.3.15 — EVIDENCE-MINED CRYPTO RESEARCH
 # Stop endless generation churn. Mine the accumulated Shadow ledger for repeatable
 # entry-score and symbol cohorts, run one evidence-derived candidate, then make a
@@ -12831,18 +12833,61 @@ def _v18315_score_bin(score: float) -> str:
     hi=min(1.0, lo+V18315_SCORE_BIN_WIDTH)
     return f"{lo:.2f}-{hi:.2f}"
 
+def _v18316_shadow_db_candidates() -> List[str]:
+    """Locate plausible persistent TradeBot DBs without mutating them.
+
+    V18.3.16 recovery path: a Render redeploy can point the process at a different
+    configured DB path while an older persistent trades.db still exists. We only
+    inspect known TradeBot state locations and select the copy containing the most
+    completed Shadow exits.
+    """
+    candidates=[]
+    for path in [
+        SQLITE_DB_FILE,
+        persistent_file("trades.db"),
+        "/var/data/trades.db",
+        os.path.join("backend", "state", "trades.db"),
+    ]:
+        path=os.path.abspath(str(path))
+        if path not in candidates and os.path.isfile(path): candidates.append(path)
+    return candidates
+
+
+def _v18316_read_shadow_rows() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    best_rows=[]; best_path=None; diagnostics=[]
+    for path in _v18316_shadow_db_candidates():
+        try:
+            # Read-only URI prevents recovery from creating or changing an old DB.
+            ro=sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
+            ro.row_factory=sqlite3.Row
+            exists=ro.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='v18232_crypto_trades'").fetchone()
+            if not exists:
+                diagnostics.append({"path":path,"sellRows":0,"usable":False}); ro.close(); continue
+            sell_count=int(ro.execute("SELECT COUNT(*) FROM v18232_crypto_trades WHERE UPPER(side)='SELL'").fetchone()[0] or 0)
+            rows=[dict(r) for r in ro.execute("SELECT id,timestamp,symbol,side,score,pnl_usd,pnl_pct,reason FROM v18232_crypto_trades ORDER BY id ASC").fetchall()]
+            ro.close(); diagnostics.append({"path":path,"sellRows":sell_count,"usable":True})
+            if sell_count > sum(1 for r in best_rows if str(r.get("side") or "").upper()=="SELL"):
+                best_rows=rows; best_path=path
+        except Exception as exc:
+            diagnostics.append({"path":path,"sellRows":0,"usable":False,"error":str(exc)[:160]})
+    return best_rows,{"selectedDb":best_path,"candidates":diagnostics}
+
+
 def _v18315_mine_shadow_evidence(force: bool=False) -> Dict[str, Any]:
     now=time.time()
-    if not force and _v18315_model_cache.get("data") is not None and now-float(_v18315_model_cache.get("at") or 0)<60:
+    if not force and _v18315_model_cache.get("data") is not None and now-float(_v18315_model_cache.get("at") or 0)<300:
         return dict(_v18315_model_cache["data"])
-    rows=[]
-    try:
-        conn=db_connect()
+    rows,recovery=_v18316_read_shadow_rows()
+    if not rows:
         try:
-            rows=[dict(r) for r in conn.execute("SELECT id,timestamp,symbol,side,score,pnl_usd,pnl_pct,reason FROM v18232_crypto_trades ORDER BY id ASC").fetchall()]
-        finally: conn.close()
-    except Exception:
-        rows=[]
+            snap_path=persistent_file("crypto_shadow_evidence_snapshot.json")
+            snap=json.loads(Path(snap_path).read_text()) if os.path.isfile(snap_path) else {}
+            old_model=snap.get("model") if isinstance(snap,dict) else None
+            if isinstance(old_model,dict) and int(old_model.get("pairedTrades") or 0)>0:
+                old_model=dict(old_model); old_model["recovery"]={**recovery,"snapshotFallback":True,"snapshotSavedAt":snap.get("savedAt")}
+                _v18315_model_cache.update({"at":now,"data":old_model})
+                return old_model
+        except Exception: pass
     open_buy={}; paired=[]
     for r in rows:
         sym=str(r.get("symbol") or "").upper()
@@ -12851,8 +12896,10 @@ def _v18315_mine_shadow_evidence(force: bool=False) -> Dict[str, Any]:
             open_buy[sym]=r
         elif str(r.get("side") or "").upper()=="SELL":
             b=open_buy.pop(sym, None)
-            if not b: continue
-            pnl=float(r.get("pnl_usd") or 0.0); score=float(b.get("score") or 0.0)
+            # Older ledgers can still provide a valid completed outcome even when
+            # its matching BUY row was compacted. Prefer BUY score, then SELL score.
+            score=float((b or {}).get("score") or r.get("score") or 0.0)
+            pnl=float(r.get("pnl_usd") or 0.0)
             paired.append({"symbol":sym,"score":score,"scoreBin":_v18315_score_bin(score),"pnlUsd":pnl,"pnlPct":float(r.get("pnl_pct") or 0.0),"exitReason":str(r.get("reason") or "")})
     def stats(items):
         n=len(items); pnl=sum(float(x["pnlUsd"]) for x in items); wins=sum(1 for x in items if float(x["pnlUsd"])>0)
@@ -12865,8 +12912,15 @@ def _v18315_mine_shadow_evidence(force: bool=False) -> Dict[str, Any]:
     good_syms=sorted([k for k,v in sym_stats.items() if v["trades"]>=V18315_MIN_SYMBOL_TRADES and v["expectancyUsd"]>=V18315_MIN_COHORT_EXPECTANCY_USD and v["pnlUsd"]>0])
     bad_syms=sorted([k for k,v in sym_stats.items() if v["trades"]>=V18315_MIN_SYMBOL_TRADES and v["expectancyUsd"]<=0])
     model={"pairedTrades":len(paired),"overall":stats(paired),"positiveScoreBins":good_bins,"positiveSymbols":good_syms,"blockedNegativeSymbols":bad_syms,
-           "scoreBins":bin_stats,"symbolStats":sym_stats,"exitReasonStats":reason_stats,
+           "scoreBins":bin_stats,"symbolStats":sym_stats,"exitReasonStats":reason_stats,"recovery":recovery,
            "limitations":["Historical ledger stores entry score, symbol and exit outcome, but not entry-time 15m/60m momentum; those fields cannot be retroactively mined."]}
+    # Persist the derived model separately so later deploys do not need a full
+    # ledger scan merely to render the dashboard. This contains research stats,
+    # not credentials or order instructions.
+    try:
+        snap=persistent_file("crypto_shadow_evidence_snapshot.json")
+        tmp=snap+".tmp"; Path(tmp).write_text(json.dumps({"savedAt":datetime.now(UTC).isoformat(),"model":model}, separators=(",",":"))); os.replace(tmp,snap)
+    except Exception: pass
     _v18315_model_cache.update({"at":now,"data":model})
     return dict(model)
 
@@ -17690,7 +17744,7 @@ def _v6_validate_source_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return {"valid":not reasons,"reasons":reasons}
 
 
-def _v6_source_rows(horizon_hours: int, limit: int) -> List[Dict[str, Any]]:
+def _v6_source_rows(horizon_hours: int, limit: int, min_decision_id: int = 0) -> List[Dict[str, Any]]:
     """Return independent observations only—one row per sample bucket and horizon."""
     init_db(); conn=db_connect()
     rows=[dict(r) for r in conn.execute(
@@ -17706,10 +17760,10 @@ def _v6_source_rows(horizon_hours: int, limit: int) -> List[Dict[str, Any]]:
                FROM v4_market_dna d
                JOIN v2_observation_outcomes o ON o.decision_id=d.decision_id
                WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL
-                 AND o.horizon_hours=?
+                 AND o.horizon_hours=? AND d.decision_id>?
            )
            SELECT * FROM ranked WHERE rn=1 ORDER BY observed_at ASC LIMIT ?""",
-        (max(1,int(horizon_hours)),max(1,min(int(limit),50000)))).fetchall()]
+        (max(1,int(horizon_hours)),max(0,int(min_decision_id)),max(1,min(int(limit),50000)))).fetchall()]
     conn.close()
     return rows
 
@@ -17740,6 +17794,18 @@ def v6_validation_report(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: i
                      "historicalCheckpointRequired":True,"maximumOutcomeDelayMinutes":V6_OUTCOME_MAX_DELAY_MINUTES}}
 
 
+def _v18316_v6_resume_decision_id(horizon_hours: int, brains: List[Dict[str, Any]]) -> int:
+    """Return the oldest fully-synchronised V6 frontier across all brains."""
+    if not brains: return 0
+    try:
+        conn=db_connect()
+        rows=conn.execute("SELECT brain_key, MAX(decision_id) AS max_id FROM v6_brain_observations WHERE horizon_hours=? GROUP BY brain_key", (int(horizon_hours),)).fetchall()
+        conn.close(); maxima={str(r[0]):int(r[1] or 0) for r in rows}
+        if any(str(b.get("key")) not in maxima for b in brains): return 0
+        return max(0, min(maxima.get(str(b.get("key")),0) for b in brains) - 500)
+    except Exception:
+        return 0
+
 def v6_sync_brains(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = 10000) -> Dict[str, Any]:
     if not SQLITE_ENABLED: return {"ok":False,"message":"SQLite disabled"}
     if not V6_BRAINS_ENABLED: return {"ok":False,"message":"V6 brains disabled"}
@@ -17747,8 +17813,9 @@ def v6_sync_brains(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = 1
     batch_size=max(50,min(int(os.getenv("V6_SYNC_BATCH_SIZE", "250") or 250),1000))
     conn=None
     try:
-        rows=_v6_source_rows(horizon,limit)
-        brains=_v6_brains(); inserted=0; accepted=0; valid_rows=0; rejected_invalid=0
+        brains=_v6_brains(); resume_after=_v18316_v6_resume_decision_id(horizon, brains)
+        rows=_v6_source_rows(horizon,limit,min_decision_id=resume_after)
+        inserted=0; accepted=0; valid_rows=0; rejected_invalid=0
         now=datetime.now(UTC).isoformat(); pending=[]
         # V18.2.12: validate/calculate outside any write transaction.
         for row in rows:
@@ -17778,7 +17845,7 @@ def v6_sync_brains(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = 1
         return {"ok":True,"version":"V6.4","advisoryOnly":True,"horizonHours":horizon,
                 "independentSourceObservations":len(rows),"validLearningObservations":valid_rows,
                 "invalidObservationsRejected":rejected_invalid,"brains":len(brains),
-                "newShadowRows":inserted,"acceptedEvaluations":accepted,"liveGateChanged":False}
+                "newShadowRows":inserted,"acceptedEvaluations":accepted,"resumeAfterDecisionId":resume_after,"liveGateChanged":False}
     except Exception as e:
         try:
             if conn is not None: conn.close()
