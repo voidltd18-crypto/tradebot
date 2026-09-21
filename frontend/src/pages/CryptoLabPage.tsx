@@ -561,7 +561,7 @@ useEffect(() => {
           ? <>ACTIVE · {fmtCountdown(lossBrakeRemainingSeconds)} remaining · eligible {lossBrakeEligibleAt} · {Number(bridge?.consecutiveCryptoLosses || 0)}/{Number(bridge?.lossBrakeStreak || 2)} consecutive · daily {gbp(bridge?.dailyCryptoPnlGbp)} / -{gbp(bridge?.dailyLossLimitGbp)}</>
           : <>READY · {Number(bridge?.consecutiveCryptoLosses || 0)}/{Number(bridge?.lossBrakeStreak || 2)} consecutive · daily {gbp(bridge?.dailyCryptoPnlGbp)} / -{gbp(bridge?.dailyLossLimitGbp)}</>}</span>
       <span><b>Governor:</b> {String(bridge?.cryptoGovernor?.mode || "SHADOW_RESEARCH").replaceAll("_", " ")} · Gen {Number(bridge?.cryptoGovernor?.generation || 1)} · {bridge?.cryptoGovernor?.preset?.name || "—"} · research {Number(bridge?.cryptoGovernor?.research?.trades || 0)}/{Number(bridge?.cryptoGovernor?.researchTargetTrades || 50)} · exp ${Number(bridge?.cryptoGovernor?.research?.expectancyUsd || 0).toFixed(2)} · max hold {Number(bridge?.cryptoGovernor?.researchMaxHoldMinutes || 45)}m</span>
-      <span><b>Stock engine:</b> £900 baseline and MARA rules untouched</span>
+      <span><b>Stock engine:</b> £900 baseline · standard stock rules</span>
     </section>
   </div>;
 }
