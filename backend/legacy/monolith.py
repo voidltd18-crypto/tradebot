@@ -12434,6 +12434,8 @@ def _v18232_shadow_buy(scan: Dict[str, Any], research_explore: bool = False) -> 
                    and float(scan.get("return60mPct") or 0.0) >= float(preset.get("ret60", -999)))
     if not symbol or price <= 0 or not gate_ok:
         return False
+    if V18315_EVIDENCE_MINING_ENABLED and not _v18315_entry_allowed(scan):
+        return False
     with _crypto_shadow_lock:
         data = _v18232_load_state(); positions = data["positions"]
         if len(positions) >= V18232_CRYPTO_MAX_POSITIONS or any(str(p.get("symbol")) == symbol for p in positions):
@@ -12812,6 +12814,73 @@ def _v18289_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 def _v18289_live_exit_rows() -> List[Dict[str, Any]]:
     return [r for r in _v18277_ledger_rows(limit=10000) if r.get("event")=="logical_exit"]
 
+# V18.3.15 — EVIDENCE-MINED CRYPTO RESEARCH
+# Stop endless generation churn. Mine the accumulated Shadow ledger for repeatable
+# entry-score and symbol cohorts, run one evidence-derived candidate, then make a
+# hard decision. If it fails, freeze new Shadow entries instead of incrementing
+# generations forever. Existing promotion and account/live safety gates stay intact.
+V18315_EVIDENCE_MINING_ENABLED = True
+V18315_SCORE_BIN_WIDTH = 0.05
+V18315_MIN_SCORE_BIN_TRADES = 25
+V18315_MIN_SYMBOL_TRADES = 8
+V18315_MIN_COHORT_EXPECTANCY_USD = 0.02
+_v18315_model_cache = {"at": 0.0, "data": None}
+
+def _v18315_score_bin(score: float) -> str:
+    lo=max(0.0, min(0.95, int(float(score)/V18315_SCORE_BIN_WIDTH)*V18315_SCORE_BIN_WIDTH))
+    hi=min(1.0, lo+V18315_SCORE_BIN_WIDTH)
+    return f"{lo:.2f}-{hi:.2f}"
+
+def _v18315_mine_shadow_evidence(force: bool=False) -> Dict[str, Any]:
+    now=time.time()
+    if not force and _v18315_model_cache.get("data") is not None and now-float(_v18315_model_cache.get("at") or 0)<60:
+        return dict(_v18315_model_cache["data"])
+    rows=[]
+    try:
+        conn=db_connect()
+        try:
+            rows=[dict(r) for r in conn.execute("SELECT id,timestamp,symbol,side,score,pnl_usd,pnl_pct,reason FROM v18232_crypto_trades ORDER BY id ASC").fetchall()]
+        finally: conn.close()
+    except Exception:
+        rows=[]
+    open_buy={}; paired=[]
+    for r in rows:
+        sym=str(r.get("symbol") or "").upper()
+        if not sym: continue
+        if str(r.get("side") or "").upper()=="BUY":
+            open_buy[sym]=r
+        elif str(r.get("side") or "").upper()=="SELL":
+            b=open_buy.pop(sym, None)
+            if not b: continue
+            pnl=float(r.get("pnl_usd") or 0.0); score=float(b.get("score") or 0.0)
+            paired.append({"symbol":sym,"score":score,"scoreBin":_v18315_score_bin(score),"pnlUsd":pnl,"pnlPct":float(r.get("pnl_pct") or 0.0),"exitReason":str(r.get("reason") or "")})
+    def stats(items):
+        n=len(items); pnl=sum(float(x["pnlUsd"]) for x in items); wins=sum(1 for x in items if float(x["pnlUsd"])>0)
+        return {"trades":n,"pnlUsd":pnl,"expectancyUsd":pnl/n if n else 0.0,"winRatePct":wins/n*100.0 if n else 0.0}
+    bins={}; syms={}; reasons={}
+    for x in paired:
+        bins.setdefault(x["scoreBin"],[]).append(x); syms.setdefault(x["symbol"],[]).append(x); reasons.setdefault(x["exitReason"],[]).append(x)
+    bin_stats={k:stats(v) for k,v in bins.items()}; sym_stats={k:stats(v) for k,v in syms.items()}; reason_stats={k:stats(v) for k,v in reasons.items()}
+    good_bins=sorted([k for k,v in bin_stats.items() if v["trades"]>=V18315_MIN_SCORE_BIN_TRADES and v["expectancyUsd"]>=V18315_MIN_COHORT_EXPECTANCY_USD and v["pnlUsd"]>0])
+    good_syms=sorted([k for k,v in sym_stats.items() if v["trades"]>=V18315_MIN_SYMBOL_TRADES and v["expectancyUsd"]>=V18315_MIN_COHORT_EXPECTANCY_USD and v["pnlUsd"]>0])
+    bad_syms=sorted([k for k,v in sym_stats.items() if v["trades"]>=V18315_MIN_SYMBOL_TRADES and v["expectancyUsd"]<=0])
+    model={"pairedTrades":len(paired),"overall":stats(paired),"positiveScoreBins":good_bins,"positiveSymbols":good_syms,"blockedNegativeSymbols":bad_syms,
+           "scoreBins":bin_stats,"symbolStats":sym_stats,"exitReasonStats":reason_stats,
+           "limitations":["Historical ledger stores entry score, symbol and exit outcome, but not entry-time 15m/60m momentum; those fields cannot be retroactively mined."]}
+    _v18315_model_cache.update({"at":now,"data":model})
+    return dict(model)
+
+def _v18315_entry_allowed(scan: Dict[str, Any]) -> bool:
+    if not V18315_EVIDENCE_MINING_ENABLED: return True
+    st=load_profit_vault_state()
+    if str(st.get("cryptoEvidenceTrialStatus") or "RUNNING")=="FAILED_HOLD": return False
+    model=_v18315_mine_shadow_evidence()
+    sym=str(scan.get("symbol") or "").upper(); score=float(scan.get("score") or 0.0); band=_v18315_score_bin(score)
+    sym_stats=(model.get("symbolStats") or {}).get(sym) or {}; n=int(sym_stats.get("trades") or 0)
+    if n>=V18315_MIN_SYMBOL_TRADES and sym in set(model.get("blockedNegativeSymbols") or []): return False
+    if sym in set(model.get("positiveSymbols") or []): return True
+    return band in set(model.get("positiveScoreBins") or [])
+
 # V18.3.14 — SELECTIVE EVOLUTIONARY CRYPTO GOVERNOR
 # Keep a persistent history of completed Shadow generations, select parents from
 # the strongest evidence seen so far, reject regressions, and periodically inject
@@ -12900,6 +12969,14 @@ def _v18314_next_child(st: Dict[str, Any], failed_generation: int, failed_preset
 
 def _v18289_preset(state: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
     st=state or load_profit_vault_state()
+    if V18315_EVIDENCE_MINING_ENABLED:
+        model=_v18315_mine_shadow_evidence()
+        bins=model.get("positiveScoreBins") or []
+        floor=0.50
+        if bins:
+            try: floor=max(0.48, min(0.72, min(float(x.split("-")[0]) for x in bins)))
+            except Exception: pass
+        return {"name":"Evidence Mined V1","score":floor,"ret15":-0.25,"ret60":-0.25,"stop":1.00,"trailStart":1.00,"trailGiveback":0.45}
     adaptive=st.get("cryptoGovernorAdaptivePreset")
     if V18313_EVOLUTION_ENABLED and isinstance(adaptive, dict) and adaptive:
         return dict(adaptive)
@@ -12917,21 +12994,40 @@ def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
         st["cryptoGovernorChangedAt"]=datetime.now(UTC).isoformat()
         st["cryptoGovernorReason"]="V18.2.89 starts safely in Shadow Research"
     mode=str(st.get("cryptoGovernorMode") or "SHADOW_RESEARCH")
+    if V18315_EVIDENCE_MINING_ENABLED and mode=="SHADOW_RESEARCH" and not st.get("cryptoEvidenceModeInitialized"):
+        st["cryptoEvidenceModeInitialized"]=True
+        st["cryptoEvidenceTrialStatus"]="RUNNING"
+        st["cryptoGovernorShadowBaseline"]=len(shadow)
+        st["cryptoGovernorReason"]="V18.3.15 Evidence Mined V1 started from accumulated Shadow outcomes; endless generation churn disabled"
+        st["cryptoGovernorChangedAt"]=datetime.now(UTC).isoformat()
     sb=max(0,int(st.get("cryptoGovernorShadowBaseline") or 0)); lb=max(0,int(st.get("cryptoGovernorLiveBaseline") or 0))
     research=_v18289_stats(shadow[sb:]); pilot=_v18289_stats(live[lb:]); rolling=_v18289_stats(live[-V18289_LIVE_ROLLING_TRADES:])
     changed=False; reason=str(st.get("cryptoGovernorReason") or "")
     if mode=="SHADOW_RESEARCH":
+        if V18315_EVIDENCE_MINING_ENABLED and str(st.get("cryptoEvidenceTrialStatus") or "RUNNING")=="FAILED_HOLD":
+            reason=str(st.get("cryptoGovernorReason") or "Evidence-mined trial failed; Shadow entries frozen pending strategy redesign")
         passed=(research["trades"]>=V18289_RESEARCH_MIN_TRADES and research["expectancyUsd"]>=V18289_RESEARCH_MIN_EXPECTANCY_USD
                 and research["pnlUsd"]>=V18289_RESEARCH_MIN_PNL_USD and research["winRatePct"]>=V18289_RESEARCH_MIN_WIN_RATE_PCT
                 and research["maxDrawdownUsd"]<=V18289_RESEARCH_MAX_DRAWDOWN_USD)
         if passed:
-            mode="PILOT_LIVE"; st["cryptoGovernorLiveBaseline"]=len(live); changed=True
+            mode="PILOT_LIVE"; st["cryptoGovernorLiveBaseline"]=len(live); st["cryptoEvidenceTrialStatus"]="GRADUATED"; changed=True
             reason=f"Shadow graduated: {research['trades']} trades, expectancy ${research['expectancyUsd']:.2f}, P&L ${research['pnlUsd']:.2f}"
         # V18.3.12 — hard decision at the full research target. Once a generation
         # reaches 50 completed Shadow exits it must either graduate or redesign;
         # it may not drift indefinitely beyond the evidence target waiting for
         # its averages to improve. The earlier Gen-5+ 15-trade negative checkpoint
         # remains in force as a fast-fail path.
+        elif V18315_EVIDENCE_MINING_ENABLED and str(st.get("cryptoEvidenceTrialStatus") or "RUNNING")=="RUNNING" and research["trades"]>=V18289_RESEARCH_MIN_TRADES:
+            failed=[]
+            if research["expectancyUsd"] < V18289_RESEARCH_MIN_EXPECTANCY_USD: failed.append(f"expectancy ${research['expectancyUsd']:.2f}")
+            if research["pnlUsd"] < V18289_RESEARCH_MIN_PNL_USD: failed.append(f"P&L ${research['pnlUsd']:.2f}")
+            if research["winRatePct"] < V18289_RESEARCH_MIN_WIN_RATE_PCT: failed.append(f"win rate {research['winRatePct']:.1f}%")
+            if research["maxDrawdownUsd"] > V18289_RESEARCH_MAX_DRAWDOWN_USD: failed.append(f"drawdown ${research['maxDrawdownUsd']:.2f}")
+            st["cryptoEvidenceTrialStatus"]="FAILED_HOLD"; changed=True
+            reason=f"Evidence Mined V1 failed its 50-trade proof ({', '.join(failed)}); new Shadow entries frozen — no generation increment"
+        elif V18315_EVIDENCE_MINING_ENABLED and str(st.get("cryptoEvidenceTrialStatus") or "RUNNING")=="RUNNING" and research["trades"]>=V18309_ADAPTIVE_REDESIGN_CHECK_TRADES and research["expectancyUsd"]<=0:
+            st["cryptoEvidenceTrialStatus"]="FAILED_HOLD"; changed=True
+            reason=f"Evidence Mined V1 failed early after {research['trades']} trades with expectancy ${research['expectancyUsd']:.2f}; new Shadow entries frozen — no generation increment"
         elif research["trades"]>=V18289_RESEARCH_MIN_TRADES:
             failed=[]
             if research["expectancyUsd"] < V18289_RESEARCH_MIN_EXPECTANCY_USD:
@@ -12989,7 +13085,10 @@ def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
             "evolutionEnabled":V18313_EVOLUTION_ENABLED,
             "evolutionReason":st.get("cryptoGovernorEvolutionReason"),
             "evolutionParent":st.get("cryptoGovernorEvolutionParent"),
-            "selectionEnabled":V18314_SELECTION_ENABLED,
+            "selectionEnabled":False if V18315_EVIDENCE_MINING_ENABLED else V18314_SELECTION_ENABLED,
+            "evidenceMiningEnabled":V18315_EVIDENCE_MINING_ENABLED,
+            "evidenceTrialStatus":st.get("cryptoEvidenceTrialStatus") if V18315_EVIDENCE_MINING_ENABLED else None,
+            "evidenceModel":_v18315_mine_shadow_evidence() if V18315_EVIDENCE_MINING_ENABLED else None,
             "generationHistoryCount":len(_v18314_history(st)),
             "bestGeneration":_v18314_best_generation(st),
             "currentVsParentExpectancyUsd":(research.get("expectancyUsd",0.0)-float(((st.get("cryptoGovernorEvolutionParent") or {}).get("stats") or {}).get("expectancyUsd") or 0.0)) if st.get("cryptoGovernorEvolutionParent") else None}

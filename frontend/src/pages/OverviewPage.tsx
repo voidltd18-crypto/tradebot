@@ -8,6 +8,7 @@ import type { ActionFn, AnyObj, PositionStyleFn } from "../lib/types";
 
 export function OverviewPage({ data, banking, message, positions, trades, rate, bestCandidate, aiConfidence, marketRegime, riskLabel, currentAction, botHealth, aiReasons, positionSettings, fetchData, action, positionGlowStyle, onExportFullBot, exportBusy, authToken }: { data: AnyObj; banking: AnyObj; message: string; positions: AnyObj[]; trades: AnyObj[]; rate: number; bestCandidate?: AnyObj; aiConfidence: number; marketRegime: string; riskLabel: string; currentAction: string; botHealth: number; aiReasons: string[]; positionSettings: AnyObj; fetchData: (force?: boolean) => Promise<void>; action: ActionFn; positionGlowStyle: PositionStyleFn; onExportFullBot: () => void; exportBusy: boolean; authToken: string }) {
   const [taxCentre, setTaxCentre] = useState<AnyObj | null>(null);
+  const [cryptoBridge, setCryptoBridge] = useState<AnyObj | null>(null);
   const [replay, setReplay] = useState<ReplayTarget | null>(null);
   const maxPositions = Number(data?.maxPositions || positionSettings?.maxPositions || 0);
   const vault = banking?.profitVault || data?.banking?.profitVault || {};
@@ -23,6 +24,19 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
     };
     loadTax();
     const id = window.setInterval(loadTax, 30000);
+    return () => { alive = false; window.clearInterval(id); };
+  }, [authToken]);
+  useEffect(() => {
+    let alive = true;
+    const loadBridge = async () => {
+      try {
+        const res = await fetch(`${API_URL}/v18/crypto-bridge`, { cache: "no-store", headers: { "X-API-Key": authToken, "X-Auth-Token": authToken } });
+        const body = await res.json();
+        if (alive && res.ok && body?.ok !== false) setCryptoBridge(body);
+      } catch { /* home research cards keep their last good snapshot */ }
+    };
+    loadBridge();
+    const id = window.setInterval(loadBridge, 10000);
     return () => { alive = false; window.clearInterval(id); };
   }, [authToken]);
   const market = data?.market || {};
@@ -50,6 +64,29 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
     return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString("en-GB", { timeZone: "Europe/London", weekday: "short", hour: "2-digit", minute: "2-digit" });
   };
 
+  // Trade event times are stored by the backend in UTC. Show them in UK local
+  // time (GMT/BST automatically via Europe/London) on the Home activity feed.
+  const formatTradeTimeUk = (trade: AnyObj) => {
+    const rawTime = String(trade?.time || "").trim();
+    if (!rawTime) return "—";
+    const rawDay = String(trade?.day || trade?.date || "").trim();
+    const isoDay = /^\d{4}-\d{2}-\d{2}$/.test(rawDay) ? rawDay : new Date().toISOString().slice(0, 10);
+    if (/^\d{2}:\d{2}(:\d{2})?$/.test(rawTime)) {
+      const d = new Date(`${isoDay}T${rawTime.length === 5 ? `${rawTime}:00` : rawTime}Z`);
+      if (!Number.isNaN(d.getTime())) {
+        return new Intl.DateTimeFormat("en-GB", {
+          timeZone: "Europe/London",
+          hour: "2-digit", minute: "2-digit", second: "2-digit",
+          hour12: false,
+        }).format(d);
+      }
+    }
+    const d = new Date(rawTime);
+    return Number.isNaN(d.getTime()) ? rawTime : new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Europe/London", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    }).format(d);
+  };
+
   return <main className="home-command-center">
     <section className="home-hero-row">
       <div className="system-banner"><span className={`status-dot ${botHealth >= 75 ? "healthy" : "warning"}`} /><b>{botHealth >= 75 ? "SYSTEM OPERATIONAL" : "SYSTEM CHECK"}</b><span>{message || currentAction}</span></div>
@@ -57,6 +94,23 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
         <span className="report-icon">▤</span>
         <span><strong>{exportBusy ? "BUILDING FULL BOT REPORT..." : "EXPORT FULL BOT REPORT PDF"}</strong><small>Everything included · V17.9 · V18 · V18.1 · all AI systems</small></span>
       </button>
+    </section>
+
+    <section className="home-research-showcase">
+      <div className="home-shadow-card">
+        <div className="home-research-title"><span className="home-research-icon">◒</span><div><small>CRYPTO LAB</small><h2>Shadow Research</h2><p>Real-market paper testing · live crypto remains {cryptoBridge?.shadowOnly === false ? "governed" : "paused"}</p></div><span className="home-research-pill">{cryptoBridge?.shadowOnly === false ? "LIVE STAGE" : "SHADOW ONLY"}</span></div>
+        <div className="home-research-kpis">
+          <div><strong>{Number(cryptoBridge?.shadowEvidence?.closedTests || 0)}</strong><span>Total tests</span></div>
+          <div><strong className={Number(cryptoBridge?.shadowEvidence?.totalPnlUsd || 0) >= 0 ? "positive" : "negative"}>${Number(cryptoBridge?.shadowEvidence?.totalPnlUsd || 0).toFixed(2)}</strong><span>Total P&amp;L</span></div>
+          <div><strong>{Number(cryptoBridge?.shadowEvidence?.winRate || 0).toFixed(2)}%</strong><span>Win rate</span></div>
+        </div>
+      </div>
+      <div className="home-governor-card">
+        <div className="home-research-title"><span className="home-research-icon governor">⚙</span><div><small>EVIDENCE-MINED STRATEGY</small><h2>Crypto Research</h2><p>Uses the accumulated Shadow outcomes instead of endlessly creating generations</p></div><span className="home-research-pill governor">{cryptoBridge?.cryptoGovernor?.evidenceTrialStatus || "RESEARCH"}</span></div>
+        <div className="home-governor-generation"><span>Current evidence trial</span><strong>{cryptoBridge?.cryptoGovernor?.preset?.name || "Evidence Mined V1"}</strong><div className="home-governor-progress"><i style={{width:`${Math.min(100, (Number(cryptoBridge?.cryptoGovernor?.research?.trades || 0) / Math.max(1, Number(cryptoBridge?.cryptoGovernor?.researchTargetTrades || 50))) * 100)}%`}} /></div><small>{Number(cryptoBridge?.cryptoGovernor?.research?.trades || 0)} / {Number(cryptoBridge?.cryptoGovernor?.researchTargetTrades || 50)} research trades</small></div>
+        <div className="home-governor-kpis"><div><strong className={Number(cryptoBridge?.cryptoGovernor?.research?.expectancyUsd || 0) >= 0 ? "positive" : "negative"}>${Number(cryptoBridge?.cryptoGovernor?.research?.expectancyUsd || 0).toFixed(2)}</strong><span>Trial expectancy</span></div><div><strong>{Number(cryptoBridge?.cryptoGovernor?.evidenceModel?.pairedTrades || 0).toLocaleString()}</strong><span>Historical outcomes mined</span></div><div><strong>{Number(cryptoBridge?.cryptoGovernor?.evidenceModel?.positiveSymbols?.length || 0)}</strong><span>Positive symbol cohorts</span></div></div>
+        <div className="home-governor-selection"><span>Positive score bands: {Number(cryptoBridge?.cryptoGovernor?.evidenceModel?.positiveScoreBins?.length || 0)}</span><span>Blocked negative symbols: {Number(cryptoBridge?.cryptoGovernor?.evidenceModel?.blockedNegativeSymbols?.length || 0)}</span><span>{String(cryptoBridge?.cryptoGovernor?.mode || "SHADOW_RESEARCH").replaceAll("_", " ")} · {Number(cryptoBridge?.cryptoGovernor?.researchMaxHoldMinutes || 45)}m max hold</span></div>
+      </div>
     </section>
 
     <Card title="Quick Actions" wide className="quick-actions-card">
@@ -115,7 +169,7 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
       <Card title="Final Gate Monitor" className="decision-card final-gate-card"><div className="final-gate-head"><span className={`gate-pill ${finalGate?.state === "FINAL_GATE_READY" ? "ready" : finalGate?.state === "FINAL_GATE_WAITING" ? "waiting" : "idle"}`}>{finalGate?.state === "FINAL_GATE_READY" ? "FINAL GATE READY" : finalGate?.state === "FINAL_GATE_WAITING" ? "FINAL GATE · WAITING" : "SCANNING"}</span></div>{finalGate?.topCandidate?.symbol ? <><h3 className="decision-symbol">{finalGate.topCandidate.symbol}</h3><div className="summary"><div><span>Portfolio score</span><b>{Number(finalGate.topCandidate.portfolioScore || 0).toFixed(3)}</b></div><div><span>Minimum</span><b>{Number(finalGate.topCandidate.minimumScore || finalGate.minimumPortfolioScore || 0).toFixed(3)}</b></div></div><p className="muted">{finalGate.detail}</p></> : <p className="muted">No stock has reached the final portfolio gate yet.</p>}</Card>
       <Card title="Piggy Bank" className="decision-card"><div className="final-gate-head"><span className={`gate-pill ${vault?.enabled ? "ready" : "idle"}`}>{vault?.enabled ? "PIGGY BANK ACTIVE" : "BANKING OFF"}</span><span className="muted">One-way realised-profit banking</span></div><div className="summary"><div><span>Trading capital</span><b>{gbp(Math.max(0, Number(vault?.accountEquityGbp || 0) - piggyBankGbp - Number(vault?.cryptoAllocatedGbp || 0)))}</b></div><div><span>Free cash</span><b>{gbp(Number(vault?.workingCapitalGbp || 0))}</b></div><div><span>Piggy Bank</span><b className={piggyBankGbp > 0 ? "positive" : ""}>{gbp(piggyBankGbp)}</b></div><div><span>Crypto engine capital</span><b>{gbp(Number(vault?.cryptoAllocatedGbp || 0))}</b></div><div><span>Lifetime profit sweeps</span><b>{gbp(Number(vault?.lifetimeBankedGbp || 0))}</b><small className="muted" style={{display:"block", marginTop:2}}>Historical total — not current balance</small></div></div><p className="muted" style={{marginTop:10}}>Positive realised profit from the bot is banked here. Piggy Bank money is excluded from both stock and crypto buys and is never automatically released back to a trading engine.</p></Card>
       <Card title={`UK Tax Centre · ${taxCentre?.taxYear || "Current tax year"}`} className="decision-card"><div className="final-gate-head"><span className="gate-pill ready">ACCOUNT-WIDE</span><span className="muted">Stocks + crypto</span></div><div className="summary"><div><span>Stock net gains</span><b className={Number(taxCentre?.stockNetGainGbp || 0) >= 0 ? "positive" : "negative"}>{gbp(Number(taxCentre?.stockNetGainGbp || 0))}</b></div><div><span>Crypto net gains</span><b className={Number(taxCentre?.cryptoNetGainGbp || 0) >= 0 ? "positive" : "negative"}>{gbp(Number(taxCentre?.cryptoNetGainGbp || 0))}</b></div><div><span>Combined net gains</span><b>{gbp(Number(taxCentre?.netTrackedGainGbp || 0))}</b></div><div><span>CGT allowance</span><b>{gbp(Number(taxCentre?.annualExemptAmountGbp || 3000))}</b></div><div><span>Estimated taxable gain</span><b>{gbp(Number(taxCentre?.estimatedTaxableGainGbp || 0))}</b></div><div><span>Suggested HMRC reserve</span><b className={Number(taxCentre?.suggestedHmrcReserveGbp || 0) > 0 ? "negative" : ""}>{gbp(Number(taxCentre?.suggestedHmrcReserveGbp || 0))}</b></div></div><p className="muted" style={{marginTop:10}}>Planning estimate using ~£30,069 annual gross employment income. Tracks future bot disposals in GBP across the whole Alpaca account. Final HMRC figures can differ because of matching/pooling rules and other gains or losses.</p></Card>
-      <Card title="Recent AI Activity" wide><div className="log-list">{trades.slice(-8).reverse().map((trade, index) => <div key={index}>{trade.time || "—"} · <b>{trade.side} {trade.symbol}</b> · {trade.reason || "Decision recorded"}</div>)}{!trades.length && <p className="muted">No recent trading activity.</p>}</div></Card>
+      <Card title="Recent AI Activity" wide><div className="log-list">{trades.slice(-8).reverse().map((trade, index) => <div key={index}>{formatTradeTimeUk(trade)} · <b>{trade.side} {trade.symbol}</b> · {trade.reason || "Decision recorded"}</div>)}{!trades.length && <p className="muted">No recent trading activity.</p>}</div></Card>
     </section>
     <TradeReplayModal target={replay} authToken={authToken} onClose={() => setReplay(null)} />
   </main>;
