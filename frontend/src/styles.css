@@ -620,3 +620,53 @@ html[data-theme="mission-control"] .sidebar{background:linear-gradient(180deg,#1
 html[data-theme="mission-control"] .brand-mark{background:linear-gradient(135deg,#1683a8,#e28a2b)}html[data-theme="mission-control"] .theme-picker{background:#1b2a35}html[data-theme="mission-control"] .theme-picker option{background:#1b2a35}
 
 html[data-theme] .gain,html[data-theme] .positive{color:var(--green)!important}html[data-theme] .loss{color:var(--red)!important}
+
+
+/* V18.3.23 — AURORA PREMIUM
+   Visual-only polish. All effects are scoped to Aurora. */
+html[data-theme="aurora"] body{
+  background-size:160% 160%;
+  animation:aurora-premium-drift 24s ease-in-out infinite alternate;
+}
+@keyframes aurora-premium-drift{
+  0%{background-position:0% 0%}
+  50%{background-position:55% 30%}
+  100%{background-position:100% 70%}
+}
+
+/* Give the selected navigation item a restrained cyan/violet illumination. */
+html[data-theme="aurora"] .sidebar-tabs button.active{
+  box-shadow:0 0 0 1px rgba(94,231,242,.10),0 0 22px rgba(192,132,252,.18),inset 0 0 18px rgba(94,231,242,.06);
+}
+
+/* Live/healthy status gets a soft breathing glow rather than a harsh animation. */
+html[data-theme="aurora"] .pill.ok{
+  box-shadow:0 0 0 1px rgba(74,222,168,.10),0 0 16px rgba(74,222,168,.14);
+  animation:aurora-live-breathe 3.6s ease-in-out infinite;
+}
+@keyframes aurora-live-breathe{
+  0%,100%{box-shadow:0 0 0 1px rgba(74,222,168,.08),0 0 10px rgba(74,222,168,.10)}
+  50%{box-shadow:0 0 0 1px rgba(74,222,168,.16),0 0 22px rgba(74,222,168,.22)}
+}
+
+/* Slight premium lift for cards without changing semantic colours. */
+html[data-theme="aurora"] .card{
+  box-shadow:0 16px 42px rgba(5,8,30,.26),0 0 0 1px rgba(94,231,242,.025);
+}
+html[data-theme="aurora"] .card:hover{
+  border-color:rgba(126,119,220,.40);
+}
+
+/* Theme selector itself gets the Aurora signature. */
+html[data-theme="aurora"] .theme-picker{
+  border-color:rgba(139,105,213,.50);
+  box-shadow:0 0 18px rgba(139,105,213,.13);
+}
+
+/* Respect reduced-motion settings. */
+@media (prefers-reduced-motion:reduce){
+  html[data-theme="aurora"] body,
+  html[data-theme="aurora"] .pill.ok{
+    animation:none!important;
+  }
+}
