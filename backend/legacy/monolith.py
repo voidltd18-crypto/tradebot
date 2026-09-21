@@ -13916,7 +13916,16 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
                 f"qualified=unknown | visibility_error={_v182774_exc}",
                 flush=True,
             )
-    if allow_normal_decisions and slots > 0 and not risk_blocked:
+    # V18.3.19: during PRE_OPEN, preserve existing crypto but do not add new risk.
+    # Existing positions have already passed through the protective-exit section above.
+    _v18319_night_mode = str((_v18278_refresh_mode() if "_v18278_refresh_mode" in globals() else {}).get("mode") or "DAY")
+    _v18319_preopen_entry_block = _v18319_night_mode == "PRE_OPEN"
+    if _v18319_preopen_entry_block and allow_normal_decisions:
+        _crypto_live_runtime["entriesPaused"] = True
+        _crypto_live_runtime["pauseReason"] = "PRE_OPEN_HOLD_EXISTING_CRYPTO"
+        print("V18.3.19 PRE-OPEN ENTRY BLOCK | new crypto buys paused; existing positions keep native stop/trail management", flush=True)
+
+    if allow_normal_decisions and slots > 0 and not risk_blocked and not _v18319_preopen_entry_block:
         regime = _v18273_crypto_market_regime(scans)
         _v18273_last_regime = dict(regime)
         qualified = [
@@ -16677,6 +16686,14 @@ def _v18278_preclose_flatten_worker(session_key: str) -> None:
             _v18278_runtime["preCloseFlattenRunning"]=False
 
 def _v18278_preopen_crypto_rebalance_worker(open_key: str) -> None:
+    """V18.3.19: do not sacrifice an active crypto thesis just to refill stock cash.
+
+    PRE_OPEN still reserves capital for stocks and therefore prevents fresh crypto
+    entries, but positions already owned by the bot remain under their native
+    5-second stop/trail/breakeven management. The stock engine uses the cash that
+    is actually available; crypto is released only by its own exit logic (or the
+    higher-priority pause/emergency/equity-floor protections).
+    """
     try:
         state=load_profit_vault_state()
         piggy=max(0.0,float(state.get("bankedProfitGbp") or 0.0))
@@ -16688,33 +16705,28 @@ def _v18278_preopen_crypto_rebalance_worker(open_key: str) -> None:
             cash_gbp=0.0
         usable_cash=max(0.0,cash_gbp-piggy)
         need=max(0.0,V18266_STOCK_CAP_GBP-usable_cash)
-        if need > 0.01:
-            positions=[p for p in _v18234_raw_crypto_positions() if bool(p.get("managedByPilot"))]
-            positions.sort(key=lambda p: float(p.get("marketValueUsd") or 0.0), reverse=True)
-            released=0.0
-            for pos in positions:
-                if released >= need:
-                    break
-                price=float(pos.get("price") or 0.0)
-                if price <= 0:
-                    continue
-                value_gbp=max(0.0,float(pos.get("marketValueUsd") or 0.0)*rate)
-                ok=_v18234_live_sell(pos, price, 0.0, "V18.2.78 PRE-OPEN STOCK RESERVE RESTORE")
-                if ok:
-                    released += value_gbp
+        positions=[p for p in _v18234_raw_crypto_positions() if bool(p.get("managedByPilot"))]
+        protected_value_gbp=sum(max(0.0,float(p.get("marketValueUsd") or 0.0)*rate) for p in positions)
+        if need > 0.01 and positions:
             print(
-                f"V18.2.78 PRE-OPEN REBALANCE | need=£{need:.2f} released_est=£{released:.2f} "
-                f"target_stock=£{V18266_STOCK_CAP_GBP:.2f}",
+                f"V18.3.19 PRE-OPEN CRYPTO HOLD | stock_need=£{need:.2f} "
+                f"crypto_positions={len(positions)} protected_value=£{protected_value_gbp:.2f} | "
+                f"no forced sell; stop/trail remains active",
+                flush=True,
+            )
+        elif need > 0.01:
+            print(
+                f"V18.3.19 PRE-OPEN STOCK CASH | need=£{need:.2f} crypto_positions=0 | no crypto to release",
                 flush=True,
             )
         else:
-            print(f"V18.2.78 PRE-OPEN REBALANCE | stock reserve already funded £{usable_cash:.2f}", flush=True)
+            print(f"V18.3.19 PRE-OPEN REBALANCE | stock reserve already funded £{usable_cash:.2f}", flush=True)
         with _v18278_lock:
             _v18278_runtime["lastPreOpenRebalance"]=open_key
     except Exception as exc:
         with _v18278_lock:
             _v18278_runtime["lastError"]=str(exc)[:500]
-        print(f"V18.2.78 PRE-OPEN REBALANCE ERROR | {exc}", flush=True)
+        print(f"V18.3.19 PRE-OPEN REBALANCE ERROR | {exc}", flush=True)
     finally:
         with _v18278_lock:
             _v18278_runtime["preOpenRebalanceRunning"]=False
