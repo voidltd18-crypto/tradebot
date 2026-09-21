@@ -6195,7 +6195,7 @@ def db_connect():
             if not _DB_WAL_INITIALISED:
                 conn.execute("PRAGMA journal_mode=WAL").fetchone()
                 conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute("PRAGMA wal_autocheckpoint=1000")
+                conn.execute("PRAGMA wal_autocheckpoint=0")  # V18.3.17: never checkpoint on a hot-path commit
                 _DB_WAL_INITIALISED = True
     else:
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -6371,7 +6371,7 @@ def _db_safe_housekeeping(force: bool = False) -> Dict[str, Any]:
             conn.commit()
             # Return WAL pages to the filesystem. This is safe and materially helps persistent-disk usage.
             try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()  # V18.3.17: non-blocking maintenance checkpoint
             except Exception as exc:
                 checkpoint_error = str(exc)[:300]
             else:
@@ -12815,6 +12815,7 @@ def _v18289_stats(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 def _v18289_live_exit_rows() -> List[Dict[str, Any]]:
     return [r for r in _v18277_ledger_rows(limit=10000) if r.get("event")=="logical_exit"]
 
+# V18.3.17 — NON-BLOCKING SHADOW DB + EVIDENCE FALLBACK
 # V18.3.16 — DB + EVIDENCE RECOVERY
 # V18.3.15 — EVIDENCE-MINED CRYPTO RESEARCH
 # Stop endless generation churn. Mine the accumulated Shadow ledger for repeatable
@@ -12873,6 +12874,33 @@ def _v18316_read_shadow_rows() -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     return best_rows,{"selectedDb":best_path,"candidates":diagnostics}
 
 
+def _v18317_logical_evidence_rows() -> List[Dict[str, Any]]:
+    """Fallback evidence from completed logical crypto exits.
+
+    This is used only when no persisted Shadow exits can be recovered. It keeps
+    the source explicit so the dashboard/model never pretends live logical exits
+    are Shadow outcomes. Only rows with a usable entry score are included.
+    """
+    out=[]
+    try:
+        for r in _v18277_ledger_rows(limit=10000):
+            if str(r.get("event") or "") != "logical_exit":
+                continue
+            sym=str(r.get("symbol") or "").upper().strip()
+            score=r.get("entryScore")
+            if not sym or score is None:
+                continue
+            try:
+                score=float(score); pnl=float(r.get("pnlUsd") or 0.0); pct=float(r.get("pnlPct") or 0.0)
+            except Exception:
+                continue
+            out.append({"symbol":sym,"score":score,"pnlUsd":pnl,"pnlPct":pct,
+                        "exitReason":str(r.get("exitReason") or ""),"evidenceSource":"liveLogicalLedger"})
+    except Exception:
+        return []
+    return out
+
+
 def _v18315_mine_shadow_evidence(force: bool=False) -> Dict[str, Any]:
     now=time.time()
     if not force and _v18315_model_cache.get("data") is not None and now-float(_v18315_model_cache.get("at") or 0)<300:
@@ -12900,7 +12928,16 @@ def _v18315_mine_shadow_evidence(force: bool=False) -> Dict[str, Any]:
             # its matching BUY row was compacted. Prefer BUY score, then SELL score.
             score=float((b or {}).get("score") or r.get("score") or 0.0)
             pnl=float(r.get("pnl_usd") or 0.0)
-            paired.append({"symbol":sym,"score":score,"scoreBin":_v18315_score_bin(score),"pnlUsd":pnl,"pnlPct":float(r.get("pnl_pct") or 0.0),"exitReason":str(r.get("reason") or "")})
+            paired.append({"symbol":sym,"score":score,"scoreBin":_v18315_score_bin(score),"pnlUsd":pnl,"pnlPct":float(r.get("pnl_pct") or 0.0),"exitReason":str(r.get("reason") or ""),"evidenceSource":"shadowLedger"})
+    # V18.3.17: if the old Shadow ledger is genuinely unavailable after a deploy,
+    # recover usable evidence from the persistent completed logical crypto ledger.
+    # This is explicitly labelled and never counted as recovered Shadow history.
+    if not paired:
+        logical=_v18317_logical_evidence_rows()
+        for x in logical:
+            x=dict(x); x["scoreBin"]=_v18315_score_bin(float(x.get("score") or 0.0)); paired.append(x)
+        if logical:
+            recovery={**recovery,"fallbackSource":"liveLogicalLedger","fallbackOutcomes":len(logical)}
     def stats(items):
         n=len(items); pnl=sum(float(x["pnlUsd"]) for x in items); wins=sum(1 for x in items if float(x["pnlUsd"])>0)
         return {"trades":n,"pnlUsd":pnl,"expectancyUsd":pnl/n if n else 0.0,"winRatePct":wins/n*100.0 if n else 0.0}
@@ -12911,8 +12948,11 @@ def _v18315_mine_shadow_evidence(force: bool=False) -> Dict[str, Any]:
     good_bins=sorted([k for k,v in bin_stats.items() if v["trades"]>=V18315_MIN_SCORE_BIN_TRADES and v["expectancyUsd"]>=V18315_MIN_COHORT_EXPECTANCY_USD and v["pnlUsd"]>0])
     good_syms=sorted([k for k,v in sym_stats.items() if v["trades"]>=V18315_MIN_SYMBOL_TRADES and v["expectancyUsd"]>=V18315_MIN_COHORT_EXPECTANCY_USD and v["pnlUsd"]>0])
     bad_syms=sorted([k for k,v in sym_stats.items() if v["trades"]>=V18315_MIN_SYMBOL_TRADES and v["expectancyUsd"]<=0])
+    source_counts={}
+    for x in paired:
+        src=str(x.get("evidenceSource") or "unknown"); source_counts[src]=source_counts.get(src,0)+1
     model={"pairedTrades":len(paired),"overall":stats(paired),"positiveScoreBins":good_bins,"positiveSymbols":good_syms,"blockedNegativeSymbols":bad_syms,
-           "scoreBins":bin_stats,"symbolStats":sym_stats,"exitReasonStats":reason_stats,"recovery":recovery,
+           "scoreBins":bin_stats,"symbolStats":sym_stats,"exitReasonStats":reason_stats,"evidenceSources":source_counts,"recovery":recovery,
            "limitations":["Historical ledger stores entry score, symbol and exit outcome, but not entry-time 15m/60m momentum; those fields cannot be retroactively mined."]}
     # Persist the derived model separately so later deploys do not need a full
     # ledger scan merely to render the dashboard. This contains research stats,
