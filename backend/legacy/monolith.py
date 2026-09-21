@@ -11795,6 +11795,14 @@ V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT = 10.0
 def _v18285_crypto_live_evidence_gate(candidate: Dict[str, Any]) -> Tuple[bool, str]:
     if not V18285_CRYPTO_LIVE_GATE_ENABLED:
         return True, "disabled"
+    # V18.3.18: controlled pilot may only spend on cohorts supported by the mined
+    # history. This sits on top of the existing score/momentum gate, not instead of it.
+    if V18318_CONTROLLED_LIVE_PILOT:
+        try:
+            if not _v18315_entry_allowed(candidate):
+                return False, "not in positive evidence cohort"
+        except Exception:
+            return False, "evidence cohort unavailable"
     score = float(candidate.get("score") or 0.0)
     ret15 = float(candidate.get("return15mPct") or 0.0)
     ret60 = float(candidate.get("return60mPct") or 0.0)
@@ -12779,8 +12787,18 @@ def _v18309_research_redesign_check_trades(state: Optional[Dict[str, Any]]=None)
     if generation >= V18309_ADAPTIVE_REDESIGN_FROM_GENERATION:
         return V18309_ADAPTIVE_REDESIGN_CHECK_TRADES
     return V18289_REDESIGN_CHECK_TRADES
-V18289_PILOT_MIN_TRADES = 15
+V18289_PILOT_MIN_TRADES = 25
 V18289_PILOT_MAX_ENTRY_ALLOCATION_PCT = 5.0
+# V18.3.18 — CONTROLLED EVIDENCE LIVE PILOT
+# The long Shadow programme is complete. Failed Evidence Mined V1 is not treated
+# as proof of profitability; instead it unlocks a deliberately tiny live pilot so
+# execution can be measured with real fills while account protections remain intact.
+V18318_CONTROLLED_LIVE_PILOT = True
+V18318_PILOT_MAX_POSITIONS = 2
+V18318_PILOT_MAX_ENTRY_ALLOCATION_PCT = 2.5
+V18318_PILOT_FAIL_MIN_EXITS = 5
+V18318_PILOT_FAIL_EXPECTANCY_USD = 0.0
+
 V18289_LIVE_ROLLING_TRADES = 12
 V18289_LIVE_MIN_SAMPLE = 5
 V18289_LIVE_FAIL_EXPECTANCY_USD = -0.25
@@ -12967,7 +12985,10 @@ def _v18315_mine_shadow_evidence(force: bool=False) -> Dict[str, Any]:
 def _v18315_entry_allowed(scan: Dict[str, Any]) -> bool:
     if not V18315_EVIDENCE_MINING_ENABLED: return True
     st=load_profit_vault_state()
-    if str(st.get("cryptoEvidenceTrialStatus") or "RUNNING")=="FAILED_HOLD": return False
+    # V18.3.18: FAILED_HOLD blocks further Shadow churn, but the controlled live
+    # pilot is allowed to use only cohorts that the accumulated evidence supports.
+    if str(st.get("cryptoEvidenceTrialStatus") or "RUNNING")=="FAILED_HOLD" and not V18318_CONTROLLED_LIVE_PILOT:
+        return False
     model=_v18315_mine_shadow_evidence()
     sym=str(scan.get("symbol") or "").upper(); score=float(scan.get("score") or 0.0); band=_v18315_score_bin(score)
     sym_stats=(model.get("symbolStats") or {}).get(sym) or {}; n=int(sym_stats.get("trades") or 0)
@@ -13088,6 +13109,19 @@ def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
         st["cryptoGovernorChangedAt"]=datetime.now(UTC).isoformat()
         st["cryptoGovernorReason"]="V18.2.89 starts safely in Shadow Research"
     mode=str(st.get("cryptoGovernorMode") or "SHADOW_RESEARCH")
+    # V18.3.18: after the completed evidence trial has failed/held, stop asking the
+    # user to wait through more paper generations. Move into a bounded live pilot.
+    # This is intentionally NOT a claim that the strategy proved profitable.
+    if (V18318_CONTROLLED_LIVE_PILOT and mode=="SHADOW_RESEARCH"
+            and str(st.get("cryptoEvidenceTrialStatus") or "") == "FAILED_HOLD"):
+        mode="PILOT_LIVE"
+        st["cryptoGovernorMode"]="PILOT_LIVE"
+        st["cryptoGovernorLiveBaseline"]=len(live)
+        st["cryptoEvidenceTrialStatus"]="CONTROLLED_PILOT"
+        st["cryptoGovernorReason"]=("V18.3.18 controlled live pilot: evidence-qualified setups only; "
+                                     "2 positions max, 2.5% allocation per entry, automatic fallback on weak live evidence")
+        st["cryptoGovernorChangedAt"]=datetime.now(UTC).isoformat()
+        save_profit_vault_state(st)
     if V18315_EVIDENCE_MINING_ENABLED and mode=="SHADOW_RESEARCH" and not st.get("cryptoEvidenceModeInitialized"):
         st["cryptoEvidenceModeInitialized"]=True
         st["cryptoEvidenceTrialStatus"]="RUNNING"
@@ -13156,12 +13190,14 @@ def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
             st["cryptoGovernorShadowBaseline"]=len(shadow); research=_v18289_stats([]); changed=True
             reason=f"Research redesign triggered after negative expectancy; evolved to {child['name']} ({evolution_reason})"
     elif mode=="PILOT_LIVE":
-        # Pilot fails fast on meaningful negative evidence; otherwise needs 15 real exits to graduate.
-        if pilot["trades"]>=5 and (pilot["expectancyUsd"]<0 or pilot["pnlUsd"]<=V18289_LIVE_FAIL_PNL_USD):
-            mode="SHADOW_RESEARCH"; st["cryptoGovernorShadowBaseline"]=len(shadow); changed=True
-            reason=f"Pilot failed: expectancy ${pilot['expectancyUsd']:.2f}, P&L ${pilot['pnlUsd']:.2f}; returned to Shadow"
+        # V18.3.18: real-money pilot is deliberately small. Five completed exits
+        # are enough to stop spending if live expectancy is non-positive. Full LIVE
+        # still requires a larger positive live sample; no Shadow-generation loop.
+        if pilot["trades"]>=V18318_PILOT_FAIL_MIN_EXITS and (pilot["expectancyUsd"]<=V18318_PILOT_FAIL_EXPECTANCY_USD or pilot["pnlUsd"]<=V18289_LIVE_FAIL_PNL_USD):
+            mode="SHADOW_RESEARCH"; st["cryptoGovernorShadowBaseline"]=len(shadow); st["cryptoEvidenceTrialStatus"]="LIVE_PILOT_FAILED"; changed=True
+            reason=f"Controlled pilot stopped: expectancy ${pilot['expectancyUsd']:.2f}, P&L ${pilot['pnlUsd']:.2f}; live entries disabled"
         elif pilot["trades"]>=V18289_PILOT_MIN_TRADES and pilot["expectancyUsd"]>0 and pilot["pnlUsd"]>0:
-            mode="LIVE"; changed=True; reason=f"Pilot graduated after {pilot['trades']} profitable live trades"
+            mode="LIVE"; st["cryptoEvidenceTrialStatus"]="LIVE"; changed=True; reason=f"Controlled pilot graduated after {pilot['trades']} profitable live trades"
     elif mode=="LIVE":
         if rolling["trades"]>=V18289_LIVE_MIN_SAMPLE and (rolling["expectancyUsd"]<=V18289_LIVE_FAIL_EXPECTANCY_USD or rolling["pnlUsd"]<=V18289_LIVE_FAIL_PNL_USD):
             mode="SHADOW_RESEARCH"; st["cryptoGovernorShadowBaseline"]=len(shadow); changed=True
@@ -13842,7 +13878,9 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
     held_symbols = {_v18246_crypto_symbol_key(p.get("symbol")) for p in positions}
     cooldown_state = load_profit_vault_state()
     active_cooldowns = _v18247_prune_crypto_cooldowns(cooldown_state, save=True)
-    slots = max(0, V18234_CRYPTO_LIVE_MAX_POSITIONS - len(positions))
+    _gov_now = _v18289_governor_refresh(save=False)
+    _effective_max_positions = min(V18234_CRYPTO_LIVE_MAX_POSITIONS, V18318_PILOT_MAX_POSITIONS) if _gov_now.get("pilot") else V18234_CRYPTO_LIVE_MAX_POSITIONS
+    slots = max(0, _effective_max_positions - len(positions))
     perf_snapshot = _v18282_crypto_performance_snapshot() if V18282_CRYPTO_PERFORMANCE_GUARD_ENABLED else {}
     risk_state = _v18250_refresh_crypto_risk_state(load_profit_vault_state(), allocation_gbp, save=True)
     risk_blocked, risk_reason = _v18250_crypto_entry_risk_block(risk_state, allocation_gbp)
@@ -13946,7 +13984,7 @@ def v18234_crypto_live_cycle(scans: Optional[List[Dict[str, Any]]] = None, allow
                 (remaining_gbp * (weight / score_total) if score_total > 0 else remaining_gbp / len(qualified))
                 for weight in weights
             ]
-            effective_entry_cap_pct = min(V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18289_PILOT_MAX_ENTRY_ALLOCATION_PCT if _v18289_governor_refresh(save=False).get("pilot") else V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT)
+            effective_entry_cap_pct = min(V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18318_PILOT_MAX_ENTRY_ALLOCATION_PCT if _v18289_governor_refresh(save=False).get("pilot") else V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT)
             per_entry_cap_gbp = max(1.0, allocation_gbp * (effective_entry_cap_pct / 100.0))
             planned_budgets = [min(budget, per_entry_cap_gbp) for budget in raw_budgets]
             if qualified:
