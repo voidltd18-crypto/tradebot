@@ -4354,10 +4354,29 @@ def pick_money_mode_stocks(
         reputation_ok, reputation_reason, reputation = symbol_reputation_allows_live_buy(symbol)
         scan["symbolReputation"] = reputation
         if not reputation_ok:
-            if log_rejections:
-                print(f"REPUTATION SKIP {symbol} | {reputation_reason}")
-            persist(scan, "REJECTED", "symbol_reputation_gate", reputation_reason)
-            continue
+            # V18.3.26 — Reputation cooldowns are historical protection, not a
+            # permanent veto on a genuinely strong fresh setup.  A symbol that
+            # is only blocked by an existing cooldown may be reconsidered when
+            # the CURRENT scan independently passes both Sniper and A+ gates.
+            # The underlying entry standards are not lowered; weak setups stay
+            # blocked and all account/PDT/risk gates above remain authoritative.
+            cooldown_override = False
+            if str((reputation or {}).get("label") or "").upper() == "COOLDOWN":
+                fresh_sniper_ok, _ = sniper_passes(scan)
+                fresh_aplus_ok, _ = a_plus_gate(scan)
+                cooldown_override = bool(fresh_sniper_ok and fresh_aplus_ok)
+            if cooldown_override:
+                if log_rejections:
+                    print(
+                        f"V18.3.26 REPUTATION COOLDOWN OVERRIDE {symbol} | "
+                        f"fresh setup passed Sniper + A+; historical cooldown remains recorded"
+                    )
+                scan["symbolReputationCooldownOverride"] = True
+            else:
+                if log_rejections:
+                    print(f"REPUTATION SKIP {symbol} | {reputation_reason}")
+                persist(scan, "REJECTED", "symbol_reputation_gate", reputation_reason)
+                continue
 
         sniper_ok, sniper_reason = sniper_passes(scan)
         if not sniper_ok:
