@@ -17091,6 +17091,43 @@ def api_banking_status():
     return {"ok": True, **banking_payload()}
 
 
+@app.post("/piggy-bank/reset")
+def api_reset_piggy_bank(request: Request, payload: dict = Body(default={})):
+    """V18.3.24 — explicitly release the current Piggy balance back to normal capital.
+
+    Historical lifetime sweep totals are retained. The existing stock/crypto capital
+    allocator decides where the newly deployable capital belongs for the current
+    market mode; this endpoint does not place an order.
+    """
+    verify_api_key(request)
+    confirmation = str(payload.get("confirmation") or "").strip().upper()
+    if confirmation != "RESET PIGGY BANK":
+        return {"ok": False, "message": "Confirmation required: RESET PIGGY BANK"}
+    with _PROFIT_VAULT_LOCK:
+        state = load_profit_vault_state()
+        released = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
+        if released <= 0.0001:
+            return {"ok": True, "releasedGbp": 0.0, "message": "Piggy Bank is already £0.00", "profitVault": profit_vault_payload()}
+        state["bankedProfitGbp"] = 0.0
+        state["lastPiggyResetAt"] = datetime.now(UTC).isoformat()
+        state["lastPiggyResetGbp"] = round(released, 4)
+        state["lifetimePiggyResetGbp"] = round(float(state.get("lifetimePiggyResetGbp") or 0.0) + released, 4)
+        state = save_profit_vault_state(state)
+    try:
+        state = _v18241_apply_vault_reserve(state, save=True)
+    except Exception as exc:
+        print(f"V18.3.24 PIGGY RESET ALLOCATION REFRESH ERROR | {exc}", flush=True)
+    vault = profit_vault_payload()
+    try:
+        latest_status["banking"] = banking_payload()
+        latest_status["lastAction"] = f"Piggy Bank reset: £{released:.2f} returned to normal capital"
+        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
+    except Exception:
+        pass
+    print(f"V18.3.24 PIGGY BANK RESET | released=£{released:.2f} piggy=£0.00", flush=True)
+    return {"ok": True, "releasedGbp": round(released, 2), "message": f"£{released:.2f} returned to normal trading capital", "profitVault": vault}
+
+
 @app.get("/trading-cap")
 def api_get_trading_cap():
     return {"ok": True, **banking_payload()}
