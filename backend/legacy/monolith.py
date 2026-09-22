@@ -4421,10 +4421,13 @@ def v17_live_entry_gate_pipeline(
         log_rejections=log_rejections,
     )
     if log_summary:
+        # V18.3.25: `raw` belonged to an older implementation and is not
+        # defined in this scope. The summary must use the actual scan input.
+        scanned_count = len(scans) if scans is not None else 0
         survivor_symbols = ",".join(str(row.get("symbol") or "") for row in survivors) or "-"
         print(
-            f"V17.0.15 ENTRY GATES | scanned={len(raw)} passed={len(survivors)} "
-            f"rejected={max(0, len(raw)-len(survivors))} survivors={survivor_symbols}"
+            f"V18.3.25 ENTRY GATES | scanned={scanned_count} passed={len(survivors)} "
+            f"rejected={max(0, scanned_count-len(survivors))} survivors={survivor_symbols}"
         )
     return survivors
 
@@ -14647,6 +14650,11 @@ def run_bot_loop():
 
                 scans = []
                 for symbol in list(current_universe):
+                    # V18.3.25: stock scans must never receive slash-form
+                    # crypto pairs. Crypto uses its own dedicated data pipeline.
+                    if "/" in str(symbol):
+                        print(f"V18.3.25 STOCK SCAN FILTER | skipped non-stock symbol={symbol}", flush=True)
+                        continue
                     try:
                         scan = compute_scan(symbol)
                         scans.append(scan)
