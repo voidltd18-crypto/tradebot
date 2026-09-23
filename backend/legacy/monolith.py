@@ -2010,6 +2010,23 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
     return False
 
 
+def _v18328_live_event_refresh(event: str, symbol: str) -> None:
+    """Refresh discovery/status immediately after a stock order without blocking it."""
+    def worker():
+        try:
+            print(f"V18.3.28 LIVE EVENT REFRESH | event={event} symbol={symbol} starting", flush=True)
+            if "refresh_dynamic_market_candidates" in globals():
+                refresh_dynamic_market_candidates(force=True)
+            if "refresh_adaptive_universe" in globals():
+                refresh_adaptive_universe(force=True)
+            if "update_status" in globals():
+                update_status(BOT_NAME, latest_scans)
+            print(f"V18.3.28 LIVE EVENT REFRESH | event={event} symbol={symbol} complete", flush=True)
+        except Exception as exc:
+            print(f"V18.3.28 LIVE EVENT REFRESH ERROR | event={event} symbol={symbol} error={exc}", flush=True)
+    threading.Thread(target=worker, daemon=True, name=f"v18328-{event.lower()}-{symbol}").start()
+
+
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", scan: Optional[Dict[str, Any]] = None):
     order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
     trading_client.submit_order(order)
@@ -2031,6 +2048,7 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
     }
     trade_events.append(event)
     add_trade_history_event(event)
+    _v18328_live_event_refresh("BUY", symbol)
     try:
         if "v18230_record_entry_timing" in globals():
             observed_price = float((scan or {}).get("price") or 0.0)
@@ -2085,6 +2103,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     }
     trade_events.append(event)
     add_trade_history_event(event)
+    _v18328_live_event_refresh("SELL", symbol)
     update_stock_memory_from_sell(symbol, pnl, pnl_pct)
     try:
         if "_v18255_record_tax_disposal" in globals():
@@ -15769,12 +15788,16 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
         data = {"enabled": False, "symbols": [], "rows": [], "source": "disabled", "updatedAt": datetime.now(UTC).isoformat(), "error": ""}
         return _save_dynamic_scanner_cache(data)
 
-    if not force and _dynamic_cache_age_seconds() < DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS:
-        return _load_dynamic_scanner_cache()
+    cached = _load_dynamic_scanner_cache()
+    cache_day = str(cached.get("tradingDay") or "")
+    if not force and cache_day == today_str() and _dynamic_cache_age_seconds() < DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS:
+        return cached
 
     _scanner_cycle_started = _cycle_monitor_start("scanner")
     prior_cache = dict(_load_dynamic_scanner_cache() or {})
-    prior_rows = list(prior_cache.get("rows") or [])
+    # Last-good rows are permitted only from TODAY. Yesterday's favourites must
+    # never seed a new trading day.
+    prior_rows = list(prior_cache.get("rows") or []) if str(prior_cache.get("tradingDay") or "") == today_str() else []
     rows_by_symbol: Dict[str, Dict[str, Any]] = {}
     errors = []
 
@@ -15815,7 +15838,8 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
 
     payload = {
         "enabled": True,
-        "mode": "dynamic-market-scanner",
+        "mode": "always-fresh-market-scanner",
+        "tradingDay": today_str(),
         "updatedAt": datetime.now(UTC).isoformat(),
         "refreshSeconds": DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS,
         "maxSymbols": DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS,
@@ -15891,7 +15915,7 @@ ADAPTIVE_UNIVERSE_ENABLED = os.getenv("ADAPTIVE_UNIVERSE_ENABLED", "true").lower
 
 ADAPTIVE_UNIVERSE_TARGET_SIZE = max(6, int(os.getenv("ADAPTIVE_UNIVERSE_TARGET_SIZE", str(AUTO_UNIVERSE_SIZE)) or AUTO_UNIVERSE_SIZE))
 ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS = max(1, min(ADAPTIVE_UNIVERSE_TARGET_SIZE, int(os.getenv("ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS", "8") or 8)))
-ADAPTIVE_UNIVERSE_CORE_SLOTS = max(0, min(ADAPTIVE_UNIVERSE_TARGET_SIZE, int(os.getenv("ADAPTIVE_UNIVERSE_CORE_SLOTS", "4") or 4)))
+ADAPTIVE_UNIVERSE_CORE_SLOTS = max(0, min(ADAPTIVE_UNIVERSE_TARGET_SIZE, int(os.getenv("ADAPTIVE_UNIVERSE_CORE_SLOTS", "0") or 0)))
 ADAPTIVE_UNIVERSE_REFRESH_SECONDS = max(300, int(os.getenv("ADAPTIVE_UNIVERSE_REFRESH_SECONDS", "1800") or 1800))
 ADAPTIVE_UNIVERSE_FILE = os.path.join("backend", "state", "adaptive_universe.json")
 
@@ -15916,26 +15940,22 @@ def _adaptive_symbol_buy_allowed(symbol: str) -> bool:
 
 
 def _adaptive_core_rows() -> List[Dict[str, Any]]:
-    """Rank stable anchors by the bot's own realised symbol evidence."""
-    pool = [str(x).upper() for x in globals().get("QUALITY_ONLY_UNIVERSE", AUTO_UNIVERSE_CANDIDATE_POOL)]
-    memory = {}
-    try:
-        memory = {str(r.get("symbol") or "").upper(): dict(r) for r in universe_rows_from_stock_memory()}
-    except Exception:
-        memory = {}
+    """Emergency fallback rows only; never rank by historical stock memory.
 
+    V18.3.28 Always Fresh Explorer deliberately removes the previous-symbol /
+    realised-memory advantage. Familiar names may still return, but only by
+    earning a place in today's discovery data (or if discovery genuinely fails).
+    """
     rows: List[Dict[str, Any]] = []
+    pool = [str(x).upper() for x in globals().get("QUALITY_ONLY_UNIVERSE", AUTO_UNIVERSE_CANDIDATE_POOL)]
     for i, sym in enumerate(pool):
         if not _adaptive_symbol_buy_allowed(sym):
             continue
-        row = dict(memory.get(sym) or score_candidate_symbol(sym))
-        # Keep scores useful for display without pretending dynamic/core scores
-        # are identical statistical quantities.
-        row.update({"symbol": sym, "adaptiveSource": "CORE", "coreAnchor": True, "dynamicPick": False})
-        row.setdefault("reason", "adaptive core anchor")
+        row = dict(score_candidate_symbol(sym))
+        row.update({"symbol": sym, "adaptiveSource": "FALLBACK", "coreAnchor": False, "dynamicPick": False})
+        row["reason"] = "always-fresh emergency fallback | discovery unavailable"
         row["anchorRank"] = i + 1
         rows.append(row)
-    rows.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
     return rows
 
 
@@ -15988,9 +16008,10 @@ def adaptive_universe_payload() -> Dict[str, Any]:
 def refresh_adaptive_universe(force: bool = False) -> Dict[str, Any]:
     """Build a runtime universe with fresh discoveries owning most slots.
 
-    Priority is: held positions -> manual pins -> broad-market discoveries ->
-    evidence-ranked core anchors -> safe refill. Every candidate still has to
-    pass the normal V17 live gates and final execution lock before buying.
+    Priority is: held positions -> manual pins -> TODAY'S broad-market discoveries.
+    Historical winners/recently-used symbols receive no preference. A fixed quality
+    pool is used only as an emergency fallback when live discovery returns nothing.
+    Every candidate still passes the normal V17 live gates and execution lock.
     """
     global current_universe, adaptive_universe_runtime_cache
     if not ADAPTIVE_UNIVERSE_ENABLED:
@@ -16053,29 +16074,20 @@ def refresh_adaptive_universe(force: bool = False) -> Dict[str, Any]:
         add_row(row, "DISCOVERY")
         discovery_added += 1
 
-    core_added = 0
-    for row in cores:
-        if len(selected) >= ADAPTIVE_UNIVERSE_TARGET_SIZE or core_added >= ADAPTIVE_UNIVERSE_CORE_SLOTS:
-            break
-        if str(row.get("symbol") or "").upper() in seen:
-            continue
-        add_row(row, "CORE")
-        core_added += 1
-
-    # If discovery/core quotas left gaps, fill from whichever side still has
-    # viable names rather than returning to a fixed dedicated pool.
-    for row in discoveries + cores:
+    # Always Fresh: once live discovery has produced names, keep filling from
+    # that fresh set. Do not mix in historical/core favourites just to fill slots.
+    for row in discoveries:
         if len(selected) >= ADAPTIVE_UNIVERSE_TARGET_SIZE:
             break
-        add_row(row, str(row.get("adaptiveSource") or "DISCOVERY"))
+        add_row(row, "DISCOVERY")
 
-    # Last-resort safe refill only if external discovery is unavailable.
-    for sym in AUTO_UNIVERSE_CANDIDATE_POOL:
-        if len(selected) >= ADAPTIVE_UNIVERSE_TARGET_SIZE:
-            break
-        if sym in seen or not _adaptive_symbol_buy_allowed(sym):
-            continue
-        add_row(score_candidate_symbol(sym), "FALLBACK")
+    # Emergency only: if live discovery genuinely produced no candidates, use
+    # the stable quality pool. This is a safety fallback, never a preference.
+    if not discoveries:
+        for row in cores:
+            if len(selected) >= ADAPTIVE_UNIVERSE_TARGET_SIZE:
+                break
+            add_row(row, "FALLBACK")
 
     previous = list(current_universe)
     current_universe = [r["symbol"] for r in selected]
@@ -16086,7 +16098,7 @@ def refresh_adaptive_universe(force: bool = False) -> Dict[str, Any]:
     changes = int(adaptive_universe_runtime_cache.get("changes") or 0) + (1 if changed else 0)
     payload = {
         "enabled": True,
-        "mode": "hybrid-open-market",
+        "mode": "always-fresh-explorer",
         "updatedAt": datetime.now(UTC).isoformat(),
         "lastRefreshTs": now_ts,
         "refreshSeconds": ADAPTIVE_UNIVERSE_REFRESH_SECONDS,
@@ -16107,7 +16119,7 @@ def refresh_adaptive_universe(force: bool = False) -> Dict[str, Any]:
     _save_adaptive_universe_payload(payload)
     try:
         latest_status["adaptiveUniverse"] = payload
-        latest_status["autoUniverse"] = {**latest_status.get("autoUniverse", {}), "mode": "hybrid-open-market", "activeSymbols": list(current_universe), "rows": selected, "size": len(current_universe)}
+        latest_status["autoUniverse"] = {**latest_status.get("autoUniverse", {}), "mode": "always-fresh-explorer", "activeSymbols": list(current_universe), "rows": selected, "size": len(current_universe)}
     except Exception:
         pass
 
