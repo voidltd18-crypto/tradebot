@@ -178,6 +178,10 @@ MAX_DAILY_LOSS = -100.00
 MAX_TRADES_PER_DAY = 12
 DUST_THRESHOLD = 0.1
 PHANTOM_CLOSED_TRADE_QTY_EPSILON = 1e-9
+# V18.3.27: hide/skip FIFO dust by economic value, not quantity alone.
+# This preserves legitimate tiny quantities of high-priced assets (e.g. BTC)
+# while preventing sub-cent residual matches from becoming 0.0000 report rows.
+PHANTOM_CLOSED_TRADE_MIN_NOTIONAL_USD = 0.01
 
 STRICT_ONE_CYCLE_PER_STOCK_PER_DAY = True
 ALLOW_CUSTOM_BUY = True
@@ -7186,9 +7190,10 @@ def closed_trades_from_db(limit: int = 1000):
         rows = conn.execute("""
             SELECT * FROM closed_trades
             WHERE COALESCE(qty, 0) > ?
+              AND ABS(COALESCE(qty, 0) * COALESCE(exit_price, 0)) >= ?
             ORDER BY timestamp DESC
             LIMIT ?
-        """, (PHANTOM_CLOSED_TRADE_QTY_EPSILON, limit)).fetchall()
+        """, (PHANTOM_CLOSED_TRADE_QTY_EPSILON, PHANTOM_CLOSED_TRADE_MIN_NOTIONAL_USD, limit)).fetchall()
         conn.close()
 
         return [
@@ -7304,8 +7309,14 @@ def rebuild_closed_trades_from_orders():
                     "source": "fifo_matcher",
                 }
 
-                save_closed_trade_to_db(trade)
-                closed_count += 1
+                # V18.3.27 Report Integrity: consume FIFO dust so accounting
+                # remains exact, but do not persist a sub-cent residual as a
+                # separate closed trade. Quantity-only thresholds are unsafe
+                # for high-priced fractional assets such as BTC.
+                matched_notional = abs(used_qty * exit_price)
+                if matched_notional >= PHANTOM_CLOSED_TRADE_MIN_NOTIONAL_USD:
+                    save_closed_trade_to_db(trade)
+                    closed_count += 1
 
                 lot["qty"] = float(lot["qty"]) - used_qty
                 remaining -= used_qty
