@@ -17179,8 +17179,10 @@ def api_add_to_piggy_bank(request: Request, payload: dict = Body(default={})):
     with _PROFIT_VAULT_LOCK:
         state = load_profit_vault_state()
         current = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
-        crypto = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
-        available = max(0.0, equity_gbp - current - crypto)
+        # V18.3.30: manual Piggy funding may come from capital currently assigned
+        # to the crypto engine. Crypto allocation is an internal allocation, not
+        # money outside the brokerage account, so do not subtract it here.
+        available = max(0.0, equity_gbp - current)
         if amount > available + 0.005:
             return {"ok": False, "message": f"Only £{available:.2f} of account equity is currently available to protect."}
         state["bankedProfitGbp"] = round(current + amount, 4)
@@ -17192,7 +17194,7 @@ def api_add_to_piggy_bank(request: Request, payload: dict = Body(default={})):
     try:
         state = _v18241_apply_vault_reserve(state, save=True)
     except Exception as exc:
-        print(f"V18.3.29 MANUAL PIGGY ALLOCATION REFRESH ERROR | {exc}", flush=True)
+        print(f"V18.3.30 MANUAL PIGGY ALLOCATION REFRESH ERROR | {exc}", flush=True)
     vault = profit_vault_payload()
     try:
         latest_status["banking"] = banking_payload()
@@ -17200,7 +17202,7 @@ def api_add_to_piggy_bank(request: Request, payload: dict = Body(default={})):
         latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
     except Exception:
         pass
-    print(f"V18.3.29 MANUAL PIGGY ADD | amount=£{amount:.2f} piggy=£{float(vault.get('piggyBankGbp') or 0.0):.2f}", flush=True)
+    print(f"V18.3.30 MANUAL PIGGY ADD | amount=£{amount:.2f} piggy=£{float(vault.get('piggyBankGbp') or 0.0):.2f}", flush=True)
     return {"ok": True, "addedGbp": amount, "message": f"£{amount:.2f} protected in the Piggy Bank", "profitVault": vault}
 
 
