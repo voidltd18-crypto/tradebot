@@ -11878,15 +11878,84 @@ def _v18245_discover_crypto_symbols(force: bool = False) -> List[str]:
         return fallback or list(V18232_CRYPTO_SYMBOLS)
 
 
+def _v18332_current_rss_mb() -> float:
+    """Cheap Linux current-RSS telemetry (not max RSS)."""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return round(float(line.split()[1]) / 1024.0, 1)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _v18332_memory_checkpoint(stage: str, collect: bool = False) -> float:
+    if collect:
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
+    rss = _v18332_current_rss_mb()
+    if rss:
+        print(f"V18.3.32 MEMORY GUARD | stage={stage} rss={rss:.1f}MB limit=512MB", flush=True)
+    return rss
+
+
+def _v18332_compact_alpaca_scan(symbol: str, raw: Any) -> Optional[Dict[str, Any]]:
+    """Convert raw Alpaca bars straight into the compact scan record.
+
+    V18.3.32 deliberately does not retain the raw bar universe in memory.
+    """
+    bars = [b for b in (raw or []) if isinstance(b, dict) and float(b.get("c") or 0) > 0]
+    if len(bars) < 4:
+        return None
+    price = float(bars[-1].get("c") or 0)
+    close_15 = float(bars[-4].get("c") or price)
+    close_60 = float(bars[-13].get("c") or price) if len(bars) >= 13 else float(bars[0].get("c") or price)
+    ret15 = ((price / close_15) - 1.0) * 100.0 if close_15 > 0 else 0.0
+    ret60 = ((price / close_60) - 1.0) * 100.0 if close_60 > 0 else 0.0
+    recent = bars[-12:] if len(bars) >= 12 else bars
+    highs = [float(b.get("h") or b.get("c") or price) for b in recent]
+    lows = [float(b.get("l") or b.get("c") or price) for b in recent]
+    high60 = max(highs) if highs else price
+    low60 = min(lows) if lows else price
+    range60 = ((high60 / low60) - 1.0) * 100.0 if low60 > 0 else 0.0
+    notional60 = 0.0
+    for b in recent:
+        try:
+            notional60 += max(0.0, float(b.get("v") or 0.0)) * max(0.0, float(b.get("c") or price))
+        except Exception:
+            pass
+    last6 = bars[-6:] if len(bars) >= 6 else bars
+    avg6 = sum(float(b.get("c") or price) for b in last6) / max(1, len(last6))
+    trend = 1.0 if price >= avg6 else 0.0
+    momentum15 = _v18232_clamp((ret15 + 0.35) / 2.50)
+    momentum60 = _v18232_clamp((ret60 + 0.75) / 5.00)
+    range_quality = _v18232_clamp(1.0 - abs(range60 - 2.0) / 5.0)
+    score = _v18232_clamp(0.38 * momentum15 + 0.34 * momentum60 + 0.18 * trend + 0.10 * range_quality)
+    entry_momentum_ok = bool(ret15 >= V18250_CRYPTO_MIN_15M_MOMENTUM_PCT and ret60 >= V18250_CRYPTO_MIN_60M_MOMENTUM_PCT)
+    return {
+        "symbol": symbol, "price": round(price, 8), "score": round(score, 4),
+        "return15mPct": round(ret15, 4), "return60mPct": round(ret60, 4),
+        "range60mPct": round(range60, 4), "liquidity60mUsd": round(notional60, 2),
+        "liquid": False, "entryMomentumOk": entry_momentum_ok, "qualified": False,
+        "bars": len(bars), "source": "alpaca_crypto_dynamic_5min",
+    }
+
+
 def _v18232_fetch_scans() -> List[Dict[str, Any]]:
     symbols = _v18245_discover_crypto_symbols()
     if not symbols:
         return []
     start = (datetime.now(UTC) - timedelta(minutes=95)).isoformat().replace("+00:00", "Z")
-    grouped: Dict[str, Any] = {}
-    # Batch the full universe instead of applying a symbol-count limit. Keeping
-    # each request small also prevents Alpaca's 1000-bar response limit from
-    # starving symbols at the end of a large universe.
+    scans: List[Dict[str, Any]] = []
+    _v18332_memory_checkpoint("alpaca-scan-start")
+
+    # V18.3.32: process one Alpaca response at a time. The old implementation
+    # accumulated every symbol's raw bars in `grouped` before scoring them, which
+    # unnecessarily kept the whole JSON bar universe alive at once.
     for offset in range(0, len(symbols), V18245_CRYPTO_SCAN_BATCH_SIZE):
         batch = symbols[offset:offset + V18245_CRYPTO_SCAN_BATCH_SIZE]
         try:
@@ -11896,57 +11965,17 @@ def _v18232_fetch_scans() -> List[Dict[str, Any]]:
             })
             bars_map = payload.get("bars") or {}
             if isinstance(bars_map, dict):
-                grouped.update(bars_map)
+                for symbol in batch:
+                    row = _v18332_compact_alpaca_scan(symbol, bars_map.get(symbol) or [])
+                    if row:
+                        scans.append(row)
+            # Drop the large response before fetching the next batch.
+            del bars_map
+            del payload
         except Exception as exc:
             print(f"V18.2.45 CRYPTO SCAN BATCH DEFERRED | offset={offset} size={len(batch)} error={str(exc)[:240]}", flush=True)
             continue
 
-    scans: List[Dict[str, Any]] = []
-    for symbol in symbols:
-        raw = grouped.get(symbol) or []
-        bars = [b for b in raw if isinstance(b, dict) and float(b.get("c") or 0) > 0]
-        if len(bars) < 4:
-            continue
-        price = float(bars[-1].get("c") or 0)
-        close_15 = float(bars[-4].get("c") or price) if len(bars) >= 4 else price
-        close_60 = float(bars[-13].get("c") or price) if len(bars) >= 13 else float(bars[0].get("c") or price)
-        ret15 = ((price / close_15) - 1.0) * 100.0 if close_15 > 0 else 0.0
-        ret60 = ((price / close_60) - 1.0) * 100.0 if close_60 > 0 else 0.0
-        recent = bars[-12:] if len(bars) >= 12 else bars
-        highs = [float(b.get("h") or b.get("c") or price) for b in recent]
-        lows = [float(b.get("l") or b.get("c") or price) for b in recent]
-        high60 = max(highs) if highs else price
-        low60 = min(lows) if lows else price
-        range60 = ((high60 / low60) - 1.0) * 100.0 if low60 > 0 else 0.0
-        # Estimate recent tradable depth from Alpaca bar volume. This is used as
-        # a safety gate, not a ranking boost, so thin pairs cannot win purely on
-        # a noisy percentage spike.
-        notional60 = 0.0
-        for b in recent:
-            try:
-                notional60 += max(0.0, float(b.get("v") or 0.0)) * max(0.0, float(b.get("c") or price))
-            except Exception:
-                pass
-        # Final liquidity eligibility is assigned after the full universe is scanned,
-        # so the adaptive gate can compare pairs against one another. Keep the raw
-        # notional estimate here for ranking/diagnostics.
-        liquid = False
-        last6 = bars[-6:] if len(bars) >= 6 else bars
-        avg6 = sum(float(b.get("c") or price) for b in last6) / max(1, len(last6))
-        trend = 1.0 if price >= avg6 else 0.0
-        momentum15 = _v18232_clamp((ret15 + 0.35) / 2.50)
-        momentum60 = _v18232_clamp((ret60 + 0.75) / 5.00)
-        range_quality = _v18232_clamp(1.0 - abs(range60 - 2.0) / 5.0)
-        score = _v18232_clamp(0.38 * momentum15 + 0.34 * momentum60 + 0.18 * trend + 0.10 * range_quality)
-        entry_momentum_ok = bool(ret15 >= V18250_CRYPTO_MIN_15M_MOMENTUM_PCT and ret60 >= V18250_CRYPTO_MIN_60M_MOMENTUM_PCT)
-        qualified = False
-        scans.append({
-            "symbol": symbol, "price": round(price, 8), "score": round(score, 4),
-            "return15mPct": round(ret15, 4), "return60mPct": round(ret60, 4),
-            "range60mPct": round(range60, 4), "liquidity60mUsd": round(notional60, 2),
-            "liquid": liquid, "entryMomentumOk": entry_momentum_ok, "qualified": qualified,
-            "bars": len(bars), "source": "alpaca_crypto_dynamic_5min",
-        })
     # V18.2.53 adaptive liquidity safety gate.
     # Prefer the configured $5k absolute floor. If that would reject every pair,
     # derive an effective threshold from the market's own 60-minute activity and
@@ -12515,7 +12544,12 @@ def _v18307_kraken_shadow_scans(existing_symbols: set, needed: int) -> List[Dict
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
         scans = []
-        with ThreadPoolExecutor(max_workers=10) as pool:
+        # V18.3.32: Kraken JSON/OHLC responses are short-lived but concurrent
+        # requests multiply peak RAM. Keep coverage identical while lowering the
+        # number of simultaneous response objects on a 512MB Render instance.
+        _rss_before_kraken = _v18332_memory_checkpoint("kraken-start")
+        _kraken_workers = 2 if _rss_before_kraken >= 400.0 else 4
+        with ThreadPoolExecutor(max_workers=_kraken_workers) as pool:
             futures = [pool.submit(fetch_one, item) for item in selected]
             for fut in as_completed(futures):
                 try:
@@ -12637,6 +12671,8 @@ def v18232_crypto_shadow_cycle() -> Dict[str, Any]:
     finally:
         conn.close()
     _crypto_shadow_runtime.update({"running": True, "lastError": None, "lastScanAt": now})
+    # V18.3.32: release cyclic/temporary research objects after the heavy scan.
+    _v18332_memory_checkpoint("shadow-cycle-end", collect=True)
     try: _v18289_governor_refresh(save=True)
     except Exception as _gov_exc: print(f"V18.2.89 GOVERNOR ERROR | {_gov_exc}", flush=True)
     # V18.2.34: same market scan can drive the separately permissioned live pilot.
