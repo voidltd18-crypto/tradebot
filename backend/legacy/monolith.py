@@ -2116,6 +2116,11 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
             profit_vault_bank_realised_profit(pnl, symbol=symbol, reason=reason)
         except Exception as vault_exc:
             print(f"V17.6 PROFIT VAULT BANK ERROR | symbol={symbol} error={vault_exc}")
+    try:
+        if "_v18333_record_stock_exit" in globals():
+            _v18333_record_stock_exit(symbol, entry, price, rounded_qty, reason)
+    except Exception as learning_exc:
+        print(f"V18.3.33 EXIT LEARNER RECORD ERROR | {symbol} {learning_exc}", flush=True)
     lock_symbol_until_tomorrow(symbol)
     notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
 
@@ -6514,6 +6519,33 @@ def _init_db_impl():
         )
     """)
     cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18230_exit_due ON v18230_one_hour_exit_evidence(status, sold_at)""")
+
+    # V18.3.33 — stock exit outcome learner. Evidence-only: records what the
+    # market did after a live stock exit so Atlas can distinguish genuine
+    # breakdowns from stop-loss whipsaws without weakening live protection.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS v18333_stock_exit_learning (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sold_at TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            exit_price REAL NOT NULL,
+            qty REAL NOT NULL,
+            realised_pnl_pct REAL,
+            price_5m REAL, after_5m_pct REAL,
+            price_15m REAL, after_15m_pct REAL,
+            price_30m REAL, after_30m_pct REAL,
+            price_60m REAL, after_60m_pct REAL,
+            post_high_30m REAL, post_low_30m REAL,
+            recovered_entry_30m INTEGER NOT NULL DEFAULT 0,
+            classification TEXT,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            updated_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_v18333_exit_learning_due
+                   ON v18333_stock_exit_learning(status, sold_at)""")
 
     # V18.2.32 — isolated crypto shadow lab. Virtual capital and virtual
     # positions only. This schema is never used by live stock execution.
@@ -11590,7 +11622,132 @@ def v18230_evidence_worker():
     while True:
         try: v18230_evaluate_evidence(25)
         except Exception as exc: print(f"V18.2.30 EVIDENCE WORKER ERROR: {exc}")
+        try:
+            if "v18333_evaluate_stock_exits" in globals():
+                v18333_evaluate_stock_exits(25)
+        except Exception as exc:
+            print(f"V18.3.33 EXIT LEARNER WORKER ERROR: {exc}", flush=True)
         time.sleep(V18230_EVIDENCE_INTERVAL_SECONDS)
+
+
+# =========================
+# V18.3.33 — STOCK EXIT WHIPSAW LEARNER
+# Evidence-only. It NEVER changes stop loss, trailing profit, sizing, entry
+# qualification, same-day lockout or live order permissions. The purpose is to
+# measure whether a stop protected us from a continuing breakdown or was
+# followed by a rapid recovery (whipsaw), then expose that evidence for review.
+# =========================
+V18333_EXIT_LEARNER_ENABLED = str(os.getenv("TRADEBOT_V18333_EXIT_LEARNER_ENABLED", "true")).lower() in ("1","true","yes","on")
+V18333_WHIPSAW_RECOVERY_PCT = max(0.10, float(os.getenv("TRADEBOT_V18333_WHIPSAW_RECOVERY_PCT", "0.75") or 0.75))
+V18333_BREAKDOWN_CONTINUE_PCT = max(0.10, float(os.getenv("TRADEBOT_V18333_BREAKDOWN_CONTINUE_PCT", "0.50") or 0.50))
+
+
+def _v18333_record_stock_exit(symbol: str, entry_price: float, exit_price: float, qty: float, reason: str) -> None:
+    if not SQLITE_ENABLED or not V18333_EXIT_LEARNER_ENABLED:
+        return
+    entry=float(entry_price or 0.0); exit_px=float(exit_price or 0.0); q=float(qty or 0.0)
+    if entry <= 0 or exit_px <= 0 or q <= PHANTOM_CLOSED_TRADE_QTY_EPSILON:
+        return
+    now=datetime.now(UTC).isoformat(); sym=str(symbol or "").upper().strip(); why=str(reason or "AUTO SELL")
+    realised=((exit_px/entry)-1.0)*100.0
+    conn=db_connect()
+    try:
+        conn.execute("""INSERT INTO v18333_stock_exit_learning
+            (sold_at,symbol,reason,entry_price,exit_price,qty,realised_pnl_pct,status,updated_at)
+            VALUES (?,?,?,?,?,?,?,'PENDING',?)""",
+            (now,sym,why,entry,exit_px,q,realised,now))
+        conn.commit()
+    finally:
+        conn.close()
+    print(f"V18.3.33 EXIT LEARNER | recorded {sym} reason={why} realised={realised:.2f}% advisory_only=True", flush=True)
+
+
+def _v18333_classify_exit(row: Dict[str, Any], updates: Dict[str, Any]) -> str:
+    reason=str(row.get("reason") or "").upper()
+    entry=float(row.get("entry_price") or 0.0); exit_px=float(row.get("exit_price") or 0.0)
+    p15=float(updates.get("price_15m") if updates.get("price_15m") is not None else row.get("price_15m") or 0.0)
+    p30=float(updates.get("price_30m") if updates.get("price_30m") is not None else row.get("price_30m") or 0.0)
+    high=float(updates.get("post_high_30m") if updates.get("post_high_30m") is not None else row.get("post_high_30m") or 0.0)
+    stop_like=("STOP" in reason or "LOSS GUARD" in reason)
+    recovered_entry = entry > 0 and max(p15,p30,high) >= entry
+    rebound=max([x for x in (p15,p30,high) if x>0], default=0.0)
+    rebound_pct=((rebound/exit_px)-1.0)*100.0 if exit_px>0 and rebound>0 else 0.0
+    after30=((p30/exit_px)-1.0)*100.0 if exit_px>0 and p30>0 else 0.0
+    if stop_like and (recovered_entry or rebound_pct >= V18333_WHIPSAW_RECOVERY_PCT):
+        return "WHIPSAW_RECOVERY"
+    if after30 <= -V18333_BREAKDOWN_CONTINUE_PCT:
+        return "BREAKDOWN_CONFIRMED"
+    if after30 >= V18333_WHIPSAW_RECOVERY_PCT:
+        return "RECOVERY_AFTER_EXIT"
+    return "EXIT_HELD"
+
+
+def v18333_evaluate_stock_exits(limit: int = 25) -> Dict[str, Any]:
+    if not SQLITE_ENABLED or not V18333_EXIT_LEARNER_ENABLED:
+        return {"ok":False,"evaluated":0}
+    now=datetime.now(UTC); conn=db_connect()
+    rows=[dict(r) for r in conn.execute(
+        "SELECT * FROM v18333_stock_exit_learning WHERE status='PENDING' ORDER BY sold_at ASC LIMIT ?",(int(limit),)
+    ).fetchall()]
+    conn.close(); evaluated=0; errors=0
+    for row in rows:
+        try:
+            sold=_v6_parse_utc(row["sold_at"]); exit_px=float(row["exit_price"] or 0.0); entry=float(row["entry_price"] or 0.0)
+            updates={}
+            for mins,col in ((5,"5m"),(15,"15m"),(30,"30m"),(60,"60m")):
+                due=sold+timedelta(minutes=mins)
+                if now < due: continue
+                if row.get(f"price_{col}") is None:
+                    px=float(_v6_historical_checkpoint_price(row["symbol"],due)["price"])
+                    updates[f"price_{col}"]=px
+                    updates[f"after_{col}_pct"]=((px/exit_px)-1.0)*100.0 if exit_px>0 else 0.0
+            if now >= sold+timedelta(minutes=30) and row.get("post_high_30m") is None:
+                rs=_v18230_range_stats(row["symbol"],sold,sold+timedelta(minutes=30))
+                updates["post_high_30m"]=float(rs["high"]); updates["post_low_30m"]=float(rs["low"])
+                updates["recovered_entry_30m"]=1 if entry>0 and float(rs["high"])>=entry else 0
+            have30=(updates.get("price_30m") is not None or row.get("price_30m") is not None)
+            if have30:
+                updates["classification"]=_v18333_classify_exit(row,updates)
+            if now >= sold+timedelta(minutes=60) and (updates.get("price_60m") is not None or row.get("price_60m") is not None):
+                updates["status"]="COMPLETE"
+            if updates:
+                sets=", ".join(f"{k}=?" for k in updates)+", updated_at=?"
+                vals=list(updates.values())+[datetime.now(UTC).isoformat(),int(row["id"])]
+                c=db_connect(); c.execute(f"UPDATE v18333_stock_exit_learning SET {sets} WHERE id=?",vals); c.commit(); c.close(); evaluated+=1
+                if updates.get("classification"):
+                    print(
+                        f"V18.3.33 EXIT OUTCOME | {row['symbol']} reason={row['reason']} "
+                        f"class={updates['classification']} after15={float(updates.get('after_15m_pct') if updates.get('after_15m_pct') is not None else row.get('after_15m_pct') or 0.0):.2f}% "
+                        f"after30={float(updates.get('after_30m_pct') if updates.get('after_30m_pct') is not None else row.get('after_30m_pct') or 0.0):.2f}% "
+                        f"recovered_entry={bool(updates.get('recovered_entry_30m',row.get('recovered_entry_30m')))} advisory_only=True",
+                        flush=True,
+                    )
+        except Exception as exc:
+            errors+=1; print(f"V18.3.33 EXIT LEARNER ERROR id={row.get('id')} symbol={row.get('symbol')}: {exc}", flush=True)
+    return {"ok":True,"evaluated":evaluated,"errors":errors}
+
+
+def v18333_stock_exit_learning_payload(days: int = 30) -> Dict[str, Any]:
+    init_db(); cutoff=(datetime.now(UTC)-timedelta(days=max(1,int(days)))).isoformat(); conn=db_connect()
+    rows=[dict(r) for r in conn.execute(
+        "SELECT * FROM v18333_stock_exit_learning WHERE sold_at>=? ORDER BY sold_at DESC",(cutoff,)
+    ).fetchall()]; conn.close()
+    complete=[r for r in rows if r.get("status")=="COMPLETE"]
+    classes={}
+    for r in rows:
+        k=str(r.get("classification") or "PENDING"); classes[k]=classes.get(k,0)+1
+    stop_rows=[r for r in rows if "STOP" in str(r.get("reason") or "").upper() or "LOSS GUARD" in str(r.get("reason") or "").upper()]
+    whipsaws=[r for r in stop_rows if r.get("classification")=="WHIPSAW_RECOVERY"]
+    return {"ok":True,"version":"V18.3.33","advisoryOnly":True,"liveProtectionChanged":False,
+        "samples":len(rows),"complete":len(complete),"classifications":classes,
+        "stopExitSamples":len(stop_rows),"stopWhipsaws":len(whipsaws),
+        "stopWhipsawRatePct":round((len(whipsaws)/len(stop_rows))*100.0,2) if stop_rows else None,
+        "recent":rows[:50]}
+
+
+@app.get('/v18/stock-exit-learning')
+def api_v18333_stock_exit_learning(request: Request, days: int = 30):
+    verify_api_key(request); return v18333_stock_exit_learning_payload(days)
 
 
 # =========================
