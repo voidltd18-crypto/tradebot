@@ -16704,6 +16704,10 @@ def _profit_vault_default_state() -> Dict[str, Any]:
         "bankPct": round(float(PROFIT_VAULT_BANK_PCT), 4),
         "bankedProfitGbp": 0.0,
         "lifetimeBankedGbp": 0.0,
+        # V18.3.29 — operator-funded Piggy money is tracked separately so it
+        # never inflates the bot's lifetime realised-profit figure.
+        "manualPiggyGbp": 0.0,
+        "lifetimeManualPiggyGbp": 0.0,
         "createdAt": now,
         "updatedAt": now,
         "lastBankedAt": "",
@@ -16743,7 +16747,9 @@ def load_profit_vault_state() -> Dict[str, Any]:
                 default["baselineGbp"] = round(max(float(PROFIT_VAULT_DEFAULT_BASELINE_GBP), float(default.get("baselineGbp") or 0.0)), 2)  # milestones may promote, never demote
                 default["bankPct"] = max(0.0, min(1.0, float(default.get("bankPct") if default.get("bankPct") is not None else PROFIT_VAULT_BANK_PCT)))
                 default["bankedProfitGbp"] = max(0.0, float(default.get("bankedProfitGbp") or 0.0))
-                default["lifetimeBankedGbp"] = max(default["bankedProfitGbp"], float(default.get("lifetimeBankedGbp") or 0.0))
+                default["lifetimeBankedGbp"] = max(0.0, float(default.get("lifetimeBankedGbp") or 0.0))
+                default["manualPiggyGbp"] = max(0.0, min(default["bankedProfitGbp"], float(default.get("manualPiggyGbp") or 0.0)))
+                default["lifetimeManualPiggyGbp"] = max(default["manualPiggyGbp"], float(default.get("lifetimeManualPiggyGbp") or 0.0))
                 default["cryptoAllocatedGbp"] = max(0.0, float(default.get("cryptoAllocatedGbp") or 0.0))
                 ceiling = max(0.0, float(default.get("cryptoEngineCapitalCeilingGbp") or 0.0))
                 if ceiling <= 0.0 and default["cryptoAllocatedGbp"] > 0.0:
@@ -16772,7 +16778,9 @@ def save_profit_vault_state(state: Dict[str, Any]) -> Dict[str, Any]:
         data["baselineGbp"] = round(max(float(PROFIT_VAULT_DEFAULT_BASELINE_GBP), float(data.get("baselineGbp") or 0.0)), 2)
         data["updatedAt"] = datetime.now(UTC).isoformat()
         data["bankedProfitGbp"] = round(max(0.0, float(data.get("bankedProfitGbp") or 0.0)), 4)
-        data["lifetimeBankedGbp"] = round(max(data["bankedProfitGbp"], float(data.get("lifetimeBankedGbp") or 0.0)), 4)
+        data["lifetimeBankedGbp"] = round(max(0.0, float(data.get("lifetimeBankedGbp") or 0.0)), 4)
+        data["manualPiggyGbp"] = round(max(0.0, min(data["bankedProfitGbp"], float(data.get("manualPiggyGbp") or 0.0))), 4)
+        data["lifetimeManualPiggyGbp"] = round(max(data["manualPiggyGbp"], float(data.get("lifetimeManualPiggyGbp") or 0.0)), 4)
         data["cryptoAllocatedGbp"] = round(max(0.0, float(data.get("cryptoAllocatedGbp") or 0.0)), 4)
         ceiling = max(0.0, float(data.get("cryptoEngineCapitalCeilingGbp") or 0.0))
         if ceiling <= 0.0 and data["cryptoAllocatedGbp"] > 0.0:
@@ -16960,6 +16968,9 @@ def profit_vault_payload(account: Any = None) -> Dict[str, Any]:
         "totalProtectedReserveGbp": round(total_reserved_gbp, 2),
         "lifetimeCryptoReleasedGbp": round(float(state.get("lifetimeCryptoReleasedGbp") or 0.0), 2),
         "lifetimeBankedGbp": round(float(state.get("lifetimeBankedGbp") or 0.0), 2),
+        "manualPiggyGbp": round(float(state.get("manualPiggyGbp") or 0.0), 2),
+        "lifetimeManualPiggyGbp": round(float(state.get("lifetimeManualPiggyGbp") or 0.0), 2),
+        "profitPiggyGbp": round(max(0.0, banked_gbp - float(state.get("manualPiggyGbp") or 0.0)), 2),
         "accountEquityGbp": round(equity_gbp, 2),
         "accountEquityUsd": round(equity_usd, 2),
         # V18.2.4 capital clarity: workingCapital remains the legacy free-cash/deployable field.
@@ -17141,6 +17152,58 @@ def api_banking_status():
     return {"ok": True, **banking_payload()}
 
 
+@app.post("/piggy-bank/add")
+def api_add_to_piggy_bank(request: Request, payload: dict = Body(default={})):
+    """V18.3.29 — manually earmark existing brokerage equity as protected Piggy money.
+
+    This does not deposit money at the broker. It only moves already-present account
+    equity out of TradeBot's deployable pool. Manual additions are deliberately kept
+    separate from lifetime realised-profit sweeps.
+    """
+    verify_api_key(request)
+    try:
+        amount = round(float(payload.get("amountGbp") or 0.0), 2)
+    except Exception:
+        amount = 0.0
+    confirmation = str(payload.get("confirmation") or "").strip().upper()
+    if confirmation != "ADD TO PIGGY BANK":
+        return {"ok": False, "message": "Confirmation required: ADD TO PIGGY BANK"}
+    if amount <= 0.0:
+        return {"ok": False, "message": "Enter an amount greater than £0.00"}
+    try:
+        account = get_account()
+        rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
+        equity_gbp = max(0.0, float(account.equity)) * rate
+    except Exception as exc:
+        return {"ok": False, "message": f"Could not verify account equity: {exc}"}
+    with _PROFIT_VAULT_LOCK:
+        state = load_profit_vault_state()
+        current = max(0.0, float(state.get("bankedProfitGbp") or 0.0))
+        crypto = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
+        available = max(0.0, equity_gbp - current - crypto)
+        if amount > available + 0.005:
+            return {"ok": False, "message": f"Only £{available:.2f} of account equity is currently available to protect."}
+        state["bankedProfitGbp"] = round(current + amount, 4)
+        state["manualPiggyGbp"] = round(float(state.get("manualPiggyGbp") or 0.0) + amount, 4)
+        state["lifetimeManualPiggyGbp"] = round(float(state.get("lifetimeManualPiggyGbp") or 0.0) + amount, 4)
+        state["lastManualPiggyAt"] = datetime.now(UTC).isoformat()
+        state["lastManualPiggyGbp"] = amount
+        state = save_profit_vault_state(state)
+    try:
+        state = _v18241_apply_vault_reserve(state, save=True)
+    except Exception as exc:
+        print(f"V18.3.29 MANUAL PIGGY ALLOCATION REFRESH ERROR | {exc}", flush=True)
+    vault = profit_vault_payload()
+    try:
+        latest_status["banking"] = banking_payload()
+        latest_status["lastAction"] = f"£{amount:.2f} manually added to Piggy Bank"
+        latest_status["lastActionAt"] = datetime.now(UTC).isoformat()
+    except Exception:
+        pass
+    print(f"V18.3.29 MANUAL PIGGY ADD | amount=£{amount:.2f} piggy=£{float(vault.get('piggyBankGbp') or 0.0):.2f}", flush=True)
+    return {"ok": True, "addedGbp": amount, "message": f"£{amount:.2f} protected in the Piggy Bank", "profitVault": vault}
+
+
 @app.post("/piggy-bank/reset")
 def api_reset_piggy_bank(request: Request, payload: dict = Body(default={})):
     """V18.3.24 — explicitly release the current Piggy balance back to normal capital.
@@ -17159,6 +17222,7 @@ def api_reset_piggy_bank(request: Request, payload: dict = Body(default={})):
         if released <= 0.0001:
             return {"ok": True, "releasedGbp": 0.0, "message": "Piggy Bank is already £0.00", "profitVault": profit_vault_payload()}
         state["bankedProfitGbp"] = 0.0
+        state["manualPiggyGbp"] = 0.0
         state["lastPiggyResetAt"] = datetime.now(UTC).isoformat()
         state["lastPiggyResetGbp"] = round(released, 4)
         state["lifetimePiggyResetGbp"] = round(float(state.get("lifetimePiggyResetGbp") or 0.0) + released, 4)
