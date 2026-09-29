@@ -12942,7 +12942,7 @@ V18289_PILOT_MAX_ENTRY_ALLOCATION_PCT = 5.0
 # The long Shadow programme is complete. Failed Evidence Mined V1 is not treated
 # as proof of profitability; instead it unlocks a deliberately tiny live pilot so
 # execution can be measured with real fills while account protections remain intact.
-V18318_CONTROLLED_LIVE_PILOT = True
+V18318_CONTROLLED_LIVE_PILOT = False  # V18.3.34: failed Shadow proof can never unlock live capital
 V18318_PILOT_MAX_POSITIONS = 2
 V18318_PILOT_MAX_ENTRY_ALLOCATION_PCT = 2.5
 V18318_PILOT_FAIL_MIN_EXITS = 5
@@ -13280,6 +13280,18 @@ def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
         st["cryptoGovernorChangedAt"]=datetime.now(UTC).isoformat()
         st["cryptoGovernorReason"]="V18.2.89 starts safely in Shadow Research"
     mode=str(st.get("cryptoGovernorMode") or "SHADOW_RESEARCH")
+    # V18.3.34 — GOVERNOR AUTHORITY INVARIANT. A running Evidence Mined V2 proof
+    # is always Shadow-only. This repairs stale persisted states where the live
+    # executor remained in LIVE while a fresh V2 proof was only part-complete.
+    _trial_status=str(st.get("cryptoEvidenceTrialStatus") or "")
+    if V18331_EVIDENCE_QUALITY_REPAIR and _trial_status == "RUNNING" and mode != "SHADOW_RESEARCH":
+        mode="SHADOW_RESEARCH"
+        st["cryptoGovernorMode"]="SHADOW_RESEARCH"
+        st["cryptoGovernorShadowBaseline"]=len(shadow)
+        st["cryptoGovernorLiveBaseline"]=len(live)
+        st["cryptoGovernorReason"]="V18.3.34 Governor authority repair: V2 proof is RUNNING, therefore live entries are OFF until Shadow graduation"
+        st["cryptoGovernorChangedAt"]=datetime.now(UTC).isoformat()
+        save_profit_vault_state(st)
     # V18.3.18: after the completed evidence trial has failed/held, stop asking the
     # user to wait through more paper generations. Move into a bounded live pilot.
     # This is intentionally NOT a claim that the strategy proved profitable.
@@ -13382,8 +13394,8 @@ def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
             mode="LIVE"; st["cryptoEvidenceTrialStatus"]="LIVE"; changed=True; reason=f"Controlled pilot graduated after {pilot['trades']} profitable live trades"
     elif mode=="LIVE":
         if rolling["trades"]>=V18289_LIVE_MIN_SAMPLE and (rolling["expectancyUsd"]<=V18289_LIVE_FAIL_EXPECTANCY_USD or rolling["pnlUsd"]<=V18289_LIVE_FAIL_PNL_USD):
-            mode="SHADOW_RESEARCH"; st["cryptoGovernorShadowBaseline"]=len(shadow); changed=True
-            reason=f"Live performance deteriorated: rolling expectancy ${rolling['expectancyUsd']:.2f}, P&L ${rolling['pnlUsd']:.2f}"
+            mode="SHADOW_RESEARCH"; st["cryptoGovernorShadowBaseline"]=len(shadow); st["cryptoEvidenceTrialStatus"]="LIVE_PILOT_FAILED"; changed=True
+            reason=f"Live performance deteriorated: rolling expectancy ${rolling['expectancyUsd']:.2f}, P&L ${rolling['pnlUsd']:.2f}; live entries disabled and V2 proof reset"
     st["cryptoGovernorMode"]=mode; st["cryptoGovernorReason"]=reason
     if changed: st["cryptoGovernorChangedAt"]=datetime.now(UTC).isoformat()
     if save: save_profit_vault_state(st)
@@ -13742,9 +13754,29 @@ def _v18234_poll_fill(order: Any, fallback_price: float, fallback_qty: float = 0
     return float(fallback_price or 0), float(fallback_qty or 0)
 
 
+def _v18334_crypto_live_entry_permission() -> Dict[str, Any]:
+    """Single authority for NEW live crypto exposure. Protective exits never use this gate."""
+    gov=_v18289_governor_refresh(save=True)
+    mode=str(gov.get("mode") or "SHADOW_RESEARCH")
+    trial=str(gov.get("evidenceTrialStatus") or "")
+    allowed=(mode == "LIVE" and trial == "LIVE") or (mode == "PILOT_LIVE" and trial == "GRADUATED")
+    stage="PROVEN_LIVE" if mode == "LIVE" and trial == "LIVE" else "PILOT_APPROVED" if mode == "PILOT_LIVE" and trial == "GRADUATED" else "SHADOW_RESEARCH"
+    return {"allowed":bool(allowed),"stage":stage,"mode":mode,"trialStatus":trial,"reason":str(gov.get("reason") or "")}
+
+
 def _v18234_live_buy(scan: Dict[str, Any], allocation_gbp_override: Optional[float] = None) -> bool:
     symbol = str(scan.get("symbol") or "").upper(); price = float(scan.get("price") or 0); score = float(scan.get("score") or 0)
     if not symbol or price <= 0 or score < V18234_CRYPTO_LIVE_ENTRY_SCORE:
+        return False
+    # V18.3.34: final order-boundary authority check. Even if the executor thread is
+    # READY, no BUY can reach Alpaca unless Governor explicitly permits live entries.
+    permission=_v18334_crypto_live_entry_permission()
+    if not permission.get("allowed"):
+        _crypto_live_runtime["entriesPaused"] = True
+        _crypto_live_runtime["pauseReason"] = "GOVERNOR_LIVE_ENTRY_BLOCK"
+        _crypto_live_runtime["riskBlocked"] = True
+        _crypto_live_runtime["riskReason"] = permission.get("reason") or "Governor has not approved live crypto entries"
+        print(f"V18.3.34 GOVERNOR ENTRY BLOCK | symbol={symbol} stage={permission.get('stage')} mode={permission.get('mode')} trial={permission.get('trialStatus')}", flush=True)
         return False
     state = load_profit_vault_state()
     allocation_gbp = max(0.0, float(state.get("cryptoAllocatedGbp") or 0.0))
@@ -14707,6 +14739,8 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "manualSellStates": {
             k: dict(v) for k, v in list(_v18268_manual_sell_pending.items())[-20:]
         },
+        "executorStatus": "READY" if V18234_CRYPTO_LIVE_ENABLED and not PAPER else "OFF",
+        "governorEntryPermission": _v18334_crypto_live_entry_permission(),
         "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
         "liveEntriesEnabled": not bool(_v18289_governor_refresh(save=False).get("shadowOnly")),
         "shadowOnly": bool(_v18289_governor_refresh(save=False).get("shadowOnly")),
@@ -15045,7 +15079,7 @@ def startup_event():
     if V18234_CRYPTO_LIVE_ENABLED and not PAPER and not v18242_crypto_live_thread_started:
         v18242_crypto_live_thread_started = True
         threading.Thread(target=v18242_crypto_live_worker, daemon=True, name="v18-crypto-live").start()
-        print(f"V18.2.51 CRYPTO LIVE EXECUTOR | safety_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s normal_decision_interval={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m independent_of_shadow=True", flush=True)
+        print(f"V18.2.51 CRYPTO LIVE EXECUTOR | safety_interval={V18242_CRYPTO_LIVE_INTERVAL_SECONDS}s normal_decision_interval={V18248_CRYPTO_DECISION_INTERVAL_SECONDS//60}m governor_authority=REQUIRED protective_exits_independent=True", flush=True)
     if not _v18267_tracker_thread_started:
         _v18267_tracker_thread_started = True
         threading.Thread(target=_v18267_crypto_tracker_worker, daemon=True, name="v18-crypto-tracker-db").start()
