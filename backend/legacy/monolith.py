@@ -227,6 +227,19 @@ V18280_STOCK_GUARD_ENABLED = str(
     os.getenv("TRADEBOT_STOCK_DOWNSIDE_GUARD_ENABLED", "true")
 ).lower() in ("1","true","yes","on")
 
+# V18.3.37 — Early Failed-Entry Guard.
+# Protects capital when a fresh stock entry never develops and then rolls over.
+# This does NOT tighten the normal stop: healthy pullbacks keep the existing room.
+# It requires a young position, a weak peak, a meaningful red P&L, negative short
+# momentum, and two consecutive confirmations before a live exit is allowed.
+V18337_FAILED_ENTRY_ENABLED = str(os.getenv("TRADEBOT_FAILED_ENTRY_GUARD_ENABLED", "true")).lower() in ("1","true","yes","on")
+V18337_FAILED_ENTRY_MIN_AGE_MIN = max(2, int(os.getenv("TRADEBOT_FAILED_ENTRY_MIN_AGE_MIN", "4") or 4))
+V18337_FAILED_ENTRY_MAX_AGE_MIN = max(V18337_FAILED_ENTRY_MIN_AGE_MIN + 1, int(os.getenv("TRADEBOT_FAILED_ENTRY_MAX_AGE_MIN", "25") or 25))
+V18337_FAILED_ENTRY_MAX_PEAK_PCT = max(0.20, float(os.getenv("TRADEBOT_FAILED_ENTRY_MAX_PEAK_PCT", "0.75") or 0.75))
+V18337_FAILED_ENTRY_TRIGGER_LOSS_PCT = max(0.15, float(os.getenv("TRADEBOT_FAILED_ENTRY_TRIGGER_LOSS_PCT", "0.35") or 0.35))
+V18337_FAILED_ENTRY_MOMENTUM = -abs(float(os.getenv("TRADEBOT_FAILED_ENTRY_MOMENTUM", "0.0015") or 0.0015))
+V18337_FAILED_ENTRY_CONFIRMATIONS = max(2, int(os.getenv("TRADEBOT_FAILED_ENTRY_CONFIRMATIONS", "2") or 2))
+
 STALL_EXIT_ENABLED = True
 STALL_EXIT_AFTER_MINUTES = 4320
 STALL_EXIT_MIN_PNL_PCT = -1.00
@@ -2344,6 +2357,48 @@ def should_fast_stop(position: Dict[str, Any]):
     profile = _ai_risk_effective_profile(symbol) if "_ai_risk_effective_profile" in globals() else {}
     threshold = -abs(float(profile.get("fastStopLossPct") or abs(FAST_STOP_LOSS_PCT)))
     return pnl_pct <= threshold, f"adaptive fast stop pnl={pnl_pct:.2f}% threshold={threshold:.2f}%"
+
+
+def _v18337_failed_entry_guard(position: Dict[str, Any]):
+    """Exit a young stock only when the entry thesis visibly fails.
+
+    Unlike the hard/fast stop this is evidence based: the trade must never have
+    developed a useful peak, must already be red, short momentum must be negative,
+    and the condition must persist for consecutive management checks.
+    """
+    if not V18337_FAILED_ENTRY_ENABLED:
+        return False, "failed-entry guard disabled"
+    symbol = str(position.get("symbol") or "").upper()
+    entry = float(position.get("entry") or 0.0)
+    price = float(position.get("price") or 0.0)
+    highest = float(position.get("highest") or 0.0)
+    pnl_pct = float(position.get("pnlPct") or 0.0)
+    minutes = int(position.get("minutesSinceBuy") or 999999)
+    if not symbol or entry <= 0 or price <= 0:
+        return False, "invalid position"
+    if minutes < V18337_FAILED_ENTRY_MIN_AGE_MIN or minutes > V18337_FAILED_ENTRY_MAX_AGE_MIN:
+        state[symbol]["failed_entry_checks"] = 0
+        return False, f"age {minutes}m outside failed-entry window"
+    peak_pct = ((highest / entry) - 1.0) * 100.0 if highest > 0 else pnl_pct
+    try:
+        momentum = float(compute_short_momentum(symbol, price))
+    except Exception:
+        momentum = 0.0
+    failed = (
+        peak_pct < V18337_FAILED_ENTRY_MAX_PEAK_PCT
+        and pnl_pct <= -V18337_FAILED_ENTRY_TRIGGER_LOSS_PCT
+        and momentum <= V18337_FAILED_ENTRY_MOMENTUM
+        and price < entry
+    )
+    if not failed:
+        state[symbol]["failed_entry_checks"] = 0
+        return False, (f"entry still viable age={minutes}m pnl={pnl_pct:.2f}% "
+                       f"peak={peak_pct:.2f}% momentum={momentum:.4f}")
+    checks = int(state[symbol].get("failed_entry_checks") or 0) + 1
+    state[symbol]["failed_entry_checks"] = checks
+    reason = (f"failed entry age={minutes}m pnl={pnl_pct:.2f}% peak={peak_pct:.2f}% "
+              f"momentum={momentum:.4f} confirm={checks}/{V18337_FAILED_ENTRY_CONFIRMATIONS}")
+    return checks >= V18337_FAILED_ENTRY_CONFIRMATIONS, reason
 
 
 def _v18293_stock_peak_profit_lock(position: Dict[str, Any]):
@@ -4807,6 +4862,24 @@ def manage_money_mode_positions():
                 )
             except Exception as e:
                 print(f"V18.2.80 STOCK LOSS GUARD ERROR | {symbol} {e}", flush=True)
+            continue
+
+        # V18.3.37: catch a fresh entry that never develops before waiting for
+        # the normal stop. Two confirmations prevent a single noisy tick from
+        # ejecting an otherwise healthy position.
+        failed_entry, failed_entry_reason = _v18337_failed_entry_guard(p)
+        if failed_entry:
+            try:
+                if pdt_aware_should_avoid_sell(symbol, "V18.3.37 FAILED ENTRY EXIT", p["pnlPct"], allow_hard_stop=True):
+                    continue
+                market_sell_qty(symbol, qty, entry=entry, price=price, reason="V18.3.37 FAILED ENTRY EXIT")
+                state[symbol]["highest_since_entry"] = None
+                state[symbol]["failed_entry_checks"] = 0
+                _v17_reset_peak_exhaustion(symbol)
+                _v17_reset_runner_trail(symbol)
+                print(f"V18.3.37 FAILED ENTRY EXIT | {symbol} qty={qty:.6f} {failed_entry_reason}", flush=True)
+            except Exception as e:
+                print(f"V18.3.37 FAILED ENTRY ERROR | {symbol} {e}", flush=True)
             continue
 
         fast_stop, fast_stop_reason = should_fast_stop(p)
