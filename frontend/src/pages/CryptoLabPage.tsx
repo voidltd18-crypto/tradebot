@@ -254,8 +254,10 @@ useEffect(() => {
   const positions = Array.isArray(data.positions) ? data.positions : [];
   const livePositions = Array.isArray(bridge?.livePositions) ? bridge.livePositions : [];
   const entryScore = Number(data.config?.entryScore || 0.34);
-  const shadowOnly = Boolean(bridge?.shadowOnly);
-  const armed = Boolean(bridge?.livePilotEnabled) && Boolean(bridge?.governorEntryPermission?.allowed) && !shadowOnly;
+  // V18.3.35: the order-boundary permission is the UI source of truth too.
+  // Never show LIVE when Governor is actually blocking new live exposure.
+  const shadowOnly = !Boolean(bridge?.governorEntryPermission?.allowed);
+  const armed = Boolean(bridge?.livePilotEnabled) && Boolean(bridge?.governorEntryPermission?.allowed);
   const accountActive = Boolean(bridge?.accountCrypto?.active);
   const entriesPaused = Boolean(bridge?.newEntriesPaused);
   const bridgeFetchedAt = Number(bridge?.__fetchedAt || 0);

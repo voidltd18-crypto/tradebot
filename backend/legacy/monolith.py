@@ -15,6 +15,7 @@ import random
 from datetime import datetime, UTC, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Any, Tuple
+from collections import deque
 
 import requests
 from fastapi import FastAPI, Request, HTTPException, Body
@@ -12047,16 +12048,34 @@ def _v18332_current_rss_mb() -> float:
     return 0.0
 
 
+def _v18336_release_heap() -> bool:
+    """Best-effort return of free glibc heap pages to Render's OS RSS accounting."""
+    try:
+        import gc as _gc
+        _gc.collect()
+        import ctypes as _ctypes
+        libc = _ctypes.CDLL("libc.so.6")
+        trim = getattr(libc, "malloc_trim", None)
+        if trim is not None:
+            trim.argtypes = [_ctypes.c_size_t]
+            trim.restype = _ctypes.c_int
+            return bool(trim(0))
+    except Exception:
+        pass
+    return False
+
+
 def _v18332_memory_checkpoint(stage: str, collect: bool = False) -> float:
-    if collect:
-        try:
-            import gc as _gc
-            _gc.collect()
-        except Exception:
-            pass
+    before = _v18332_current_rss_mb()
+    trimmed = False
+    # V18.3.36: Render Starter has a 512 MB hard ceiling. At pressure points,
+    # collect Python garbage and ask glibc to return free arenas to the OS.
+    if collect or before >= 360.0:
+        trimmed = _v18336_release_heap()
     rss = _v18332_current_rss_mb()
     if rss:
-        print(f"V18.3.32 MEMORY GUARD | stage={stage} rss={rss:.1f}MB limit=512MB", flush=True)
+        extra = f" before={before:.1f}MB trimmed={trimmed}" if (collect or before >= 360.0) else ""
+        print(f"V18.3.36 MEMORY GUARD | stage={stage} rss={rss:.1f}MB limit=512MB{extra}", flush=True)
     return rss
 
 
@@ -12236,16 +12255,20 @@ def _v18274_audit_write(row: Dict[str, Any]) -> None:
         print(f"V18.2.76 AUDIT WRITE ERROR | {exc}",flush=True)
 
 def _v18274_audit_summary(limit: int = 5000) -> Dict[str, Any]:
-    rows=[]
+    # V18.3.36: never load the entire append-only audit JSONL into RAM. The old
+    # reader accumulated every historical row and sliced only afterwards, causing
+    # large transient allocations as the file grew. Keep only the requested tail.
+    bounded_limit = max(1, min(int(limit or 5000), 20000))
+    tail = deque(maxlen=bounded_limit)
     try:
         if os.path.exists(V18274_CRYPTO_AUDIT_FILE):
             with open(V18274_CRYPTO_AUDIT_FILE,"r",encoding="utf-8") as fh:
                 for line in fh:
-                    try: rows.append(json.loads(line))
+                    try: tail.append(json.loads(line))
                     except Exception: pass
     except Exception as exc:
         return {"ok":False,"error":str(exc),"closedTrades":0}
-    rows=rows[-max(1,int(limit)):]
+    rows=list(tail)
     raw_exits=[r for r in rows if r.get("event")=="exit"]
     deduped={}
     legacy=[]
@@ -12410,16 +12433,20 @@ def _v18277_ledger_append(row: Dict[str, Any]) -> None:
         print(f"V18.2.77 LEDGER WRITE ERROR | {exc}",flush=True)
 
 def _v18277_ledger_rows(limit: int = 10000) -> List[Dict[str, Any]]:
-    rows=[]
+    # V18.3.36: bounded tail reader. This ledger is append-only and is consulted
+    # from live crypto performance guards, so whole-file reads can create an RSS
+    # spike even when the caller only needs the latest N rows.
+    bounded_limit = max(1, min(int(limit or 10000), 20000))
+    tail = deque(maxlen=bounded_limit)
     try:
         if os.path.exists(V18277_LEDGER_FILE):
             with open(V18277_LEDGER_FILE,"r",encoding="utf-8") as fh:
                 for line in fh:
-                    try: rows.append(json.loads(line))
+                    try: tail.append(json.loads(line))
                     except Exception: pass
     except Exception:
         pass
-    return rows[-max(1,int(limit)):]
+    return list(tail)
 
 def _v18282_crypto_performance_snapshot() -> Dict[str, Dict[str, Any]]:
     """Summarise recent completed live trades per symbol from the logical ledger."""
@@ -13077,6 +13104,20 @@ def _v18315_mine_shadow_evidence(force: bool=False) -> Dict[str, Any]:
     if not force and _v18315_model_cache.get("data") is not None and now-float(_v18315_model_cache.get("at") or 0)<300:
         return dict(_v18315_model_cache["data"])
     rows,recovery=_v18316_read_shadow_rows()
+    # V18.3.35: the dashboard must never report an empty evidence model merely
+    # because the read-only recovery probe was temporarily unable to inspect the
+    # active SQLite file. Fall back to the same live DB connection used by Shadow.
+    if not rows:
+        try:
+            conn=db_connect()
+            try:
+                rows=[dict(r) for r in conn.execute("SELECT id,timestamp,symbol,side,score,pnl_usd,pnl_pct,reason FROM v18232_crypto_trades ORDER BY id ASC").fetchall()]
+            finally:
+                conn.close()
+            if rows:
+                recovery={**recovery,"activeDbFallback":True,"activeDbRows":len(rows)}
+        except Exception as exc:
+            recovery={**recovery,"activeDbFallbackError":str(exc)[:160]}
     if not rows:
         try:
             snap_path=persistent_file("crypto_shadow_evidence_snapshot.json")
@@ -13138,7 +13179,9 @@ def _v18315_mine_shadow_evidence(force: bool=False) -> Dict[str, Any]:
     # not credentials or order instructions.
     try:
         snap=persistent_file("crypto_shadow_evidence_snapshot.json")
-        tmp=snap+".tmp"; Path(tmp).write_text(json.dumps({"savedAt":datetime.now(UTC).isoformat(),"model":model}, separators=(",",":"))); os.replace(tmp,snap)
+        # Never replace a previously useful snapshot with a transient empty read.
+        if int(model.get("pairedTrades") or 0) > 0:
+            tmp=snap+".tmp"; Path(tmp).write_text(json.dumps({"savedAt":datetime.now(UTC).isoformat(),"model":model}, separators=(",",":"))); os.replace(tmp,snap)
     except Exception: pass
     _v18315_model_cache.update({"at":now,"data":model})
     return dict(model)
@@ -13287,9 +13330,12 @@ def _v18289_governor_refresh(save: bool=True) -> Dict[str, Any]:
     if V18331_EVIDENCE_QUALITY_REPAIR and _trial_status == "RUNNING" and mode != "SHADOW_RESEARCH":
         mode="SHADOW_RESEARCH"
         st["cryptoGovernorMode"]="SHADOW_RESEARCH"
-        st["cryptoGovernorShadowBaseline"]=len(shadow)
+        # V18.3.35: DO NOT move the Shadow baseline when correcting authority.
+        # V18.3.34 accidentally did this, which made an in-progress V2 proof appear
+        # to reset to 0/50 even though the Shadow ledger was still intact.
+        # Authority repair and evidence-window bookkeeping are separate concerns.
         st["cryptoGovernorLiveBaseline"]=len(live)
-        st["cryptoGovernorReason"]="V18.3.34 Governor authority repair: V2 proof is RUNNING, therefore live entries are OFF until Shadow graduation"
+        st["cryptoGovernorReason"]="V18.3.35 Governor authority repair: V2 proof remains Shadow-only; existing evidence baseline preserved"
         st["cryptoGovernorChangedAt"]=datetime.now(UTC).isoformat()
         save_profit_vault_state(st)
     # V18.3.18: after the completed evidence trial has failed/held, stop asking the
@@ -14656,6 +14702,20 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
     usable_max = min(pool, V18234_CRYPTO_LIVE_PILOT_MAX_GBP)
     live_positions = _v18234_raw_crypto_positions()
     active_cooldowns = _v18247_prune_crypto_cooldowns(state, save=True)
+    # V18.3.35: one authoritative Governor snapshot per API response. Repeated
+    # refreshes inside one payload could mutate/read state at different instants
+    # and make the badge, footer and entry permission disagree.
+    governor = _v18289_governor_refresh(save=True)
+    governor_mode = str(governor.get("mode") or "SHADOW_RESEARCH")
+    governor_trial = str(governor.get("evidenceTrialStatus") or "")
+    governor_allowed = ((governor_mode == "LIVE" and governor_trial == "LIVE") or
+                        (governor_mode == "PILOT_LIVE" and governor_trial == "GRADUATED"))
+    governor_permission = {
+        "allowed": bool(governor_allowed),
+        "stage": "PROVEN_LIVE" if governor_mode == "LIVE" and governor_trial == "LIVE" else "PILOT_APPROVED" if governor_mode == "PILOT_LIVE" and governor_trial == "GRADUATED" else "SHADOW_RESEARCH",
+        "mode": governor_mode, "trialStatus": governor_trial,
+        "reason": str(governor.get("reason") or ""),
+    }
 
     # V18.2.64: expose the exact protection state used by the live safety loop.
     # This is display-only telemetry; execution continues to use the same
@@ -14721,7 +14781,7 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
             "weakScoreFloor": V18279_CRYPTO_WEAK_SCORE_FLOOR,
             "breakevenArmPct": V18279_CRYPTO_BREAKEVEN_ARM_PCT,
             "breakevenLockPct": V18279_CRYPTO_BREAKEVEN_LOCK_PCT,
-            "maxEntryAllocationPct": min(V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18289_PILOT_MAX_ENTRY_ALLOCATION_PCT if _v18289_governor_refresh(save=False).get("pilot") else V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT),
+            "maxEntryAllocationPct": min(V18279_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT, V18289_PILOT_MAX_ENTRY_ALLOCATION_PCT if governor.get("pilot") else V18285_CRYPTO_MAX_ENTRY_ALLOCATION_PCT),
             "liveEvidenceGateVersion": "V18.2.85",
             "liveEvidenceGateEnabled": V18285_CRYPTO_LIVE_GATE_ENABLED,
             "liveEvidenceMinScore": V18285_CRYPTO_MIN_SCORE,
@@ -14740,12 +14800,12 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
             k: dict(v) for k, v in list(_v18268_manual_sell_pending.items())[-20:]
         },
         "executorStatus": "READY" if V18234_CRYPTO_LIVE_ENABLED and not PAPER else "OFF",
-        "governorEntryPermission": _v18334_crypto_live_entry_permission(),
+        "governorEntryPermission": governor_permission,
         "livePilotEnabled": bool(state.get("cryptoLivePilotEnabled")),
-        "liveEntriesEnabled": not bool(_v18289_governor_refresh(save=False).get("shadowOnly")),
-        "shadowOnly": bool(_v18289_governor_refresh(save=False).get("shadowOnly")),
-        "shadowOnlyReason": _v18289_governor_refresh(save=False).get("reason") if _v18289_governor_refresh(save=False).get("shadowOnly") else None,
-        "cryptoGovernor": _v18289_governor_refresh(save=False),
+        "liveEntriesEnabled": bool(governor_permission.get("allowed")),
+        "shadowOnly": not bool(governor_permission.get("allowed")),
+        "shadowOnlyReason": governor_permission.get("reason") if not governor_permission.get("allowed") else None,
+        "cryptoGovernor": governor,
         "liveMaxPositions": V18234_CRYPTO_LIVE_MAX_POSITIONS,
         "reentryCooldownMinutes": V18247_CRYPTO_REENTRY_COOLDOWN_MINUTES,
         "activeReentryCooldowns": active_cooldowns,
@@ -14771,8 +14831,8 @@ def v18234_crypto_bridge_payload() -> Dict[str, Any]:
         "lossBrakeUntil": state.get("cryptoLossBrakeUntil"),
         "riskBlocked": bool(_crypto_live_runtime.get("riskBlocked")),
         "riskReason": _crypto_live_runtime.get("riskReason"),
-        "newEntriesPaused": bool(_v18289_governor_refresh(save=False).get("shadowOnly")) or (not bool(bot_enabled)) or bool(manual_override) or bool(emergency_stop),
-        "pauseReason": ("CRYPTO_SHADOW_RESEARCH" if _v18289_governor_refresh(save=False).get("shadowOnly") else "BOT_PAUSED" if not bool(bot_enabled) else "MANUAL_OVERRIDE" if bool(manual_override) else "EMERGENCY_STOP" if bool(emergency_stop) else None),
+        "newEntriesPaused": (not bool(governor_permission.get("allowed"))) or (not bool(bot_enabled)) or bool(manual_override) or bool(emergency_stop),
+        "pauseReason": ("CRYPTO_SHADOW_RESEARCH" if not governor_permission.get("allowed") else "BOT_PAUSED" if not bool(bot_enabled) else "MANUAL_OVERRIDE" if bool(manual_override) else "EMERGENCY_STOP" if bool(emergency_stop) else None),
         "protectiveExitsActiveWhilePaused": True,
         "accountCrypto": account, "vaultAvailableGbp": round(piggy_bank,2),
         "piggyBankGbp": round(piggy_bank,2),
