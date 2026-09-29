@@ -707,6 +707,13 @@ _v18286_equity_floor_runtime: Dict[str, Any] = {
 _v18286_equity_floor_guard = threading.Lock()
 v18286_equity_floor_thread_started = False
 
+# V18.3.38 — dedicated fast stock profit-lock safety path.  The normal stock
+# loop performs discovery/scanning on a much slower cadence; protective exits
+# must not wait behind that work once a winner has armed its profit lock.
+V18338_STOCK_EXIT_SAFETY_SECONDS = max(2, int(os.getenv("TRADEBOT_STOCK_EXIT_SAFETY_SECONDS", "5") or 5))
+_v18338_stock_exit_guard = threading.RLock()
+v18338_stock_exit_thread_started = False
+
 bot_thread_started = False
 v6_sync_thread_started = False
 v7_weekend_thread_started = False
@@ -2024,11 +2031,56 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
     return False
 
 
+def _v18339_fast_position_reconcile(event: str, symbol: str) -> None:
+    """Publish broker positions before slower discovery work so Home never waits on a full refresh."""
+    delays = (0.20, 0.45, 0.90, 1.50) if str(event).upper() == "SELL" else (0.20, 0.60)
+    last_positions = None
+    for delay in delays:
+        try:
+            time.sleep(delay)
+            positions = get_all_positions()
+            last_positions = positions
+            symbols = {str(p.get("symbol") or "").upper() for p in positions}
+            event_upper = str(event).upper()
+            symbol_upper = str(symbol).upper()
+
+            # Publish the broker snapshot atomically without rebuilding the expensive
+            # scanner/status payload. The browser already polls /status every ~3s.
+            with _STATUS_LOCK:
+                latest_status["positions"] = positions
+                latest_status["lastPositionReconcileAt"] = datetime.now(UTC).isoformat()
+                latest_status["lastPositionReconcileEvent"] = event_upper
+                latest_status["lastPositionReconcileSymbol"] = symbol_upper
+
+            resolved = (event_upper == "SELL" and symbol_upper not in symbols) or (event_upper == "BUY" and symbol_upper in symbols)
+            print(
+                f"V18.3.39 FAST POSITION SYNC | event={event_upper} symbol={symbol_upper} "
+                f"positions={len(positions)} resolved={resolved}",
+                flush=True,
+            )
+            if resolved:
+                return
+        except Exception as exc:
+            print(f"V18.3.39 FAST POSITION SYNC ERROR | event={event} symbol={symbol} error={exc}", flush=True)
+
+    if last_positions is not None:
+        print(
+            f"V18.3.39 FAST POSITION SYNC | event={str(event).upper()} symbol={str(symbol).upper()} "
+            f"broker_pending_after_retries=True",
+            flush=True,
+        )
+
+
 def _v18328_live_event_refresh(event: str, symbol: str) -> None:
-    """Refresh discovery/status immediately after a stock order without blocking it."""
+    """Fast broker/UI reconciliation first; slower discovery refresh second."""
     def worker():
         try:
             print(f"V18.3.28 LIVE EVENT REFRESH | event={event} symbol={symbol} starting", flush=True)
+
+            # V18.3.39: do NOT make the Home page wait for scanner/universe rebuilds.
+            # Reconcile the accepted order against Alpaca and publish positions first.
+            _v18339_fast_position_reconcile(event, symbol)
+
             if "refresh_dynamic_market_candidates" in globals():
                 refresh_dynamic_market_candidates(force=True)
             if "refresh_adaptive_universe" in globals():
@@ -4944,22 +4996,27 @@ def manage_money_mode_positions():
         # gain reaches the arm threshold and then gives back too much, bank the
         # remaining green P&L. Broker-side account/PDT restrictions remain
         # authoritative if an order is not permitted.
-        peak_lock, peak_lock_reason = _v18293_stock_peak_profit_lock(p)
-        if peak_lock:
-            try:
-                market_sell_qty(symbol, qty, entry=entry, price=price, reason="V18.2.93 PEAK PROFIT LOCK")
-                state[symbol]["highest_since_entry"] = None
-                _v17_reset_peak_exhaustion(symbol)
-                _v17_reset_runner_trail(symbol)
-                print(
-                    f"V18.2.93 PEAK PROFIT LOCK SELL | {symbol} qty={qty:.6f} "
-                    f"pnl={float(p.get('pnlPct') or 0.0):.2f}% price={price:.4f} entry={entry:.4f} | "
-                    f"{peak_lock_reason}",
-                    flush=True,
-                )
-            except Exception as e:
-                print(f"V18.2.93 PEAK PROFIT LOCK ERROR | {symbol} {e}", flush=True)
-            continue
+        with _v18338_stock_exit_guard:
+            # Re-check the broker immediately before deciding/submitting.  The
+            # dedicated fast worker may have acted since this slow cycle began.
+            if has_open_order(symbol):
+                continue
+            peak_lock, peak_lock_reason = _v18293_stock_peak_profit_lock(p)
+            if peak_lock:
+                try:
+                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="V18.2.93 PEAK PROFIT LOCK")
+                    state[symbol]["highest_since_entry"] = None
+                    _v17_reset_peak_exhaustion(symbol)
+                    _v17_reset_runner_trail(symbol)
+                    print(
+                        f"V18.2.93 PEAK PROFIT LOCK SELL | {symbol} qty={qty:.6f} "
+                        f"pnl={float(p.get('pnlPct') or 0.0):.2f}% price={price:.4f} entry={entry:.4f} | "
+                        f"{peak_lock_reason}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"V18.2.93 PEAK PROFIT LOCK ERROR | {symbol} {e}", flush=True)
+                continue
 
         peak_exit = _v17_peak_exhaustion_decision(p)
         if peak_exit.get("sell"):
@@ -15013,6 +15070,62 @@ def v18232_crypto_shadow_worker() -> None:
         time.sleep(V18232_CRYPTO_INTERVAL_SECONDS)
 
 
+def _v18338_fast_stock_exit_worker():
+    """Check Peak Profit Lock independently of the slow scanner loop.
+
+    This worker is intentionally narrow: it does not scan, buy, rotate, or
+    change strategy.  It only enforces the already-existing V18.2.93 Peak
+    Profit Lock against live broker positions.
+    """
+    print(
+        f"V18.3.38 FAST STOCK EXIT SAFETY | enabled=True interval={V18338_STOCK_EXIT_SAFETY_SECONDS}s "
+        f"rule=V18.2.93_PEAK_PROFIT_LOCK",
+        flush=True,
+    )
+    while True:
+        try:
+            if not bot_enabled or emergency_stop:
+                time.sleep(V18338_STOCK_EXIT_SAFETY_SECONDS)
+                continue
+            market_state = get_effective_market_status_payload()
+            if not bool(market_state.get("isOpen")):
+                time.sleep(V18338_STOCK_EXIT_SAFETY_SECONDS)
+                continue
+
+            # Serialize only the profit-lock decision/submission path.  This
+            # prevents the 60-second manager and this 5-second worker from
+            # submitting the same exit at the same time.
+            with _v18338_stock_exit_guard:
+                for p in get_all_positions():
+                    symbol = str(p.get("symbol") or "").upper()
+                    qty = float(p.get("qty") or 0.0)
+                    entry = float(p.get("entry") or 0.0)
+                    price = float(p.get("price") or 0.0)
+                    if not symbol or qty <= DUST_THRESHOLD or entry <= 0 or price <= 0:
+                        continue
+                    if has_open_order(symbol):
+                        continue
+                    peak_lock, peak_lock_reason = _v18293_stock_peak_profit_lock(p)
+                    if not peak_lock:
+                        continue
+                    market_sell_qty(
+                        symbol, qty, entry=entry, price=price,
+                        reason="V18.3.38 FAST PEAK PROFIT LOCK",
+                    )
+                    state[symbol]["highest_since_entry"] = None
+                    _v17_reset_peak_exhaustion(symbol)
+                    _v17_reset_runner_trail(symbol)
+                    print(
+                        f"V18.3.38 FAST PEAK PROFIT LOCK SELL | {symbol} qty={qty:.6f} "
+                        f"pnl={float(p.get('pnlPct') or 0.0):.2f}% price={price:.4f} entry={entry:.4f} | "
+                        f"{peak_lock_reason}",
+                        flush=True,
+                    )
+        except Exception as exc:
+            print(f"V18.3.38 FAST STOCK EXIT SAFETY ERROR | {exc}", flush=True)
+        time.sleep(V18338_STOCK_EXIT_SAFETY_SECONDS)
+
+
 def run_bot_loop():
     print("Rebuilt Sniper Profit Bot started...")
     init_db()
@@ -15150,7 +15263,7 @@ def run_bot_loop():
 
 @app.on_event("startup")
 def startup_event():
-    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started, v18224_live_audit_thread_started, v18230_evidence_thread_started, v18232_crypto_shadow_thread_started, v18242_crypto_live_thread_started, _v18267_tracker_thread_started, v18286_equity_floor_thread_started, bot_enabled, emergency_stop
+    global bot_thread_started, v6_sync_thread_started, v7_weekend_thread_started, v11_learning_thread_started, ai_research_thread_started, ai_summary_thread_started, db_housekeeping_thread_started, trade_replay_thread_started, v18224_live_audit_thread_started, v18230_evidence_thread_started, v18232_crypto_shadow_thread_started, v18242_crypto_live_thread_started, _v18267_tracker_thread_started, v18286_equity_floor_thread_started, v18338_stock_exit_thread_started, bot_enabled, emergency_stop
     # Initialise the shared SQLite schema synchronously before any worker threads start.
     # This removes the startup race where multiple workers all tried to create tables.
     init_db()
@@ -15180,6 +15293,9 @@ def startup_event():
     if not bot_thread_started:
         bot_thread_started = True
         threading.Thread(target=run_bot_loop, daemon=True).start()
+    if not v18338_stock_exit_thread_started:
+        v18338_stock_exit_thread_started = True
+        threading.Thread(target=_v18338_fast_stock_exit_worker, daemon=True, name="v18-fast-stock-exit").start()
     if TRADE_REPLAY_ENABLED and not trade_replay_thread_started:
         trade_replay_thread_started = True
         threading.Thread(target=trade_replay_recorder_worker, daemon=True, name="v17-trade-replay-recorder").start()
