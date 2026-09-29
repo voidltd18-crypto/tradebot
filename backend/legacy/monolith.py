@@ -240,6 +240,18 @@ V18337_FAILED_ENTRY_TRIGGER_LOSS_PCT = max(0.15, float(os.getenv("TRADEBOT_FAILE
 V18337_FAILED_ENTRY_MOMENTUM = -abs(float(os.getenv("TRADEBOT_FAILED_ENTRY_MOMENTUM", "0.0015") or 0.0015))
 V18337_FAILED_ENTRY_CONFIRMATIONS = max(2, int(os.getenv("TRADEBOT_FAILED_ENTRY_CONFIRMATIONS", "2") or 2))
 
+# V18.3.40 — Time-Decay Failed Thesis Guard.
+# Stage two for trades that survive the very-early V18.3.37 window but still
+# never prove the entry thesis. This targets the ORCL/BFLY pattern: weak peak,
+# prolonged failure to develop, then a controlled red exit before the full stop.
+V18340_THESIS_DECAY_ENABLED = str(os.getenv("TRADEBOT_THESIS_DECAY_ENABLED", "true")).lower() in ("1","true","yes","on")
+V18340_THESIS_DECAY_MIN_AGE_MIN = max(8, int(os.getenv("TRADEBOT_THESIS_DECAY_MIN_AGE_MIN", "12") or 12))
+V18340_THESIS_DECAY_MAX_AGE_MIN = max(V18340_THESIS_DECAY_MIN_AGE_MIN + 1, int(os.getenv("TRADEBOT_THESIS_DECAY_MAX_AGE_MIN", "45") or 45))
+V18340_THESIS_DECAY_MAX_PEAK_PCT = max(0.20, float(os.getenv("TRADEBOT_THESIS_DECAY_MAX_PEAK_PCT", "0.75") or 0.75))
+V18340_THESIS_DECAY_TRIGGER_LOSS_PCT = max(0.25, float(os.getenv("TRADEBOT_THESIS_DECAY_TRIGGER_LOSS_PCT", "0.55") or 0.55))
+V18340_THESIS_DECAY_MIN_GIVEBACK_PCT = max(0.25, float(os.getenv("TRADEBOT_THESIS_DECAY_MIN_GIVEBACK_PCT", "0.75") or 0.75))
+V18340_THESIS_DECAY_CONFIRMATIONS = max(2, int(os.getenv("TRADEBOT_THESIS_DECAY_CONFIRMATIONS", "3") or 3))
+
 STALL_EXIT_ENABLED = True
 STALL_EXIT_AFTER_MINUTES = 4320
 STALL_EXIT_MIN_PNL_PCT = -1.00
@@ -2452,6 +2464,62 @@ def _v18337_failed_entry_guard(position: Dict[str, Any]):
               f"momentum={momentum:.4f} confirm={checks}/{V18337_FAILED_ENTRY_CONFIRMATIONS}")
     return checks >= V18337_FAILED_ENTRY_CONFIRMATIONS, reason
 
+
+
+def _v18340_time_decay_failed_thesis(position: Dict[str, Any]):
+    """Cut a mature non-performing entry before it reaches the normal hard stop.
+
+    This is intentionally different from V18.3.37. The early guard uses short
+    momentum. This second stage asks whether the trade has had enough time to
+    prove itself at all. It requires:
+      * 12-45 minute age window,
+      * no meaningful positive excursion (<0.75% peak),
+      * at least 0.55% current loss,
+      * at least 0.75 percentage-points given back from its best excursion,
+      * price below entry,
+      * three consecutive management confirmations.
+    """
+    if not V18340_THESIS_DECAY_ENABLED:
+        return False, "thesis-decay disabled"
+
+    symbol = str(position.get("symbol") or "").upper()
+    entry = float(position.get("entry") or 0.0)
+    price = float(position.get("price") or 0.0)
+    highest = float(position.get("highest") or 0.0)
+    pnl_pct = float(position.get("pnlPct") or 0.0)
+    minutes = int(position.get("minutesSinceBuy") or 999999)
+
+    if not symbol or entry <= 0 or price <= 0:
+        return False, "invalid position"
+
+    if minutes < V18340_THESIS_DECAY_MIN_AGE_MIN or minutes > V18340_THESIS_DECAY_MAX_AGE_MIN:
+        state[symbol]["thesis_decay_checks"] = 0
+        return False, f"age {minutes}m outside thesis-decay window"
+
+    peak_pct = ((highest / entry) - 1.0) * 100.0 if highest > 0 else pnl_pct
+    giveback_pct = peak_pct - pnl_pct
+
+    failed = (
+        peak_pct < V18340_THESIS_DECAY_MAX_PEAK_PCT
+        and pnl_pct <= -V18340_THESIS_DECAY_TRIGGER_LOSS_PCT
+        and giveback_pct >= V18340_THESIS_DECAY_MIN_GIVEBACK_PCT
+        and price < entry
+    )
+
+    if not failed:
+        state[symbol]["thesis_decay_checks"] = 0
+        return False, (
+            f"thesis viable age={minutes}m pnl={pnl_pct:.2f}% "
+            f"peak={peak_pct:.2f}% giveback={giveback_pct:.2f}%"
+        )
+
+    checks = int(state[symbol].get("thesis_decay_checks") or 0) + 1
+    state[symbol]["thesis_decay_checks"] = checks
+    reason = (
+        f"thesis failed age={minutes}m pnl={pnl_pct:.2f}% peak={peak_pct:.2f}% "
+        f"giveback={giveback_pct:.2f}% confirm={checks}/{V18340_THESIS_DECAY_CONFIRMATIONS}"
+    )
+    return checks >= V18340_THESIS_DECAY_CONFIRMATIONS, reason
 
 def _v18293_stock_peak_profit_lock(position: Dict[str, Any]):
     """Protect intraday stock profit before the one-hour review.
@@ -4932,6 +5000,31 @@ def manage_money_mode_positions():
                 print(f"V18.3.37 FAILED ENTRY EXIT | {symbol} qty={qty:.6f} {failed_entry_reason}", flush=True)
             except Exception as e:
                 print(f"V18.3.37 FAILED ENTRY ERROR | {symbol} {e}", flush=True)
+            continue
+
+        # V18.3.40: second-stage failed-thesis protection. A trade that has
+        # had 12+ minutes to work, never achieved a useful peak, and is now
+        # persistently deteriorating no longer has to wait for the full stop.
+        thesis_failed, thesis_reason = _v18340_time_decay_failed_thesis(p)
+        if thesis_failed:
+            try:
+                if pdt_aware_should_avoid_sell(symbol, "V18.3.40 TIME DECAY FAILED THESIS", p["pnlPct"], allow_hard_stop=True):
+                    continue
+                market_sell_qty(
+                    symbol, qty, entry=entry, price=price,
+                    reason="V18.3.40 TIME DECAY FAILED THESIS"
+                )
+                state[symbol]["highest_since_entry"] = None
+                state[symbol]["failed_entry_checks"] = 0
+                state[symbol]["thesis_decay_checks"] = 0
+                _v17_reset_peak_exhaustion(symbol)
+                _v17_reset_runner_trail(symbol)
+                print(
+                    f"V18.3.40 THESIS DECAY EXIT | {symbol} qty={qty:.6f} {thesis_reason}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"V18.3.40 THESIS DECAY ERROR | {symbol} {e}", flush=True)
             continue
 
         fast_stop, fast_stop_reason = should_fast_stop(p)
