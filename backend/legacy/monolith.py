@@ -252,6 +252,18 @@ V18340_THESIS_DECAY_TRIGGER_LOSS_PCT = max(0.25, float(os.getenv("TRADEBOT_THESI
 V18340_THESIS_DECAY_MIN_GIVEBACK_PCT = max(0.25, float(os.getenv("TRADEBOT_THESIS_DECAY_MIN_GIVEBACK_PCT", "0.75") or 0.75))
 V18340_THESIS_DECAY_CONFIRMATIONS = max(2, int(os.getenv("TRADEBOT_THESIS_DECAY_CONFIRMATIONS", "3") or 3))
 
+
+# V18.3.41 — Stale / No-Progress Exit.
+# Frees capital from mature stock positions that have had ample time to work but
+# never developed meaningful upside. Unlike V18.3.40, this does NOT require a
+# -0.55% loss: after the stale-age threshold, a weak-peak trade at/below entry
+# can be released after consecutive confirmations.
+V18341_STALE_EXIT_ENABLED = str(os.getenv("TRADEBOT_STALE_EXIT_ENABLED", "true")).lower() in ("1","true","yes","on")
+V18341_STALE_EXIT_MIN_AGE_MIN = max(30, int(os.getenv("TRADEBOT_STALE_EXIT_MIN_AGE_MIN", "60") or 60))
+V18341_STALE_EXIT_MAX_PEAK_PCT = max(0.20, float(os.getenv("TRADEBOT_STALE_EXIT_MAX_PEAK_PCT", "0.75") or 0.75))
+V18341_STALE_EXIT_MAX_CURRENT_PCT = float(os.getenv("TRADEBOT_STALE_EXIT_MAX_CURRENT_PCT", "0.00") or 0.00)
+V18341_STALE_EXIT_CONFIRMATIONS = max(2, int(os.getenv("TRADEBOT_STALE_EXIT_CONFIRMATIONS", "3") or 3))
+
 STALL_EXIT_ENABLED = True
 STALL_EXIT_AFTER_MINUTES = 4320
 STALL_EXIT_MIN_PNL_PCT = -1.00
@@ -2520,6 +2532,53 @@ def _v18340_time_decay_failed_thesis(position: Dict[str, Any]):
         f"giveback={giveback_pct:.2f}% confirm={checks}/{V18340_THESIS_DECAY_CONFIRMATIONS}"
     )
     return checks >= V18340_THESIS_DECAY_CONFIRMATIONS, reason
+
+def _v18341_stale_no_progress_exit(position: Dict[str, Any]):
+    """Release capital from a mature stock trade that never proved itself.
+
+    A position qualifies only after 60+ minutes, when its best excursion never
+    reached the useful-peak threshold and it is currently at/below entry. Three
+    consecutive management checks reduce the chance of selling on one noisy tick.
+    """
+    if not V18341_STALE_EXIT_ENABLED:
+        return False, "stale exit disabled"
+
+    symbol = str(position.get("symbol") or "").upper()
+    entry = float(position.get("entry") or 0.0)
+    price = float(position.get("price") or 0.0)
+    highest = float(position.get("highest") or 0.0)
+    pnl_pct = float(position.get("pnlPct") or 0.0)
+    minutes = int(position.get("minutesSinceBuy") or 999999)
+
+    if not symbol or entry <= 0 or price <= 0:
+        return False, "invalid position"
+
+    if minutes < V18341_STALE_EXIT_MIN_AGE_MIN:
+        state[symbol]["stale_exit_checks"] = 0
+        return False, f"age {minutes}m below stale threshold"
+
+    peak_pct = ((highest / entry) - 1.0) * 100.0 if highest > 0 else pnl_pct
+    stale = (
+        peak_pct < V18341_STALE_EXIT_MAX_PEAK_PCT
+        and pnl_pct <= V18341_STALE_EXIT_MAX_CURRENT_PCT
+        and price <= entry
+    )
+
+    if not stale:
+        state[symbol]["stale_exit_checks"] = 0
+        return False, (
+            f"trade still progressing age={minutes}m pnl={pnl_pct:.2f}% "
+            f"peak={peak_pct:.2f}%"
+        )
+
+    checks = int(state[symbol].get("stale_exit_checks") or 0) + 1
+    state[symbol]["stale_exit_checks"] = checks
+    reason = (
+        f"stale/no-progress age={minutes}m pnl={pnl_pct:.2f}% peak={peak_pct:.2f}% "
+        f"confirm={checks}/{V18341_STALE_EXIT_CONFIRMATIONS}"
+    )
+    return checks >= V18341_STALE_EXIT_CONFIRMATIONS, reason
+
 
 def _v18293_stock_peak_profit_lock(position: Dict[str, Any]):
     """Protect intraday stock profit before the one-hour review.
@@ -5025,6 +5084,32 @@ def manage_money_mode_positions():
                 )
             except Exception as e:
                 print(f"V18.3.40 THESIS DECAY ERROR | {symbol} {e}", flush=True)
+            continue
+
+        # V18.3.41: stale/no-progress capital release. This catches the KO-style
+        # dead zone: mature trade, weak peak, now at/below entry, but not red
+        # enough for V18.3.40 and nowhere near the normal stop.
+        stale_exit, stale_reason = _v18341_stale_no_progress_exit(p)
+        if stale_exit:
+            try:
+                if pdt_aware_should_avoid_sell(symbol, "V18.3.41 STALE NO-PROGRESS EXIT", p["pnlPct"], allow_hard_stop=True):
+                    continue
+                market_sell_qty(
+                    symbol, qty, entry=entry, price=price,
+                    reason="V18.3.41 STALE NO-PROGRESS EXIT"
+                )
+                state[symbol]["highest_since_entry"] = None
+                state[symbol]["failed_entry_checks"] = 0
+                state[symbol]["thesis_decay_checks"] = 0
+                state[symbol]["stale_exit_checks"] = 0
+                _v17_reset_peak_exhaustion(symbol)
+                _v17_reset_runner_trail(symbol)
+                print(
+                    f"V18.3.41 STALE NO-PROGRESS EXIT | {symbol} qty={qty:.6f} {stale_reason}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"V18.3.41 STALE NO-PROGRESS ERROR | {symbol} {e}", flush=True)
             continue
 
         fast_stop, fast_stop_reason = should_fast_stop(p)
