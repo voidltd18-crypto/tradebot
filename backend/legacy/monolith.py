@@ -15924,6 +15924,97 @@ def _build_reports_payload() -> Dict[str, Any]:
     }
 
 
+# V18.3.42 — Stock Leak Analyzer
+# Read-only diagnostics over persisted closed trades + replay telemetry. It does
+# not alter entry gates, position sizing, exits or live order execution.
+def v18342_stock_leak_analysis(days: int = 31, limit: int = 5000) -> Dict[str, Any]:
+    if not SQLITE_ENABLED:
+        return {"ok": False, "message": "SQLite disabled"}
+    _trade_replay_ensure_tables()
+    days = max(1, min(int(days or 31), 3660))
+    limit = max(50, min(int(limit or 5000), 20000))
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    conn = db_connect()
+    try:
+        trades = [dict(r) for r in conn.execute(
+            """SELECT * FROM closed_trades
+               WHERE timestamp>=? AND COALESCE(qty,0)>?
+                 AND ABS(COALESCE(qty,0)*COALESCE(exit_price,0))>=?
+               ORDER BY timestamp DESC LIMIT ?""",
+            (cutoff, PHANTOM_CLOSED_TRADE_QTY_EPSILON, PHANTOM_CLOSED_TRADE_MIN_NOTIONAL_USD, limit),
+        ).fetchall()]
+        sessions = {int(r["closed_trade_id"]): dict(r) for r in conn.execute(
+            """SELECT * FROM trade_replay_sessions
+               WHERE closed_trade_id IS NOT NULL AND ended_at>=?""", (cutoff,)
+        ).fetchall()}
+
+        rows=[]
+        for t in trades:
+            tid=int(t.get("id") or 0); entry=float(t.get("entry_price") or 0); pnl=float(t.get("pnl") or 0)
+            pnl_gbp=float(t.get("pnl_gbp") or 0); pnl_pct=float(t.get("pnl_pct") or 0)
+            sess=sessions.get(tid); hold_min=None; max_gain=None; max_dd=None; capture=None
+            if sess:
+                try:
+                    st=_v6_parse_utc(sess.get("started_at")); en=_v6_parse_utc(sess.get("ended_at") or t.get("timestamp"))
+                    hold_min=max(0.0,(en-st).total_seconds()/60.0)
+                except Exception: pass
+                pts=conn.execute("SELECT MIN(price) lo, MAX(price) hi FROM trade_replay_points WHERE session_id=? AND price>0",(int(sess["id"]),)).fetchone()
+                if pts and entry>0:
+                    hi=float(pts["hi"] or 0); lo=float(pts["lo"] or 0)
+                    if hi>0: max_gain=((hi/entry)-1.0)*100.0
+                    if lo>0: max_dd=((lo/entry)-1.0)*100.0
+                    if max_gain is not None and max_gain>0 and pnl_pct>0: capture=max(0.0,min(200.0,(pnl_pct/max_gain)*100.0))
+            try:
+                dt=_v6_parse_utc(t.get("timestamp")); hour=int(dt.astimezone(ZoneInfo("Europe/London")).hour)
+            except Exception: hour=None
+            rows.append({"id":tid,"symbol":str(t.get("symbol") or ""),"timestamp":t.get("timestamp"),"reason":str(t.get("reason") or "UNKNOWN"),
+                         "pnlUsd":pnl,"pnlGbp":pnl_gbp,"pnlPct":pnl_pct,"holdMinutes":hold_min,"maxGainPct":max_gain,
+                         "maxDrawdownPct":max_dd,"capturePct":capture,"exitHourUk":hour})
+
+        n=len(rows); wins=[r for r in rows if r["pnlUsd"]>0]; losses=[r for r in rows if r["pnlUsd"]<0]
+        def avg(vals):
+            vals=[float(v) for v in vals if v is not None]
+            return sum(vals)/len(vals) if vals else None
+        total_win=sum(r["pnlGbp"] for r in wins); total_loss=sum(r["pnlGbp"] for r in losses)
+        summary={"trades":n,"wins":len(wins),"losses":len(losses),"winRatePct":(len(wins)/n*100.0 if n else 0.0),
+                 "netPnlGbp":sum(r["pnlGbp"] for r in rows),"avgWinGbp":avg([r["pnlGbp"] for r in wins]) or 0.0,
+                 "avgLossGbp":avg([r["pnlGbp"] for r in losses]) or 0.0,
+                 "payoffRatio":((total_win/len(wins))/abs(total_loss/len(losses)) if wins and losses and total_loss else 0.0),
+                 "avgWinnerHoldMin":avg([r["holdMinutes"] for r in wins]),"avgLoserHoldMin":avg([r["holdMinutes"] for r in losses]),
+                 "avgWinnerMaxGainPct":avg([r["maxGainPct"] for r in wins]),"avgLoserMaxGainPct":avg([r["maxGainPct"] for r in losses]),
+                 "avgWinnerCapturePct":avg([r["capturePct"] for r in wins]),"replayCoverage":sum(1 for r in rows if r["holdMinutes"] is not None)}
+
+        def group(key):
+            buckets={}
+            for r in rows:
+                k=r.get(key)
+                if k is None: continue
+                b=buckets.setdefault(str(k),[]); b.append(r)
+            out=[]
+            for k,rs in buckets.items():
+                if not rs: continue
+                out.append({"name":k,"trades":len(rs),"winRatePct":sum(1 for r in rs if r["pnlUsd"]>0)/len(rs)*100.0,
+                            "pnlGbp":sum(r["pnlGbp"] for r in rs),"avgPnlGbp":sum(r["pnlGbp"] for r in rs)/len(rs)})
+            return out
+        by_reason=sorted(group("reason"),key=lambda x:x["pnlGbp"])
+        by_symbol=sorted(group("symbol"),key=lambda x:x["pnlGbp"])
+        by_hour=sorted(group("exitHourUk"),key=lambda x:int(x["name"]))
+        biggest_losses=sorted(losses,key=lambda r:r["pnlGbp"])[:10]
+        gave_back=[r for r in rows if r["maxGainPct"] is not None and r["maxGainPct"]>0.20 and r["pnlPct"] < r["maxGainPct"]-0.20]
+        gave_back=sorted(gave_back,key=lambda r:(r["maxGainPct"]-r["pnlPct"]),reverse=True)[:10]
+        return {"ok":True,"version":"V18.3.42","days":days,"summary":summary,"byExitReason":by_reason[:20],"bySymbol":by_symbol[:20],
+                "byExitHourUk":by_hour,"biggestLosses":biggest_losses,"largestGivebacks":gave_back,
+                "note":"Read-only evidence. Replay-derived hold/peak/drawdown metrics only exist where replay telemetry was recorded."}
+    finally:
+        conn.close()
+
+
+@app.get("/v18/stock-leak-analysis")
+def api_v18342_stock_leak_analysis(request: Request, days: int = 31, limit: int = 5000):
+    verify_api_key(request)
+    return v18342_stock_leak_analysis(days, limit)
+
+
 @app.get("/trade-replay/live/{symbol}")
 def api_trade_replay_live(symbol: str, limit: int = TRADE_REPLAY_MAX_POINTS):
     return trade_replay_live_payload(symbol, limit)

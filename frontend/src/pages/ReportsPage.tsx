@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { Card } from "../components/Card";
 import { TradeReplayModal, type ReplayTarget } from "../components/TradeReplayModal";
@@ -59,6 +59,9 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const [momentFilter, setMomentFilter] = useState<{from:number; to:number; label:string} | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyMessage, setHistoryMessage] = useState("");
+  const [leakAnalysis, setLeakAnalysis] = useState<AnyObj | null>(null);
+  const [leakLoading, setLeakLoading] = useState(false);
+  const [leakError, setLeakError] = useState("");
   const totalDeposited = Number(reports?.totalDeposited || 0);
   const totalGainLoss = Number(reports?.totalGainLoss || 0);
   const earned = Number(reports?.earnedSinceDeposit || 0);
@@ -72,6 +75,22 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const recoveryReached = currentEquityGbp >= RECOVERY_GOAL_GBP;
   const equityFloor = Number(data?.equityFloorKillSwitch?.floorGbp ?? 800);
   const equityFloorLatched = Boolean(data?.equityFloorKillSwitch?.latched);
+
+  const loadLeakAnalysis = async () => {
+    if (!authToken || leakLoading) return;
+    setLeakLoading(true); setLeakError("");
+    try {
+      const response = await fetch(`${API_URL}/v18/stock-leak-analysis?days=31&limit=5000`, {
+        cache: "no-store", headers: { "X-Auth-Token": authToken, "x-api-key": authToken },
+      });
+      const json = await readJson(response);
+      if (!response.ok || json?.ok === false) throw new Error(json?.detail || json?.message || `Leak analysis failed (${response.status})`);
+      setLeakAnalysis(json);
+    } catch (error:any) { setLeakError(error?.message || "Stock leak analysis failed."); }
+    finally { setLeakLoading(false); }
+  };
+
+  useEffect(() => { if (authToken) void loadLeakAnalysis(); }, [authToken, closedTrades.length]);
 
   const reportChart = useMemo(() => {
     const start = rangeStart(range);
@@ -239,6 +258,31 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       {historyMessage && <p className="notice">{historyMessage}</p>}
       {reportsError && <p className="notice loss">{reportsError}</p>}
       {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })} · {Number(reports?.closedTradeRowsReturned || closedTrades.length).toLocaleString("en-GB")} closed rows loaded</p>}
+    </Card>
+
+    <Card title="V18.3.42 Stock Leak Analyzer" wide>
+      <div className="actions"><button onClick={loadLeakAnalysis} disabled={leakLoading}>{leakLoading ? "Analysing…" : "Refresh Leak Analysis"}</button></div>
+      {leakError && <p className="notice loss">{leakError}</p>}
+      {leakAnalysis?.summary && <>
+        <section className="stats">
+          <Stat label="Trades analysed" value={Number(leakAnalysis.summary.trades||0).toLocaleString("en-GB")} sub={`${Number(leakAnalysis.days||31)} days`}/>
+          <Stat label="Win rate" value={`${Number(leakAnalysis.summary.winRatePct||0).toFixed(1)}%`} sub={`${leakAnalysis.summary.wins||0} wins / ${leakAnalysis.summary.losses||0} losses`}/>
+          <Stat label="Average winner" value={gbp(Number(leakAnalysis.summary.avgWinGbp||0))} className="profit" sub={`Avg hold ${leakAnalysis.summary.avgWinnerHoldMin==null?"—":Number(leakAnalysis.summary.avgWinnerHoldMin).toFixed(0)+"m"}`}/>
+          <Stat label="Average loser" value={gbp(Number(leakAnalysis.summary.avgLossGbp||0))} className="loss" sub={`Avg hold ${leakAnalysis.summary.avgLoserHoldMin==null?"—":Number(leakAnalysis.summary.avgLoserHoldMin).toFixed(0)+"m"}`}/>
+          <Stat label="Payoff ratio" value={`${Number(leakAnalysis.summary.payoffRatio||0).toFixed(2)}×`} sub="Avg win ÷ avg loss"/>
+          <Stat label="Replay coverage" value={`${Number(leakAnalysis.summary.replayCoverage||0)}/${Number(leakAnalysis.summary.trades||0)}`} sub="Peak/drawdown evidence"/>
+        </section>
+        <div className="grid two">
+          <div><h3>Worst exit reasons</h3><div className="table-wrap"><table className="compact-table"><thead><tr><th>Reason</th><th>Trades</th><th>Win %</th><th>PnL</th></tr></thead><tbody>{(leakAnalysis.byExitReason||[]).slice(0,6).map((r:AnyObj)=><tr key={r.name}><td>{r.name}</td><td>{r.trades}</td><td>{Number(r.winRatePct||0).toFixed(1)}%</td><td className={tone(r.pnlGbp)}>{gbp(r.pnlGbp)}</td></tr>)}</tbody></table></div></div>
+          <div><h3>Worst symbols</h3><div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>Trades</th><th>Win %</th><th>PnL</th></tr></thead><tbody>{(leakAnalysis.bySymbol||[]).slice(0,6).map((r:AnyObj)=><tr key={r.name}><td><b>{r.name}</b></td><td>{r.trades}</td><td>{Number(r.winRatePct||0).toFixed(1)}%</td><td className={tone(r.pnlGbp)}>{gbp(r.pnlGbp)}</td></tr>)}</tbody></table></div></div>
+        </div>
+        <div className="grid two">
+          <div><h3>Biggest losses</h3><div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>PnL</th><th>Hold</th><th>Peak</th></tr></thead><tbody>{(leakAnalysis.biggestLosses||[]).slice(0,6).map((r:AnyObj)=><tr key={`loss-${r.id}`}><td><b>{r.symbol}</b></td><td className="loss">{gbp(r.pnlGbp)}</td><td>{r.holdMinutes==null?"—":`${Number(r.holdMinutes).toFixed(0)}m`}</td><td>{r.maxGainPct==null?"—":`${Number(r.maxGainPct).toFixed(2)}%`}</td></tr>)}</tbody></table></div></div>
+          <div><h3>Largest profit givebacks</h3><div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>Peak</th><th>Exit</th><th>Giveback</th></tr></thead><tbody>{(leakAnalysis.largestGivebacks||[]).slice(0,6).map((r:AnyObj)=><tr key={`give-${r.id}`}><td><b>{r.symbol}</b></td><td>{r.maxGainPct==null?"—":`${Number(r.maxGainPct).toFixed(2)}%`}</td><td className={tone(r.pnlPct)}>{Number(r.pnlPct||0).toFixed(2)}%</td><td>{r.maxGainPct==null?"—":`${Math.max(0,Number(r.maxGainPct)-Number(r.pnlPct||0)).toFixed(2)}pp`}</td></tr>)}</tbody></table></div></div>
+        </div>
+        <p className="muted">Read-only diagnostics: this panel does not change trading rules. Hold time, peak gain and drawdown use recorded Trade Replay evidence only.</p>
+      </>}
+      {!leakLoading && !leakError && !leakAnalysis?.summary && <p className="muted">Waiting for stock evidence…</p>}
     </Card>
 
     <Card title="Performance Summary" wide><section className="stats"><Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={usd(totalDeposited)}/><Stat label="Earned" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)}/><Stat label="Lost" value={gbp(lost * rate)} sub={usd(lost)} className="loss"/><Stat label="Current Equity" value={gbp(Number(reports?.currentEquity ?? data?.account?.equity ?? 0) * rate)} sub={usd(reports?.currentEquity ?? data?.account?.equity ?? 0)}/></section><p className={tone(totalGainLoss)}>Total gain/loss: {gbp(totalGainLoss * rate)}</p></Card>
