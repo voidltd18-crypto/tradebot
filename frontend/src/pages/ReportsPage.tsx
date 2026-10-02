@@ -277,7 +277,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })} · {Number(reports?.closedTradeRowsReturned || closedTrades.length).toLocaleString("en-GB")} closed rows loaded</p>}
     </Card>
 
-    <Card title="V18.3.44 Replay Lab" wide>
+    <Card title="V18.3.45 Replay Forensics" wide>
       <div className="actions"><button onClick={loadReplayLab} disabled={replayLabLoading}>{replayLabLoading ? "Replaying…" : "Run Replay Lab"}</button></div>
       {replayLabError && <p className="notice loss">{replayLabError}</p>}
       {replayLab?.results && <>
@@ -285,6 +285,18 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
         <div className="table-wrap"><table className="compact-table"><thead><tr><th>Scenario</th><th>Trades</th><th>Actual</th><th>Replay</th><th>Difference</th><th>Win rate</th><th>Avg win</th><th>Avg loss</th><th>Payoff</th><th>£10+ losses</th></tr></thead><tbody>
           {replayLab.results.map((row:AnyObj)=><tr key={row.key}><td><b>{row.name}</b></td><td>{row.trades}</td><td>{gbp(Number(row.actualPnlGbp||0))}</td><td className={tone(row.simPnlGbp)}>{gbp(Number(row.simPnlGbp||0))}</td><td className={tone(row.deltaGbp)}>{gbp(Number(row.deltaGbp||0))}</td><td>{Number(row.winRatePct||0).toFixed(1)}%</td><td className="profit">{gbp(Number(row.avgWinGbp||0))}</td><td className="loss">{gbp(Number(row.avgLossGbp||0))}</td><td>{Number(row.payoffRatio||0).toFixed(2)}×</td><td>{Number(row.tailLossesOver10Gbp||0)}</td></tr>)}
         </tbody></table></div>
+        {Array.isArray(replayLab.proxyReasonSummary) && replayLab.proxyReasonSummary.length > 0 && <>
+          <h3>Why the proxy diverges</h3>
+          <div className="table-wrap"><table className="compact-table"><thead><tr><th>Proxy trigger</th><th>Trades</th><th>Actual PnL</th><th>Proxy PnL</th><th>Difference</th></tr></thead><tbody>
+            {replayLab.proxyReasonSummary.map((row:AnyObj)=><tr key={row.reason}><td><b>{row.reason}</b></td><td>{row.trades}</td><td className={tone(row.actualPnlGbp)}>{gbp(Number(row.actualPnlGbp||0))}</td><td className={tone(row.proxyPnlGbp)}>{gbp(Number(row.proxyPnlGbp||0))}</td><td className={tone(row.deltaGbp)}>{gbp(Number(row.deltaGbp||0))}</td></tr>)}
+          </tbody></table></div>
+        </>}
+        {Array.isArray(replayLab.tradeForensics) && replayLab.tradeForensics.length > 0 && <>
+          <h3>Trade-by-trade forensic comparison</h3>
+          <div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>Date</th><th>Actual</th><th>Proxy</th><th>Difference</th><th>Proxy trigger</th><th>Peak</th><th>Link</th></tr></thead><tbody>
+            {replayLab.tradeForensics.map((row:AnyObj)=><tr key={row.id}><td><b>{row.symbol}</b></td><td>{row.timestamp ? new Date(row.timestamp).toLocaleString("en-GB",{timeZone:"Europe/London",day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}) : "—"}</td><td className={tone(row.actualPnlGbp)}>{gbp(Number(row.actualPnlGbp||0))}</td><td className={tone(row.proxyPnlGbp)}>{gbp(Number(row.proxyPnlGbp||0))}</td><td className={tone(row.proxyDeltaGbp)}>{gbp(Number(row.proxyDeltaGbp||0))}</td><td>{row.proxyExitReason||"—"}</td><td>{Number(row.recordedPeakPct||0).toFixed(2)}%</td><td>{row.replayLink||"—"}</td></tr>)}
+          </tbody></table></div>
+        </>}
         <p className="muted">{replayLab.warning}</p>
       </>}
     </Card>
