@@ -154,9 +154,39 @@ def install_v18344_replay_lab(app, m) -> None:
                 rs["trades"]+=1; rs["actualPnlGbp"]+=r["actualPnlGbp"]; rs["proxyPnlGbp"]+=s["pnlGbp"]; rs["deltaGbp"]+=s["deltaGbp"]
             detail=sorted(detail,key=lambda x:abs(x["proxyDeltaGbp"]),reverse=True)
             reasons=sorted(reason_summary.values(),key=lambda x:abs(x["deltaGbp"]),reverse=True)
-            return {"ok":True,"version":"V18.3.45","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
+            # V18.3.46 Exit Intelligence Lab: diagnose whether defensive proxy
+            # triggers fired on genuine failures or on trades that later recovered.
+            exit_intelligence=[]
+            exit_summary={}
+            for row in detail:
+                reason=str(row.get("proxyExitReason") or "")
+                if reason not in ("STOP","STALE"): continue
+                actual=float(row.get("actualPnlGbp") or 0)
+                proxy=float(row.get("proxyPnlGbp") or 0)
+                delta=actual-proxy
+                if actual > 0 and proxy < actual:
+                    outcome="RECOVERED WINNER"
+                elif actual >= 0 and proxy < 0:
+                    outcome="RECOVERED / AVOIDED LOSS"
+                elif actual < 0 and proxy > actual:
+                    outcome="PROTECTION HELPED"
+                elif actual < proxy:
+                    outcome="PROXY WORSE"
+                else:
+                    outcome="SIMILAR"
+                item={**row,"forensicOutcome":outcome,"recoveryValueGbp":delta,
+                      "actualWinner":actual>0,"proxyWinner":proxy>0}
+                exit_intelligence.append(item)
+                key=f"{reason} · {outcome}"
+                g=exit_summary.setdefault(key,{"trigger":reason,"outcome":outcome,"trades":0,
+                    "actualPnlGbp":0.0,"proxyPnlGbp":0.0,"recoveryValueGbp":0.0})
+                g["trades"]+=1; g["actualPnlGbp"]+=actual; g["proxyPnlGbp"]+=proxy; g["recoveryValueGbp"]+=delta
+            exit_intelligence=sorted(exit_intelligence,key=lambda x:abs(x["recoveryValueGbp"]),reverse=True)
+            exit_summary=sorted(exit_summary.values(),key=lambda x:abs(x["recoveryValueGbp"]),reverse=True)
+            return {"ok":True,"version":"V18.3.46","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
                     "skippedNoReplay":skipped,"results":results,"largestChanges":detail[:20],
                     "tradeForensics":detail,"proxyReasonSummary":reasons,
+                    "exitIntelligence":exit_intelligence,"exitIntelligenceSummary":exit_summary,
                     "warning":"Counterfactual replay is diagnostic, not a guarantee. It uses recorded sampled prices, so exits can only trigger on saved replay points.",
                     "liveTradingChanged":False,"pointTimingMode":"recorded" if time_col else "synthesized-10s"}
         finally: conn.close()
