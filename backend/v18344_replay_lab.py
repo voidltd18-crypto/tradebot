@@ -139,14 +139,24 @@ def install_v18344_replay_lab(app, m) -> None:
                     "payoffRatio":((sum(wins)/len(wins))/abs(sum(losses)/len(losses)) if wins and losses else 0),
                     "tailLossesOver10Gbp":sum(1 for x in losses if x<=-10),
                     "worstLossGbp":min(losses,default=0)})
-            # Show the trades with the largest absolute counterfactual changes under the proxy.
+            # V18.3.45 forensic view: expose every replayable trade and group
+            # proxy divergence by the rule that fired.
             detail=[]
+            reason_summary={}
             for r in usable:
                 s=r["simulations"].get("current_proxy")
-                if s: detail.append({**r,"proxyPnlGbp":s["pnlGbp"],"proxyDeltaGbp":s["deltaGbp"],"proxyExitReason":s["exitReason"]})
-            detail=sorted(detail,key=lambda x:abs(x["proxyDeltaGbp"]),reverse=True)[:20]
-            return {"ok":True,"version":"V18.3.44","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
-                    "skippedNoReplay":skipped,"results":results,"largestChanges":detail,
+                if not s: continue
+                row={**r,"proxyPnlGbp":s["pnlGbp"],"proxyDeltaGbp":s["deltaGbp"],
+                     "proxyExitReason":s["exitReason"],"proxyExitPrice":s["exitPrice"],
+                     "proxyExitTime":s["exitTime"],"recordedPeakPct":s["peakPct"]}
+                detail.append(row)
+                rs=reason_summary.setdefault(s["exitReason"],{"reason":s["exitReason"],"trades":0,"actualPnlGbp":0.0,"proxyPnlGbp":0.0,"deltaGbp":0.0})
+                rs["trades"]+=1; rs["actualPnlGbp"]+=r["actualPnlGbp"]; rs["proxyPnlGbp"]+=s["pnlGbp"]; rs["deltaGbp"]+=s["deltaGbp"]
+            detail=sorted(detail,key=lambda x:abs(x["proxyDeltaGbp"]),reverse=True)
+            reasons=sorted(reason_summary.values(),key=lambda x:abs(x["deltaGbp"]),reverse=True)
+            return {"ok":True,"version":"V18.3.45","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
+                    "skippedNoReplay":skipped,"results":results,"largestChanges":detail[:20],
+                    "tradeForensics":detail,"proxyReasonSummary":reasons,
                     "warning":"Counterfactual replay is diagnostic, not a guarantee. It uses recorded sampled prices, so exits can only trigger on saved replay points.",
                     "liveTradingChanged":False,"pointTimingMode":"recorded" if time_col else "synthesized-10s"}
         finally: conn.close()
