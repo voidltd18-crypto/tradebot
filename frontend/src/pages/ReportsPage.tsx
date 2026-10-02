@@ -277,7 +277,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })} · {Number(reports?.closedTradeRowsReturned || closedTrades.length).toLocaleString("en-GB")} closed rows loaded</p>}
     </Card>
 
-    <Card title="V18.3.46 Exit Intelligence Lab" wide>
+    <Card title="V18.3.47 Recovery-Aware Exit Research" wide>
       <div className="actions"><button onClick={loadReplayLab} disabled={replayLabLoading}>{replayLabLoading ? "Replaying…" : "Run Replay Lab"}</button></div>
       {replayLabError && <p className="notice loss">{replayLabError}</p>}
       {replayLab?.results && <>
@@ -289,6 +289,18 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
           <h3>Why the proxy diverges</h3>
           <div className="table-wrap"><table className="compact-table"><thead><tr><th>Proxy trigger</th><th>Trades</th><th>Actual PnL</th><th>Proxy PnL</th><th>Difference</th></tr></thead><tbody>
             {replayLab.proxyReasonSummary.map((row:AnyObj)=><tr key={row.reason}><td><b>{row.reason}</b></td><td>{row.trades}</td><td className={tone(row.actualPnlGbp)}>{gbp(Number(row.actualPnlGbp||0))}</td><td className={tone(row.proxyPnlGbp)}>{gbp(Number(row.proxyPnlGbp||0))}</td><td className={tone(row.deltaGbp)}>{gbp(Number(row.deltaGbp||0))}</td></tr>)}
+          </tbody></table></div>
+        </>}
+        {Array.isArray(replayLab.recoveryAwareSummary) && replayLab.recoveryAwareSummary.length > 0 && <>
+          <h3>Recovery-Aware Research · temporary dip or genuine failure?</h3>
+          <div className="table-wrap"><table className="compact-table"><thead><tr><th>Trigger</th><th>Class</th><th>Trades</th><th>3-sample momentum</th><th>Recent drawdown</th><th>Post-trigger best</th><th>Reclaimed entry</th><th>Actual PnL</th><th>Proxy PnL</th></tr></thead><tbody>
+            {replayLab.recoveryAwareSummary.map((row:AnyObj,index:number)=><tr key={`recovery-summary-${index}`}><td><b>{row.trigger}</b></td><td>{row.label}</td><td>{row.trades}</td><td>{Number(row.avgMomentum3Pct||0).toFixed(2)}%</td><td>{Number(row.avgRecentDrawdownPct||0).toFixed(2)}%</td><td>{Number(row.avgPostTriggerBestPct||0).toFixed(2)}%</td><td>{Number(row.reclaimRatePct||0).toFixed(0)}%</td><td className={tone(row.actualPnlGbp)}>{gbp(Number(row.actualPnlGbp||0))}</td><td className={tone(row.proxyPnlGbp)}>{gbp(Number(row.proxyPnlGbp||0))}</td></tr>)}
+          </tbody></table></div>
+        </>}
+        {Array.isArray(replayLab.recoveryAwareResearch) && replayLab.recoveryAwareResearch.length > 0 && <>
+          <h3>Recovery-Aware forensic cases</h3>
+          <div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>Trigger</th><th>Class</th><th>Actual</th><th>Proxy</th><th>3-sample momentum</th><th>Recent drawdown</th><th>Post-trigger best</th><th>Reclaimed entry</th></tr></thead><tbody>
+            {replayLab.recoveryAwareResearch.map((row:AnyObj)=><tr key={`recovery-case-${row.id}`}><td><b>{row.symbol}</b></td><td>{row.proxyExitReason}</td><td>{row.researchLabel}</td><td className={tone(row.actualPnlGbp)}>{gbp(Number(row.actualPnlGbp||0))}</td><td className={tone(row.proxyPnlGbp)}>{gbp(Number(row.proxyPnlGbp||0))}</td><td>{Number(row.momentum3Pct||0).toFixed(2)}%</td><td>{Number(row.recentDrawdownPct||0).toFixed(2)}%</td><td>{Number(row.postTriggerBestPct||0).toFixed(2)}%</td><td>{row.reclaimedEntry ? "YES" : "NO"}</td></tr>)}
           </tbody></table></div>
         </>}
         {Array.isArray(replayLab.exitIntelligenceSummary) && replayLab.exitIntelligenceSummary.length > 0 && <>

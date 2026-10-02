@@ -100,7 +100,7 @@ def install_v18344_replay_lab(app, m) -> None:
               {"key":"giveback_040","name":"Tighter giveback 0.40pp","stop":1.50,"arm":1.25,"giveback":0.40,"stale":60,"stalePeak":0.75},
               {"key":"stale_45","name":"Earlier stale exit 45m","stop":1.50,"arm":1.25,"giveback":0.55,"stale":45,"stalePeak":0.75},
             ]
-            usable=[]; skipped=0
+            usable=[]; skipped=0; replay_paths={}
             for t in trades:
                 sess,link=match(t)
                 if not sess: skipped+=1; continue
@@ -125,7 +125,9 @@ def install_v18344_replay_lab(app, m) -> None:
                     if s:
                         s["pnlGbp"]=s["pnlUsd"]*fx; s["deltaGbp"]=s["pnlGbp"]-actual_gbp
                         sims[cfg["key"]]=s
-                usable.append({"id":int(t.get("id") or 0),"symbol":str(t.get("symbol") or ""),"timestamp":t.get("timestamp"),
+                trade_id=int(t.get("id") or 0)
+                replay_paths[trade_id]={"points":pts,"entry":entry,"actualExit":actual_exit}
+                usable.append({"id":trade_id,"symbol":str(t.get("symbol") or ""),"timestamp":t.get("timestamp"),
                                "actualPnlGbp":actual_gbp,"actualPnlPct":float(t.get("pnl_pct") or 0),"replayLink":link,"simulations":sims})
             results=[]
             for cfg in configs:
@@ -183,10 +185,66 @@ def install_v18344_replay_lab(app, m) -> None:
                 g["trades"]+=1; g["actualPnlGbp"]+=actual; g["proxyPnlGbp"]+=proxy; g["recoveryValueGbp"]+=delta
             exit_intelligence=sorted(exit_intelligence,key=lambda x:abs(x["recoveryValueGbp"]),reverse=True)
             exit_summary=sorted(exit_summary.values(),key=lambda x:abs(x["recoveryValueGbp"]),reverse=True)
-            return {"ok":True,"version":"V18.3.46","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
+            # V18.3.47 Recovery-Aware Exit Research: measure the price behaviour
+            # around STOP/STALE triggers without changing any live rule.
+            recovery_research=[]
+            recovery_groups={}
+            for row in exit_intelligence:
+                path=replay_paths.get(int(row.get("id") or 0)) or {}
+                pts=path.get("points") or []; entry=float(path.get("entry") or 0)
+                trigger_time=_dt(row.get("proxyExitTime"))
+                trigger_idx=None
+                if trigger_time:
+                    best_gap=1e99
+                    for i,p in enumerate(pts):
+                        pt=_dt(p.get("point_time"))
+                        if pt:
+                            gap=abs((pt-trigger_time).total_seconds())
+                            if gap<best_gap: best_gap=gap; trigger_idx=i
+                if trigger_idx is None:
+                    target=float(row.get("proxyExitPrice") or 0)
+                    trigger_idx=min(range(len(pts)),key=lambda i:abs(float(pts[i].get("price") or 0)-target)) if pts else 0
+                prices=[float(p.get("price") or 0) for p in pts]
+                tp=prices[trigger_idx] if prices and trigger_idx<len(prices) else 0
+                def mom(back):
+                    j=max(0,trigger_idx-back); old=prices[j] if prices else 0
+                    return ((tp/old)-1)*100 if tp>0 and old>0 else 0
+                before=prices[max(0,trigger_idx-6):trigger_idx+1]
+                after=prices[trigger_idx+1:]
+                pre_peak=max(before,default=tp)
+                post_peak=max(after,default=tp)
+                post_low=min(after,default=tp)
+                reclaim_entry=bool(entry>0 and post_peak>=entry)
+                post_best_pct=((post_peak/tp)-1)*100 if tp>0 else 0
+                post_worst_pct=((post_low/tp)-1)*100 if tp>0 else 0
+                drawdown_from_recent=((tp/pre_peak)-1)*100 if tp>0 and pre_peak>0 else 0
+                actual=float(row.get("actualPnlGbp") or 0); proxy=float(row.get("proxyPnlGbp") or 0)
+                research_label="RECOVERY" if actual>proxy and (actual>=0 or reclaim_entry) else "FAILURE / PROTECTION"
+                rr={**row,"researchLabel":research_label,"momentum1Pct":mom(1),"momentum3Pct":mom(3),
+                    "momentum6Pct":mom(6),"recentDrawdownPct":drawdown_from_recent,
+                    "postTriggerBestPct":post_best_pct,"postTriggerWorstPct":post_worst_pct,
+                    "reclaimedEntry":reclaim_entry,"samplesBefore":len(before),"samplesAfter":len(after)}
+                recovery_research.append(rr)
+                key=f"{row.get('proxyExitReason')} · {research_label}"
+                g=recovery_groups.setdefault(key,{"trigger":row.get("proxyExitReason"),"label":research_label,"trades":0,
+                    "avgMomentum3Pct":0.0,"avgRecentDrawdownPct":0.0,"avgPostTriggerBestPct":0.0,
+                    "reclaimedEntryTrades":0,"actualPnlGbp":0.0,"proxyPnlGbp":0.0})
+                g["trades"]+=1; g["avgMomentum3Pct"]+=rr["momentum3Pct"]; g["avgRecentDrawdownPct"]+=rr["recentDrawdownPct"]
+                g["avgPostTriggerBestPct"]+=post_best_pct; g["reclaimedEntryTrades"]+=1 if reclaim_entry else 0
+                g["actualPnlGbp"]+=actual; g["proxyPnlGbp"]+=proxy
+            recovery_summary=[]
+            for g in recovery_groups.values():
+                n=max(1,g["trades"])
+                g["avgMomentum3Pct"]/=n; g["avgRecentDrawdownPct"]/=n; g["avgPostTriggerBestPct"]/=n
+                g["reclaimRatePct"]=g["reclaimedEntryTrades"]/n*100
+                recovery_summary.append(g)
+            recovery_research=sorted(recovery_research,key=lambda x:abs(float(x.get("recoveryValueGbp") or 0)),reverse=True)
+            recovery_summary=sorted(recovery_summary,key=lambda x:(x["trigger"],x["label"]))
+
+            return {"ok":True,"version":"V18.3.47","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
                     "skippedNoReplay":skipped,"results":results,"largestChanges":detail[:20],
                     "tradeForensics":detail,"proxyReasonSummary":reasons,
-                    "exitIntelligence":exit_intelligence,"exitIntelligenceSummary":exit_summary,
+                    "exitIntelligence":exit_intelligence,"exitIntelligenceSummary":exit_summary,\n                    "recoveryAwareResearch":recovery_research,"recoveryAwareSummary":recovery_summary,
                     "warning":"Counterfactual replay is diagnostic, not a guarantee. It uses recorded sampled prices, so exits can only trigger on saved replay points.",
                     "liveTradingChanged":False,"pointTimingMode":"recorded" if time_col else "synthesized-10s"}
         finally: conn.close()
