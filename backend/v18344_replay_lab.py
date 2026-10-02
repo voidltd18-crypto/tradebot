@@ -19,7 +19,7 @@ def install_v18344_replay_lab(app, m) -> None:
 
     def _point_time_col(conn):
         cols = set(_columns(conn, "trade_replay_points"))
-        for c in ("timestamp", "time", "recorded_at", "created_at", "ts"):
+        for c in ("timestamp", "time", "recorded_at", "created_at", "observed_at", "sampled_at", "captured_at", "ts"):
             if c in cols: return c
         return None
 
@@ -64,8 +64,8 @@ def install_v18344_replay_lab(app, m) -> None:
         conn=m.db_connect()
         try:
             time_col=_point_time_col(conn)
-            if not time_col:
-                return {"ok":False,"message":"Replay point timestamp column unavailable"}
+            point_cols=set(_columns(conn, "trade_replay_points"))
+            order_col = time_col or ("id" if "id" in point_cols else "rowid")
             trades=[dict(r) for r in conn.execute(
                 """SELECT * FROM closed_trades WHERE timestamp>=? AND COALESCE(qty,0)>?
                    AND ABS(COALESCE(qty,0)*COALESCE(exit_price,0))>=?
@@ -104,9 +104,14 @@ def install_v18344_replay_lab(app, m) -> None:
             for t in trades:
                 sess,link=match(t)
                 if not sess: skipped+=1; continue
-                pts=[dict(r) for r in conn.execute(
-                    f'SELECT price, "{time_col}" AS point_time FROM trade_replay_points WHERE session_id=? AND price>0 ORDER BY "{time_col}" ASC',
-                    (int(sess["id"]),)).fetchall()]
+                if time_col:
+                    sql = 'SELECT price, "' + time_col + '" AS point_time FROM trade_replay_points WHERE session_id=? AND price>0 ORDER BY "' + order_col + '" ASC'
+                    pts=[dict(r) for r in conn.execute(sql,(int(sess["id"]),)).fetchall()]
+                else:
+                    sql = "SELECT price FROM trade_replay_points WHERE session_id=? AND price>0 ORDER BY " + order_col + " ASC"
+                    raw=[dict(r) for r in conn.execute(sql,(int(sess["id"]),)).fetchall()]
+                    start=_dt(sess.get("started_at"))
+                    pts=[{**p,"point_time":(start+timedelta(seconds=i*10)).isoformat() if start else None} for i,p in enumerate(raw)]
                 if len(pts)<2: skipped+=1; continue
                 entry=float(t.get("entry_price") or 0); qty=float(t.get("qty") or 0); actual_exit=float(t.get("exit_price") or 0)
                 if entry<=0 or qty<=0 or actual_exit<=0: skipped+=1; continue
@@ -143,5 +148,5 @@ def install_v18344_replay_lab(app, m) -> None:
             return {"ok":True,"version":"V18.3.44","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
                     "skippedNoReplay":skipped,"results":results,"largestChanges":detail,
                     "warning":"Counterfactual replay is diagnostic, not a guarantee. It uses recorded sampled prices, so exits can only trigger on saved replay points.",
-                    "liveTradingChanged":False}
+                    "liveTradingChanged":False,"pointTimingMode":"recorded" if time_col else "synthesized-10s"}
         finally: conn.close()
