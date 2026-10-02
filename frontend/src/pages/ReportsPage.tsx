@@ -260,7 +260,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })} · {Number(reports?.closedTradeRowsReturned || closedTrades.length).toLocaleString("en-GB")} closed rows loaded</p>}
     </Card>
 
-    <Card title="V18.3.42 Stock Leak Analyzer" wide>
+    <Card title="V18.3.43 Stock Leak Analyzer" wide>
       <div className="actions"><button onClick={loadLeakAnalysis} disabled={leakLoading}>{leakLoading ? "Analysing…" : "Refresh Leak Analysis"}</button></div>
       {leakError && <p className="notice loss">{leakError}</p>}
       {leakAnalysis?.summary && <>
@@ -270,8 +270,16 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
           <Stat label="Average winner" value={gbp(Number(leakAnalysis.summary.avgWinGbp||0))} className="profit" sub={`Avg hold ${leakAnalysis.summary.avgWinnerHoldMin==null?"—":Number(leakAnalysis.summary.avgWinnerHoldMin).toFixed(0)+"m"}`}/>
           <Stat label="Average loser" value={gbp(Number(leakAnalysis.summary.avgLossGbp||0))} className="loss" sub={`Avg hold ${leakAnalysis.summary.avgLoserHoldMin==null?"—":Number(leakAnalysis.summary.avgLoserHoldMin).toFixed(0)+"m"}`}/>
           <Stat label="Payoff ratio" value={`${Number(leakAnalysis.summary.payoffRatio||0).toFixed(2)}×`} sub="Avg win ÷ avg loss"/>
-          <Stat label="Replay coverage" value={`${Number(leakAnalysis.summary.replayCoverage||0)}/${Number(leakAnalysis.summary.trades||0)}`} sub="Peak/drawdown evidence"/>
+          <Stat label="Replay coverage" value={`${Number(leakAnalysis.summary.replayCoverage||0)}/${Number(leakAnalysis.summary.trades||0)}`} sub={`${Number(leakAnalysis.replayDirect||0)} direct + ${Number(leakAnalysis.replayReconciled||0)} reconciled`}/>
         </section>
+        {leakAnalysis.currentRules && <><h3>Current exit rules · since 01/10/2026</h3><section className="stats">
+          <Stat label="Current-rule trades" value={Number(leakAnalysis.currentRules.trades||0).toLocaleString("en-GB")} sub={`${leakAnalysis.currentRules.wins||0} wins / ${leakAnalysis.currentRules.losses||0} losses`}/>
+          <Stat label="Current PnL" value={gbp(Number(leakAnalysis.currentRules.netPnlGbp||0))} className={tone(leakAnalysis.currentRules.netPnlGbp)} sub={`${Number(leakAnalysis.currentRules.winRatePct||0).toFixed(1)}% win rate`}/>
+          <Stat label="Current avg winner" value={gbp(Number(leakAnalysis.currentRules.avgWinGbp||0))} className="profit" sub={`${Number(leakAnalysis.currentRules.payoffRatio||0).toFixed(2)}× payoff`}/>
+          <Stat label="Current avg loser" value={gbp(Number(leakAnalysis.currentRules.avgLossGbp||0))} className="loss" sub={`Worst ${gbp(Number(leakAnalysis.currentRules.worstLossGbp||0))}`}/>
+          <Stat label="£10+ tail losses" value={Number(leakAnalysis.currentRules.tailLossesOver10Gbp||0).toLocaleString("en-GB")} className={Number(leakAnalysis.currentRules.tailLossesOver10Gbp||0)>0?"loss":undefined} sub="Under current exit stack"/>
+          <Stat label="Old £10+ tail losses" value={Number(leakAnalysis.historicalBeforeCurrentRules?.tailLossesOver10Gbp||0).toLocaleString("en-GB")} sub="Before current exit stack"/>
+        </section></>}
         <div className="grid two">
           <div><h3>Worst exit reasons</h3><div className="table-wrap"><table className="compact-table"><thead><tr><th>Reason</th><th>Trades</th><th>Win %</th><th>PnL</th></tr></thead><tbody>{(leakAnalysis.byExitReason||[]).slice(0,6).map((r:AnyObj)=><tr key={r.name}><td>{r.name}</td><td>{r.trades}</td><td>{Number(r.winRatePct||0).toFixed(1)}%</td><td className={tone(r.pnlGbp)}>{gbp(r.pnlGbp)}</td></tr>)}</tbody></table></div></div>
           <div><h3>Worst symbols</h3><div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>Trades</th><th>Win %</th><th>PnL</th></tr></thead><tbody>{(leakAnalysis.bySymbol||[]).slice(0,6).map((r:AnyObj)=><tr key={r.name}><td><b>{r.name}</b></td><td>{r.trades}</td><td>{Number(r.winRatePct||0).toFixed(1)}%</td><td className={tone(r.pnlGbp)}>{gbp(r.pnlGbp)}</td></tr>)}</tbody></table></div></div>
@@ -280,7 +288,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
           <div><h3>Biggest losses</h3><div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>PnL</th><th>Hold</th><th>Peak</th></tr></thead><tbody>{(leakAnalysis.biggestLosses||[]).slice(0,6).map((r:AnyObj)=><tr key={`loss-${r.id}`}><td><b>{r.symbol}</b></td><td className="loss">{gbp(r.pnlGbp)}</td><td>{r.holdMinutes==null?"—":`${Number(r.holdMinutes).toFixed(0)}m`}</td><td>{r.maxGainPct==null?"—":`${Number(r.maxGainPct).toFixed(2)}%`}</td></tr>)}</tbody></table></div></div>
           <div><h3>Largest profit givebacks</h3><div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>Peak</th><th>Exit</th><th>Giveback</th></tr></thead><tbody>{(leakAnalysis.largestGivebacks||[]).slice(0,6).map((r:AnyObj)=><tr key={`give-${r.id}`}><td><b>{r.symbol}</b></td><td>{r.maxGainPct==null?"—":`${Number(r.maxGainPct).toFixed(2)}%`}</td><td className={tone(r.pnlPct)}>{Number(r.pnlPct||0).toFixed(2)}%</td><td>{r.maxGainPct==null?"—":`${Math.max(0,Number(r.maxGainPct)-Number(r.pnlPct||0)).toFixed(2)}pp`}</td></tr>)}</tbody></table></div></div>
         </div>
-        <p className="muted">Read-only diagnostics: this panel does not change trading rules. Hold time, peak gain and drawdown use recorded Trade Replay evidence only.</p>
+        <p className="muted">Stock-only, read-only diagnostics. Current-rule results are separated from older historical losses; replay evidence is linked directly or reconciled where possible.</p>
       </>}
       {!leakLoading && !leakError && !leakAnalysis?.summary && <p className="muted">Waiting for stock evidence…</p>}
     </Card>
