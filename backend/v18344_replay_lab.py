@@ -241,10 +241,74 @@ def install_v18344_replay_lab(app, m) -> None:
             recovery_research=sorted(recovery_research,key=lambda x:abs(float(x.get("recoveryValueGbp") or 0)),reverse=True)
             recovery_summary=sorted(recovery_summary,key=lambda x:(x["trigger"],x["label"]))
 
-            return {"ok":True,"version":"V18.3.47","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
+            # V18.3.48 Live Exit Validation: use the historical Recovery-Aware
+            # cases as a read-only fingerprint library, then compare fresh live
+            # trades from 02/10/2026 onward using only information available by
+            # the end of each recorded replay path. This does not change trading.
+            validation_since=datetime(2026,10,2,tzinfo=UTC)
+            training=[]
+            for rr in recovery_research:
+                ts=_dt(rr.get("timestamp"))
+                if not ts or ts>=validation_since: continue
+                training.append(rr)
+
+            def _actual_end_features(trade_row):
+                path=replay_paths.get(int(trade_row.get("id") or 0)) or {}
+                pts=path.get("points") or []; entry=float(path.get("entry") or 0)
+                prices=[float(p.get("price") or 0) for p in pts if float(p.get("price") or 0)>0]
+                if len(prices)<2 or entry<=0: return None
+                idx=len(prices)-1; price=prices[idx]
+                def _mom(back):
+                    j=max(0,idx-back); old=prices[j]
+                    return ((price/old)-1)*100 if old>0 else 0
+                recent=prices[max(0,idx-6):idx+1]
+                recent_peak=max(recent,default=price)
+                all_peak=max(prices,default=price)
+                return {
+                    "momentum3Pct":_mom(3),
+                    "momentum6Pct":_mom(6),
+                    "recentDrawdownPct":((price/recent_peak)-1)*100 if recent_peak>0 else 0,
+                    "peakPct":((all_peak/entry)-1)*100 if entry>0 else 0,
+                }
+
+            live_validation=[]
+            live_validation_summary={}
+            for row in usable:
+                ts=_dt(row.get("timestamp"))
+                if not ts or ts<validation_since: continue
+                feat=_actual_end_features(row)
+                if not feat: continue
+                nearest=None; nearest_distance=1e99
+                for rr in training:
+                    d=(abs(feat["momentum3Pct"]-float(rr.get("momentum3Pct") or 0))
+                       +abs(feat["recentDrawdownPct"]-float(rr.get("recentDrawdownPct") or 0))
+                       +abs(feat["peakPct"]-float(rr.get("recordedPeakPct") or 0)))
+                    if d<nearest_distance:
+                        nearest=rr; nearest_distance=d
+                signal=str(nearest.get("researchLabel") or "UNKNOWN") if nearest else "UNKNOWN"
+                item={**row,**feat,"fingerprintSignal":signal,
+                    "nearestHistoricalSymbol":str(nearest.get("symbol") or "") if nearest else "",
+                    "nearestHistoricalTrigger":str(nearest.get("proxyExitReason") or "") if nearest else "",
+                    "fingerprintDistance":nearest_distance if nearest else None}
+                live_validation.append(item)
+                g=live_validation_summary.setdefault(signal,{"signal":signal,"trades":0,"actualPnlGbp":0.0,
+                    "wins":0,"losses":0,"avgDistance":0.0})
+                g["trades"]+=1; g["actualPnlGbp"]+=float(row.get("actualPnlGbp") or 0)
+                g["wins"]+=1 if float(row.get("actualPnlGbp") or 0)>0 else 0
+                g["losses"]+=1 if float(row.get("actualPnlGbp") or 0)<0 else 0
+                g["avgDistance"]+=(nearest_distance if nearest else 0)
+            live_validation=sorted(live_validation,key=lambda x:abs(float(x.get("actualPnlGbp") or 0)),reverse=True)
+            live_validation_summary=list(live_validation_summary.values())
+            for g in live_validation_summary:
+                g["avgDistance"]/=max(1,g["trades"])
+
+            return {"ok":True,"version":"V18.3.48","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
                     "skippedNoReplay":skipped,"results":results,"largestChanges":detail[:20],
                     "tradeForensics":detail,"proxyReasonSummary":reasons,
-                    "exitIntelligence":exit_intelligence,"exitIntelligenceSummary":exit_summary,\n                    "recoveryAwareResearch":recovery_research,"recoveryAwareSummary":recovery_summary,
+                    "exitIntelligence":exit_intelligence,"exitIntelligenceSummary":exit_summary,
+                    "recoveryAwareResearch":recovery_research,"recoveryAwareSummary":recovery_summary,
+                    "liveExitValidation":live_validation,"liveExitValidationSummary":live_validation_summary,
+                    "liveExitValidationSince":validation_since.isoformat(),
                     "warning":"Counterfactual replay is diagnostic, not a guarantee. It uses recorded sampled prices, so exits can only trigger on saved replay points.",
                     "liveTradingChanged":False,"pointTimingMode":"recorded" if time_col else "synthesized-10s"}
         finally: conn.close()
