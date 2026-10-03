@@ -277,7 +277,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })} · {Number(reports?.closedTradeRowsReturned || closedTrades.length).toLocaleString("en-GB")} closed rows loaded</p>}
     </Card>
 
-    <Card title="V18.3.47 Recovery-Aware Exit Research" wide>
+    <Card title="V18.3.48 Live Exit Validation" wide>
       <div className="actions"><button onClick={loadReplayLab} disabled={replayLabLoading}>{replayLabLoading ? "Replaying…" : "Run Replay Lab"}</button></div>
       {replayLabError && <p className="notice loss">{replayLabError}</p>}
       {replayLab?.results && <>
@@ -289,6 +289,19 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
           <h3>Why the proxy diverges</h3>
           <div className="table-wrap"><table className="compact-table"><thead><tr><th>Proxy trigger</th><th>Trades</th><th>Actual PnL</th><th>Proxy PnL</th><th>Difference</th></tr></thead><tbody>
             {replayLab.proxyReasonSummary.map((row:AnyObj)=><tr key={row.reason}><td><b>{row.reason}</b></td><td>{row.trades}</td><td className={tone(row.actualPnlGbp)}>{gbp(Number(row.actualPnlGbp||0))}</td><td className={tone(row.proxyPnlGbp)}>{gbp(Number(row.proxyPnlGbp||0))}</td><td className={tone(row.deltaGbp)}>{gbp(Number(row.deltaGbp||0))}</td></tr>)}
+          </tbody></table></div>
+        </>}
+        {Array.isArray(replayLab.liveExitValidationSummary) && replayLab.liveExitValidationSummary.length > 0 && <>
+          <h3>Fresh live validation · from 02/10/2026</h3>
+          <p className="notice">Out-of-sample check against the historical recovery/failure fingerprints. Read-only · no live exit rules changed.</p>
+          <div className="table-wrap"><table className="compact-table"><thead><tr><th>Signal</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Actual PnL</th><th>Avg fingerprint distance</th></tr></thead><tbody>
+            {replayLab.liveExitValidationSummary.map((row:AnyObj,index:number)=><tr key={`live-val-summary-${index}`}><td><b>{row.signal}</b></td><td>{row.trades}</td><td>{row.wins}</td><td>{row.losses}</td><td className={tone(row.actualPnlGbp)}>{gbp(Number(row.actualPnlGbp||0))}</td><td>{Number(row.avgDistance||0).toFixed(2)}</td></tr>)}
+          </tbody></table></div>
+        </>}
+        {Array.isArray(replayLab.liveExitValidation) && replayLab.liveExitValidation.length > 0 && <>
+          <h3>Fresh trades vs historical fingerprints</h3>
+          <div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>Date</th><th>Actual PnL</th><th>Signal</th><th>Nearest historical case</th><th>3-sample momentum</th><th>Recent drawdown</th><th>Peak</th><th>Distance</th></tr></thead><tbody>
+            {replayLab.liveExitValidation.map((row:AnyObj)=><tr key={`live-val-${row.id}`}><td><b>{row.symbol}</b></td><td>{row.timestamp ? new Date(row.timestamp).toLocaleString("en-GB",{timeZone:"Europe/London",day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}) : "—"}</td><td className={tone(row.actualPnlGbp)}>{gbp(Number(row.actualPnlGbp||0))}</td><td>{row.fingerprintSignal}</td><td>{row.nearestHistoricalSymbol ? `${row.nearestHistoricalSymbol} · ${row.nearestHistoricalTrigger||"—"}` : "—"}</td><td>{Number(row.momentum3Pct||0).toFixed(2)}%</td><td>{Number(row.recentDrawdownPct||0).toFixed(2)}%</td><td>{Number(row.peakPct||0).toFixed(2)}%</td><td>{row.fingerprintDistance==null ? "—" : Number(row.fingerprintDistance).toFixed(2)}</td></tr>)}
           </tbody></table></div>
         </>}
         {Array.isArray(replayLab.recoveryAwareSummary) && replayLab.recoveryAwareSummary.length > 0 && <>
