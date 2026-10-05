@@ -65,6 +65,9 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const [replayLab, setReplayLab] = useState<AnyObj | null>(null);
   const [replayLabLoading, setReplayLabLoading] = useState(false);
   const [replayLabError, setReplayLabError] = useState("");
+  const [incidentAudit, setIncidentAudit] = useState<AnyObj | null>(null);
+  const [incidentAuditLoading, setIncidentAuditLoading] = useState(false);
+  const [incidentAuditError, setIncidentAuditError] = useState("");
   const totalDeposited = Number(reports?.totalDeposited || 0);
   const totalGainLoss = Number(reports?.totalGainLoss || 0);
   const earned = Number(reports?.earnedSinceDeposit || 0);
@@ -107,7 +110,21 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
     finally { setReplayLabLoading(false); }
   };
 
-  useEffect(() => { if (authToken) { void loadLeakAnalysis(); void loadReplayLab(); } }, [authToken, closedTrades.length]);
+  const loadIncidentAudit = async () => {
+    if (!authToken || incidentAuditLoading) return;
+    setIncidentAuditLoading(true); setIncidentAuditError("");
+    try {
+      const response = await fetch(`${API_URL}/v18/exit-incident-audit`, {
+        cache: "no-store", headers: { "X-Auth-Token": authToken, "x-api-key": authToken },
+      });
+      const json = await readJson(response);
+      if (!response.ok || json?.ok === false) throw new Error(json?.detail || json?.message || `Incident audit failed (${response.status})`);
+      setIncidentAudit(json);
+    } catch (error:any) { setIncidentAuditError(error?.message || "Incident audit failed."); }
+    finally { setIncidentAuditLoading(false); }
+  };
+
+  useEffect(() => { if (authToken) { void loadLeakAnalysis(); void loadReplayLab(); void loadIncidentAudit(); } }, [authToken, closedTrades.length]);
 
   const reportChart = useMemo(() => {
     const start = rangeStart(range);
@@ -275,6 +292,22 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       {historyMessage && <p className="notice">{historyMessage}</p>}
       {reportsError && <p className="notice loss">{reportsError}</p>}
       {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })} · {Number(reports?.closedTradeRowsReturned || closedTrades.length).toLocaleString("en-GB")} closed rows loaded</p>}
+    </Card>
+
+    <Card title="V18.3.50 Stock Exit Incident Audit" wide>
+      <div className="actions"><button onClick={loadIncidentAudit} disabled={incidentAuditLoading}>{incidentAuditLoading ? "Auditing…" : "Run Incident Audit"}</button></div>
+      {incidentAuditError && <p className="notice loss">{incidentAuditError}</p>}
+      {incidentAudit?.rows && <>
+        <p className="notice">Read-only audit of recent losing stock trades · live trading unchanged.</p>
+        <section className="stats">
+          <Stat label="Loss trades" value={Number(incidentAudit.lossTrades||0).toLocaleString("en-GB")} sub="Since 02/10/2026"/>
+          <Stat label="Replay ready" value={Number(incidentAudit.readyReplay||0).toLocaleString("en-GB")} sub="Usable for forensic replay"/>
+          <Stat label="Missing replay" value={Number(incidentAudit.missingReplay||0).toLocaleString("en-GB")} sub="Needs capture coverage"/>
+        </section>
+        <div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>Date</th><th>PnL</th><th>%</th><th>Reason</th><th>Source</th><th>Replay</th><th>Points</th><th>Replay low</th><th>Replay high</th></tr></thead><tbody>
+          {incidentAudit.rows.map((row:AnyObj)=><tr key={`incident-${row.id}`}><td><b>{row.symbol}</b></td><td>{row.timestamp ? new Date(row.timestamp).toLocaleString("en-GB",{timeZone:"Europe/London",day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}) : "—"}</td><td className={tone(row.pnlGbp)}>{gbp(Number(row.pnlGbp||0))}</td><td>{Number(row.pnlPct||0).toFixed(2)}%</td><td>{row.reason||"—"}</td><td>{row.source||"—"}</td><td>{row.replayStatus||"—"}</td><td>{Number(row.replayPoints||0)}</td><td>{row.replayMinPct==null?"—":Number(row.replayMinPct).toFixed(2)+"%"}</td><td>{row.replayMaxPct==null?"—":Number(row.replayMaxPct).toFixed(2)+"%"}</td></tr>)}
+        </tbody></table></div>
+      </>}
     </Card>
 
     <Card title="V18.3.49 Live Replay Coverage + Trigger Snapshot" wide>
