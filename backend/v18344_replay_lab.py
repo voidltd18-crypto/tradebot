@@ -241,10 +241,10 @@ def install_v18344_replay_lab(app, m) -> None:
             recovery_research=sorted(recovery_research,key=lambda x:abs(float(x.get("recoveryValueGbp") or 0)),reverse=True)
             recovery_summary=sorted(recovery_summary,key=lambda x:(x["trigger"],x["label"]))
 
-            # V18.3.48 Live Exit Validation: use the historical Recovery-Aware
-            # cases as a read-only fingerprint library, then compare fresh live
-            # trades from 02/10/2026 onward using only information available by
-            # the end of each recorded replay path. This does not change trading.
+            # V18.3.49 Live Replay Coverage + Trigger Snapshot Validation.
+            # Fresh trades are validated at the exact proxy STOP/STALE trigger
+            # snapshot, not at their final exit. Missing replay coverage is
+            # surfaced explicitly. Read-only: no live trading rule changes.
             validation_since=datetime(2026,10,2,tzinfo=UTC)
             training=[]
             for rr in recovery_research:
@@ -252,23 +252,40 @@ def install_v18344_replay_lab(app, m) -> None:
                 if not ts or ts>=validation_since: continue
                 training.append(rr)
 
-            def _actual_end_features(trade_row):
+            def _trigger_snapshot(trade_row):
                 path=replay_paths.get(int(trade_row.get("id") or 0)) or {}
                 pts=path.get("points") or []; entry=float(path.get("entry") or 0)
                 prices=[float(p.get("price") or 0) for p in pts if float(p.get("price") or 0)>0]
                 if len(prices)<2 or entry<=0: return None
-                idx=len(prices)-1; price=prices[idx]
+                sim=trade_row.get("simulations",{}).get("current_proxy") or {}
+                reason=str(sim.get("exitReason") or "")
+                if reason not in ("STOP","STALE"):
+                    return {"triggerReason":reason or "ACTUAL END","triggered":False}
+                trigger_time=_dt(sim.get("exitTime"))
+                idx=None
+                if trigger_time:
+                    best_gap=1e99
+                    for i,p in enumerate(pts):
+                        pt=_dt(p.get("point_time"))
+                        if not pt: continue
+                        gap=abs((pt-trigger_time).total_seconds())
+                        if gap<best_gap: best_gap=gap; idx=i
+                if idx is None:
+                    target=float(sim.get("exitPrice") or 0)
+                    idx=min(range(len(prices)),key=lambda i:abs(prices[i]-target))
+                price=prices[idx]
                 def _mom(back):
                     j=max(0,idx-back); old=prices[j]
                     return ((price/old)-1)*100 if old>0 else 0
                 recent=prices[max(0,idx-6):idx+1]
                 recent_peak=max(recent,default=price)
-                all_peak=max(prices,default=price)
+                all_peak=max(prices[:idx+1],default=price)
                 return {
-                    "momentum3Pct":_mom(3),
-                    "momentum6Pct":_mom(6),
+                    "triggered":True,"triggerReason":reason,
+                    "momentum3Pct":_mom(3),"momentum6Pct":_mom(6),
                     "recentDrawdownPct":((price/recent_peak)-1)*100 if recent_peak>0 else 0,
                     "peakPct":((all_peak/entry)-1)*100 if entry>0 else 0,
+                    "triggerPrice":price,"triggerTime":sim.get("exitTime"),
                 }
 
             live_validation=[]
@@ -276,13 +293,13 @@ def install_v18344_replay_lab(app, m) -> None:
             for row in usable:
                 ts=_dt(row.get("timestamp"))
                 if not ts or ts<validation_since: continue
-                feat=_actual_end_features(row)
-                if not feat: continue
+                feat=_trigger_snapshot(row)
+                if not feat or not feat.get("triggered"): continue
                 nearest=None; nearest_distance=1e99
                 for rr in training:
-                    d=(abs(feat["momentum3Pct"]-float(rr.get("momentum3Pct") or 0))
-                       +abs(feat["recentDrawdownPct"]-float(rr.get("recentDrawdownPct") or 0))
-                       +abs(feat["peakPct"]-float(rr.get("recordedPeakPct") or 0)))
+                    d=(abs(float(feat["momentum3Pct"])-float(rr.get("momentum3Pct") or 0))
+                       +abs(float(feat["recentDrawdownPct"])-float(rr.get("recentDrawdownPct") or 0))
+                       +abs(float(feat["peakPct"])-float(rr.get("recordedPeakPct") or 0)))
                     if d<nearest_distance:
                         nearest=rr; nearest_distance=d
                 signal=str(nearest.get("researchLabel") or "UNKNOWN") if nearest else "UNKNOWN"
@@ -302,13 +319,47 @@ def install_v18344_replay_lab(app, m) -> None:
             for g in live_validation_summary:
                 g["avgDistance"]/=max(1,g["trades"])
 
-            return {"ok":True,"version":"V18.3.48","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
+            # Explicit fresh replay coverage diagnostics, including trades that
+            # never made it into the replayable set.
+            usable_ids={int(r.get("id") or 0) for r in usable}
+            fresh_coverage=[]
+            for t in trades:
+                ts=_dt(t.get("timestamp"))
+                if not ts or ts<validation_since: continue
+                tid=int(t.get("id") or 0); sym=str(t.get("symbol") or "")
+                if tid in usable_ids:
+                    linked=next((r for r in usable if int(r.get("id") or 0)==tid),None)
+                    snap=_trigger_snapshot(linked) if linked else None
+                    status="READY" if snap and snap.get("triggered") else "REPLAY OK · NO STOP/STALE TRIGGER"
+                    fresh_coverage.append({"id":tid,"symbol":sym,"timestamp":t.get("timestamp"),
+                        "status":status,"replayLink":linked.get("replayLink") if linked else None,
+                        "actualPnlGbp":float(t.get("pnl_gbp") or 0)})
+                    continue
+                sess,link=match(t)
+                reason="NO REPLAY SESSION"
+                point_count=0
+                if sess:
+                    try:
+                        point_count=int(conn.execute("SELECT COUNT(*) c FROM trade_replay_points WHERE session_id=? AND price>0",(int(sess["id"]),)).fetchone()["c"] or 0)
+                    except Exception:
+                        point_count=0
+                    reason="INSUFFICIENT REPLAY POINTS" if point_count<2 else "INVALID TRADE / REPLAY DATA"
+                fresh_coverage.append({"id":tid,"symbol":sym,"timestamp":t.get("timestamp"),
+                    "status":reason,"replayLink":link,"replayPoints":point_count,
+                    "actualPnlGbp":float(t.get("pnl_gbp") or 0)})
+            coverage_ready=sum(1 for r in fresh_coverage if str(r.get("status") or "")=="READY")
+            coverage_missing=sum(1 for r in fresh_coverage if str(r.get("status") or "") in ("NO REPLAY SESSION","INSUFFICIENT REPLAY POINTS","INVALID TRADE / REPLAY DATA"))
+            fresh_coverage_summary={"trades":len(fresh_coverage),"readyTriggerSnapshots":coverage_ready,
+                "missingReplay":coverage_missing,
+                "coveragePct":((len(fresh_coverage)-coverage_missing)/len(fresh_coverage)*100.0 if fresh_coverage else 0.0)}
+
+            return {"ok":True,"version":"V18.3.49","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
                     "skippedNoReplay":skipped,"results":results,"largestChanges":detail[:20],
                     "tradeForensics":detail,"proxyReasonSummary":reasons,
                     "exitIntelligence":exit_intelligence,"exitIntelligenceSummary":exit_summary,
                     "recoveryAwareResearch":recovery_research,"recoveryAwareSummary":recovery_summary,
                     "liveExitValidation":live_validation,"liveExitValidationSummary":live_validation_summary,
-                    "liveExitValidationSince":validation_since.isoformat(),
+                    "liveExitValidationSince":validation_since.isoformat(),\n                    "freshReplayCoverage":fresh_coverage,"freshReplayCoverageSummary":fresh_coverage_summary,
                     "warning":"Counterfactual replay is diagnostic, not a guarantee. It uses recorded sampled prices, so exits can only trigger on saved replay points.",
                     "liveTradingChanged":False,"pointTimingMode":"recorded" if time_col else "synthesized-10s"}
         finally: conn.close()
