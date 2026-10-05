@@ -277,7 +277,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })} · {Number(reports?.closedTradeRowsReturned || closedTrades.length).toLocaleString("en-GB")} closed rows loaded</p>}
     </Card>
 
-    <Card title="V18.3.48 Live Exit Validation" wide>
+    <Card title="V18.3.49 Live Replay Coverage + Trigger Snapshot" wide>
       <div className="actions"><button onClick={loadReplayLab} disabled={replayLabLoading}>{replayLabLoading ? "Replaying…" : "Run Replay Lab"}</button></div>
       {replayLabError && <p className="notice loss">{replayLabError}</p>}
       {replayLab?.results && <>
@@ -291,9 +291,22 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
             {replayLab.proxyReasonSummary.map((row:AnyObj)=><tr key={row.reason}><td><b>{row.reason}</b></td><td>{row.trades}</td><td className={tone(row.actualPnlGbp)}>{gbp(Number(row.actualPnlGbp||0))}</td><td className={tone(row.proxyPnlGbp)}>{gbp(Number(row.proxyPnlGbp||0))}</td><td className={tone(row.deltaGbp)}>{gbp(Number(row.deltaGbp||0))}</td></tr>)}
           </tbody></table></div>
         </>}
+        {replayLab.freshReplayCoverageSummary && <>
+          <h3>Fresh replay coverage · from 02/10/2026</h3>
+          <section className="stats">
+            <Stat label="Fresh trades" value={Number(replayLab.freshReplayCoverageSummary.trades||0).toLocaleString("en-GB")} sub="Closed stock trades checked"/>
+            <Stat label="Replay coverage" value={`${Number(replayLab.freshReplayCoverageSummary.coveragePct||0).toFixed(0)}%`} sub={`${Number(replayLab.freshReplayCoverageSummary.missingReplay||0)} missing replay`}/>
+            <Stat label="Trigger snapshots" value={Number(replayLab.freshReplayCoverageSummary.readyTriggerSnapshots||0).toLocaleString("en-GB")} sub="STOP / STALE snapshots ready"/>
+          </section>
+        </>}
+        {Array.isArray(replayLab.freshReplayCoverage) && replayLab.freshReplayCoverage.length > 0 && <>
+          <div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>Date</th><th>PnL</th><th>Replay status</th><th>Link</th><th>Replay points</th></tr></thead><tbody>
+            {replayLab.freshReplayCoverage.map((row:AnyObj)=><tr key={`coverage-${row.id}`}><td><b>{row.symbol}</b></td><td>{row.timestamp ? new Date(row.timestamp).toLocaleString("en-GB",{timeZone:"Europe/London",day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}) : "—"}</td><td className={tone(row.actualPnlGbp)}>{gbp(Number(row.actualPnlGbp||0))}</td><td>{row.status}</td><td>{row.replayLink||"—"}</td><td>{row.replayPoints==null ? "—" : Number(row.replayPoints)}</td></tr>)}
+          </tbody></table></div>
+        </>}
         {Array.isArray(replayLab.liveExitValidationSummary) && replayLab.liveExitValidationSummary.length > 0 && <>
-          <h3>Fresh live validation · from 02/10/2026</h3>
-          <p className="notice">Out-of-sample check against the historical recovery/failure fingerprints. Read-only · no live exit rules changed.</p>
+          <h3>Trigger-snapshot validation · from 02/10/2026</h3>
+          <p className="notice">Out-of-sample check using the exact proxy STOP/STALE trigger snapshot. Read-only · no live exit rules changed.</p>
           <div className="table-wrap"><table className="compact-table"><thead><tr><th>Signal</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Actual PnL</th><th>Avg fingerprint distance</th></tr></thead><tbody>
             {replayLab.liveExitValidationSummary.map((row:AnyObj,index:number)=><tr key={`live-val-summary-${index}`}><td><b>{row.signal}</b></td><td>{row.trades}</td><td>{row.wins}</td><td>{row.losses}</td><td className={tone(row.actualPnlGbp)}>{gbp(Number(row.actualPnlGbp||0))}</td><td>{Number(row.avgDistance||0).toFixed(2)}</td></tr>)}
           </tbody></table></div>
