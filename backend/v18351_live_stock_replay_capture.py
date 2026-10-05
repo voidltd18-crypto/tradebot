@@ -1,4 +1,4 @@
-"""V18.3.51 Live Stock Replay Capture Repair.
+"""V18.3.52 Replay Capture Self-Diagnostics.
 
 Observational stock replay recorder. It records live stock position price paths
 for later diagnostics and persists observed sell-decision metadata separately.
@@ -21,10 +21,26 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
         "pointsWritten": 0,
         "sessionsCreated": 0,
         "sessionsClosed": 0,
+        "lastPositions": [],
+        "lastOpenSessionSymbols": [],
+        "lastSchema": {},
+        "lastCycleEvents": [],
+        "positionSource": "",
+        "positionError": "",
+        "sessionInsertError": "",
+        "pointInsertError": "",
     }
 
     def now_iso():
         return datetime.now(UTC).isoformat()
+
+    def diag(event, **data):
+        row = {"at": now_iso(), "event": event, **data}
+        runtime["lastCycleEvents"] = (runtime.get("lastCycleEvents") or [])[-39:] + [row]
+        try:
+            print("V18.3.52 REPLAY DIAG | " + str(row), flush=True)
+        except Exception:
+            pass
 
     def cols(conn, table):
         try:
@@ -59,7 +75,7 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
         available = cols(conn, table)
         data = {k: v for k, v in values.items() if k in available}
         if not data:
-            return None
+            raise RuntimeError(f"{table}: no compatible columns for values={list(values)} schema={sorted(available)}")
         names = list(data)
         placeholders = ",".join(["?"] * len(names))
         cur = conn.execute(
@@ -142,6 +158,7 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
         return best
 
     def position_snapshot():
+        runtime["positionError"] = ""
         getter = getattr(m, "get_all_positions", None)
         if callable(getter):
             try:
@@ -156,16 +173,22 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
                     price = float(p.get("price") or p.get("current_price") or 0)
                     if qty > 0 and entry > 0 and price > 0:
                         out[sym] = {"qty": qty, "entry": entry, "price": price}
+                runtime["positionSource"] = "monolith.get_all_positions"
+                runtime["lastPositions"] = [{"symbol":s, **p} for s,p in out.items()]
                 return out
-            except Exception:
-                pass
+            except Exception as exc:
+                runtime["positionError"] = f"get_all_positions: {type(exc).__name__}: {exc}"
+                diag("POSITION_SOURCE_ERROR", source="monolith.get_all_positions", error=runtime["positionError"])
 
         client = getattr(m, "trading_client", None)
         out = {}
         if client is None:
+            runtime["positionSource"] = "none"
+            runtime["positionError"] = (runtime.get("positionError") or "") + " | trading_client missing"
             return out
         try:
-            for p in client.get_all_positions():
+            raw = list(client.get_all_positions() or [])
+            for p in raw:
                 sym = str(getattr(p, "symbol", "") or "").upper()
                 if not sym or "/" in sym:
                     continue
@@ -174,11 +197,15 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
                 price = float(getattr(p, "current_price", 0) or 0)
                 if qty > 0 and entry > 0 and price > 0:
                     out[sym] = {"qty": qty, "entry": entry, "price": price}
-        except Exception:
-            pass
+            runtime["positionSource"] = "trading_client.get_all_positions"
+            runtime["lastPositions"] = [{"symbol":s, **p} for s,p in out.items()]
+        except Exception as exc:
+            runtime["positionSource"] = "trading_client.get_all_positions"
+            runtime["positionError"] = f"trading_client: {type(exc).__name__}: {exc}"
+            diag("POSITION_SOURCE_ERROR", source="trading_client.get_all_positions", error=runtime["positionError"])
         return out
 
-    def write_point(conn, session_id, price):
+    def write_point(conn, session_id, price, symbol=""):
         pc = cols(conn, "trade_replay_points")
         values = {"session_id": int(session_id), "price": float(price)}
         stamp = now_iso()
@@ -186,36 +213,56 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
             if candidate in pc:
                 values[candidate] = stamp
                 break
-        point_id = insert_dynamic(conn, "trade_replay_points", values)
-        if point_id is not None:
-            runtime["pointsWritten"] += 1
+        try:
+            point_id = insert_dynamic(conn, "trade_replay_points", values)
+            if point_id is not None:
+                runtime["pointsWritten"] += 1
+                runtime["pointInsertError"] = ""
+                diag("POINT_WRITTEN", symbol=symbol, sessionId=int(session_id), pointId=point_id, price=float(price))
+        except Exception as exc:
+            runtime["pointInsertError"] = f"{type(exc).__name__}: {exc}"
+            diag("POINT_INSERT_ERROR", symbol=symbol, sessionId=int(session_id), error=runtime["pointInsertError"], schema=sorted(pc))
+            raise
 
     def cycle():
         ensure_tables()
         positions = position_snapshot()
         conn = m.db_connect()
         try:
+            session_schema = sorted(cols(conn, "trade_replay_sessions"))
+            point_schema = sorted(cols(conn, "trade_replay_points"))
+            runtime["lastSchema"] = {"trade_replay_sessions": session_schema, "trade_replay_points": point_schema}
             active = open_sessions(conn)
+            runtime["lastOpenSessionSymbols"] = sorted(active)
+            diag("CYCLE", positions=sorted(positions), activeSessions=sorted(active), source=runtime.get("positionSource"),
+                 positionError=runtime.get("positionError"), sessionSchema=session_schema, pointSchema=point_schema)
 
             for sym, p in positions.items():
                 sess = active.get(sym)
                 if not sess:
-                    sid = insert_dynamic(
-                        conn,
-                        "trade_replay_sessions",
-                        {
-                            "symbol": sym,
-                            "started_at": now_iso(),
-                            "entry_price": p["entry"],
-                            "qty": p["qty"],
-                        },
-                    )
+                    try:
+                        sid = insert_dynamic(
+                            conn,
+                            "trade_replay_sessions",
+                            {
+                                "symbol": sym,
+                                "started_at": now_iso(),
+                                "entry_price": p["entry"],
+                                "qty": p["qty"],
+                            },
+                        )
+                        runtime["sessionInsertError"] = ""
+                    except Exception as exc:
+                        runtime["sessionInsertError"] = f"{type(exc).__name__}: {exc}"
+                        diag("SESSION_INSERT_ERROR", symbol=sym, error=runtime["sessionInsertError"], schema=session_schema, position=p)
+                        raise
                     if sid is not None:
                         runtime["sessionsCreated"] += 1
                         sess = {"id": sid, "symbol": sym, "entry_price": p["entry"], "qty": p["qty"]}
                         active[sym] = sess
+                        diag("SESSION_CREATED", symbol=sym, sessionId=sid, entry=p["entry"], qty=p["qty"])
                 if sess and sess.get("id"):
-                    write_point(conn, int(sess["id"]), p["price"])
+                    write_point(conn, int(sess["id"]), p["price"], sym)
 
             for sym, sess in list(active.items()):
                 if sym in positions:
@@ -241,6 +288,7 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
                     (sid, closed_trade_id, sym, closed_at, reason, source, payload),
                 )
                 runtime["sessionsClosed"] += 1
+                diag("SESSION_CLOSED", symbol=sym, sessionId=sid, closedTradeId=closed_trade_id, reason=reason, source=source)
 
             conn.commit()
             runtime["openSessions"] = len(positions)
@@ -256,7 +304,8 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
             try:
                 cycle()
             except Exception as exc:
-                runtime["lastError"] = str(exc)
+                runtime["lastError"] = f"{type(exc).__name__}: {exc}"
+                diag("CYCLE_ERROR", error=runtime["lastError"])
             stop_flag.wait(10)
 
     @app.get("/v18/replay-capture-status")
@@ -272,12 +321,13 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
             conn.close()
         return {
             "ok": True,
-            "version": "V18.3.51",
+            "version": "V18.3.52",
             "recorder": dict(runtime),
             "database": {"sessions": int(sessions or 0), "points": int(points or 0), "exitDecisionAudits": int(exits or 0)},
             "liveTradingChanged": False,
         }
 
     ensure_tables()
-    thread = threading.Thread(target=worker, name="v18351-stock-replay", daemon=True)
+    diag("RECORDER_INSTALL", intervalSec=10)
+    thread = threading.Thread(target=worker, name="v18352-stock-replay-diagnostics", daemon=True)
     thread.start()
