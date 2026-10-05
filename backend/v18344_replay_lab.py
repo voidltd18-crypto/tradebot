@@ -359,7 +359,8 @@ def install_v18344_replay_lab(app, m) -> None:
                     "exitIntelligence":exit_intelligence,"exitIntelligenceSummary":exit_summary,
                     "recoveryAwareResearch":recovery_research,"recoveryAwareSummary":recovery_summary,
                     "liveExitValidation":live_validation,"liveExitValidationSummary":live_validation_summary,
-                    "liveExitValidationSince":validation_since.isoformat(),\n                    "freshReplayCoverage":fresh_coverage,"freshReplayCoverageSummary":fresh_coverage_summary,
+                    "liveExitValidationSince":validation_since.isoformat(),
+                    "freshReplayCoverage":fresh_coverage,"freshReplayCoverageSummary":fresh_coverage_summary,
                     "warning":"Counterfactual replay is diagnostic, not a guarantee. It uses recorded sampled prices, so exits can only trigger on saved replay points.",
                     "liveTradingChanged":False,"pointTimingMode":"recorded" if time_col else "synthesized-10s"}
         finally: conn.close()
