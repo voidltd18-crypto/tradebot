@@ -9,6 +9,7 @@ import type { ActionFn, AnyObj, PositionStyleFn } from "../lib/types";
 export function OverviewPage({ data, banking, message, positions, trades, rate, bestCandidate, aiConfidence, marketRegime, riskLabel, currentAction, botHealth, aiReasons, positionSettings, fetchData, action, positionGlowStyle, onExportFullBot, exportBusy, authToken }: { data: AnyObj; banking: AnyObj; message: string; positions: AnyObj[]; trades: AnyObj[]; rate: number; bestCandidate?: AnyObj; aiConfidence: number; marketRegime: string; riskLabel: string; currentAction: string; botHealth: number; aiReasons: string[]; positionSettings: AnyObj; fetchData: (force?: boolean) => Promise<void>; action: ActionFn; positionGlowStyle: PositionStyleFn; onExportFullBot: () => void; exportBusy: boolean; authToken: string }) {
   const [taxCentre, setTaxCentre] = useState<AnyObj | null>(null);
   const [cryptoBridge, setCryptoBridge] = useState<AnyObj | null>(null);
+  const [cryptoAccelerator, setCryptoAccelerator] = useState<AnyObj | null>(null);
   const [replay, setReplay] = useState<ReplayTarget | null>(null);
   const [piggyResetBusy, setPiggyResetBusy] = useState(false);
   const [piggyAddBusy, setPiggyAddBusy] = useState(false);
@@ -40,6 +41,19 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
     };
     loadBridge();
     const id = window.setInterval(loadBridge, 10000);
+    return () => { alive = false; window.clearInterval(id); };
+  }, [authToken]);
+  useEffect(() => {
+    let alive = true;
+    const loadAccelerator = async () => {
+      try {
+        const res = await fetch(`${API_URL}/v18/crypto-evidence-accelerator`, { cache: "no-store", headers: { "X-API-Key": authToken } });
+        const body = await res.json();
+        if (alive && res.ok && body?.ok !== false) setCryptoAccelerator(body);
+      } catch { /* home card keeps last good accelerator snapshot */ }
+    };
+    loadAccelerator();
+    const id = window.setInterval(loadAccelerator, 10000);
     return () => { alive = false; window.clearInterval(id); };
   }, [authToken]);
   const addToPiggyBank = async () => {
@@ -150,11 +164,18 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
 
     <section className="home-research-showcase">
       <div className="home-shadow-card">
-        <div className="home-research-title"><span className="home-research-icon">◒</span><div><small>CRYPTO LAB</small><h2>Shadow Research</h2><p>Real-market paper testing · live crypto remains {cryptoBridge?.shadowOnly === false ? "governed" : "paused"}</p></div><span className="home-research-pill">{cryptoBridge?.shadowOnly === false ? "LIVE STAGE" : "SHADOW ONLY"}</span></div>
+        <div className="home-research-title"><span className="home-research-icon">⚡</span><div><small>V18.3.55 · EVIDENCE ACCELERATOR</small><h2>Filtered Shadow Research</h2><p>Fresh post-accelerator evidence · live crypto remains off</p></div><span className="home-research-pill">SHADOW ONLY</span></div>
         <div className="home-research-kpis">
-          <div><strong>{Number(cryptoBridge?.shadowEvidence?.closedTests || 0)}</strong><span>Total tests</span></div>
-          <div><strong className={Number(cryptoBridge?.shadowEvidence?.totalPnlUsd || 0) >= 0 ? "positive" : "negative"}>${Number(cryptoBridge?.shadowEvidence?.totalPnlUsd || 0).toFixed(2)}</strong><span>Total P&amp;L</span></div>
-          <div><strong>{Number(cryptoBridge?.shadowEvidence?.winRate || 0).toFixed(2)}%</strong><span>Win rate</span></div>
+          <div><strong>{Number(cryptoAccelerator?.model?.filteredTrial?.trades || 0)} / 50</strong><span>Fresh filtered closes</span></div>
+          <div><strong className={Number(cryptoAccelerator?.model?.filteredTrial?.expectancyUsd || 0) >= 0 ? "positive" : "negative"}>${Number(cryptoAccelerator?.model?.filteredTrial?.expectancyUsd || 0).toFixed(2)}</strong><span>Filtered expectancy</span></div>
+          <div><strong>{Number(cryptoAccelerator?.model?.filteredTrial?.winRatePct || 0).toFixed(1)}%</strong><span>Filtered win rate</span></div>
+        </div>
+        <div className="home-governor-selection">
+          <span>History mined: {Number(cryptoAccelerator?.model?.outcomes || 0).toLocaleString("en-GB")}</span>
+          <span>Weak blocked: {Number(cryptoAccelerator?.runtime?.exploreBlockedWeakRegime || 0)}</span>
+          <span>Momentum blocked: {Number(cryptoAccelerator?.runtime?.exploreBlockedMomentum || 0)}</span>
+          <span>History blocked: {Number(cryptoAccelerator?.runtime?.exploreBlockedHistorical || 0)}</span>
+          <span>Allowed: {Number(cryptoAccelerator?.runtime?.exploreAllowed || 0)}</span>
         </div>
       </div>
       <div className="home-governor-card">
