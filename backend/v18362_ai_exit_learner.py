@@ -13,6 +13,7 @@ import threading
 import time
 from datetime import datetime, UTC
 from typing import Any, Dict
+from fastapi import Request
 
 VERSION = "V18.3.62"
 POLL_SECONDS = 300
@@ -213,7 +214,7 @@ def install_v18362_ai_exit_learner(app, m) -> None:
     m.v18362_exit_learning_bias = lambda regime, action: get_bias(m, regime, action)
 
     @app.get("/v18/ai-exit-learning")
-    def api_v18362_ai_exit_learning(request: m.Request):
+    def api_v18362_ai_exit_learning(request: Request):
         m.verify_api_key(request)
         with _lock:
             payload = dict(_runtime)

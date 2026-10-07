@@ -17,6 +17,7 @@ import threading
 import time
 from datetime import datetime, UTC
 from typing import Any, Dict, Optional
+from fastapi import Request
 
 VERSION = "V18.3.64"
 POLL_SECONDS = 10
@@ -289,7 +290,7 @@ def install_v18364_ai_exit_pilot_guardian(app, m) -> None:
     )
 
     @app.get("/v18/ai-exit-pilot-guardian")
-    def api_v18364_guardian(request: m.Request):
+    def api_v18364_guardian(request: Request):
         m.verify_api_key(request)
         _load_state(m)
         with _lock:

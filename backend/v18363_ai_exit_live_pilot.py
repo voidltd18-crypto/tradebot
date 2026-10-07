@@ -15,6 +15,7 @@ import threading
 import time
 from datetime import datetime, UTC
 from typing import Any, Dict
+from fastapi import Request
 
 VERSION = "V18.3.63"
 PILOT_ENABLED = str(os.getenv("TRADEBOT_AI_EXIT_PILOT_ENABLED", "false")).lower() in ("1","true","yes","on")
@@ -214,7 +215,7 @@ def install_v18363_ai_exit_live_pilot(app, m) -> None:
     m.v18363_record_ai_exit = record_live_exit
 
     @app.get("/v18/ai-exit-pilot")
-    def api_v18363_ai_exit_pilot(request: m.Request):
+    def api_v18363_ai_exit_pilot(request: Request):
         m.verify_api_key(request)
         _reset_day_if_needed()
         with _lock:
