@@ -9,17 +9,20 @@ export function PositionsPage({ positions, rate, action, positionGlowStyle, auth
   const [replay, setReplay] = useState<ReplayTarget | null>(null);
   const [aiExit, setAiExit] = useState<AnyObj | null>(null);
   const [aiOutcome, setAiOutcome] = useState<AnyObj | null>(null);
+  const [aiLearning, setAiLearning] = useState<AnyObj | null>(null);
   useEffect(() => {
     let alive = true;
     const load = async () => {
       try {
-        const [res, outcomeRes] = await Promise.all([
+        const [res, outcomeRes, learningRes] = await Promise.all([
           fetch(`${API_URL}/v18/ai-exit-manager?limit=30`, { headers: { "X-API-Key": authToken, "X-Auth-Token": authToken } }),
           fetch(`${API_URL}/v18/ai-exit-outcomes`, { headers: { "X-API-Key": authToken, "X-Auth-Token": authToken } }),
+          fetch(`${API_URL}/v18/ai-exit-learning`, { headers: { "X-API-Key": authToken, "X-Auth-Token": authToken } }),
         ]);
-        const [body, outcomeBody] = await Promise.all([res.json(), outcomeRes.json()]);
+        const [body, outcomeBody, learningBody] = await Promise.all([res.json(), outcomeRes.json(), learningRes.json()]);
         if (alive && res.ok) setAiExit(body);
         if (alive && outcomeRes.ok) setAiOutcome(outcomeBody);
+        if (alive && learningRes.ok) setAiLearning(learningBody);
       } catch {}
     };
     load();
@@ -30,6 +33,7 @@ export function PositionsPage({ positions, rate, action, positionGlowStyle, auth
   return <>
     <Card title="AI Exit Manager · Shadow"><p className="muted">Autonomous HOLD / PROTECT / EXIT decisions are being recorded every 10 seconds. Shadow only — the AI cannot submit a sell order yet.</p><div className="summary"><div><span>Mode</span><b>{aiExit?.mode || "SHADOW"}</b></div><div><span>Live authority</span><b>{aiExit?.liveAuthority ? "ON" : "OFF"}</b></div><div><span>Cycles</span><b>{Number(aiExit?.cycles || 0).toLocaleString("en-GB")}</b></div><div><span>Positions watched</span><b>{Number(aiExit?.positionsSeen || 0)}</b></div></div></Card>
     <Card title="AI Exit Outcome Scorer"><p className="muted">Scores each sampled Shadow decision against what actually happens 5, 15, 30 and 60 trading minutes later. Research only.</p><div className="summary"><div><span>Anchors</span><b>{Number(aiOutcome?.anchors || 0)}</b></div><div><span>Outcomes scored</span><b>{Number(aiOutcome?.outcomes || 0)}</b></div><div><span>30m accuracy</span><b>{Number((Array.isArray(aiOutcome?.byHorizon) ? aiOutcome.byHorizon : []).find((x:AnyObj) => Number(x.horizonMin) === 30)?.decisionAccuracyPct || 0).toFixed(1)}%</b></div><div><span>30m edge</span><b>{Number((Array.isArray(aiOutcome?.byHorizon) ? aiOutcome.byHorizon : []).find((x:AnyObj) => Number(x.horizonMin) === 30)?.avgDecisionEdgePct || 0).toFixed(2)}%</b></div><div><span>Pilot gate</span><b>{aiOutcome?.pilotEligible ? "QUALIFIED" : "COLLECTING"}</b></div><div><span>Live authority</span><b>OFF</b></div></div></Card>
+    <Card title="AI Exit Learner"><p className="muted">Learns small bounded HOLD / PROTECT / EXIT calibration biases from scored 30-minute outcomes. Shadow only.</p><div className="summary"><div><span>Learning mode</span><b>{aiLearning?.mode || "SHADOW_LEARNING"}</b></div><div><span>Qualified buckets</span><b>{Number(aiLearning?.qualifiedBuckets || 0)}</b></div><div><span>Max adjustment</span><b>±8 points</b></div><div><span>Minimum per bucket</span><b>12 samples</b></div><div><span>Live authority</span><b>OFF</b></div></div></Card>
     <Card title="Open Positions — Best to Worst"><p className="muted">Your live holdings, sorted by performance. Price movement is recorded automatically for Trade Replay.</p><div className="position-list">{positions.map((position) => { const ai = aiDecisionFor(String(position.symbol)); return <article className="position" key={position.symbol} style={positionGlowStyle(position)}><div><h3>{position.symbol}</h3><p>Qty {Number(position.qty || 0).toFixed(4)} · Entry {usd(position.entry)} · Price {usd(position.price)}</p><p>Value <b>{gbp(position.marketValueGbp ?? Number(position.marketValue || 0) * rate)}</b> / {usd(position.marketValue)}</p></div><div className="position-side"><b className={tone(position.pnl)}>PnL {gbp(position.pnlGbp ?? Number(position.pnl || 0) * rate)} / {usd(position.pnl)} / {pct(position.pnlPct)}</b><span>{position.runnerGraceActive
   ? `Runner grace ${Number(position.runnerGraceCheck || 1)}/${Number(position.runnerGraceRequired || 2)} · floor ${usd(position.trailFloor)}`
   : (position.peakExhaustionArmed
