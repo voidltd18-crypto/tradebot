@@ -5179,6 +5179,20 @@ def manage_money_mode_positions():
                             v18363_record_ai_exit(symbol)
                     except Exception:
                         pass
+                    try:
+                        if "v18364_record_ai_exit" in globals():
+                            v18364_record_ai_exit(
+                                symbol,
+                                price,
+                                float(p.get("pnlPct") or 0.0),
+                                float(ai_pilot.get("confidencePct") or 0.0),
+                                str(ai_pilot.get("reason") or ""),
+                            )
+                    except Exception as guardian_record_error:
+                        print(
+                            f"V18.3.64 AI EXIT GUARDIAN RECORD ERROR | {symbol} {guardian_record_error}",
+                            flush=True,
+                        )
                     print(
                         f"V18.3.63 AI EXIT PILOT SELL | {symbol} qty={qty:.6f} "
                         f"pnl={float(p.get('pnlPct') or 0.0):.2f}% | "
