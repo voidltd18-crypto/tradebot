@@ -77,6 +77,8 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [engineHealth, setEngineHealth] = useState<any>(null);
   const [engineHealthError, setEngineHealthError] = useState<string>("");
   const [ledgerHealth, setLedgerHealth] = useState<any>(null);
+  const [accelerator, setAccelerator] = useState<any>(null);
+  const [acceleratorError, setAcceleratorError] = useState<string>("");
 
 
   const [error, setError] = useState("");
@@ -164,10 +166,11 @@ useEffect(() => {
     const load = async () => {
       // V18.2.67: requests are independent. A slow history/bridge endpoint must
       // never leave the entire 24/7 Crypto Lab stuck on the loading card.
-      const [shadowResult, bridgeResult, historyResult] = await Promise.allSettled([
+      const [shadowResult, bridgeResult, historyResult, acceleratorResult] = await Promise.allSettled([
         fetchJson(`${API_URL}/v18/crypto-shadow`, 8000),
         fetchJson(`${API_URL}/v18/crypto-bridge`, 8000),
         fetchJson(`${API_URL}/v18/crypto-history?limit=5000`, 8000),
+        fetchJson(`${API_URL}/v18/crypto-evidence-accelerator`, 8000),
       ]);
       if (!alive) return;
 
@@ -186,6 +189,12 @@ useEffect(() => {
         setHistory(historyResult.value.points);
       } else if (historyResult.status === "rejected") {
         warnings.push(`history: ${historyResult.reason?.name === "AbortError" ? "timeout" : historyResult.reason?.message || "unavailable"}`);
+      }
+      if (acceleratorResult.status === "fulfilled") {
+        setAccelerator(acceleratorResult.value);
+        setAcceleratorError("");
+      } else {
+        setAcceleratorError(acceleratorResult.reason?.name === "AbortError" ? "timeout" : acceleratorResult.reason?.message || "unavailable");
       }
       setError(warnings.length ? `Partial refresh · ${warnings.join(" · ")}` : "");
     };
@@ -319,6 +328,51 @@ useEffect(() => {
         <span className="crypto-chip live">RECORDING</span>
       </div>
       <CryptoRecordTracker points={history} />
+    </section>
+
+    <section className="crypto-card">
+      <div className="crypto-section-heading">
+        <div>
+          <div className="crypto-kicker">⚡ V18.3.55 · Evidence Accelerator</div>
+          <h2>Filtered Shadow Research</h2>
+          <p>Shows what the accelerator is blocking and whether the post-accelerator Shadow cohort is improving.</p>
+        </div>
+        <span className="crypto-chip">{accelerator?.shadowOnly === false ? "CHECK MODE" : "SHADOW ONLY"}</span>
+      </div>
+
+      {acceleratorError && <div className="crypto-warning">Accelerator warning: {acceleratorError}</div>}
+
+      <div className="crypto-metric-grid">
+        <div className="crypto-metric"><span>Historical outcomes mined</span><strong>{Number(accelerator?.model?.outcomes || 0).toLocaleString("en-GB")}</strong></div>
+        <div className="crypto-metric"><span>Positive score bands</span><strong>{Number(accelerator?.model?.positiveScoreBins?.length || 0)}</strong></div>
+        <div className="crypto-metric"><span>Positive symbols</span><strong>{Number(accelerator?.model?.positiveSymbols?.length || 0)}</strong></div>
+        <div className="crypto-metric"><span>Negative symbols blocked</span><strong>{Number(accelerator?.model?.negativeSymbols?.length || 0)}</strong></div>
+      </div>
+
+      <div className="crypto-metric-grid">
+        <div className="crypto-metric"><span>Blocked · weak regime</span><strong>{Number(accelerator?.runtime?.exploreBlockedWeakRegime || 0)}</strong></div>
+        <div className="crypto-metric"><span>Blocked · poor momentum</span><strong>{Number(accelerator?.runtime?.exploreBlockedMomentum || 0)}</strong></div>
+        <div className="crypto-metric"><span>Blocked · history</span><strong>{Number(accelerator?.runtime?.exploreBlockedHistorical || 0)}</strong></div>
+        <div className="crypto-metric"><span>Exploratory entries allowed</span><strong>{Number(accelerator?.runtime?.exploreAllowed || 0)}</strong></div>
+      </div>
+
+      <div className="crypto-metric-grid">
+        <div className="crypto-metric"><span>Filtered closed trades</span><strong>{Number(accelerator?.model?.filteredTrial?.trades || 0)}</strong></div>
+        <div className="crypto-metric"><span>Filtered win rate</span><strong>{Number(accelerator?.model?.filteredTrial?.winRatePct || 0).toFixed(1)}%</strong></div>
+        <div className="crypto-metric"><span>Filtered expectancy</span><strong className={Number(accelerator?.model?.filteredTrial?.expectancyUsd || 0) >= 0 ? "gain" : "loss"}>{money(accelerator?.model?.filteredTrial?.expectancyUsd)}</strong></div>
+        <div className="crypto-metric"><span>Filtered P&amp;L</span><strong className={Number(accelerator?.model?.filteredTrial?.pnlUsd || 0) >= 0 ? "gain" : "loss"}>{money(accelerator?.model?.filteredTrial?.pnlUsd)}</strong></div>
+      </div>
+
+      <div className="crypto-audit-progress">
+        <div className="crypto-audit-progress-head">
+          <span>First checkpoint</span>
+          <strong>{Number(accelerator?.model?.filteredTrial?.trades || 0)} / 50</strong>
+        </div>
+        <div className="crypto-audit-progress-track">
+          <div className="crypto-audit-progress-fill" style={{ width: `${Math.min(100, (Number(accelerator?.model?.filteredTrial?.trades || 0) / 50) * 100)}%` }} />
+        </div>
+        <small>{Number(accelerator?.model?.filteredTrial?.trades || 0) >= 50 ? "Checkpoint reached — enough filtered outcomes for the first serious comparison." : "Collecting filtered Shadow exits. Live crypto remains off."}</small>
+      </div>
     </section>
 
     {livePositions.length > 0 && <section className="crypto-panel crypto-live-positions">
