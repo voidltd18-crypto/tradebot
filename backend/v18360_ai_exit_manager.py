@@ -13,6 +13,7 @@ import threading
 import time
 from datetime import datetime, UTC
 from typing import Any, Dict, List
+from fastapi import Request
 
 VERSION = "V18.3.60"
 INTERVAL_SECONDS = 10
@@ -340,7 +341,7 @@ def install_v18360_ai_exit_manager(app, m) -> None:
         _runtime["startedAt"] = _now()
 
     @app.get("/v18/ai-exit-manager")
-    def api_v18360_ai_exit_manager(request: m.Request, limit: int = 60):
+    def api_v18360_ai_exit_manager(request: Request, limit: int = 60):
         m.verify_api_key(request)
         with _lock:
             payload = dict(_runtime)
