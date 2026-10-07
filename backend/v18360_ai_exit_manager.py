@@ -115,8 +115,18 @@ def _decision(m, p: Dict[str, Any]) -> Dict[str, Any]:
     hist = _history_edge(m, symbol)
     regime = _market_regime(m)
 
-    hold = 50.0
-    exit_pressure = 0.0
+    # V18.3.62: bounded evidence-driven calibration from scored 30m outcomes.
+    # Missing/immature buckets return zero, so fresh deployments behave exactly
+    # like V18.3.60 until enough evidence exists.
+    try:
+        hold_bias = _f(m.v18362_exit_learning_bias(regime, "HOLD"))
+        protect_bias = _f(m.v18362_exit_learning_bias(regime, "PROTECT"))
+        exit_bias = _f(m.v18362_exit_learning_bias(regime, "EXIT"))
+    except Exception:
+        hold_bias = protect_bias = exit_bias = 0.0
+
+    hold = 50.0 + hold_bias
+    exit_pressure = exit_bias
     reasons: List[str] = []
 
     # Thesis strength: live direction matters more than static age.
@@ -168,12 +178,18 @@ def _decision(m, p: Dict[str, Any]) -> Dict[str, Any]:
         hold += 5; reasons.append("mature winner is still behaving")
 
     net = hold - exit_pressure
+    protect_giveback_threshold = max(0.20, min(0.55, 0.35 - (protect_bias * 0.015)))
     if exit_pressure >= 34 and net < 42:
         action = "EXIT"
-    elif peak_pct >= 0.75 and giveback >= 0.35 and pnl_pct > 0:
+    elif peak_pct >= 0.75 and giveback >= protect_giveback_threshold and pnl_pct > 0:
         action = "PROTECT"
     else:
         action = "HOLD"
+
+    if abs(hold_bias) >= 0.5 or abs(exit_bias) >= 0.5 or abs(protect_bias) >= 0.5:
+        reasons.append(
+            f"learned calibration H={hold_bias:+.1f} P={protect_bias:+.1f} E={exit_bias:+.1f}"
+        )
 
     # Confidence is about decisiveness, not probability of profit.
     confidence_pct = min(99.0, max(50.0, 50.0 + abs(net - 50.0) * 1.15))
@@ -201,6 +217,10 @@ def _decision(m, p: Dict[str, Any]) -> Dict[str, Any]:
         "marketRegime": regime,
         "historyTrades": hist.get("trades", 0),
         "historyWinRatePct": round(hist.get("winRate", 0.0) * 100.0, 1),
+        "learnedHoldBias": round(hold_bias, 3),
+        "learnedProtectBias": round(protect_bias, 3),
+        "learnedExitBias": round(exit_bias, 3),
+        "protectGivebackThresholdPct": round(protect_giveback_threshold, 3),
         "reasons": reasons[:6],
         "shadowOnly": True,
         "liveAuthority": False,
@@ -247,7 +267,8 @@ def _record(m, row: Dict[str, Any]) -> None:
     try:
         features = {k: row.get(k) for k in (
             "holdScore","exitPressure","scanConfidence","scanQuality","sniperPass",
-            "aPlusPass","historyTrades","historyWinRatePct","marketValueGbp"
+            "aPlusPass","historyTrades","historyWinRatePct","marketValueGbp",
+            "learnedHoldBias","learnedProtectBias","learnedExitBias","protectGivebackThresholdPct"
         )}
         conn.execute("""INSERT INTO v18360_ai_exit_decisions
             (observed_at,symbol,action,confidence_pct,price,entry_price,pnl_pct,peak_pct,
