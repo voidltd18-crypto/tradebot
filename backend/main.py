@@ -22,9 +22,11 @@ from backend.v18364_ai_exit_pilot_guardian import install_v18364_ai_exit_pilot_g
 from backend.v18365_ai_exit_pilot_simulator import install_v18365_ai_exit_pilot_simulator
 from backend.v18366_autonomous_ai_exit_promotion import install_v18366_autonomous_ai_exit_promotion
 from backend.v18371_global_stock_discovery import install_v18371_global_stock_discovery
+from backend.v18372_loss_guard_confirmation import install_v18372_loss_guard_confirmation
 
 app = monolith.app
 install_v18371_global_stock_discovery(app, monolith)
+install_v18372_loss_guard_confirmation(app, monolith)
 install_v18343(app, monolith)
 install_v18344_replay_lab(app, monolith)
 install_v18350_exit_incident_audit(app, monolith)
