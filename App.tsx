@@ -291,6 +291,7 @@ manual_override = False
 emergency_stop = False
 bot_thread_started = False
 bot_lock = threading.Lock()
+emergency_action_lock = threading.Lock()
 
 starting_equity_today: Optional[float] = None
 starting_equity_day: Optional[str] = None
@@ -3230,12 +3231,18 @@ def sell_symbol(symbol: str, request: Request):
 def emergency_sell(request: Request):
     verify_api_key(request)
     global emergency_stop, bot_enabled
-    with bot_lock:
-        emergency_stop = True
-        bot_enabled = False
+
+    # Emergency actions must never queue behind the main scan/trading lock.
+    # The bot loop can hold bot_lock for the duration of a full universe scan,
+    # which previously made Emergency Sell appear dead for minutes.
+    emergency_stop = True
+    bot_enabled = False
+
+    with emergency_action_lock:
         result = close_all_positions(reason="EMERGENCY SELL")
         update_status(BOT_NAME, latest_scans)
-        return {**result, "emergencyStop": True, "botEnabled": False}
+
+    return {**result, "emergencyStop": True, "botEnabled": False}
 
 
 
