@@ -8,7 +8,10 @@ permission remains under the existing Governor and is not loosened here.
 from __future__ import annotations
 import time
 import threading
+from datetime import datetime, timezone
 from typing import Any, Dict, List
+
+ACCELERATOR_COHORT_START_UTC = "2026-10-07T08:16:09+00:00"
 
 _CACHE: Dict[str, Any] = {"at": 0.0, "model": None}
 _RUNTIME: Dict[str, Any] = {
@@ -93,6 +96,7 @@ def install_v18354_historical_evidence_accelerator(app, m):
             entry_reason = str(b.get("reason") or "")
             paired.append({
                 "symbol": sym,
+                "entryTimestamp": str(b.get("timestamp") or ""),
                 "score": score,
                 "scoreBin": score_bin(score),
                 "pnlUsd": pnl,
@@ -126,10 +130,28 @@ def install_v18354_historical_evidence_accelerator(app, m):
             if int(v["trades"]) >= 20 and float(v["expectancyUsd"]) < 0 and float(v["pnlUsd"]) < 0
         ])
 
+        def after_cutover(value: str) -> bool:
+            try:
+                raw = str(value or "").replace("Z", "+00:00")
+                dt = datetime.fromisoformat(raw)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                cut = datetime.fromisoformat(ACCELERATOR_COHORT_START_UTC)
+                return dt >= cut
+            except Exception:
+                return False
+
+        filtered_trial = [
+            x for x in paired
+            if bool(x.get("exploratory")) and after_cutover(str(x.get("entryTimestamp") or ""))
+        ]
+
         model = {
-            "version": "V18.3.54",
+            "version": "V18.3.55",
             "outcomes": len(paired),
             "overall": stats(paired),
+            "filteredTrial": stats(filtered_trial),
+            "filteredTrialStartUtc": ACCELERATOR_COHORT_START_UTC,
             "positiveScoreBins": positive_bins,
             "positiveSymbols": positive_symbols,
             "negativeSymbols": negative_symbols,
@@ -219,13 +241,15 @@ def install_v18354_historical_evidence_accelerator(app, m):
             runtime = dict(_RUNTIME)
         return {
             "ok": True,
-            "version": "V18.3.54",
+            "version": "V18.3.55",
             "shadowOnly": True,
             "liveTradingChanged": False,
             "stockTradingChanged": False,
             "model": {
                 "outcomes": model.get("outcomes"),
                 "overall": model.get("overall"),
+                "filteredTrial": model.get("filteredTrial"),
+                "filteredTrialStartUtc": model.get("filteredTrialStartUtc"),
                 "positiveScoreBins": model.get("positiveScoreBins"),
                 "positiveSymbols": model.get("positiveSymbols"),
                 "negativeSymbols": model.get("negativeSymbols"),
