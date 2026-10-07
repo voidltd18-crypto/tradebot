@@ -5155,6 +5155,40 @@ def manage_money_mode_positions():
                 print(f"SELL ERROR {symbol}: {e}")
             continue
 
+        # V18.3.63: evidence-gated live AI exit pilot. This path is inert by
+        # default and remains subordinate to the hard downside stops above.
+        # When explicitly enabled, it can execute only after the V18.3.61 scorer
+        # qualifies and the AI produces repeated high-confidence EXIT decisions.
+        if "v18363_ai_exit_pilot_decision" in globals():
+            try:
+                ai_pilot = v18363_ai_exit_pilot_decision(p)
+                if isinstance(ai_pilot, dict) and ai_pilot.get("sell"):
+                    if pdt_aware_should_avoid_sell(
+                        symbol, "V18.3.63 AI EXIT PILOT", p["pnlPct"], allow_hard_stop=False
+                    ):
+                        continue
+                    market_sell_qty(
+                        symbol, qty, entry=entry, price=price,
+                        reason="V18.3.63 AI EXIT PILOT"
+                    )
+                    state[symbol]["highest_since_entry"] = None
+                    _v17_reset_peak_exhaustion(symbol)
+                    _v17_reset_runner_trail(symbol)
+                    try:
+                        if "v18363_record_ai_exit" in globals():
+                            v18363_record_ai_exit(symbol)
+                    except Exception:
+                        pass
+                    print(
+                        f"V18.3.63 AI EXIT PILOT SELL | {symbol} qty={qty:.6f} "
+                        f"pnl={float(p.get('pnlPct') or 0.0):.2f}% | "
+                        f"{str(ai_pilot.get('reason') or '')}",
+                        flush=True,
+                    )
+                    continue
+            except Exception as e:
+                print(f"V18.3.63 AI EXIT PILOT ERROR | {symbol} {e}", flush=True)
+
         # V18.3.03: severe fresh company news can accelerate protection, but
         # never sells on headline sentiment alone. A sell requires both an >=80
         # news-risk score and corroborating live price weakness/giveback.
@@ -15309,6 +15343,7 @@ def run_bot_loop():
     print("Rebuilt Sniper Profit Bot started...")
     print(f"V18.3.58 SEPTEMBER STOCK PROFILE | enabled={V18358_SEPTEMBER_STOCK_PROFILE} failed_entry={V18337_FAILED_ENTRY_ENABLED} thesis_decay={V18340_THESIS_DECAY_ENABLED} stale_exit={V18341_STALE_EXIT_ENABLED} peak_lock=UNCHANGED hard_stop=UNCHANGED", flush=True)
     print(f"V18.3.59 PRE-CLOSE STOCK FLATTEN | enabled={V18359_PRE_CLOSE_STOCK_FLATTEN_ENABLED} overnight_hold={not V18359_PRE_CLOSE_STOCK_FLATTEN_ENABLED} normal_protection=ACTIVE", flush=True)
+    print("V18.3.63 AI EXIT LIVE PILOT | bridge=INSTALLED default_authority=OFF evidence_gate=REQUIRED", flush=True)
     init_db()
     seeded_outcomes = v2_seed_missing_outcomes()
     if seeded_outcomes:
