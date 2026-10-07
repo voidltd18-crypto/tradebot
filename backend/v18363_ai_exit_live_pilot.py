@@ -20,7 +20,7 @@ VERSION = "V18.3.63"
 PILOT_ENABLED = str(os.getenv("TRADEBOT_AI_EXIT_PILOT_ENABLED", "false")).lower() in ("1","true","yes","on")
 MIN_DECISION_CONFIDENCE = max(60.0, float(os.getenv("TRADEBOT_AI_EXIT_PILOT_MIN_CONFIDENCE", "75") or 75))
 REQUIRED_CONSECUTIVE_EXIT = max(2, int(os.getenv("TRADEBOT_AI_EXIT_PILOT_CONFIRMATIONS", "2") or 2))
-MAX_AI_EXITS_PER_DAY = max(1, int(os.getenv("TRADEBOT_AI_EXIT_PILOT_MAX_EXITS_PER_DAY", "1") or 1))
+MAX_AI_EXITS_PER_DAY = max(1, int(os.getenv("TRADEBOT_AI_EXIT_PILOT_MAX_EXITS_PER_DAY", "4") or 4))
 MIN_SECONDS_BETWEEN_CONFIRMATIONS = max(5, int(os.getenv("TRADEBOT_AI_EXIT_PILOT_CONFIRMATION_SECONDS", "10") or 10))
 
 _runtime: Dict[str, Any] = {
