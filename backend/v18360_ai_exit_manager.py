@@ -329,6 +329,13 @@ def _history(m, limit: int = 100) -> List[Dict[str, Any]]:
 def install_v18360_ai_exit_manager(app, m) -> None:
     global _started
     _ensure_table(m)
+
+    def _latest_for_symbol(symbol: str):
+        sym = str(symbol or "").upper()
+        with _lock:
+            return dict((_runtime.get("decisions") or {}).get(sym) or {})
+
+    m.v18360_latest_exit_decision = _latest_for_symbol
     if not _runtime.get("startedAt"):
         _runtime["startedAt"] = _now()
 
