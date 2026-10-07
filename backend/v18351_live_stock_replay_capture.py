@@ -207,7 +207,7 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
 
     def write_point(conn, session_id, price, symbol=""):
         pc = cols(conn, "trade_replay_points")
-        values = {"session_id": int(session_id), "price": float(price)}
+        values = {"session_id": int(session_id), "symbol": str(symbol or "").upper(), "price": float(price)}
         stamp = now_iso()
         for candidate in ("timestamp", "time", "recorded_at", "created_at", "observed_at", "sampled_at", "captured_at", "ts"):
             if candidate in pc:
@@ -321,7 +321,7 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
             conn.close()
         return {
             "ok": True,
-            "version": "V18.3.52",
+            "version": "V18.3.53",
             "recorder": dict(runtime),
             "database": {"sessions": int(sessions or 0), "points": int(points or 0), "exitDecisionAudits": int(exits or 0)},
             "liveTradingChanged": False,
