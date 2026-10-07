@@ -14,6 +14,7 @@ import threading
 import time
 from datetime import datetime, UTC
 from typing import Any, Dict, List, Optional
+from fastapi import Request
 
 VERSION = "V18.3.61"
 POLL_SECONDS = 10
@@ -427,7 +428,7 @@ def install_v18361_ai_exit_outcome_scorer(app, m) -> None:
         _runtime["startedAt"] = _now()
 
     @app.get("/v18/ai-exit-outcomes")
-    def api_v18361_ai_exit_outcomes(request: m.Request):
+    def api_v18361_ai_exit_outcomes(request: Request):
         m.verify_api_key(request)
         stats = _stats(m)
         with _lock:
