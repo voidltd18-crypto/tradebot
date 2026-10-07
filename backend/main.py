@@ -16,6 +16,7 @@ from backend.v18354_crypto_evidence_accelerator import install_v18354_historical
 from backend.v18357_capital_earnback_ladder import install_v18357_capital_earnback_ladder
 from backend.v18360_ai_exit_manager import install_v18360_ai_exit_manager
 from backend.v18361_ai_exit_outcome_scorer import install_v18361_ai_exit_outcome_scorer
+from backend.v18362_ai_exit_learner import install_v18362_ai_exit_learner
 
 app = monolith.app
 install_v18343(app, monolith)
@@ -26,5 +27,6 @@ install_v18354_historical_evidence_accelerator(app, monolith)
 install_v18357_capital_earnback_ladder(app, monolith)
 install_v18360_ai_exit_manager(app, monolith)
 install_v18361_ai_exit_outcome_scorer(app, monolith)
+install_v18362_ai_exit_learner(app, monolith)
 
 __all__ = ["app"]
