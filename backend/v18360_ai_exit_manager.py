@@ -193,6 +193,7 @@ def _decision(m, p: Dict[str, Any]) -> Dict[str, Any]:
         "heldMinutes": held,
         "price": round(price, 6),
         "entry": round(entry, 6),
+        "marketValueGbp": round(_f(p.get("marketValueGbp")), 4),
         "scanConfidence": round(confidence, 4),
         "scanQuality": round(quality, 6),
         "sniperPass": sniper,
@@ -246,7 +247,7 @@ def _record(m, row: Dict[str, Any]) -> None:
     try:
         features = {k: row.get(k) for k in (
             "holdScore","exitPressure","scanConfidence","scanQuality","sniperPass",
-            "aPlusPass","historyTrades","historyWinRatePct"
+            "aPlusPass","historyTrades","historyWinRatePct","marketValueGbp"
         )}
         conn.execute("""INSERT INTO v18360_ai_exit_decisions
             (observed_at,symbol,action,confidence_pct,price,entry_price,pnl_pct,peak_pct,
