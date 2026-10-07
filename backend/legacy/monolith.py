@@ -25727,6 +25727,18 @@ def _v15_aiops_worker() -> None:
         try:
             result = v15_aiops_run_audit(); s=result["summary"]
             print(f"V15 AIOPS | status={s['overallStatus']} health={s['healthScore']} pass={s['passed']} warn={s['warnings']} fail={s['failed']}")
+            for component in (result.get("components") or []):
+                component_status = str(component.get("status") or "").upper()
+                if component_status != "PASS":
+                    print(
+                        "V18.3.67 AIOPS DETAIL | "
+                        + "status=" + component_status
+                        + " component=" + str(component.get("name") or "")
+                        + " critical=" + str(bool(component.get("critical")))
+                        + " message=" + str(component.get("message") or "")
+                        + " durationMs=" + str(component.get("durationMs") or ""),
+                        flush=True,
+                    )
         except Exception as exc:
             print(f"V15 AIOPS WORKER ERROR: {exc}")
         time.sleep(V15_AIOPS_INTERVAL_SECONDS)
