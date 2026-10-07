@@ -13,6 +13,7 @@ import threading
 import time
 from datetime import datetime, UTC
 from typing import Any, Dict
+from fastapi import Request
 
 VERSION = "V18.3.66"
 POLL_SECONDS = 30
@@ -269,7 +270,7 @@ def install_v18366_autonomous_ai_exit_promotion(app, m) -> None:
     m.v18366_ai_exit_live_preflight = lambda: live_preflight(m)
 
     @app.get("/v18/ai-exit-promotion")
-    def api_v18366(request: m.Request):
+    def api_v18366(request: Request):
         m.verify_api_key(request)
         payload = promotion_status(m)
         payload["liveAuthority"] = False
