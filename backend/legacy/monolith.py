@@ -15308,6 +15308,7 @@ def _v18338_fast_stock_exit_worker():
 def run_bot_loop():
     print("Rebuilt Sniper Profit Bot started...")
     print(f"V18.3.58 SEPTEMBER STOCK PROFILE | enabled={V18358_SEPTEMBER_STOCK_PROFILE} failed_entry={V18337_FAILED_ENTRY_ENABLED} thesis_decay={V18340_THESIS_DECAY_ENABLED} stale_exit={V18341_STALE_EXIT_ENABLED} peak_lock=UNCHANGED hard_stop=UNCHANGED", flush=True)
+    print(f"V18.3.59 PRE-CLOSE STOCK FLATTEN | enabled={V18359_PRE_CLOSE_STOCK_FLATTEN_ENABLED} overnight_hold={not V18359_PRE_CLOSE_STOCK_FLATTEN_ENABLED} normal_protection=ACTIVE", flush=True)
     init_db()
     seeded_outcomes = v2_seed_missing_outcomes()
     if seeded_outcomes:
@@ -17263,6 +17264,8 @@ V18266_STOCK_CAP_GBP = max(0.0, float(os.getenv("TRADEBOT_STOCK_CAP_GBP", "900")
 # Uses Alpaca's actual next_open/next_close, so weekends, holidays and early closes
 # follow the broker calendar rather than hard-coded clock times.
 V18278_NIGHT_SHIFT_ENABLED = str(os.getenv("TRADEBOT_NIGHT_SHIFT_ENABLED", "true")).lower() in ("1","true","yes","on")
+# V18.3.59 — hold stock positions overnight; never force-sell simply because the session is ending.
+V18359_PRE_CLOSE_STOCK_FLATTEN_ENABLED = str(os.getenv("TRADEBOT_PRE_CLOSE_STOCK_FLATTEN_ENABLED", "false")).lower() in ("1","true","yes","on")
 V18278_WINDOW_MINUTES = max(5, int(os.getenv("TRADEBOT_NIGHT_SHIFT_WINDOW_MINUTES", "30") or 30))
 _v18278_runtime: Dict[str, Any] = {
     "mode": "DAY",
@@ -17430,16 +17433,24 @@ def _v18278_night_shift_tick() -> Dict[str, Any]:
     mode=str(plan.get("mode") or "DAY")
     if mode == "PRE_CLOSE":
         session_key=str(plan.get("nextClose") or datetime.now(UTC).date().isoformat())
-        with _v18278_lock:
-            should_start=(not _v18278_runtime.get("preCloseFlattenRunning")
-                          and _v18278_runtime.get("lastFlattenSession") != session_key)
+        # V18.3.59: PRE_CLOSE may still block brand-new stock entries, but it no
+        # longer liquidates an existing position merely because the session is
+        # ending. Normal hard-stop / trailing / peak protection remain active.
+        if V18359_PRE_CLOSE_STOCK_FLATTEN_ENABLED:
+            with _v18278_lock:
+                should_start=(not _v18278_runtime.get("preCloseFlattenRunning")
+                              and _v18278_runtime.get("lastFlattenSession") != session_key)
+                if should_start:
+                    _v18278_runtime["preCloseFlattenRunning"]=True
             if should_start:
-                _v18278_runtime["preCloseFlattenRunning"]=True
-        if should_start:
-            threading.Thread(
-                target=_v18278_preclose_flatten_worker,
-                args=(session_key,), daemon=True, name="night-shift-stock-flatten"
-            ).start()
+                threading.Thread(
+                    target=_v18278_preclose_flatten_worker,
+                    args=(session_key,), daemon=True, name="night-shift-stock-flatten"
+                ).start()
+        else:
+            with _v18278_lock:
+                _v18278_runtime["preCloseFlattenRunning"]=False
+            plan["preCloseFlattenDisabled"]=True
     elif mode == "PRE_OPEN":
         open_key=str(plan.get("nextOpen") or "")
         with _v18278_lock:
