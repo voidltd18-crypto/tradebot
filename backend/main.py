@@ -19,6 +19,7 @@ from backend.v18361_ai_exit_outcome_scorer import install_v18361_ai_exit_outcome
 from backend.v18362_ai_exit_learner import install_v18362_ai_exit_learner
 from backend.v18363_ai_exit_live_pilot import install_v18363_ai_exit_live_pilot
 from backend.v18364_ai_exit_pilot_guardian import install_v18364_ai_exit_pilot_guardian
+from backend.v18365_ai_exit_pilot_simulator import install_v18365_ai_exit_pilot_simulator
 
 app = monolith.app
 install_v18343(app, monolith)
@@ -31,6 +32,7 @@ install_v18360_ai_exit_manager(app, monolith)
 install_v18361_ai_exit_outcome_scorer(app, monolith)
 install_v18362_ai_exit_learner(app, monolith)
 install_v18364_ai_exit_pilot_guardian(app, monolith)
+install_v18365_ai_exit_pilot_simulator(app, monolith)
 install_v18363_ai_exit_live_pilot(app, monolith)
 
 __all__ = ["app"]
