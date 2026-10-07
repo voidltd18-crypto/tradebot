@@ -12,11 +12,13 @@ from backend.v18343_stock_leak import install_v18343
 from backend.v18344_replay_lab import install_v18344_replay_lab
 from backend.v18350_exit_incident_audit import install_v18350_exit_incident_audit
 from backend.v18351_live_stock_replay_capture import install_v18351_live_stock_replay_capture
+from backend.v18354_crypto_evidence_accelerator import install_v18354_historical_evidence_accelerator
 
 app = monolith.app
 install_v18343(app, monolith)
 install_v18344_replay_lab(app, monolith)
 install_v18350_exit_incident_audit(app, monolith)
 install_v18351_live_stock_replay_capture(app, monolith)
+install_v18354_historical_evidence_accelerator(app, monolith)
 
 __all__ = ["app"]
