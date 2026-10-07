@@ -291,6 +291,7 @@ manual_override = False
 emergency_stop = False
 bot_thread_started = False
 bot_lock = threading.Lock()
+trade_action_lock = threading.Lock()
 emergency_action_lock = threading.Lock()
 
 starting_equity_today: Optional[float] = None
@@ -3192,7 +3193,9 @@ def manual_override_off(request: Request):
 @app.post("/manual-buy")
 def manual_buy(request: Request):
     verify_api_key(request)
-    with bot_lock:
+    # User trade commands must not queue behind the long universe-scan lock.
+    # Serialize only the short broker/order section against automatic trading.
+    with trade_action_lock:
         if not trading_client.get_clock().is_open:
             return {"ok": False, "message": "Market closed"}
         result = money_mode_buy(latest_scans, manual=True)
@@ -3203,7 +3206,7 @@ def manual_buy(request: Request):
 @app.post("/custom-buy/{symbol}")
 def custom_buy(symbol: str, request: Request):
     verify_api_key(request)
-    with bot_lock:
+    with trade_action_lock:
         result = buy_custom_symbol(symbol)
         update_status(BOT_NAME, latest_scans)
         return result
@@ -3212,7 +3215,7 @@ def custom_buy(symbol: str, request: Request):
 @app.post("/manual-sell")
 def manual_sell(request: Request):
     verify_api_key(request)
-    with bot_lock:
+    with trade_action_lock:
         result = close_worst_or_largest_position(reason="MANUAL SELL")
         update_status(BOT_NAME, latest_scans)
         return result
@@ -3221,7 +3224,7 @@ def manual_sell(request: Request):
 @app.post("/sell/{symbol}")
 def sell_symbol(symbol: str, request: Request):
     verify_api_key(request)
-    with bot_lock:
+    with trade_action_lock:
         result = close_position_by_symbol(symbol.upper(), reason="MANUAL SYMBOL SELL")
         update_status(BOT_NAME, latest_scans)
         return result
@@ -3324,15 +3327,18 @@ def run_bot_loop():
                 latest_scans.extend(scans)
 
                 if bot_enabled and not emergency_stop:
-                    manage_money_mode_positions()
-                    if PROFIT_MODE_ENABLED and ROTATION_MODE_ENABLED:
-                        rr = maybe_rotate_weakest_into_best(scans)
-                        if rr:
-                            print(rr)
-                    if not manual_override:
-                        result = money_mode_buy(scans, manual=False)
-                        if result:
-                            print(result)
+                    # Keep broker/order work in a short dedicated lock so UI
+                    # manual buy/sell commands never wait behind the full scan.
+                    with trade_action_lock:
+                        manage_money_mode_positions()
+                        if PROFIT_MODE_ENABLED and ROTATION_MODE_ENABLED:
+                            rr = maybe_rotate_weakest_into_best(scans)
+                            if rr:
+                                print(rr)
+                        if not manual_override:
+                            result = money_mode_buy(scans, manual=False)
+                            if result:
+                                print(result)
                 update_status(BOT_NAME, scans)
 
             time.sleep(CHECK_INTERVAL)
