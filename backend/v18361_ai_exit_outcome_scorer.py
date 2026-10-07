@@ -415,6 +415,14 @@ def _worker(m) -> None:
 def install_v18361_ai_exit_outcome_scorer(app, m) -> None:
     global _started
     _ensure_tables(m)
+
+    def _pilot_eligible():
+        try:
+            return bool(_stats(m).get("pilotEligible"))
+        except Exception:
+            return False
+
+    m.v18361_exit_pilot_eligible = _pilot_eligible
     if not _runtime.get("startedAt"):
         _runtime["startedAt"] = _now()
 
