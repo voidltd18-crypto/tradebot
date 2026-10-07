@@ -13,25 +13,28 @@ export function PositionsPage({ positions, rate, action, positionGlowStyle, auth
   const [aiPilot, setAiPilot] = useState<AnyObj | null>(null);
   const [aiGuardian, setAiGuardian] = useState<AnyObj | null>(null);
   const [aiPilotSim, setAiPilotSim] = useState<AnyObj | null>(null);
+  const [aiPromotion, setAiPromotion] = useState<AnyObj | null>(null);
   useEffect(() => {
     let alive = true;
     const load = async () => {
       try {
-        const [res, outcomeRes, learningRes, pilotRes, guardianRes, simRes] = await Promise.all([
+        const [res, outcomeRes, learningRes, pilotRes, guardianRes, simRes, promotionRes] = await Promise.all([
           fetch(`${API_URL}/v18/ai-exit-manager?limit=30`, { headers: { "X-API-Key": authToken, "X-Auth-Token": authToken } }),
           fetch(`${API_URL}/v18/ai-exit-outcomes`, { headers: { "X-API-Key": authToken, "X-Auth-Token": authToken } }),
           fetch(`${API_URL}/v18/ai-exit-learning`, { headers: { "X-API-Key": authToken, "X-Auth-Token": authToken } }),
           fetch(`${API_URL}/v18/ai-exit-pilot`, { headers: { "X-API-Key": authToken, "X-Auth-Token": authToken } }),
           fetch(`${API_URL}/v18/ai-exit-pilot-guardian`, { headers: { "X-API-Key": authToken, "X-Auth-Token": authToken } }),
           fetch(`${API_URL}/v18/ai-exit-pilot-simulator`, { headers: { "X-API-Key": authToken, "X-Auth-Token": authToken } }),
+          fetch(`${API_URL}/v18/ai-exit-promotion`, { headers: { "X-API-Key": authToken, "X-Auth-Token": authToken } }),
         ]);
-        const [body, outcomeBody, learningBody, pilotBody, guardianBody, simBody] = await Promise.all([res.json(), outcomeRes.json(), learningRes.json(), pilotRes.json(), guardianRes.json(), simRes.json()]);
+        const [body, outcomeBody, learningBody, pilotBody, guardianBody, simBody, promotionBody] = await Promise.all([res.json(), outcomeRes.json(), learningRes.json(), pilotRes.json(), guardianRes.json(), simRes.json(), promotionRes.json()]);
         if (alive && res.ok) setAiExit(body);
         if (alive && outcomeRes.ok) setAiOutcome(outcomeBody);
         if (alive && learningRes.ok) setAiLearning(learningBody);
         if (alive && pilotRes.ok) setAiPilot(pilotBody);
         if (alive && guardianRes.ok) setAiGuardian(guardianBody);
         if (alive && simRes.ok) setAiPilotSim(simBody);
+        if (alive && promotionRes.ok) setAiPromotion(promotionBody);
       } catch {}
     };
     load();
@@ -46,6 +49,7 @@ export function PositionsPage({ positions, rate, action, positionGlowStyle, auth
     <Card title="AI Exit Live Pilot"><p className="muted">The bridge to live AI-controlled selling. It stays OFF until both the evidence gate qualifies and the pilot is explicitly enabled.</p><div className="summary"><div><span>Pilot enabled</span><b>{aiPilot?.pilotEnabled ? "YES" : "NO"}</b></div><div><span>Evidence qualified</span><b>{aiPilot?.pilotEligible ? "YES" : "NO"}</b></div><div><span>Live authority</span><b>{aiPilot?.liveAuthority ? "ON" : "OFF"}</b></div><div><span>Min confidence</span><b>{Number(aiPilot?.minDecisionConfidencePct || 75).toFixed(0)}%</b></div><div><span>Confirmations</span><b>{Number(aiPilot?.requiredConsecutiveExit || 2)}</b></div><div><span>AI exits today</span><b>{Number(aiPilot?.aiExitsToday || 0)} / {Number(aiPilot?.maxAiExitsPerDay || 1)}</b></div></div></Card>
     <Card title="AI Exit Pilot Guardian"><p className="muted">Every future live AI exit is quarantined for a 30-open-minute review before another AI exit can happen.</p><div className="summary"><div><span>Guardian state</span><b>{aiGuardian?.state || "READY"}</b></div><div><span>Pending review</span><b>{aiGuardian?.pendingReview ? "YES" : "NO"}</b></div><div><span>Suspended</span><b>{aiGuardian?.suspended ? "YES" : "NO"}</b></div><div><span>Review window</span><b>{Number(aiGuardian?.reviewOpenMinutes || 30)}m</b></div><div><span>Bad-exit trigger</span><b>+{Number(aiGuardian?.badExitThresholdPct || 0.3).toFixed(2)}%</b></div><div><span>Last verdict</span><b>{aiGuardian?.lastReview?.verdict || "—"}</b></div></div>{aiGuardian?.suspensionReason && <p className="notice">{String(aiGuardian.suspensionReason)}</p>}</Card>
     <Card title="AI Exit Pilot Simulator"><p className="muted">Dry-runs the exact live-pilot gate before real AI selling is enabled. It scores hypothetical pilot exits after 30 open-market minutes.</p><div className="summary"><div><span>Mode</span><b>{aiPilotSim?.mode || "DRY_RUN"}</b></div><div><span>Simulated exits</span><b>{Number(aiPilotSim?.totalSimulatedExits || 0)}</b></div><div><span>Reviewed</span><b>{Number(aiPilotSim?.reviewed || 0)}</b></div><div><span>Accuracy</span><b>{Number(aiPilotSim?.accuracyPct || 0).toFixed(1)}%</b></div><div><span>Average edge</span><b>{Number(aiPilotSim?.avgEdgePct || 0).toFixed(2)}%</b></div><div><span>Real-pilot readiness</span><b>{aiPilotSim?.qualifiedForRealPilot ? "QUALIFIED" : "COLLECTING"}</b></div></div></Card>
+    <Card title="Autonomous AI Exit Promotion"><p className="muted">The controller now moves the AI through evidence → simulation → guarded pilot → trusted pilot → graduated authority automatically, while hard safety remains above it.</p><div className="summary"><div><span>State</span><b>{aiPromotion?.state || "EVIDENCE"}</b></div><div><span>Scorer qualified</span><b>{aiPromotion?.scorerQualified ? "YES" : "NO"}</b></div><div><span>Simulator qualified</span><b>{aiPromotion?.simulatorQualified ? "YES" : "NO"}</b></div><div><span>Live reviews</span><b>{Number(aiPromotion?.liveReviewed || 0)}</b></div><div><span>Live accuracy</span><b>{Number(aiPromotion?.liveAccuracyPct || 0).toFixed(1)}%</b></div><div><span>Daily AI exit cap</span><b>{Number(aiPromotion?.dailyAiExitCap || 0)}</b></div></div></Card>
     <Card title="Open Positions — Best to Worst"><p className="muted">Your live holdings, sorted by performance. Price movement is recorded automatically for Trade Replay.</p><div className="position-list">{positions.map((position) => { const ai = aiDecisionFor(String(position.symbol)); return <article className="position" key={position.symbol} style={positionGlowStyle(position)}><div><h3>{position.symbol}</h3><p>Qty {Number(position.qty || 0).toFixed(4)} · Entry {usd(position.entry)} · Price {usd(position.price)}</p><p>Value <b>{gbp(position.marketValueGbp ?? Number(position.marketValue || 0) * rate)}</b> / {usd(position.marketValue)}</p></div><div className="position-side"><b className={tone(position.pnl)}>PnL {gbp(position.pnlGbp ?? Number(position.pnl || 0) * rate)} / {usd(position.pnl)} / {pct(position.pnlPct)}</b><span>{position.runnerGraceActive
   ? `Runner grace ${Number(position.runnerGraceCheck || 1)}/${Number(position.runnerGraceRequired || 2)} · floor ${usd(position.trailFloor)}`
   : (position.peakExhaustionArmed
