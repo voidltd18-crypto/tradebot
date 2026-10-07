@@ -112,6 +112,11 @@ def _ensure_tables(m) -> None:
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_v18361_anchor_symbol ON v18361_exit_outcome_anchors(symbol, observed_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_v18361_outcome_horizon ON v18361_exit_outcomes(horizon_min, verdict)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS v18361_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )""")
+        conn.execute("INSERT OR IGNORE INTO v18361_meta(key,value) VALUES ('lastDecisionId','0')")
         conn.commit()
     finally:
         conn.close()
@@ -147,10 +152,10 @@ def _accept_new_anchors(m, is_open: bool) -> int:
             str(r["name"]) for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }:
             return 0
-        last_decision = conn.execute(
-            "SELECT COALESCE(MAX(decision_id),0) AS x FROM v18361_exit_outcome_anchors"
+        cursor_row = conn.execute(
+            "SELECT value FROM v18361_meta WHERE key='lastDecisionId'"
         ).fetchone()
-        last_id = _i(last_decision["x"] if last_decision else 0)
+        last_id = _i(cursor_row["value"] if cursor_row else 0)
         rows = conn.execute(
             """SELECT id,observed_at,symbol,action,confidence_pct,price,pnl_pct,peak_pct,
                       giveback_pct,momentum,held_minutes,market_regime,features_json
@@ -195,8 +200,19 @@ def _accept_new_anchors(m, is_open: bool) -> int:
                     _decision_market_value_gbp(row), _now(), _now(),
                 ),
             )
-            if conn.total_changes:
-                accepted += 1
+            accepted += 1
+            conn.execute(
+                "UPDATE v18361_meta SET value=? WHERE key='lastDecisionId'",
+                (str(_i(row.get("id"))),),
+            )
+        if rows:
+            # Advance the cursor even when a decision was intentionally skipped by
+            # the 5-minute anchor spacing rule, otherwise the scorer would reread
+            # the same skipped rows forever.
+            conn.execute(
+                "UPDATE v18361_meta SET value=? WHERE key='lastDecisionId'",
+                (str(_i(dict(rows[-1]).get("id"))),),
+            )
         conn.commit()
         return accepted
     finally:
