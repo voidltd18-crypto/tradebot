@@ -107,7 +107,16 @@ def evaluate_live_exit(m, position: Dict[str, Any]) -> Dict[str, Any]:
     action = str(decision.get("action") or "").upper()
     confidence = _f(decision.get("decisionConfidencePct"))
     observed_at = str(decision.get("observedAt") or "")
-    live_authority = bool(PILOT_ENABLED and eligible)
+
+    guardian = {"allowed": True, "reason": "guardian unavailable"}
+    try:
+        guardian_fn = getattr(m, "v18364_ai_exit_guardian_check", None)
+        if callable(guardian_fn):
+            guardian = dict(guardian_fn() or guardian)
+    except Exception as exc:
+        guardian = {"allowed": False, "reason": f"guardian error: {type(exc).__name__}"}
+
+    live_authority = bool(PILOT_ENABLED and eligible and guardian.get("allowed"))
 
     with _lock:
         _runtime["pilotEligible"] = bool(eligible)
@@ -119,6 +128,8 @@ def evaluate_live_exit(m, position: Dict[str, Any]) -> Dict[str, Any]:
         return {"sell": False, "reason": "AI exit pilot disabled", "symbol": symbol}
     if not eligible:
         return {"sell": False, "reason": "AI exit evidence has not qualified", "symbol": symbol}
+    if not guardian.get("allowed"):
+        return {"sell": False, "reason": f"AI exit guardian blocked: {guardian.get('reason')}", "symbol": symbol}
     if _i(_runtime.get("aiExitsToday")) >= MAX_AI_EXITS_PER_DAY:
         return {"sell": False, "reason": "daily AI exit pilot limit reached", "symbol": symbol}
     if action != "EXIT":
