@@ -116,7 +116,17 @@ def evaluate_live_exit(m, position: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as exc:
         guardian = {"allowed": False, "reason": f"guardian error: {type(exc).__name__}"}
 
-    live_authority = bool(PILOT_ENABLED and eligible and guardian.get("allowed"))
+    promotion = {"allowed": False, "reason": "promotion controller unavailable", "dailyCap": 0}
+    try:
+        promotion_fn = getattr(m, "v18366_ai_exit_live_preflight", None)
+        if callable(promotion_fn):
+            promotion = dict(promotion_fn() or promotion)
+    except Exception as exc:
+        promotion = {"allowed": False, "reason": f"promotion error: {type(exc).__name__}", "dailyCap": 0}
+
+    live_authority = bool(
+        PILOT_ENABLED and eligible and guardian.get("allowed") and promotion.get("allowed")
+    )
 
     with _lock:
         _runtime["pilotEligible"] = bool(eligible)
@@ -130,8 +140,15 @@ def evaluate_live_exit(m, position: Dict[str, Any]) -> Dict[str, Any]:
         return {"sell": False, "reason": "AI exit evidence has not qualified", "symbol": symbol}
     if not guardian.get("allowed"):
         return {"sell": False, "reason": f"AI exit guardian blocked: {guardian.get('reason')}", "symbol": symbol}
-    if _i(_runtime.get("aiExitsToday")) >= MAX_AI_EXITS_PER_DAY:
-        return {"sell": False, "reason": "daily AI exit pilot limit reached", "symbol": symbol}
+    if not promotion.get("allowed"):
+        return {"sell": False, "reason": f"AI exit promotion blocked: {promotion.get('reason')}", "symbol": symbol}
+
+    daily_cap = max(1, min(MAX_AI_EXITS_PER_DAY, _i(promotion.get("dailyCap"), 1)))
+    with _lock:
+        _runtime["effectiveDailyAiExitCap"] = daily_cap
+        _runtime["promotionState"] = str(promotion.get("reason") or "")
+    if _i(_runtime.get("aiExitsToday")) >= daily_cap:
+        return {"sell": False, "reason": f"daily AI exit pilot limit reached ({daily_cap})", "symbol": symbol}
     if action != "EXIT":
         # Reset confirmation streak whenever the AI no longer wants out.
         with _lock:
