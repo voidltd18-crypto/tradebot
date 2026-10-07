@@ -232,7 +232,8 @@ V18280_STOCK_GUARD_ENABLED = str(
 # This does NOT tighten the normal stop: healthy pullbacks keep the existing room.
 # It requires a young position, a weak peak, a meaningful red P&L, negative short
 # momentum, and two consecutive confirmations before a live exit is allowed.
-V18337_FAILED_ENTRY_ENABLED = str(os.getenv("TRADEBOT_FAILED_ENTRY_GUARD_ENABLED", "true")).lower() in ("1","true","yes","on")
+V18358_SEPTEMBER_STOCK_PROFILE = str(os.getenv("TRADEBOT_SEPTEMBER_STOCK_PROFILE", "true")).lower() in ("1","true","yes","on")
+V18337_FAILED_ENTRY_ENABLED = (not V18358_SEPTEMBER_STOCK_PROFILE) and str(os.getenv("TRADEBOT_FAILED_ENTRY_GUARD_ENABLED", "true")).lower() in ("1","true","yes","on")
 V18337_FAILED_ENTRY_MIN_AGE_MIN = max(2, int(os.getenv("TRADEBOT_FAILED_ENTRY_MIN_AGE_MIN", "4") or 4))
 V18337_FAILED_ENTRY_MAX_AGE_MIN = max(V18337_FAILED_ENTRY_MIN_AGE_MIN + 1, int(os.getenv("TRADEBOT_FAILED_ENTRY_MAX_AGE_MIN", "25") or 25))
 V18337_FAILED_ENTRY_MAX_PEAK_PCT = max(0.20, float(os.getenv("TRADEBOT_FAILED_ENTRY_MAX_PEAK_PCT", "0.75") or 0.75))
@@ -244,7 +245,7 @@ V18337_FAILED_ENTRY_CONFIRMATIONS = max(2, int(os.getenv("TRADEBOT_FAILED_ENTRY_
 # Stage two for trades that survive the very-early V18.3.37 window but still
 # never prove the entry thesis. This targets the ORCL/BFLY pattern: weak peak,
 # prolonged failure to develop, then a controlled red exit before the full stop.
-V18340_THESIS_DECAY_ENABLED = str(os.getenv("TRADEBOT_THESIS_DECAY_ENABLED", "true")).lower() in ("1","true","yes","on")
+V18340_THESIS_DECAY_ENABLED = (not V18358_SEPTEMBER_STOCK_PROFILE) and str(os.getenv("TRADEBOT_THESIS_DECAY_ENABLED", "true")).lower() in ("1","true","yes","on")
 V18340_THESIS_DECAY_MIN_AGE_MIN = max(8, int(os.getenv("TRADEBOT_THESIS_DECAY_MIN_AGE_MIN", "12") or 12))
 V18340_THESIS_DECAY_MAX_AGE_MIN = max(V18340_THESIS_DECAY_MIN_AGE_MIN + 1, int(os.getenv("TRADEBOT_THESIS_DECAY_MAX_AGE_MIN", "45") or 45))
 V18340_THESIS_DECAY_MAX_PEAK_PCT = max(0.20, float(os.getenv("TRADEBOT_THESIS_DECAY_MAX_PEAK_PCT", "0.75") or 0.75))
@@ -258,7 +259,7 @@ V18340_THESIS_DECAY_CONFIRMATIONS = max(2, int(os.getenv("TRADEBOT_THESIS_DECAY_
 # never developed meaningful upside. Unlike V18.3.40, this does NOT require a
 # -0.55% loss: after the stale-age threshold, a weak-peak trade at/below entry
 # can be released after consecutive confirmations.
-V18341_STALE_EXIT_ENABLED = str(os.getenv("TRADEBOT_STALE_EXIT_ENABLED", "true")).lower() in ("1","true","yes","on")
+V18341_STALE_EXIT_ENABLED = (not V18358_SEPTEMBER_STOCK_PROFILE) and str(os.getenv("TRADEBOT_STALE_EXIT_ENABLED", "true")).lower() in ("1","true","yes","on")
 V18341_STALE_EXIT_MIN_AGE_MIN = max(30, int(os.getenv("TRADEBOT_STALE_EXIT_MIN_AGE_MIN", "60") or 60))
 V18341_STALE_EXIT_MAX_PEAK_PCT = max(0.20, float(os.getenv("TRADEBOT_STALE_EXIT_MAX_PEAK_PCT", "0.75") or 0.75))
 V18341_STALE_EXIT_MAX_CURRENT_PCT = float(os.getenv("TRADEBOT_STALE_EXIT_MAX_CURRENT_PCT", "0.00") or 0.00)
@@ -15306,6 +15307,7 @@ def _v18338_fast_stock_exit_worker():
 
 def run_bot_loop():
     print("Rebuilt Sniper Profit Bot started...")
+    print(f"V18.3.58 SEPTEMBER STOCK PROFILE | enabled={V18358_SEPTEMBER_STOCK_PROFILE} failed_entry={V18337_FAILED_ENTRY_ENABLED} thesis_decay={V18340_THESIS_DECAY_ENABLED} stale_exit={V18341_STALE_EXIT_ENABLED} peak_lock=UNCHANGED hard_stop=UNCHANGED", flush=True)
     init_db()
     seeded_outcomes = v2_seed_missing_outcomes()
     if seeded_outcomes:
