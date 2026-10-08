@@ -23,7 +23,8 @@ BAD_EXIT_THRESHOLD_PCT = 0.30
 MIN_CONFIDENCE = 75.0
 CONFIRMATIONS_REQUIRED = 2
 MIN_CONFIRMATION_SECONDS = 10
-MAX_SIMULATED_EXITS_PER_DAY = 1
+MAX_SIMULATED_EXITS_PER_DAY = 10
+MAX_PENDING_REVIEWS = 10
 
 _runtime: Dict[str, Any] = {
     "version": VERSION,
@@ -156,11 +157,27 @@ def _latest_decision(m, symbol: str) -> Dict[str, Any]:
         return {}
 
 
-def _pending_review(m) -> bool:
+def _pending_review_count(m) -> int:
     conn = m.db_connect()
     try:
         r = conn.execute(
             "SELECT COUNT(*) c FROM v18365_ai_exit_pilot_sim WHERE verdict IS NULL"
+        ).fetchone()
+        return _i(r["c"])
+    finally:
+        conn.close()
+
+
+def _pending_review(m) -> bool:
+    return _pending_review_count(m) > 0
+
+
+def _symbol_pending_review(m, symbol: str) -> bool:
+    conn = m.db_connect()
+    try:
+        r = conn.execute(
+            "SELECT COUNT(*) c FROM v18365_ai_exit_pilot_sim WHERE verdict IS NULL AND symbol=?",
+            (str(symbol or "").upper().strip(),),
         ).fetchone()
         return _i(r["c"]) > 0
     finally:
@@ -168,7 +185,9 @@ def _pending_review(m) -> bool:
 
 
 def _consider_simulated_exit(m, p: Dict[str, Any], eligible: bool, is_open: bool) -> bool:
-    if not is_open or not eligible or _pending_review(m):
+    if not is_open or not eligible:
+        return False
+    if _pending_review_count(m) >= MAX_PENDING_REVIEWS:
         return False
     with _lock:
         if _i(_runtime.get("simulatedExitsToday")) >= MAX_SIMULATED_EXITS_PER_DAY:
@@ -176,6 +195,8 @@ def _consider_simulated_exit(m, p: Dict[str, Any], eligible: bool, is_open: bool
 
     symbol = str(p.get("symbol") or "").upper().strip()
     if not symbol or "/" in symbol:
+        return False
+    if _symbol_pending_review(m, symbol):
         return False
 
     decision = _latest_decision(m, symbol)
@@ -344,7 +365,8 @@ def _stats(m) -> Dict[str, Any]:
 def _worker(m) -> None:
     print(
         f"{VERSION} AI EXIT PILOT SIMULATOR | mode=DRY_RUN live_orders=False "
-        f"confidence={MIN_CONFIDENCE:.0f}% confirmations={CONFIRMATIONS_REQUIRED}",
+        f"confidence={MIN_CONFIDENCE:.0f}% confirmations={CONFIRMATIONS_REQUIRED} "
+        f"max_per_day={MAX_SIMULATED_EXITS_PER_DAY} max_pending={MAX_PENDING_REVIEWS}",
         flush=True,
     )
     while True:
@@ -353,16 +375,18 @@ def _worker(m) -> None:
             is_open = _market_open(m)
             eligible = _pilot_eligible(m)
             _advance_reviews(m, is_open)
-            if is_open and eligible and not _pending_review(m):
+            if is_open and eligible and _pending_review_count(m) < MAX_PENDING_REVIEWS:
                 for p in list(m.get_all_positions() or []):
-                    if _consider_simulated_exit(m, p, eligible, is_open):
-                        break
+                    _consider_simulated_exit(m, p, eligible, is_open)
             stats = _stats(m)
             with _lock:
                 _runtime.update(stats)
                 _runtime["marketOpen"] = bool(is_open)
                 _runtime["pilotEligible"] = bool(eligible)
                 _runtime["pendingReview"] = bool(_pending_review(m))
+                _runtime["pendingReviewCount"] = _pending_review_count(m)
+                _runtime["maxPendingReviews"] = MAX_PENDING_REVIEWS
+                _runtime["maxSimulatedExitsPerDay"] = MAX_SIMULATED_EXITS_PER_DAY
                 _runtime["lastRunAt"] = _now()
                 _runtime["lastError"] = None
         except Exception as exc:
