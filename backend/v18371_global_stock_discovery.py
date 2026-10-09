@@ -44,6 +44,21 @@ def _num(value: Any, default: float = 0.0) -> float:
     except Exception:
         return float(default)
 
+def _asset_is_notional_buyable(m, symbol: str) -> tuple[bool, str]:
+    try:
+        asset = m.trading_client.get_asset(symbol)
+        if not bool(getattr(asset, "tradable", False)):
+            return False, "not-tradable"
+        if not bool(getattr(asset, "fractionable", False)):
+            return False, "not-fractionable"
+        status = str(getattr(asset, "status", "") or "").lower()
+        if status and status not in ("active", "assetstatus.active"):
+            return False, f"status={status}"
+        return True, ""
+    except Exception as exc:
+        return False, f"asset-check:{exc}"
+
+
 def _discover(m):
     scores: Dict[str, Dict[str, Any]] = {}
     errors: List[str] = []
@@ -94,6 +109,9 @@ def _discover(m):
         if not symbol.replace("-", "").isalnum() or len(symbol) > 6:
             continue
         try:
+            asset_ok, asset_reason = _asset_is_notional_buyable(m, symbol)
+            if not asset_ok:
+                continue
             quote = m.get_quote(symbol)
             price = _num(quote.get("mid"))
             spread = _num(quote.get("spread"), 999.0)
@@ -134,6 +152,9 @@ def _fallback_rows(m, seen, slots):
     for symbol in fallback:
         symbol = str(symbol or "").upper().strip()
         if not symbol or symbol in seen:
+            continue
+        asset_ok, _ = _asset_is_notional_buyable(m, symbol)
+        if not asset_ok:
             continue
         rows.append({
             "symbol": symbol, "score": 0.0,
