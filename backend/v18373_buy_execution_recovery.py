@@ -152,7 +152,7 @@ def install_v18373_buy_execution_recovery(app, m) -> None:
         if metadata:
             print(
                 f"V18.3.77 BUY HANDOFF METADATA | symbol={symbol_u} "
-                f"ignored={\',\'.join(sorted(metadata.keys()))}"
+                f"ignored={','.join(sorted(metadata.keys()))}"
             )
         print(
             f"V18.3.73 BUY SUBMIT | symbol={symbol_u} notional=${amount:.2f} "
