@@ -37,6 +37,7 @@ BOUNCE_REQUIRED_PCT = max(
 
 _lock = threading.Lock()
 _watch: Dict[str, Dict[str, Any]] = {}
+_grandfathered_symbols = set()
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -99,6 +100,17 @@ def _submit_original_sell(original_market_sell_qty, symbol, qty, entry, price, r
 def install_v18375_stock_recovery_watch(app, m) -> None:
     original_market_sell_qty = m.market_sell_qty
 
+    # Positions already open when this version starts are grandfathered into
+    # one full recovery watch. This prevents a deploy itself from instantly
+    # liquidating a position that was already below the new hard floor.
+    try:
+        for p in m.get_all_positions():
+            sym = str(p.get("symbol") or "").upper().strip()
+            if sym:
+                _grandfathered_symbols.add(sym)
+    except Exception:
+        pass
+
     def recovery_market_sell_qty(symbol, qty, *args, **kwargs):
         entry, trigger_price, reason = _extract_call_values(args, kwargs)
 
@@ -128,10 +140,12 @@ def install_v18375_stock_recovery_watch(app, m) -> None:
             and broker_loss <= HARD_FLOOR_PCT
             and quote_loss <= HARD_FLOOR_PCT
         )
+        grandfathered = symbol_u in _grandfathered_symbols
 
-        if hard_floor_confirmed:
+        if hard_floor_confirmed and not grandfathered:
             with _lock:
                 _watch.pop(symbol_u, None)
+            _grandfathered_symbols.discard(symbol_u)
             sell_price = broker_price if broker_price > 0 else trigger_price
             print(
                 f"V18.3.75 RECOVERY HARD FLOOR | {symbol_u} "
@@ -181,7 +195,7 @@ def install_v18375_stock_recovery_watch(app, m) -> None:
                     f"V18.3.75 RECOVERY WATCH START | {symbol_u} "
                     f"loss={trigger_loss:.2f}% trigger={RECOVERY_TRIGGER_PCT:.2f}% "
                     f"watch={WATCH_SECONDS:.0f}s hard_floor={HARD_FLOOR_PCT:.2f}% "
-                    "live_sell=False"
+                    f"grandfathered={grandfathered} live_sell=False"
                 )
                 return None
 
@@ -253,6 +267,7 @@ def install_v18375_stock_recovery_watch(app, m) -> None:
                 return None
 
             _watch.pop(symbol_u, None)
+            _grandfathered_symbols.discard(symbol_u)
             sell_price = broker_price if broker_price > 0 else trigger_price
             print(
                 f"V18.3.75 RECOVERY EXPIRED SELL | {symbol_u} "
@@ -275,5 +290,6 @@ def install_v18375_stock_recovery_watch(app, m) -> None:
         "V18.3.75 STOCK RECOVERY WATCH | installed "
         f"trigger={RECOVERY_TRIGGER_PCT:.2f}% watch={WATCH_SECONDS:.0f}s "
         f"bounce=+{BOUNCE_REQUIRED_PCT:.2f}pp extend={BOUNCE_EXTENSION_SECONDS:.0f}s "
-        f"hard_floor={HARD_FLOOR_PCT:.2f}% scope=V18.2.80_ONLY"
+        f"hard_floor={HARD_FLOOR_PCT:.2f}% grandfathered={sorted(_grandfathered_symbols)} "
+        "scope=V18.2.80_ONLY"
     )
