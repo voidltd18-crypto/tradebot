@@ -127,6 +127,18 @@ def _candidate_still_safe(m, pick) -> tuple[bool, str]:
     except Exception as exc:
         return False, f"A+ check error: {exc}"
 
+    try:
+        asset = m.trading_client.get_asset(symbol)
+        if not bool(getattr(asset, "tradable", False)):
+            return False, "asset not tradable"
+        if not bool(getattr(asset, "fractionable", False)):
+            return False, "asset not fractionable for notional order"
+        status = str(getattr(asset, "status", "") or "").lower()
+        if status and status not in ("active", "assetstatus.active"):
+            return False, f"asset status {status}"
+    except Exception as exc:
+        return False, f"asset preflight error: {exc}"
+
     return True, ""
 
 
@@ -134,9 +146,14 @@ def install_v18373_buy_execution_recovery(app, m) -> None:
     original_market_buy_notional = m.market_buy_notional
     original_money_mode_buy = m.money_mode_buy
 
-    def traced_market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY"):
+    def traced_market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", **metadata):
         symbol_u = str(symbol or "").upper().strip()
         amount = round(_num(notional_amount), 2)
+        if metadata:
+            print(
+                f"V18.3.77 BUY HANDOFF METADATA | symbol={symbol_u} "
+                f"ignored={\',\'.join(sorted(metadata.keys()))}"
+            )
         print(
             f"V18.3.73 BUY SUBMIT | symbol={symbol_u} notional=${amount:.2f} "
             f"reason={reason}"
