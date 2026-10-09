@@ -23,11 +23,13 @@ from backend.v18365_ai_exit_pilot_simulator import install_v18365_ai_exit_pilot_
 from backend.v18366_autonomous_ai_exit_promotion import install_v18366_autonomous_ai_exit_promotion
 from backend.v18371_global_stock_discovery import install_v18371_global_stock_discovery
 from backend.v18375_stock_recovery_watch import install_v18375_stock_recovery_watch
+from backend.v18376_keep_buying_after_loss import install_v18376_keep_buying_after_loss
 from backend.v18373_buy_execution_recovery import install_v18373_buy_execution_recovery
 
 app = monolith.app
 install_v18371_global_stock_discovery(app, monolith)
 install_v18375_stock_recovery_watch(app, monolith)
+install_v18376_keep_buying_after_loss(app, monolith)
 install_v18373_buy_execution_recovery(app, monolith)
 install_v18343(app, monolith)
 install_v18344_replay_lab(app, monolith)
