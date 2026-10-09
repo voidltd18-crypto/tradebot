@@ -154,6 +154,18 @@ def install_v18373_buy_execution_recovery(app, m) -> None:
                 f"V18.3.77 BUY HANDOFF METADATA | symbol={symbol_u} "
                 f"ignored={','.join(sorted(metadata.keys()))}"
             )
+        try:
+            asset = m.trading_client.get_asset(symbol_u)
+            if not bool(getattr(asset, "tradable", False)):
+                raise RuntimeError("asset is not tradable")
+            if not bool(getattr(asset, "fractionable", False)):
+                raise RuntimeError("asset is not fractionable for notional order")
+        except Exception as exc:
+            print(
+                f"V18.3.77 BUY PREFLIGHT BLOCKED | symbol={symbol_u} "
+                f"reason={exc}"
+            )
+            raise
         print(
             f"V18.3.73 BUY SUBMIT | symbol={symbol_u} notional=${amount:.2f} "
             f"reason={reason}"
