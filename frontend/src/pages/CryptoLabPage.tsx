@@ -228,10 +228,7 @@ useEffect(() => {
     };
   }, [authToken]);
 
-  const confirmEvidenceBuy = async (row: AnyObj) => {
-    const symbol = String(row?.symbol || "").toUpperCase();
-    if (!symbol || buyBusySymbol) return;
-
+  const suggestedEvidenceBuyUsd = () => {
     const fxRate = Number(data?.fx?.usdToGbp || 0.7403);
     const allocatedGbp = Math.max(0, Number(bridge?.cryptoAllocatedGbp || 0));
     const buyingPowerUsd = Math.max(
@@ -244,34 +241,21 @@ useEffect(() => {
       )
     );
     const allocatedUsd = fxRate > 0 ? allocatedGbp / fxRate : allocatedGbp;
-    const suggestedUsd = Math.max(
-      1,
-      Math.floor(
-        buyingPowerUsd > 0
-          ? Math.min(allocatedUsd > 0 ? allocatedUsd : buyingPowerUsd, buyingPowerUsd)
-          : allocatedUsd > 0
-            ? allocatedUsd
-            : 25
-      )
-    );
-    const rawAmount = window.prompt(
-      `How much USD do you want to buy of ${symbol}?\n\nSuggested from current Crypto Allocation: ${suggestedUsd.toFixed(2)}`,
-      suggestedUsd.toFixed(2)
-    );
-    if (rawAmount === null) return;
-    const notionalUsd = Number(rawAmount);
-    if (!Number.isFinite(notionalUsd) || notionalUsd < 1) {
-      setBuyMessage("Enter a valid amount of at least $1.00.");
+    const usableUsd = buyingPowerUsd > 0
+      ? Math.min(allocatedUsd > 0 ? allocatedUsd : buyingPowerUsd, buyingPowerUsd)
+      : allocatedUsd;
+    return usableUsd >= 1 ? Math.floor(usableUsd * 100) / 100 : 0;
+  };
+
+  const confirmEvidenceBuy = async (row: AnyObj) => {
+    const symbol = String(row?.symbol || "").toUpperCase();
+    if (!symbol || buyBusySymbol) return;
+
+    const notionalUsd = suggestedEvidenceBuyUsd();
+    if (notionalUsd < 1) {
+      setBuyMessage("No usable Crypto Allocation is available for a live buy.");
       return;
     }
-
-    const evidenceText = [
-      `Decision: ${String(row?.verdict || "").replaceAll("_", " ")}`,
-      `Historical expectancy: ${money(row?.historicalExpectancyUsd)}`,
-      `Evidence: ${Number(row?.evidenceTrades || 0)} outcomes`,
-    ].join("\n");
-
-    if (!window.confirm(`BUY ${money(notionalUsd)} of ${symbol} now?\n\n${evidenceText}\n\nThis submits a real Alpaca crypto market order.`)) return;
 
     setBuyBusySymbol(symbol);
     setBuyMessage("");
@@ -296,7 +280,7 @@ useEffect(() => {
 
       const body = await res.json();
       if (!res.ok || body?.ok === false) throw new Error(body?.detail || body?.message || `HTTP ${res.status}`);
-      setBuyMessage(body?.message || `Crypto buy submitted for ${symbol}.`);
+      setBuyMessage(body?.message || `Live crypto buy submitted for ${symbol} at ${money(notionalUsd)}.`);
     } catch (e: any) {
       setBuyMessage(e?.name === "AbortError" ? "Buy request timed out." : e?.message || `Buy failed for ${symbol}.`);
     } finally {
@@ -539,9 +523,9 @@ useEffect(() => {
                     <button
                       className="crypto-sell-now"
                       onClick={() => confirmEvidenceBuy(row)}
-                      disabled={Boolean(buyBusySymbol)}
+                      disabled={Boolean(buyBusySymbol) || suggestedEvidenceBuyUsd() < 1}
                     >
-                      {buyBusySymbol === row.symbol ? "SUBMITTING…" : "CONFIRM BUY"}
+                      {buyBusySymbol === row.symbol ? "SUBMITTING…" : suggestedEvidenceBuyUsd() > 0 ? `CONFIRM LIVE BUY · ${money(suggestedEvidenceBuyUsd())}` : "NO CRYPTO ALLOCATION"}
                     </button>
                   ) : <span className="muted">—</span>}
                 </td>
@@ -552,7 +536,7 @@ useEffect(() => {
         </table>
       </div>
       {buyMessage && <div className="crypto-notice crypto-sell-notice">{buyMessage}</div>}
-      <small className="muted">Evidence decisions remain advisory until you press CONFIRM BUY. The amount box now defaults to the current Crypto Allocation converted to USD (capped by available crypto buying power when reported), and you can still reduce or change it before confirming.</small>
+      <small className="muted">Evidence decisions remain advisory until you press CONFIRM LIVE BUY. The button shows the live amount calculated from the current Crypto Allocation and submits that one trade immediately when clicked.</small>
     </section>
 
     <section className="crypto-panel crypto-scanner-panel">
