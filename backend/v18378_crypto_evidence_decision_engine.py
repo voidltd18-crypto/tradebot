@@ -188,7 +188,7 @@ def install_v18378_crypto_evidence_decision_engine(app, m) -> None:
 
         broker_tradable_symbols, broker_filter_available = _alpaca_tradable_crypto_symbols(m)
 
-                positives = set(model.get("positiveSymbols") or [])
+        positives = set(model.get("positiveSymbols") or [])
         negatives = set(model.get("negativeSymbols") or [])
         positive_bins = set(model.get("positiveScoreBins") or [])
         symbol_stats = model.get("symbolStats") or {}
