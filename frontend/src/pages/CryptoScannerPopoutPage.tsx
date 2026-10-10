@@ -23,6 +23,8 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
   const [buyAlertMessage, setBuyAlertMessage] = useState("");
   const previousActionableRef = useRef<Set<string>>(new Set());
   const alertBaselineReadyRef = useRef(false);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const [soundReady, setSoundReady] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -78,11 +80,36 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
   }, [authToken]);
 
 
-  const playBuyJingle = () => {
+  const ensureAudioReady = async () => {
     try {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return;
-      const ctx = new AudioCtx();
+      if (!AudioCtx) return false;
+      let ctx = audioContextRef.current;
+      if (!ctx || ctx.state === "closed") {
+        ctx = new AudioCtx();
+        audioContextRef.current = ctx;
+      }
+      if (ctx.state === "suspended") {
+        await ctx.resume();
+      }
+      const ready = ctx.state === "running";
+      setSoundReady(ready);
+      return ready;
+    } catch (_) {
+      setSoundReady(false);
+      return false;
+    }
+  };
+
+  const playBuyJingle = async () => {
+    const ready = await ensureAudioReady();
+    const ctx = audioContextRef.current;
+    if (!ready || !ctx) {
+      setBuyAlertMessage("BUY alert fired, but the browser blocked audio. Click TEST SOUND once to arm sound for this session.");
+      return;
+    }
+
+    try {
       const now = ctx.currentTime;
       const master = ctx.createGain();
       master.gain.value = 0.95;
@@ -119,10 +146,28 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
           layer.stop(end);
         });
       });
-
-      window.setTimeout(() => { try { ctx.close(); } catch (_) {} }, 1900);
     } catch (_) {}
   };
+
+  const testBuySound = async () => {
+    const ready = await ensureAudioReady();
+    if (!ready) {
+      setBuyAlertMessage("Browser audio is still blocked. Click the pop-out once, then press TEST SOUND again.");
+      return;
+    }
+    setBuyAlertMessage("BUY alert sound armed for this session.");
+    await playBuyJingle();
+  };
+
+  useEffect(() => {
+    const unlock = () => { void ensureAudioReady(); };
+    window.addEventListener("pointerdown", unlock, { once: true });
+    window.addEventListener("keydown", unlock, { once: true });
+    return () => {
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("keydown", unlock);
+    };
+  }, []);
 
   const toggleBuyAlerts = async () => {
     if (buyAlertsEnabled) {
@@ -148,7 +193,7 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
       "BUY alerts armed and remembered. New WOULD BUY / STRONG WOULD BUY signals will chime" +
       ("Notification" in window && Notification.permission === "granted" ? " and show a desktop notification." : ".")
     );
-    playBuyJingle();
+    await playBuyJingle();
   };
 
   useEffect(() => {
@@ -179,7 +224,7 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
     for (const row of newlyActionable) {
       const symbol = String(row?.symbol || "").toUpperCase();
       const verdict = String(row?.verdict || "WOULD_BUY").replaceAll("_", " ");
-      playBuyJingle();
+      void playBuyJingle();
       setBuyAlertMessage(`NEW BUY SIGNAL · ${symbol} · ${verdict}`);
       if ("Notification" in window && Notification.permission === "granted") {
         try {
@@ -284,6 +329,14 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
             style={{cursor:"pointer"}}
           >
             {buyAlertsEnabled ? "🔔 BUY ALERTS ON" : "🔕 BUY ALERTS OFF"}
+          </button>
+          <button
+            type="button"
+            className="crypto-chip"
+            onClick={testBuySound}
+            style={{cursor:"pointer"}}
+          >
+            {soundReady ? "🔊 TEST SOUND" : "🔇 ARM / TEST SOUND"}
           </button>
           <span className="crypto-chip">{Number(evidence?.model?.outcomes || 0).toLocaleString("en-GB")} outcomes learned</span>
         </div>
