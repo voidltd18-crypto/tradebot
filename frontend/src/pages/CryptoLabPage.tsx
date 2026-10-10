@@ -512,7 +512,7 @@ useEffect(() => {
         <table className="crypto-scanner-table">
           <thead><tr><th>Rank</th><th>Symbol</th><th>Decision</th><th>Score</th><th>Historical expectancy</th><th>Evidence</th><th>Why</th><th>Action</th></tr></thead>
           <tbody>
-            {(Array.isArray(evidenceDecision?.decisions) ? evidenceDecision.decisions.slice(0, 12) : []).map((row: AnyObj, index: number) => (
+            {(Array.isArray(evidenceDecision?.decisions) ? [...evidenceDecision.decisions].sort((a: AnyObj, b: AnyObj) => { const priority = (v: unknown) => String(v || "") === "STRONG_WOULD_BUY" ? 0 : String(v || "") === "WOULD_BUY" ? 1 : String(v || "") === "WAIT" ? 2 : 3; return priority(a?.verdict) - priority(b?.verdict) || Number(b?.evidenceRank || 0) - Number(a?.evidenceRank || 0); }).slice(0, 12) : []).map((row: AnyObj, index: number) => (
               <tr key={`evidence-${row.symbol}`}>
                 <td>{index + 1}</td>
                 <td><b>{row.symbol}</b></td>
