@@ -88,7 +88,41 @@ def _evidence_verdict(m, scan: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+
+def _crypto_buying_power(account: Any) -> Dict[str, float]:
+    total = max(0.0, _num(getattr(account, "buying_power", 0.0)))
+    non_marginable = max(0.0, _num(getattr(account, "non_marginable_buying_power", 0.0)))
+    cash = max(0.0, _num(getattr(account, "cash", 0.0)))
+
+    # Alpaca crypto is non-marginable. If that field is available and positive,
+    # it is the real ceiling for crypto even when stock buying_power is larger.
+    usable = non_marginable if non_marginable > 0 else total
+    if cash > 0:
+        usable = min(usable, cash) if usable > 0 else cash
+
+    return {
+        "buyingPowerUsd": round(total, 2),
+        "nonMarginableBuyingPowerUsd": round(non_marginable, 2),
+        "cashUsd": round(cash, 2),
+        "usableCryptoBuyingPowerUsd": round(max(0.0, usable), 2),
+    }
+
+
 def install_v18379_confirm_crypto_buy(app, m) -> None:
+    @app.get("/v18/crypto-evidence/buy-preflight")
+    def v18379_crypto_buy_preflight(request: Request):
+        verify = getattr(m, "verify_api_key", None)
+        if callable(verify):
+            verify(request)
+
+        account = m.trading_client.get_account()
+        power = _crypto_buying_power(account)
+        return {
+            "ok": True,
+            "version": VERSION,
+            **power,
+        }
+
     @app.post("/v18/crypto-evidence/confirm-buy")
     def v18379_confirm_crypto_buy(
         request: Request,
@@ -110,13 +144,24 @@ def install_v18379_confirm_crypto_buy(app, m) -> None:
             raise HTTPException(status_code=400, detail="Minimum crypto buy is $1.00")
 
         account = m.trading_client.get_account()
-        buying_power = _num(getattr(account, "buying_power", 0.0))
+        power = _crypto_buying_power(account)
+        buying_power = _num(power.get("usableCryptoBuyingPowerUsd"))
         if buying_power <= 0:
-            raise HTTPException(status_code=400, detail="No buying power available")
+            print(
+                f"{VERSION} CONFIRMED CRYPTO BUY REJECTED | reason=NO_CRYPTO_BUYING_POWER "
+                f"requested=${amount:.2f} account={power}",
+                flush=True,
+            )
+            raise HTTPException(status_code=400, detail="No usable crypto buying power available")
         if amount > buying_power:
+            print(
+                f"{VERSION} CONFIRMED CRYPTO BUY REJECTED | reason=INSUFFICIENT_CRYPTO_BUYING_POWER "
+                f"requested=${amount:.2f} usable=${buying_power:.2f} account={power}",
+                flush=True,
+            )
             raise HTTPException(
                 status_code=400,
-                detail=f"Requested ${amount:.2f} exceeds available buying power ${buying_power:.2f}",
+                detail=f"Requested ${amount:.2f} exceeds usable crypto buying power ${buying_power:.2f}",
             )
 
         decision = _evidence_verdict(m, scan)
@@ -136,7 +181,18 @@ def install_v18379_confirm_crypto_buy(app, m) -> None:
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,
         )
-        submitted = m.trading_client.submit_order(order_data=order)
+        try:
+            submitted = m.trading_client.submit_order(order_data=order)
+        except Exception as exc:
+            print(
+                f"{VERSION} CONFIRMED CRYPTO BUY BROKER REJECTED | symbol={symbol} "
+                f"notional=${amount:.2f} error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"Alpaca rejected the crypto buy: {exc}",
+            )
         order_id = str(getattr(submitted, "id", "") or "")
 
         print(

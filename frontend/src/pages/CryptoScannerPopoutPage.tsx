@@ -11,6 +11,7 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
   const [error, setError] = useState("");
   const [buyBusySymbol, setBuyBusySymbol] = useState("");
   const [buyMessage, setBuyMessage] = useState("");
+  const [buyPreflight, setBuyPreflight] = useState<AnyObj | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -31,9 +32,10 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
     const load = async () => {
       try {
         const headers = { "X-API-Key": authToken };
-        const [shadowBody, bridgeBody] = await Promise.all([
+        const [shadowBody, bridgeBody, buyPreflightBody] = await Promise.all([
           fetchJson(`${API_URL}/v18/crypto-shadow`, { cache: "no-store", headers }),
           fetchJson(`${API_URL}/v18/crypto-bridge`, { cache: "no-store", headers }),
+          fetchJson(`${API_URL}/v18/crypto-evidence/buy-preflight`, { cache: "no-store", headers }),
         ]);
 
         const decisionBody = await fetchJson(
@@ -48,6 +50,7 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
         if (!alive) return;
         setShadow(shadowBody);
         setBridge(bridgeBody);
+        setBuyPreflight(buyPreflightBody);
         setEvidence(decisionBody);
         setError("");
       } catch (e: any) {
@@ -83,6 +86,7 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
     const buyingPowerUsd = Math.max(
       0,
       Number(
+        buyPreflight?.usableCryptoBuyingPowerUsd ??
         bridge?.accountCrypto?.buyingPowerUsd ??
         bridge?.accountCrypto?.buyingPower ??
         bridge?.buyingPowerUsd ??
