@@ -24,6 +24,7 @@ from backend.v18366_autonomous_ai_exit_promotion import install_v18366_autonomou
 from backend.v18371_global_stock_discovery import install_v18371_global_stock_discovery
 from backend.v18375_stock_recovery_watch import install_v18375_stock_recovery_watch
 from backend.v18376_keep_buying_after_loss import install_v18376_keep_buying_after_loss
+from backend.v18378_crypto_evidence_decision_engine import install_v18378_crypto_evidence_decision_engine
 from backend.v18373_buy_execution_recovery import install_v18373_buy_execution_recovery
 
 app = monolith.app
@@ -36,6 +37,7 @@ install_v18344_replay_lab(app, monolith)
 install_v18350_exit_incident_audit(app, monolith)
 install_v18351_live_stock_replay_capture(app, monolith)
 install_v18354_historical_evidence_accelerator(app, monolith)
+install_v18378_crypto_evidence_decision_engine(app, monolith)
 install_v18357_capital_earnback_ladder(app, monolith)
 install_v18360_ai_exit_manager(app, monolith)
 install_v18361_ai_exit_outcome_scorer(app, monolith)

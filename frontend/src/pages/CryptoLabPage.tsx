@@ -79,6 +79,8 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [ledgerHealth, setLedgerHealth] = useState<any>(null);
   const [accelerator, setAccelerator] = useState<any>(null);
   const [acceleratorError, setAcceleratorError] = useState<string>("");
+  const [evidenceDecision, setEvidenceDecision] = useState<any>(null);
+  const [evidenceDecisionError, setEvidenceDecisionError] = useState<string>("");
 
 
   const [error, setError] = useState("");
@@ -177,6 +179,23 @@ useEffect(() => {
       const warnings: string[] = [];
       if (shadowResult.status === "fulfilled") {
         setData(shadowResult.value);
+        try {
+          const controller = new AbortController();
+          const timer = window.setTimeout(() => controller.abort(), 8000);
+          const decisionRes = await fetch(`${API_URL}/v18/crypto-evidence-decisions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-API-Key": authToken },
+            body: JSON.stringify({ scans: Array.isArray(shadowResult.value?.scans) ? shadowResult.value.scans : [] }),
+            signal: controller.signal,
+          });
+          window.clearTimeout(timer);
+          const decisionBody = await decisionRes.json();
+          if (!decisionRes.ok) throw new Error(decisionBody?.detail || `HTTP ${decisionRes.status}`);
+          setEvidenceDecision(decisionBody);
+          setEvidenceDecisionError("");
+        } catch (err: any) {
+          setEvidenceDecisionError(err?.name === "AbortError" ? "timeout" : err?.message || "unavailable");
+        }
       } else {
         warnings.push(`scanner: ${shadowResult.reason?.name === "AbortError" ? "timeout" : shadowResult.reason?.message || "unavailable"}`);
       }
@@ -395,6 +414,43 @@ useEffect(() => {
       </div>
       {sellMessage && <div className="crypto-notice crypto-sell-notice">{sellMessage}</div>}
     </section>}
+
+    <section className="crypto-panel">
+      <div className="crypto-panel-head">
+        <div>
+          <h3><span className="panel-icon">◎</span> V18.3.78 Evidence Decision Engine</h3>
+          <p>Your accumulated Shadow outcomes now score the current live market feed. This is advisory only: it shows what the evidence model would select without submitting an order.</p>
+        </div>
+        <span className="crypto-chip">{Number(evidenceDecision?.model?.outcomes || 0).toLocaleString("en-GB")} outcomes learned</span>
+      </div>
+      {evidenceDecisionError && <div className="crypto-warning">Evidence engine: {evidenceDecisionError}</div>}
+      <div className="crypto-metric-grid">
+        <div className="crypto-metric"><span>Positive symbols</span><strong>{Number(evidenceDecision?.model?.positiveSymbols?.length || 0)}</strong></div>
+        <div className="crypto-metric"><span>Positive score bands</span><strong>{Number(evidenceDecision?.model?.positiveScoreBins?.length || 0)}</strong></div>
+        <div className="crypto-metric"><span>Blocked negative symbols</span><strong>{Number(evidenceDecision?.model?.negativeSymbols?.length || 0)}</strong></div>
+        <div className="crypto-metric"><span>Would select now</span><strong>{Number(evidenceDecision?.wouldSelect?.length || 0)}</strong></div>
+      </div>
+      <div className="crypto-table-wrap">
+        <table className="crypto-scanner-table">
+          <thead><tr><th>Rank</th><th>Symbol</th><th>Decision</th><th>Score</th><th>Historical expectancy</th><th>Evidence</th><th>Why</th></tr></thead>
+          <tbody>
+            {(Array.isArray(evidenceDecision?.decisions) ? evidenceDecision.decisions.slice(0, 12) : []).map((row: AnyObj, index: number) => (
+              <tr key={`evidence-${row.symbol}`}>
+                <td>{index + 1}</td>
+                <td><b>{row.symbol}</b></td>
+                <td><span className={`crypto-chip ${String(row.verdict || "").includes("BUY") ? "qualified" : row.verdict === "BLOCK" ? "loss" : "watching"}`}>{String(row.verdict || "WAIT").replaceAll("_", " ")}</span></td>
+                <td>{Number(row.score || 0).toFixed(3)}</td>
+                <td className={Number(row.historicalExpectancyUsd || 0) >= 0 ? "gain" : "loss"}>{money(row.historicalExpectancyUsd)}</td>
+                <td>{Number(row.evidenceTrades || 0)} outcomes</td>
+                <td>{String(row.reason || "—").replaceAll("_", " ")}</td>
+              </tr>
+            ))}
+            {!Array.isArray(evidenceDecision?.decisions) || !evidenceDecision.decisions.length ? <tr><td colSpan={7}>Waiting for current scanner evidence.</td></tr> : null}
+          </tbody>
+        </table>
+      </div>
+      <small className="muted">No broker order is submitted by this engine. It continuously compares current scanner candidates with the historical Shadow cohorts you have already collected.</small>
+    </section>
 
     <section className="crypto-panel crypto-scanner-panel">
       <div className="crypto-panel-head">
