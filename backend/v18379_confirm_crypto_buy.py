@@ -89,6 +89,13 @@ def _evidence_verdict(m, scan: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+def _alpaca_crypto_order_symbol(symbol: str) -> str:
+    normalised = _normalise_symbol(symbol)
+    if not normalised.endswith("/USD"):
+        return ""
+    return normalised.replace("/", "")
+
+
 def _crypto_buying_power(account: Any) -> Dict[str, float]:
     total = max(0.0, _num(getattr(account, "buying_power", 0.0)))
     non_marginable = max(0.0, _num(getattr(account, "non_marginable_buying_power", 0.0)))
@@ -175,8 +182,12 @@ def install_v18379_confirm_crypto_buy(app, m) -> None:
         if not symbol.endswith("/USD"):
             raise HTTPException(status_code=400, detail="Only USD crypto pairs are supported")
 
+        broker_symbol = _alpaca_crypto_order_symbol(symbol)
+        if not broker_symbol:
+            raise HTTPException(status_code=400, detail="Unable to convert crypto symbol for Alpaca")
+
         order = MarketOrderRequest(
-            symbol=symbol,
+            symbol=broker_symbol,
             notional=round(amount, 2),
             side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,
@@ -186,7 +197,8 @@ def install_v18379_confirm_crypto_buy(app, m) -> None:
         except Exception as exc:
             print(
                 f"{VERSION} CONFIRMED CRYPTO BUY BROKER REJECTED | symbol={symbol} "
-                f"notional=${amount:.2f} error={type(exc).__name__}: {exc}",
+                f"broker_symbol={broker_symbol} notional=${amount:.2f} "
+                f"error={type(exc).__name__}: {exc}",
                 flush=True,
             )
             raise HTTPException(
@@ -196,7 +208,7 @@ def install_v18379_confirm_crypto_buy(app, m) -> None:
         order_id = str(getattr(submitted, "id", "") or "")
 
         print(
-            f"{VERSION} USER CONFIRMED CRYPTO BUY | symbol={symbol} "
+            f"{VERSION} USER CONFIRMED CRYPTO BUY | symbol={symbol} broker_symbol={broker_symbol} "
             f"notional=${amount:.2f} verdict={decision['verdict']} "
             f"score={decision['score']:.3f} evidence={decision['evidenceTrades']} "
             f"expectancy=${decision['historicalExpectancyUsd']:.5f} order_id={order_id or '-'}",
@@ -208,6 +220,7 @@ def install_v18379_confirm_crypto_buy(app, m) -> None:
             "version": VERSION,
             "message": f"Confirmed crypto buy submitted for {symbol}.",
             "symbol": symbol,
+            "brokerSymbol": broker_symbol,
             "notionalUsd": round(amount, 2),
             "orderId": order_id or None,
             "decision": decision,
