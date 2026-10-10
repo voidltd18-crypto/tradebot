@@ -77,10 +77,7 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
       .slice(0, 20);
   }, [evidence]);
 
-  const confirmEvidenceBuy = async (row: AnyObj) => {
-    const symbol = String(row?.symbol || "").toUpperCase();
-    if (!symbol || buyBusySymbol) return;
-
+  const suggestedEvidenceBuyUsd = () => {
     const fxRate = Number(shadow?.fx?.usdToGbp || 0.7403);
     const allocatedGbp = Math.max(0, Number(bridge?.cryptoAllocatedGbp || 0));
     const buyingPowerUsd = Math.max(
@@ -93,38 +90,21 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
       )
     );
     const allocatedUsd = fxRate > 0 ? allocatedGbp / fxRate : allocatedGbp;
-    const suggestedUsd = Math.max(
-      1,
-      Math.floor(
-        buyingPowerUsd > 0
-          ? Math.min(allocatedUsd > 0 ? allocatedUsd : buyingPowerUsd, buyingPowerUsd)
-          : allocatedUsd > 0
-            ? allocatedUsd
-            : 25
-      )
-    );
+    const usableUsd = buyingPowerUsd > 0
+      ? Math.min(allocatedUsd > 0 ? allocatedUsd : buyingPowerUsd, buyingPowerUsd)
+      : allocatedUsd;
+    return usableUsd >= 1 ? Math.floor(usableUsd * 100) / 100 : 0;
+  };
 
-    const rawAmount = window.prompt(
-      `How much USD do you want to buy of ${symbol}?\n\nSuggested from current Crypto Allocation: $${suggestedUsd.toFixed(2)}`,
-      suggestedUsd.toFixed(2)
-    );
-    if (rawAmount === null) return;
+  const confirmEvidenceBuy = async (row: AnyObj) => {
+    const symbol = String(row?.symbol || "").toUpperCase();
+    if (!symbol || buyBusySymbol) return;
 
-    const notionalUsd = Number(rawAmount);
-    if (!Number.isFinite(notionalUsd) || notionalUsd < 1) {
-      setBuyMessage("Enter a valid amount of at least $1.00.");
+    const notionalUsd = suggestedEvidenceBuyUsd();
+    if (notionalUsd < 1) {
+      setBuyMessage("No usable Crypto Allocation is available for a live buy.");
       return;
     }
-
-    const evidenceText = [
-      `Decision: ${String(row?.verdict || "").replaceAll("_", " ")}`,
-      `Historical expectancy: ${money(row?.historicalExpectancyUsd)}`,
-      `Evidence: ${Number(row?.evidenceTrades || 0)} outcomes`,
-    ].join("\n");
-
-    if (!window.confirm(
-      `BUY ${money(notionalUsd)} of ${symbol} now?\n\n${evidenceText}\n\nThis submits a real Alpaca crypto market order.`
-    )) return;
 
     setBuyBusySymbol(symbol);
     setBuyMessage("");
@@ -149,7 +129,7 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
 
       const body = await res.json();
       if (!res.ok || body?.ok === false) throw new Error(body?.detail || body?.message || `HTTP ${res.status}`);
-      setBuyMessage(body?.message || `Crypto buy submitted for ${symbol}.`);
+      setBuyMessage(body?.message || `Live crypto buy submitted for ${symbol} at ${money(notionalUsd)}.`);
     } catch (e: any) {
       setBuyMessage(e?.name === "AbortError" ? "Buy request timed out." : e?.message || `Buy failed for ${symbol}.`);
     } finally {
@@ -191,8 +171,8 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
                 <td>{String(row.reason || "—").replaceAll("_", " ")}</td>
                 <td>
                   {String(row.verdict || "").includes("WOULD_BUY") ? (
-                    <button className="crypto-sell-now" onClick={() => confirmEvidenceBuy(row)} disabled={Boolean(buyBusySymbol)}>
-                      {buyBusySymbol === row.symbol ? "SUBMITTING…" : "CONFIRM BUY"}
+                    <button className="crypto-sell-now" onClick={() => confirmEvidenceBuy(row)} disabled={Boolean(buyBusySymbol) || suggestedEvidenceBuyUsd() < 1}>
+                      {buyBusySymbol === row.symbol ? "SUBMITTING…" : suggestedEvidenceBuyUsd() > 0 ? `CONFIRM LIVE BUY · ${money(suggestedEvidenceBuyUsd())}` : "NO CRYPTO ALLOCATION"}
                     </button>
                   ) : <span className="muted">—</span>}
                 </td>
@@ -204,7 +184,7 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
       </div>
 
       {buyMessage && <div className="crypto-notice crypto-sell-notice">{buyMessage}</div>}
-      <small className="muted">This is the same Evidence Decision Engine as the main Crypto Lab. Real buys still require your CONFIRM BUY click and final confirmation.</small>
+      <small className="muted">This is the same Evidence Decision Engine as the main Crypto Lab. A real buy is submitted only when you click the clearly labelled CONFIRM LIVE BUY button for that specific row.</small>
     </section>
   </main>;
 }
