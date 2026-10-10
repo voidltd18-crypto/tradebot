@@ -17,10 +17,65 @@ No broker order function is called anywhere in this module.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set, Tuple
+import time
 from fastapi import Body
 
 VERSION = "V18.3.78"
+_TRADABLE_CACHE_TTL_SECONDS = 300.0
+_tradable_crypto_cache: Set[str] = set()
+_tradable_crypto_cache_at = 0.0
+
+
+def _canonical_crypto_symbol(value: Any) -> str:
+    raw = str(value or "").upper().strip().replace("-", "/")
+    if not raw:
+        return ""
+    if "/" in raw:
+        base, quote = raw.split("/", 1)
+        return f"{base}/{quote}"
+    if raw.endswith("USD") and len(raw) > 3:
+        return f"{raw[:-3]}/USD"
+    return raw
+
+
+def _alpaca_tradable_crypto_symbols(m) -> Tuple[Set[str], bool]:
+    global _tradable_crypto_cache, _tradable_crypto_cache_at
+    now = time.time()
+    if _tradable_crypto_cache and (now - _tradable_crypto_cache_at) < _TRADABLE_CACHE_TTL_SECONDS:
+        return set(_tradable_crypto_cache), True
+
+    try:
+        assets = m.trading_client.get_all_assets()
+        tradable: Set[str] = set()
+        for asset in assets or []:
+            raw_symbol = str(getattr(asset, "symbol", "") or "").upper().strip()
+            if not raw_symbol:
+                continue
+            asset_class = str(getattr(asset, "asset_class", "") or "").lower()
+            is_crypto = "crypto" in asset_class or "/" in raw_symbol
+            if not is_crypto or not bool(getattr(asset, "tradable", False)):
+                continue
+            canonical = _canonical_crypto_symbol(raw_symbol)
+            if canonical.endswith("/USD"):
+                tradable.add(canonical)
+
+        _tradable_crypto_cache = tradable
+        _tradable_crypto_cache_at = now
+        return set(tradable), True
+    except Exception as exc:
+        if _tradable_crypto_cache:
+            print(
+                f"{VERSION} BROKER ASSET FILTER | refresh_failed={type(exc).__name__}: {exc} using_cached={len(_tradable_crypto_cache)}",
+                flush=True,
+            )
+            return set(_tradable_crypto_cache), True
+        print(
+            f"{VERSION} BROKER ASSET FILTER | unavailable={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return set(), False
+
 
 
 def _num(value: Any, default: float = 0.0) -> float:
@@ -131,7 +186,9 @@ def install_v18378_crypto_evidence_decision_engine(app, m) -> None:
         scans = scans if isinstance(scans, list) else []
         model = _build_model(m)
 
-        positives = set(model.get("positiveSymbols") or [])
+        broker_tradable_symbols, broker_filter_available = _alpaca_tradable_crypto_symbols(m)
+
+                positives = set(model.get("positiveSymbols") or [])
         negatives = set(model.get("negativeSymbols") or [])
         positive_bins = set(model.get("positiveScoreBins") or [])
         symbol_stats = model.get("symbolStats") or {}
@@ -141,7 +198,7 @@ def install_v18378_crypto_evidence_decision_engine(app, m) -> None:
         for scan in scans:
             if not isinstance(scan, dict):
                 continue
-            symbol = str(scan.get("symbol") or "").upper().strip()
+            symbol = _canonical_crypto_symbol(scan.get("symbol"))
             if not symbol:
                 continue
 
@@ -157,8 +214,15 @@ def install_v18378_crypto_evidence_decision_engine(app, m) -> None:
             positive_symbol = symbol in positives
             positive_band = band in positive_bins
             negative_symbol = symbol in negatives
+            broker_tradable = symbol in broker_tradable_symbols if broker_filter_available else False
 
-            if negative_symbol:
+            if not broker_filter_available:
+                verdict = "WAIT"
+                reason = "BROKER_TRADABILITY_UNAVAILABLE"
+            elif not broker_tradable:
+                verdict = "BLOCK"
+                reason = "BROKER_NOT_TRADABLE"
+            elif negative_symbol:
                 verdict = "BLOCK"
                 reason = "HISTORICALLY_NEGATIVE_SYMBOL"
             elif not liquid:
@@ -202,6 +266,8 @@ def install_v18378_crypto_evidence_decision_engine(app, m) -> None:
                     "positiveSymbol": positive_symbol,
                     "positiveScoreBand": positive_band,
                     "negativeSymbol": negative_symbol,
+                    "brokerTradable": broker_tradable,
+                    "brokerTradabilityAvailable": broker_filter_available,
                     "symbolHistory": sym,
                     "scoreBandHistory": bstat,
                     "historicalExpectancyUsd": round(expectancy, 5),
@@ -230,6 +296,8 @@ def install_v18378_crypto_evidence_decision_engine(app, m) -> None:
                 "positiveSymbols": model.get("positiveSymbols"),
                 "negativeSymbols": model.get("negativeSymbols"),
                 "positiveScoreBins": model.get("positiveScoreBins"),
+                "brokerTradableSymbols": sorted(broker_tradable_symbols),
+                "brokerTradabilityAvailable": broker_filter_available,
             },
             "wouldSelect": selected[:10],
             "decisions": decisions,
