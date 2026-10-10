@@ -232,7 +232,32 @@ useEffect(() => {
     const symbol = String(row?.symbol || "").toUpperCase();
     if (!symbol || buyBusySymbol) return;
 
-    const rawAmount = window.prompt(`How much USD do you want to buy of ${symbol}?`, "25");
+    const fxRate = Number(data?.fx?.usdToGbp || 0.7403);
+    const allocatedGbp = Math.max(0, Number(bridge?.cryptoAllocatedGbp || 0));
+    const buyingPowerUsd = Math.max(
+      0,
+      Number(
+        bridge?.accountCrypto?.buyingPowerUsd ??
+        bridge?.accountCrypto?.buyingPower ??
+        bridge?.buyingPowerUsd ??
+        0
+      )
+    );
+    const allocatedUsd = fxRate > 0 ? allocatedGbp / fxRate : allocatedGbp;
+    const suggestedUsd = Math.max(
+      1,
+      Math.floor(
+        buyingPowerUsd > 0
+          ? Math.min(allocatedUsd > 0 ? allocatedUsd : buyingPowerUsd, buyingPowerUsd)
+          : allocatedUsd > 0
+            ? allocatedUsd
+            : 25
+      )
+    );
+    const rawAmount = window.prompt(
+      `How much USD do you want to buy of ${symbol}?\n\nSuggested from current Crypto Allocation: ${suggestedUsd.toFixed(2)}`,
+      suggestedUsd.toFixed(2)
+    );
     if (rawAmount === null) return;
     const notionalUsd = Number(rawAmount);
     if (!Number.isFinite(notionalUsd) || notionalUsd < 1) {
@@ -514,7 +539,7 @@ useEffect(() => {
         </table>
       </div>
       {buyMessage && <div className="crypto-notice crypto-sell-notice">{buyMessage}</div>}
-      <small className="muted">Evidence decisions remain advisory until you press CONFIRM BUY. The button asks for the amount, shows one final confirmation, then submits the selected crypto buy to Alpaca.</small>
+      <small className="muted">Evidence decisions remain advisory until you press CONFIRM BUY. The amount box now defaults to the current Crypto Allocation converted to USD (capped by available crypto buying power when reported), and you can still reduce or change it before confirming.</small>
     </section>
 
     <section className="crypto-panel crypto-scanner-panel">
