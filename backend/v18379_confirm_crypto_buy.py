@@ -18,7 +18,7 @@ from fastapi import Body, HTTPException, Request
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 
-from backend.v18378_crypto_evidence_decision_engine import _build_model, _num, _score_bin
+from backend.v18378_crypto_evidence_decision_engine import _alpaca_tradable_crypto_symbols, _build_model, _num, _score_bin
 
 VERSION = "V18.3.79"
 CONFIRMATION = "CONFIRM CRYPTO BUY"
@@ -87,13 +87,6 @@ def _evidence_verdict(m, scan: Dict[str, Any]) -> Dict[str, Any]:
         "evidenceTrades": max(int(sym.get("trades") or 0), int(bstat.get("trades") or 0)),
     }
 
-
-
-def _alpaca_crypto_order_symbol(symbol: str) -> str:
-    normalised = _normalise_symbol(symbol)
-    if not normalised.endswith("/USD"):
-        return ""
-    return normalised.replace("/", "")
 
 
 def _crypto_buying_power(account: Any) -> Dict[str, float]:
@@ -182,9 +175,18 @@ def install_v18379_confirm_crypto_buy(app, m) -> None:
         if not symbol.endswith("/USD"):
             raise HTTPException(status_code=400, detail="Only USD crypto pairs are supported")
 
-        broker_symbol = _alpaca_crypto_order_symbol(symbol)
-        if not broker_symbol:
-            raise HTTPException(status_code=400, detail="Unable to convert crypto symbol for Alpaca")
+        broker_symbols, broker_filter_available = _alpaca_tradable_crypto_symbols(m)
+        if not broker_filter_available:
+            raise HTTPException(status_code=503, detail="Unable to verify Alpaca crypto tradability right now")
+        if symbol not in broker_symbols:
+            print(
+                f"{VERSION} CONFIRMED CRYPTO BUY REJECTED | reason=BROKER_NOT_TRADABLE "
+                f"symbol={symbol} notional=${amount:.2f}",
+                flush=True,
+            )
+            raise HTTPException(status_code=409, detail=f"{symbol} is not currently tradable on Alpaca")
+
+        broker_symbol = symbol
 
         order = MarketOrderRequest(
             symbol=broker_symbol,
