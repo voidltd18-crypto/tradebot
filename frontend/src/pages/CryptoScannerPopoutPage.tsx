@@ -84,22 +84,43 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
       if (!AudioCtx) return;
       const ctx = new AudioCtx();
       const now = ctx.currentTime;
-      [659.25, 783.99, 987.77].forEach((frequency, index) => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        const start = now + index * 0.16;
-        const end = start + 0.12;
-        osc.frequency.value = frequency;
-        osc.type = "sine";
-        gain.gain.setValueAtTime(0.0001, start);
-        gain.gain.exponentialRampToValueAtTime(0.12, start + 0.015);
-        gain.gain.exponentialRampToValueAtTime(0.0001, end);
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start(start);
-        osc.stop(end);
+      const master = ctx.createGain();
+      master.gain.value = 0.95;
+      master.connect(ctx.destination);
+
+      const notes = [659.25, 783.99, 987.77];
+      [0, 0.72].forEach((repeatOffset) => {
+        notes.forEach((frequency, index) => {
+          const start = now + repeatOffset + index * 0.18;
+          const end = start + 0.16;
+
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.frequency.value = frequency;
+          osc.type = "square";
+          gain.gain.setValueAtTime(0.0001, start);
+          gain.gain.exponentialRampToValueAtTime(0.35, start + 0.02);
+          gain.gain.exponentialRampToValueAtTime(0.0001, end);
+          osc.connect(gain);
+          gain.connect(master);
+          osc.start(start);
+          osc.stop(end);
+
+          const layer = ctx.createOscillator();
+          const layerGain = ctx.createGain();
+          layer.frequency.value = frequency * 2;
+          layer.type = "sine";
+          layerGain.gain.setValueAtTime(0.0001, start);
+          layerGain.gain.exponentialRampToValueAtTime(0.14, start + 0.02);
+          layerGain.gain.exponentialRampToValueAtTime(0.0001, end);
+          layer.connect(layerGain);
+          layerGain.connect(master);
+          layer.start(start);
+          layer.stop(end);
+        });
       });
-      window.setTimeout(() => { try { ctx.close(); } catch (_) {} }, 900);
+
+      window.setTimeout(() => { try { ctx.close(); } catch (_) {} }, 1900);
     } catch (_) {}
   };
 
