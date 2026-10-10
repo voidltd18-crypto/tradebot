@@ -22,6 +22,10 @@ import time
 from fastapi import Body
 
 VERSION = "V18.3.78"
+FAST_TRACK_MIN_SCORE = 0.50
+FAST_TRACK_MIN_15M_PCT = 0.15
+FAST_TRACK_MIN_60M_PCT = 0.25
+FAST_TRACK_MIN_60M_LIQUIDITY_USD = 100.0
 _TRADABLE_CACHE_TTL_SECONDS = 300.0
 _tradable_crypto_cache: Set[str] = set()
 _tradable_crypto_cache_at = 0.0
@@ -210,11 +214,22 @@ def install_v18378_crypto_evidence_decision_engine(app, m) -> None:
             liquid = scan.get("liquid") is not False
             ret15 = _num(scan.get("return15mPct"))
             ret60 = _num(scan.get("return60mPct"))
+            liquidity60m = _num(scan.get("liquidity60mUsd"))
 
             positive_symbol = symbol in positives
             positive_band = band in positive_bins
             negative_symbol = symbol in negatives
             broker_tradable = symbol in broker_tradable_symbols if broker_filter_available else False
+
+            fast_track = bool(
+                broker_tradable
+                and not negative_symbol
+                and (positive_symbol or positive_band)
+                and score >= FAST_TRACK_MIN_SCORE
+                and ret15 >= FAST_TRACK_MIN_15M_PCT
+                and ret60 >= FAST_TRACK_MIN_60M_PCT
+                and liquidity60m >= FAST_TRACK_MIN_60M_LIQUIDITY_USD
+            )
 
             if not broker_filter_available:
                 verdict = "WAIT"
@@ -225,18 +240,21 @@ def install_v18378_crypto_evidence_decision_engine(app, m) -> None:
             elif negative_symbol:
                 verdict = "BLOCK"
                 reason = "HISTORICALLY_NEGATIVE_SYMBOL"
+            elif backend_qualified and liquid and positive_symbol and positive_band:
+                verdict = "STRONG_WOULD_BUY"
+                reason = "POSITIVE_SYMBOL_AND_SCORE_BAND"
+            elif backend_qualified and liquid and (positive_symbol or positive_band):
+                verdict = "WOULD_BUY"
+                reason = "POSITIVE_HISTORICAL_COHORT"
+            elif fast_track:
+                verdict = "FAST_TRACK"
+                reason = "WIDER_MOMENTUM_POSITIVE_EVIDENCE"
             elif not liquid:
                 verdict = "WAIT"
                 reason = "THIN_LIQUIDITY"
             elif not backend_qualified:
                 verdict = "WAIT"
                 reason = "BASE_SCANNER_NOT_QUALIFIED"
-            elif positive_symbol and positive_band:
-                verdict = "STRONG_WOULD_BUY"
-                reason = "POSITIVE_SYMBOL_AND_SCORE_BAND"
-            elif positive_symbol or positive_band:
-                verdict = "WOULD_BUY"
-                reason = "POSITIVE_HISTORICAL_COHORT"
             else:
                 verdict = "WAIT"
                 reason = "UNPROVEN_HISTORICAL_COHORT"
@@ -263,6 +281,8 @@ def install_v18378_crypto_evidence_decision_engine(app, m) -> None:
                     "return60mPct": round(ret60, 4),
                     "backendQualified": backend_qualified,
                     "liquid": liquid,
+                    "liquidity60mUsd": round(liquidity60m, 2),
+                    "fastTrack": fast_track,
                     "positiveSymbol": positive_symbol,
                     "positiveScoreBand": positive_band,
                     "negativeSymbol": negative_symbol,
@@ -282,6 +302,7 @@ def install_v18378_crypto_evidence_decision_engine(app, m) -> None:
             for row in decisions
             if row.get("verdict") in ("STRONG_WOULD_BUY", "WOULD_BUY")
         ]
+        fast_track_rows = [row for row in decisions if row.get("verdict") == "FAST_TRACK"]
 
         return {
             "ok": True,
@@ -300,12 +321,21 @@ def install_v18378_crypto_evidence_decision_engine(app, m) -> None:
                 "brokerTradabilityAvailable": broker_filter_available,
             },
             "wouldSelect": selected[:10],
+            "fastTrack": fast_track_rows[:20],
+            "fastTrackRules": {
+                "minScore": FAST_TRACK_MIN_SCORE,
+                "min15mPct": FAST_TRACK_MIN_15M_PCT,
+                "min60mPct": FAST_TRACK_MIN_60M_PCT,
+                "minLiquidity60mUsd": FAST_TRACK_MIN_60M_LIQUIDITY_USD,
+                "requiresPositiveHistoricalEvidence": True,
+                "liveBuyEnabled": False,
+            },
             "decisions": decisions,
         }
 
     print(
         f"{VERSION} CRYPTO EVIDENCE DECISION ENGINE | installed "
         "mode=SHADOW live_authority=False orders=False "
-        "historical_symbols=ON score_bands=ON current_scanner=ON",
+        "historical_symbols=ON score_bands=ON current_scanner=ON fast_track=ADVISORY_ONLY",
         flush=True,
     )
