@@ -244,7 +244,8 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
     const priority = (v: unknown) =>
       String(v || "") === "STRONG_WOULD_BUY" ? 0 :
       String(v || "") === "WOULD_BUY" ? 1 :
-      String(v || "") === "WAIT" ? 2 : 3;
+      String(v || "") === "FAST_TRACK" ? 2 :
+      String(v || "") === "WAIT" ? 3 : 4;
     return list
       .sort((a: AnyObj, b: AnyObj) =>
         priority(a?.verdict) - priority(b?.verdict) ||
@@ -349,7 +350,7 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
         <div className="crypto-metric"><span>Positive symbols</span><strong>{Number(evidence?.model?.positiveSymbols?.length || 0)}</strong></div>
         <div className="crypto-metric"><span>Positive score bands</span><strong>{Number(evidence?.model?.positiveScoreBins?.length || 0)}</strong></div>
         <div className="crypto-metric"><span>Blocked negative symbols</span><strong>{Number(evidence?.model?.negativeSymbols?.length || 0)}</strong></div>
-        <div className="crypto-metric"><span>Would select now</span><strong>{Number(evidence?.wouldSelect?.length || 0)}</strong></div>
+        <div className="crypto-metric"><span>Would select now</span><strong>{Number(evidence?.wouldSelect?.length || 0)}</strong><small>{Number(evidence?.fastTrack?.length || 0)} fast track</small></div>
       </div>
 
       <div className="crypto-table-wrap">
@@ -360,7 +361,7 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
               <tr key={`evidence-${row.symbol}`}>
                 <td>{index + 1}</td>
                 <td><b>{row.symbol}</b></td>
-                <td><span className={`crypto-chip ${String(row.verdict || "").includes("BUY") ? "qualified" : row.verdict === "BLOCK" ? "loss" : "watching"}`}>{String(row.verdict || "WAIT").replaceAll("_", " ")}</span></td>
+                <td><span className={`crypto-chip ${String(row.verdict || "").includes("BUY") ? "qualified" : row.verdict === "BLOCK" ? "loss" : row.verdict === "FAST_TRACK" ? "qualified" : "watching"}`}>{String(row.verdict || "WAIT").replaceAll("_", " ")}</span></td>
                 <td>{Number(row.score || 0).toFixed(3)}</td>
                 <td className={Number(row.historicalExpectancyUsd || 0) >= 0 ? "gain" : "loss"}>{money(row.historicalExpectancyUsd)}</td>
                 <td>{Number(row.evidenceTrades || 0)} outcomes</td>
