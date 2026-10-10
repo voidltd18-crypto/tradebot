@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { API_URL } from "../lib/api";
 import type { AnyObj } from "../lib/types";
 
@@ -12,6 +12,10 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
   const [buyBusySymbol, setBuyBusySymbol] = useState("");
   const [buyMessage, setBuyMessage] = useState("");
   const [buyPreflight, setBuyPreflight] = useState<AnyObj | null>(null);
+  const [buyAlertsEnabled, setBuyAlertsEnabled] = useState(false);
+  const [buyAlertMessage, setBuyAlertMessage] = useState("");
+  const previousActionableRef = useRef<Set<string>>(new Set());
+  const alertBaselineReadyRef = useRef(false);
 
   useEffect(() => {
     let alive = true;
@@ -65,6 +69,87 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
       window.clearInterval(id);
     };
   }, [authToken]);
+
+
+  const playBuyJingle = () => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      const now = ctx.currentTime;
+      [659.25, 783.99, 987.77].forEach((frequency, index) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        const start = now + index * 0.16;
+        const end = start + 0.12;
+        osc.frequency.value = frequency;
+        osc.type = "sine";
+        gain.gain.setValueAtTime(0.0001, start);
+        gain.gain.exponentialRampToValueAtTime(0.12, start + 0.015);
+        gain.gain.exponentialRampToValueAtTime(0.0001, end);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(start);
+        osc.stop(end);
+      });
+      window.setTimeout(() => { try { ctx.close(); } catch (_) {} }, 900);
+    } catch (_) {}
+  };
+
+  const toggleBuyAlerts = async () => {
+    if (buyAlertsEnabled) {
+      setBuyAlertsEnabled(false);
+      setBuyAlertMessage("BUY alerts muted.");
+      return;
+    }
+
+    if ("Notification" in window && Notification.permission === "default") {
+      try { await Notification.requestPermission(); } catch (_) {}
+    }
+
+    previousActionableRef.current = new Set(
+      (Array.isArray(evidence?.decisions) ? evidence.decisions : [])
+        .filter((row: AnyObj) => String(row?.verdict || "").includes("WOULD_BUY"))
+        .map((row: AnyObj) => String(row?.symbol || "").toUpperCase())
+    );
+    alertBaselineReadyRef.current = true;
+    setBuyAlertsEnabled(true);
+    setBuyAlertMessage(
+      "BUY alerts armed. New WOULD BUY / STRONG WOULD BUY signals will chime" +
+      ("Notification" in window && Notification.permission === "granted" ? " and show a desktop notification." : ".")
+    );
+    playBuyJingle();
+  };
+
+  useEffect(() => {
+    if (!buyAlertsEnabled || !evidence || !alertBaselineReadyRef.current) return;
+
+    const actionable = (Array.isArray(evidence?.decisions) ? evidence.decisions : [])
+      .filter((row: AnyObj) => String(row?.verdict || "").includes("WOULD_BUY"));
+
+    const current = new Set(actionable.map((row: AnyObj) => String(row?.symbol || "").toUpperCase()));
+    const newlyActionable = actionable.filter((row: AnyObj) => {
+      const symbol = String(row?.symbol || "").toUpperCase();
+      return symbol && !previousActionableRef.current.has(symbol);
+    });
+
+    for (const row of newlyActionable) {
+      const symbol = String(row?.symbol || "").toUpperCase();
+      const verdict = String(row?.verdict || "WOULD_BUY").replaceAll("_", " ");
+      playBuyJingle();
+      setBuyAlertMessage(`NEW BUY SIGNAL · ${symbol} · ${verdict}`);
+      if ("Notification" in window && Notification.permission === "granted") {
+        try {
+          new Notification("TradeBot BUY signal", {
+            body: `${symbol} · ${verdict} · Score ${Number(row?.score || 0).toFixed(3)}`,
+            tag: `tradebot-buy-${symbol}`,
+          });
+        } catch (_) {}
+      }
+    }
+
+    previousActionableRef.current = current;
+  }, [evidence, buyAlertsEnabled]);
 
   const rows = useMemo(() => {
     const list = Array.isArray(evidence?.decisions) ? [...evidence.decisions] : [];
@@ -148,8 +233,19 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
           <h3><span className="panel-icon">◎</span> V18.3.78 Evidence Decision Engine · Pop-out</h3>
           <p>Dedicated evidence view. Refreshes every 15 seconds and keeps actionable BUY decisions at the top.</p>
         </div>
-        <span className="crypto-chip">{Number(evidence?.model?.outcomes || 0).toLocaleString("en-GB")} outcomes learned</span>
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",justifyContent:"flex-end"}}>
+          <button
+            type="button"
+            className="crypto-chip"
+            onClick={toggleBuyAlerts}
+            style={{cursor:"pointer"}}
+          >
+            {buyAlertsEnabled ? "🔔 BUY ALERTS ON" : "🔕 BUY ALERTS OFF"}
+          </button>
+          <span className="crypto-chip">{Number(evidence?.model?.outcomes || 0).toLocaleString("en-GB")} outcomes learned</span>
+        </div>
       </div>
+      {buyAlertMessage && <div className="crypto-notice">{buyAlertMessage}</div>}
 
       {error && <div className="crypto-warning">Evidence engine: {error}</div>}
 
