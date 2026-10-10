@@ -28,7 +28,7 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
     let alive = true;
     const load = async () => {
       try {
-        const headers = { "X-API-Key": authToken, "X-Auth-Token": authToken, "x-api-key": authToken };
+        const headers = { "X-API-Key": authToken };
         const [shadowRes, bridgeRes] = await Promise.all([
           fetch(`${API_URL}/v18/crypto-shadow`, { cache: "no-store", headers }),
           fetch(`${API_URL}/v18/crypto-bridge`, { cache: "no-store", headers }),
