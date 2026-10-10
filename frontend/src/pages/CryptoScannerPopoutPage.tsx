@@ -2,7 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { API_URL } from "../lib/api";
 import type { AnyObj } from "../lib/types";
 
-const money = (n: unknown) => `$${Number(n || 0).toFixed(2)}`;
+const money = (n: unknown) => `${Number(n || 0).toFixed(2)}`;
+const BUY_ALERTS_STORAGE_KEY = "tradebot_evidence_buy_alerts_enabled";
 
 export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
   const [shadow, setShadow] = useState<AnyObj | null>(null);
@@ -12,7 +13,13 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
   const [buyBusySymbol, setBuyBusySymbol] = useState("");
   const [buyMessage, setBuyMessage] = useState("");
   const [buyPreflight, setBuyPreflight] = useState<AnyObj | null>(null);
-  const [buyAlertsEnabled, setBuyAlertsEnabled] = useState(false);
+  const [buyAlertsEnabled, setBuyAlertsEnabled] = useState(() => {
+    try {
+      return window.localStorage.getItem(BUY_ALERTS_STORAGE_KEY) === "true";
+    } catch (_) {
+      return false;
+    }
+  });
   const [buyAlertMessage, setBuyAlertMessage] = useState("");
   const previousActionableRef = useRef<Set<string>>(new Set());
   const alertBaselineReadyRef = useRef(false);
@@ -99,7 +106,8 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
   const toggleBuyAlerts = async () => {
     if (buyAlertsEnabled) {
       setBuyAlertsEnabled(false);
-      setBuyAlertMessage("BUY alerts muted.");
+      try { window.localStorage.setItem(BUY_ALERTS_STORAGE_KEY, "false"); } catch (_) {}
+      setBuyAlertMessage("BUY alerts muted. This setting will be remembered.");
       return;
     }
 
@@ -114,15 +122,29 @@ export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
     );
     alertBaselineReadyRef.current = true;
     setBuyAlertsEnabled(true);
+    try { window.localStorage.setItem(BUY_ALERTS_STORAGE_KEY, "true"); } catch (_) {}
     setBuyAlertMessage(
-      "BUY alerts armed. New WOULD BUY / STRONG WOULD BUY signals will chime" +
+      "BUY alerts armed and remembered. New WOULD BUY / STRONG WOULD BUY signals will chime" +
       ("Notification" in window && Notification.permission === "granted" ? " and show a desktop notification." : ".")
     );
     playBuyJingle();
   };
 
   useEffect(() => {
-    if (!buyAlertsEnabled || !evidence || !alertBaselineReadyRef.current) return;
+    if (!buyAlertsEnabled || !evidence) return;
+
+    if (!alertBaselineReadyRef.current) {
+      previousActionableRef.current = new Set(
+        (Array.isArray(evidence?.decisions) ? evidence.decisions : [])
+          .filter((row: AnyObj) => String(row?.verdict || "").includes("WOULD_BUY"))
+          .map((row: AnyObj) => String(row?.symbol || "").toUpperCase())
+      );
+      alertBaselineReadyRef.current = true;
+      setBuyAlertMessage(
+        "BUY alerts restored from your saved setting. Waiting for a new actionable signal."
+      );
+      return;
+    }
 
     const actionable = (Array.isArray(evidence?.decisions) ? evidence.decisions : [])
       .filter((row: AnyObj) => String(row?.verdict || "").includes("WOULD_BUY"));
