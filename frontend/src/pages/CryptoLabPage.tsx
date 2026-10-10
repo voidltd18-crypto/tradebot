@@ -83,6 +83,7 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [evidenceDecisionError, setEvidenceDecisionError] = useState<string>("");
   const [buyBusySymbol, setBuyBusySymbol] = useState<string>("");
   const [buyMessage, setBuyMessage] = useState<string>("");
+  const [buyPreflight, setBuyPreflight] = useState<AnyObj | null>(null);
 
 
   const [error, setError] = useState("");
@@ -170,11 +171,12 @@ useEffect(() => {
     const load = async () => {
       // V18.2.67: requests are independent. A slow history/bridge endpoint must
       // never leave the entire 24/7 Crypto Lab stuck on the loading card.
-      const [shadowResult, bridgeResult, historyResult, acceleratorResult] = await Promise.allSettled([
+      const [shadowResult, bridgeResult, historyResult, acceleratorResult, buyPreflightResult] = await Promise.allSettled([
         fetchJson(`${API_URL}/v18/crypto-shadow`, 8000),
         fetchJson(`${API_URL}/v18/crypto-bridge`, 8000),
         fetchJson(`${API_URL}/v18/crypto-history?limit=5000`, 8000),
         fetchJson(`${API_URL}/v18/crypto-evidence-accelerator`, 8000),
+        fetchJson(`${API_URL}/v18/crypto-evidence/buy-preflight`, 8000),
       ]);
       if (!alive) return;
 
@@ -211,6 +213,8 @@ useEffect(() => {
       } else if (historyResult.status === "rejected") {
         warnings.push(`history: ${historyResult.reason?.name === "AbortError" ? "timeout" : historyResult.reason?.message || "unavailable"}`);
       }
+      if (buyPreflightResult.status === "fulfilled") setBuyPreflight(buyPreflightResult.value);
+      else warnings.push(`buy preflight: ${buyPreflightResult.reason?.name === "AbortError" ? "timeout" : buyPreflightResult.reason?.message || "unavailable"}`);
       if (acceleratorResult.status === "fulfilled") {
         setAccelerator(acceleratorResult.value);
         setAcceleratorError("");
@@ -234,6 +238,7 @@ useEffect(() => {
     const buyingPowerUsd = Math.max(
       0,
       Number(
+        buyPreflight?.usableCryptoBuyingPowerUsd ??
         bridge?.accountCrypto?.buyingPowerUsd ??
         bridge?.accountCrypto?.buyingPower ??
         bridge?.buyingPowerUsd ??
