@@ -508,17 +508,17 @@ useEffect(() => {
         <div className="crypto-metric"><span>Positive symbols</span><strong>{Number(evidenceDecision?.model?.positiveSymbols?.length || 0)}</strong></div>
         <div className="crypto-metric"><span>Positive score bands</span><strong>{Number(evidenceDecision?.model?.positiveScoreBins?.length || 0)}</strong></div>
         <div className="crypto-metric"><span>Blocked negative symbols</span><strong>{Number(evidenceDecision?.model?.negativeSymbols?.length || 0)}</strong></div>
-        <div className="crypto-metric"><span>Would select now</span><strong>{Number(evidenceDecision?.wouldSelect?.length || 0)}</strong></div>
+        <div className="crypto-metric"><span>Would select now</span><strong>{Number(evidenceDecision?.wouldSelect?.length || 0)}</strong><small>{Number(evidenceDecision?.fastTrack?.length || 0)} fast track</small></div>
       </div>
       <div className="crypto-table-wrap">
         <table className="crypto-scanner-table">
           <thead><tr><th>Rank</th><th>Symbol</th><th>Decision</th><th>Score</th><th>Historical expectancy</th><th>Evidence</th><th>Why</th><th>Action</th></tr></thead>
           <tbody>
-            {(Array.isArray(evidenceDecision?.decisions) ? [...evidenceDecision.decisions].sort((a: AnyObj, b: AnyObj) => { const priority = (v: unknown) => String(v || "") === "STRONG_WOULD_BUY" ? 0 : String(v || "") === "WOULD_BUY" ? 1 : String(v || "") === "WAIT" ? 2 : 3; return priority(a?.verdict) - priority(b?.verdict) || Number(b?.evidenceRank || 0) - Number(a?.evidenceRank || 0); }).slice(0, 12) : []).map((row: AnyObj, index: number) => (
+            {(Array.isArray(evidenceDecision?.decisions) ? [...evidenceDecision.decisions].sort((a: AnyObj, b: AnyObj) => { const priority = (v: unknown) => String(v || "") === "STRONG_WOULD_BUY" ? 0 : String(v || "") === "WOULD_BUY" ? 1 : String(v || "") === "FAST_TRACK" ? 2 : String(v || "") === "WAIT" ? 3 : 4; return priority(a?.verdict) - priority(b?.verdict) || Number(b?.evidenceRank || 0) - Number(a?.evidenceRank || 0); }).slice(0, 12) : []).map((row: AnyObj, index: number) => (
               <tr key={`evidence-${row.symbol}`}>
                 <td>{index + 1}</td>
                 <td><b>{row.symbol}</b></td>
-                <td><span className={`crypto-chip ${String(row.verdict || "").includes("BUY") ? "qualified" : row.verdict === "BLOCK" ? "loss" : "watching"}`}>{String(row.verdict || "WAIT").replaceAll("_", " ")}</span></td>
+                <td><span className={`crypto-chip ${String(row.verdict || "").includes("BUY") ? "qualified" : row.verdict === "BLOCK" ? "loss" : row.verdict === "FAST_TRACK" ? "qualified" : "watching"}`}>{String(row.verdict || "WAIT").replaceAll("_", " ")}</span></td>
                 <td>{Number(row.score || 0).toFixed(3)}</td>
                 <td className={Number(row.historicalExpectancyUsd || 0) >= 0 ? "gain" : "loss"}>{money(row.historicalExpectancyUsd)}</td>
                 <td>{Number(row.evidenceTrades || 0)} outcomes</td>
@@ -541,7 +541,7 @@ useEffect(() => {
         </table>
       </div>
       {buyMessage && <div className="crypto-notice crypto-sell-notice">{buyMessage}</div>}
-      <small className="muted">Evidence decisions remain advisory until you press CONFIRM LIVE BUY. The button shows the live amount calculated from the current Crypto Allocation and submits that one trade immediately when clicked.</small>
+      <small className="muted">Evidence decisions remain advisory until you press CONFIRM LIVE BUY. FAST TRACK widens the search but stays advisory-only with no live BUY button. The button shows the live amount calculated from the current Crypto Allocation and submits that one trade immediately when clicked.</small>
     </section>
 
     <section className="crypto-panel crypto-scanner-panel">
