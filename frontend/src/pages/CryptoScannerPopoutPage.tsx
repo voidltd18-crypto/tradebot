@@ -3,127 +3,208 @@ import { API_URL } from "../lib/api";
 import type { AnyObj } from "../lib/types";
 
 const money = (n: unknown) => `$${Number(n || 0).toFixed(2)}`;
-const pct = (n: unknown) => `${Number(n || 0).toFixed(2)}%`;
-
-function scoreState(score: number, threshold: number) {
-  if (score >= Math.max(0.60, threshold - 0.08)) return { label: "NEAR ENTRY", cls: "near" };
-  if (score >= 0.50) return { label: "BUILDING", cls: "building" };
-  return { label: "WATCHING", cls: "watching" };
-}
-
-function fmtCountdown(seconds: number) {
-  const total = Math.max(0, Math.floor(seconds));
-  const mm = Math.floor(total / 60);
-  const ss = total % 60;
-  return `${mm}:${String(ss).padStart(2, "0")}`;
-}
 
 export function CryptoScannerPopoutPage({ authToken }: { authToken: string }) {
-  const [data, setData] = useState<AnyObj | null>(null);
+  const [shadow, setShadow] = useState<AnyObj | null>(null);
   const [bridge, setBridge] = useState<AnyObj | null>(null);
+  const [evidence, setEvidence] = useState<AnyObj | null>(null);
   const [error, setError] = useState("");
-  const [clockTick, setClockTick] = useState(0);
+  const [buyBusySymbol, setBuyBusySymbol] = useState("");
+  const [buyMessage, setBuyMessage] = useState("");
 
   useEffect(() => {
     let alive = true;
+
+    const fetchJson = async (url: string, options: RequestInit = {}, timeoutMs = 8000) => {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, { ...options, signal: controller.signal });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body?.detail || body?.message || `HTTP ${res.status}`);
+        return body;
+      } finally {
+        window.clearTimeout(timer);
+      }
+    };
+
     const load = async () => {
       try {
         const headers = { "X-API-Key": authToken };
-        const [shadowRes, bridgeRes] = await Promise.all([
-          fetch(`${API_URL}/v18/crypto-shadow`, { cache: "no-store", headers }),
-          fetch(`${API_URL}/v18/crypto-bridge`, { cache: "no-store", headers }),
+        const [shadowBody, bridgeBody] = await Promise.all([
+          fetchJson(`${API_URL}/v18/crypto-shadow`, { cache: "no-store", headers }),
+          fetchJson(`${API_URL}/v18/crypto-bridge`, { cache: "no-store", headers }),
         ]);
-        const shadowBody = await shadowRes.json();
-        const bridgeBody = await bridgeRes.json();
-        if (!shadowRes.ok) throw new Error(shadowBody?.detail || `Scanner HTTP ${shadowRes.status}`);
-        if (!bridgeRes.ok) throw new Error(bridgeBody?.detail || `Bridge HTTP ${bridgeRes.status}`);
+
+        const decisionBody = await fetchJson(
+          `${API_URL}/v18/crypto-evidence-decisions`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-API-Key": authToken },
+            body: JSON.stringify({ scans: Array.isArray(shadowBody?.scans) ? shadowBody.scans : [] }),
+          }
+        );
+
         if (!alive) return;
-        setData(shadowBody);
-        setBridge({ ...bridgeBody, __fetchedAt: Date.now() });
+        setShadow(shadowBody);
+        setBridge(bridgeBody);
+        setEvidence(decisionBody);
         setError("");
       } catch (e: any) {
-        if (alive) setError(e?.message || "Scanner unavailable");
+        if (alive) setError(e?.name === "AbortError" ? "Refresh timed out." : e?.message || "Evidence engine unavailable");
       }
     };
+
     load();
-    const refreshId = window.setInterval(load, 15000);
-    const tickId = window.setInterval(() => setClockTick(v => v + 1), 1000);
+    const id = window.setInterval(load, 15000);
     return () => {
       alive = false;
-      window.clearInterval(refreshId);
-      window.clearInterval(tickId);
+      window.clearInterval(id);
     };
   }, [authToken]);
 
-  const scans = useMemo(() => {
-    const rows = Array.isArray(data?.scans) ? [...data.scans] : [];
-    return rows.sort((a: AnyObj, b: AnyObj) =>
-      Number(Boolean(b?.qualified)) - Number(Boolean(a?.qualified)) ||
-      Number(b?.score || 0) - Number(a?.score || 0)
+  const rows = useMemo(() => {
+    const list = Array.isArray(evidence?.decisions) ? [...evidence.decisions] : [];
+    const priority = (v: unknown) =>
+      String(v || "") === "STRONG_WOULD_BUY" ? 0 :
+      String(v || "") === "WOULD_BUY" ? 1 :
+      String(v || "") === "WAIT" ? 2 : 3;
+    return list
+      .sort((a: AnyObj, b: AnyObj) =>
+        priority(a?.verdict) - priority(b?.verdict) ||
+        Number(b?.evidenceRank || 0) - Number(a?.evidenceRank || 0)
+      )
+      .slice(0, 20);
+  }, [evidence]);
+
+  const confirmEvidenceBuy = async (row: AnyObj) => {
+    const symbol = String(row?.symbol || "").toUpperCase();
+    if (!symbol || buyBusySymbol) return;
+
+    const fxRate = Number(shadow?.fx?.usdToGbp || 0.7403);
+    const allocatedGbp = Math.max(0, Number(bridge?.cryptoAllocatedGbp || 0));
+    const buyingPowerUsd = Math.max(
+      0,
+      Number(
+        bridge?.accountCrypto?.buyingPowerUsd ??
+        bridge?.accountCrypto?.buyingPower ??
+        bridge?.buyingPowerUsd ??
+        0
+      )
     );
-  }, [data]);
+    const allocatedUsd = fxRate > 0 ? allocatedGbp / fxRate : allocatedGbp;
+    const suggestedUsd = Math.max(
+      1,
+      Math.floor(
+        buyingPowerUsd > 0
+          ? Math.min(allocatedUsd > 0 ? allocatedUsd : buyingPowerUsd, buyingPowerUsd)
+          : allocatedUsd > 0
+            ? allocatedUsd
+            : 25
+      )
+    );
 
-  if (!data) {
-    return <main className="crypto-lab-page crypto-scanner-popout"><section className="crypto-panel"><strong>Crypto Scanner</strong><p className="muted">{error || "Loading scanner…"}</p></section></main>;
-  }
+    const rawAmount = window.prompt(
+      `How much USD do you want to buy of ${symbol}?\n\nSuggested from current Crypto Allocation: $${suggestedUsd.toFixed(2)}`,
+      suggestedUsd.toFixed(2)
+    );
+    if (rawAmount === null) return;
 
-  const entryScore = Number(data?.config?.entryScore || 0.34);
-  const fetchedAt = Number(bridge?.__fetchedAt || 0);
-  const elapsed = fetchedAt ? Math.max(0, Math.floor((Date.now() - fetchedAt) / 1000)) : 0;
-  void clockTick;
-  const nextDecisionSeconds = Math.max(0, Number(bridge?.nextNormalDecisionInSeconds || 0) - elapsed);
+    const notionalUsd = Number(rawAmount);
+    if (!Number.isFinite(notionalUsd) || notionalUsd < 1) {
+      setBuyMessage("Enter a valid amount of at least $1.00.");
+      return;
+    }
+
+    const evidenceText = [
+      `Decision: ${String(row?.verdict || "").replaceAll("_", " ")}`,
+      `Historical expectancy: ${money(row?.historicalExpectancyUsd)}`,
+      `Evidence: ${Number(row?.evidenceTrades || 0)} outcomes`,
+    ].join("\n");
+
+    if (!window.confirm(
+      `BUY ${money(notionalUsd)} of ${symbol} now?\n\n${evidenceText}\n\nThis submits a real Alpaca crypto market order.`
+    )) return;
+
+    setBuyBusySymbol(symbol);
+    setBuyMessage("");
+    try {
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 10000);
+      let res: Response;
+      try {
+        res = await fetch(`${API_URL}/v18/crypto-evidence/confirm-buy`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Auth-Token": authToken, "x-api-key": authToken },
+          body: JSON.stringify({
+            confirmation: "CONFIRM CRYPTO BUY",
+            notionalUsd,
+            scan: row,
+          }),
+          signal: controller.signal,
+        });
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+
+      const body = await res.json();
+      if (!res.ok || body?.ok === false) throw new Error(body?.detail || body?.message || `HTTP ${res.status}`);
+      setBuyMessage(body?.message || `Crypto buy submitted for ${symbol}.`);
+    } catch (e: any) {
+      setBuyMessage(e?.name === "AbortError" ? "Buy request timed out." : e?.message || `Buy failed for ${symbol}.`);
+    } finally {
+      setBuyBusySymbol("");
+    }
+  };
 
   return <main className="crypto-lab-page crypto-scanner-popout">
-    <section className="crypto-panel crypto-scanner-panel">
+    <section className="crypto-panel">
       <div className="crypto-panel-head">
         <div>
-          <h3><span className="panel-icon">◈</span> Crypto Scanner · Pop-out</h3>
-          <p>Live scanner-only view. Refreshes every 15 seconds so this window can stay open beside the main TradeBot dashboard.</p>
+          <h3><span className="panel-icon">◎</span> V18.3.78 Evidence Decision Engine · Pop-out</h3>
+          <p>Dedicated evidence view. Refreshes every 15 seconds and keeps actionable BUY decisions at the top.</p>
         </div>
-        <div className="scanner-state">
-          <span className="crypto-chip">{Number(data?.marketDiscovery?.discovered || scans.length)} discovered</span>
-          <span className="crypto-chip">{Number(data?.marketDiscovery?.eligible || scans.filter((s: AnyObj) => s.liquid !== false).length)} liquid</span>
-          <span className="crypto-chip">{scans.filter((s: AnyObj) => Boolean(s.qualified)).length} qualified</span>
-          <span className="crypto-chip crypto-countdown-chip">NEXT DECISION {fmtCountdown(nextDecisionSeconds)}</span>
-          <span className="crypto-chip crypto-cycle-chip">CYCLES {Number(bridge?.normalDecisionCycleCount || 0)}</span>
-          <span className="scanning-dot">●</span><span>Dynamic</span>
-        </div>
+        <span className="crypto-chip">{Number(evidence?.model?.outcomes || 0).toLocaleString("en-GB")} outcomes learned</span>
+      </div>
+
+      {error && <div className="crypto-warning">Evidence engine: {error}</div>}
+
+      <div className="crypto-metric-grid">
+        <div className="crypto-metric"><span>Positive symbols</span><strong>{Number(evidence?.model?.positiveSymbols?.length || 0)}</strong></div>
+        <div className="crypto-metric"><span>Positive score bands</span><strong>{Number(evidence?.model?.positiveScoreBins?.length || 0)}</strong></div>
+        <div className="crypto-metric"><span>Blocked negative symbols</span><strong>{Number(evidence?.model?.negativeSymbols?.length || 0)}</strong></div>
+        <div className="crypto-metric"><span>Would select now</span><strong>{Number(evidence?.wouldSelect?.length || 0)}</strong></div>
       </div>
 
       <div className="crypto-table-wrap">
         <table className="crypto-scanner-table">
-          <thead><tr><th>Symbol</th><th>Price</th><th>Score</th><th>15m</th><th>60m</th><th>60m Range</th><th>Liquidity</th><th>Status</th></tr></thead>
-          <tbody>{scans.map((s: AnyObj) => {
-            const score = Number(s.score || 0);
-            const min15 = Number(bridge?.min15mMomentumPct ?? -0.10);
-            const min60 = Number(bridge?.min60mMomentumPct ?? 0.00);
-            const ret15 = Number(s.return15mPct || 0);
-            const ret60 = Number(s.return60mPct || 0);
-            const backendQualified = Boolean(s.qualified);
-            let state = scoreState(score, entryScore);
-            if (s.liquid === false) state = { label: "BLOCKED · THIN LIQUIDITY", cls: "watching" };
-            else if (score < entryScore) state = { label: `BLOCKED · SCORE ${score.toFixed(3)} < ${entryScore.toFixed(2)}`, cls: "watching" };
-            else if (ret15 < min15) state = { label: `BLOCKED · 15m ${ret15.toFixed(2)}% < ${min15.toFixed(2)}%`, cls: "watching" };
-            else if (ret60 < min60) state = { label: `BLOCKED · 60m ${ret60.toFixed(2)}% < ${min60.toFixed(2)}%`, cls: "watching" };
-            else if (backendQualified) state = { label: nextDecisionSeconds > 0 ? `QUALIFIED · ${fmtCountdown(nextDecisionSeconds)}` : "QUALIFIED · DUE", cls: "qualified" };
-            else state = { label: "BLOCKED · BACKEND GATE", cls: "watching" };
-
-            const progress = Math.max(4, Math.min(100, (score / entryScore) * 100));
-            return <tr key={s.symbol} className={backendQualified ? "qualified-row" : ""}>
-              <td><strong>{s.symbol}</strong></td>
-              <td>{money(s.price)}</td>
-              <td><span className={`score-badge ${state.cls}`}>{score.toFixed(3)}</span></td>
-              <td className={ret15 >= 0 ? "gain" : "loss"}>{pct(ret15)}</td>
-              <td className={ret60 >= 0 ? "gain" : "loss"}>{pct(ret60)}</td>
-              <td>{pct(s.range60mPct)}</td>
-              <td><span className={s.liquid === false ? "loss" : "gain"}>{money(s.liquidity60mUsd)}</span><small style={{display:"block",opacity:.7}}>{s.liquid === false ? "THIN" : "LIQUID"}</small></td>
-              <td><div className="crypto-status-cell"><span className={`crypto-chip ${state.cls}`}>{state.label}</span><span className="score-track"><span style={{ width: `${progress}%` }} /></span></div></td>
-            </tr>;
-          })}</tbody>
+          <thead><tr><th>Rank</th><th>Symbol</th><th>Decision</th><th>Score</th><th>Historical expectancy</th><th>Evidence</th><th>Why</th><th>Action</th></tr></thead>
+          <tbody>
+            {rows.map((row: AnyObj, index: number) => (
+              <tr key={`evidence-${row.symbol}`}>
+                <td>{index + 1}</td>
+                <td><b>{row.symbol}</b></td>
+                <td><span className={`crypto-chip ${String(row.verdict || "").includes("BUY") ? "qualified" : row.verdict === "BLOCK" ? "loss" : "watching"}`}>{String(row.verdict || "WAIT").replaceAll("_", " ")}</span></td>
+                <td>{Number(row.score || 0).toFixed(3)}</td>
+                <td className={Number(row.historicalExpectancyUsd || 0) >= 0 ? "gain" : "loss"}>{money(row.historicalExpectancyUsd)}</td>
+                <td>{Number(row.evidenceTrades || 0)} outcomes</td>
+                <td>{String(row.reason || "—").replaceAll("_", " ")}</td>
+                <td>
+                  {String(row.verdict || "").includes("WOULD_BUY") ? (
+                    <button className="crypto-sell-now" onClick={() => confirmEvidenceBuy(row)} disabled={Boolean(buyBusySymbol)}>
+                      {buyBusySymbol === row.symbol ? "SUBMITTING…" : "CONFIRM BUY"}
+                    </button>
+                  ) : <span className="muted">—</span>}
+                </td>
+              </tr>
+            ))}
+            {!rows.length && <tr><td colSpan={8}>Waiting for current scanner evidence.</td></tr>}
+          </tbody>
         </table>
       </div>
-      {error && <div className="crypto-warning">Last refresh warning: {error}</div>}
-      {data?.lastError && <div className="crypto-warning">Engine warning: {data.lastError}</div>}
+
+      {buyMessage && <div className="crypto-notice crypto-sell-notice">{buyMessage}</div>}
+      <small className="muted">This is the same Evidence Decision Engine as the main Crypto Lab. Real buys still require your CONFIRM BUY click and final confirmation.</small>
     </section>
   </main>;
 }
