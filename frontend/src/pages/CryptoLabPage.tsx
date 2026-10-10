@@ -81,6 +81,8 @@ export function CryptoLabPage({ authToken }: { authToken: string }) {
   const [acceleratorError, setAcceleratorError] = useState<string>("");
   const [evidenceDecision, setEvidenceDecision] = useState<any>(null);
   const [evidenceDecisionError, setEvidenceDecisionError] = useState<string>("");
+  const [buyBusySymbol, setBuyBusySymbol] = useState<string>("");
+  const [buyMessage, setBuyMessage] = useState<string>("");
 
 
   const [error, setError] = useState("");
@@ -225,6 +227,57 @@ useEffect(() => {
       window.clearInterval(id);
     };
   }, [authToken]);
+
+  const confirmEvidenceBuy = async (row: AnyObj) => {
+    const symbol = String(row?.symbol || "").toUpperCase();
+    if (!symbol || buyBusySymbol) return;
+
+    const rawAmount = window.prompt(`How much USD do you want to buy of ${symbol}?`, "25");
+    if (rawAmount === null) return;
+    const notionalUsd = Number(rawAmount);
+    if (!Number.isFinite(notionalUsd) || notionalUsd < 1) {
+      setBuyMessage("Enter a valid amount of at least $1.00.");
+      return;
+    }
+
+    const evidenceText = [
+      `Decision: ${String(row?.verdict || "").replaceAll("_", " ")}`,
+      `Historical expectancy: ${money(row?.historicalExpectancyUsd)}`,
+      `Evidence: ${Number(row?.evidenceTrades || 0)} outcomes`,
+    ].join("\n");
+
+    if (!window.confirm(`BUY ${money(notionalUsd)} of ${symbol} now?\n\n${evidenceText}\n\nThis submits a real Alpaca crypto market order.`)) return;
+
+    setBuyBusySymbol(symbol);
+    setBuyMessage("");
+    try {
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 10000);
+      let res: Response;
+      try {
+        res = await fetch(`${API_URL}/v18/crypto-evidence/confirm-buy`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Auth-Token": authToken, "x-api-key": authToken },
+          body: JSON.stringify({
+            confirmation: "CONFIRM CRYPTO BUY",
+            notionalUsd,
+            scan: row,
+          }),
+          signal: controller.signal,
+        });
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+
+      const body = await res.json();
+      if (!res.ok || body?.ok === false) throw new Error(body?.detail || body?.message || `HTTP ${res.status}`);
+      setBuyMessage(body?.message || `Crypto buy submitted for ${symbol}.`);
+    } catch (e: any) {
+      setBuyMessage(e?.name === "AbortError" ? "Buy request timed out." : e?.message || `Buy failed for ${symbol}.`);
+    } finally {
+      setBuyBusySymbol("");
+    }
+  };
 
   const manualSellCrypto = async (position: AnyObj) => {
     const symbol = String(position?.symbol || "").toUpperCase();
@@ -432,7 +485,7 @@ useEffect(() => {
       </div>
       <div className="crypto-table-wrap">
         <table className="crypto-scanner-table">
-          <thead><tr><th>Rank</th><th>Symbol</th><th>Decision</th><th>Score</th><th>Historical expectancy</th><th>Evidence</th><th>Why</th></tr></thead>
+          <thead><tr><th>Rank</th><th>Symbol</th><th>Decision</th><th>Score</th><th>Historical expectancy</th><th>Evidence</th><th>Why</th><th>Action</th></tr></thead>
           <tbody>
             {(Array.isArray(evidenceDecision?.decisions) ? evidenceDecision.decisions.slice(0, 12) : []).map((row: AnyObj, index: number) => (
               <tr key={`evidence-${row.symbol}`}>
@@ -443,13 +496,25 @@ useEffect(() => {
                 <td className={Number(row.historicalExpectancyUsd || 0) >= 0 ? "gain" : "loss"}>{money(row.historicalExpectancyUsd)}</td>
                 <td>{Number(row.evidenceTrades || 0)} outcomes</td>
                 <td>{String(row.reason || "—").replaceAll("_", " ")}</td>
+                <td>
+                  {String(row.verdict || "").includes("WOULD_BUY") ? (
+                    <button
+                      className="crypto-sell-now"
+                      onClick={() => confirmEvidenceBuy(row)}
+                      disabled={Boolean(buyBusySymbol)}
+                    >
+                      {buyBusySymbol === row.symbol ? "SUBMITTING…" : "CONFIRM BUY"}
+                    </button>
+                  ) : <span className="muted">—</span>}
+                </td>
               </tr>
             ))}
-            {!Array.isArray(evidenceDecision?.decisions) || !evidenceDecision.decisions.length ? <tr><td colSpan={7}>Waiting for current scanner evidence.</td></tr> : null}
+            {!Array.isArray(evidenceDecision?.decisions) || !evidenceDecision.decisions.length ? <tr><td colSpan={8}>Waiting for current scanner evidence.</td></tr> : null}
           </tbody>
         </table>
       </div>
-      <small className="muted">No broker order is submitted by this engine. It continuously compares current scanner candidates with the historical Shadow cohorts you have already collected.</small>
+      {buyMessage && <div className="crypto-notice crypto-sell-notice">{buyMessage}</div>}
+      <small className="muted">Evidence decisions remain advisory until you press CONFIRM BUY. The button asks for the amount, shows one final confirmation, then submits the selected crypto buy to Alpaca.</small>
     </section>
 
     <section className="crypto-panel crypto-scanner-panel">
