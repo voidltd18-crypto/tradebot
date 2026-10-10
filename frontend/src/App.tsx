@@ -19,6 +19,7 @@ const ObservatoryPage = lazy(() => import("./pages/ObservatoryPage").then((modul
 const WeeklyReviewPage = lazy(() => import("./pages/WeeklyReviewPage").then((module) => ({ default: module.WeeklyReviewPage })));
 const AuditPage = lazy(() => import("./pages/AuditPage").then((module) => ({ default: module.AuditPage })));
 const CryptoLabPage = lazy(() => import("./pages/CryptoLabPage").then((module) => ({ default: module.CryptoLabPage })));
+const CryptoScannerPopoutPage = lazy(() => import("./pages/CryptoScannerPopoutPage").then((module) => ({ default: module.CryptoScannerPopoutPage })));
 const ReportsPage = lazy(() => import("./pages/ReportsPage").then((module) => ({ default: module.ReportsPage })));
 
 
@@ -64,6 +65,7 @@ export default function App() {
   }, [theme]);
   const isPhone = usePhoneLayout();
   const bot = useTradeBot(tab);
+  const scannerPopout = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("popout") === "crypto-scanner";
 
   function positionGlowStyle(position: AnyObj): React.CSSProperties {
     const pnlPct = Number(position?.pnlPct || 0);
@@ -76,6 +78,10 @@ export default function App() {
 
   if (!bot.authToken) {
     return <Login username={bot.secureUsername} password={bot.securePassword} error={bot.authError} setUsername={bot.setSecureUsername} setPassword={bot.setSecurePassword} onLogin={bot.secureLogin} />;
+  }
+
+  if (scannerPopout) {
+    return <div className="app ai-dashboard command-dashboard"><DashboardStyles /><Suspense fallback={<PageLoading />}><CryptoScannerPopoutPage authToken={bot.authToken} /></Suspense></div>;
   }
 
   const totalDeposited = Number(bot.reports?.totalDeposited || 0);
