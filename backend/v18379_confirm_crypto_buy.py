@@ -13,6 +13,8 @@ Important:
 from __future__ import annotations
 
 from typing import Any, Dict
+from threading import Lock
+from time import monotonic
 
 from fastapi import Body, HTTPException, Request
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -22,6 +24,9 @@ from backend.v18378_crypto_evidence_decision_engine import _alpaca_tradable_cryp
 
 VERSION = "V18.3.79"
 CONFIRMATION = "CONFIRM CRYPTO BUY"
+CONFIRMED_BUY_DUPLICATE_WINDOW_SECONDS = 30.0
+_confirmed_buy_submit_lock = Lock()
+_recent_confirmed_buy_submits: Dict[str, float] = {}
 
 
 def _normalise_symbol(value: Any) -> str:
@@ -188,6 +193,24 @@ def install_v18379_confirm_crypto_buy(app, m) -> None:
 
         broker_symbol = symbol
 
+        now = monotonic()
+        with _confirmed_buy_submit_lock:
+            previous_submit = _recent_confirmed_buy_submits.get(symbol)
+            if previous_submit is not None:
+                age = now - previous_submit
+                if age < CONFIRMED_BUY_DUPLICATE_WINDOW_SECONDS:
+                    remaining = max(1, int(CONFIRMED_BUY_DUPLICATE_WINDOW_SECONDS - age + 0.999))
+                    print(
+                        f"{VERSION} CONFIRMED CRYPTO BUY REJECTED | reason=DUPLICATE_SUBMIT_LOCK "
+                        f"symbol={symbol} remaining={remaining}s",
+                        flush=True,
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"{symbol} was just submitted. Duplicate buy blocked for {remaining}s.",
+                    )
+            _recent_confirmed_buy_submits[symbol] = now
+
         order = MarketOrderRequest(
             symbol=broker_symbol,
             notional=round(amount, 2),
@@ -197,6 +220,9 @@ def install_v18379_confirm_crypto_buy(app, m) -> None:
         try:
             submitted = m.trading_client.submit_order(order_data=order)
         except Exception as exc:
+            with _confirmed_buy_submit_lock:
+                if _recent_confirmed_buy_submits.get(symbol) == now:
+                    _recent_confirmed_buy_submits.pop(symbol, None)
             print(
                 f"{VERSION} CONFIRMED CRYPTO BUY BROKER REJECTED | symbol={symbol} "
                 f"broker_symbol={broker_symbol} notional=${amount:.2f} "
@@ -211,6 +237,7 @@ def install_v18379_confirm_crypto_buy(app, m) -> None:
 
         print(
             f"{VERSION} USER CONFIRMED CRYPTO BUY | symbol={symbol} broker_symbol={broker_symbol} "
+            f"duplicate_lock={int(CONFIRMED_BUY_DUPLICATE_WINDOW_SECONDS)}s "
             f"notional=${amount:.2f} verdict={decision['verdict']} "
             f"score={decision['score']:.3f} evidence={decision['evidenceTrades']} "
             f"expectancy=${decision['historicalExpectancyUsd']:.5f} order_id={order_id or '-'}",
