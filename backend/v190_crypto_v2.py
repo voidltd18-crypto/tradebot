@@ -88,7 +88,7 @@ def _discover_tradable_usd(m) -> List[str]:
 def _snapshot_batch(m, symbols: List[str]) -> Dict[str, Any]:
     if not symbols:
         return {}
-    url = "https://data.alpaca.markets/v1beta3/crypto/us/latest/snapshots"
+    url = "https://data.alpaca.markets/v1beta3/crypto/us/snapshots"
     r = requests.get(
         url,
         headers=_headers(m),
