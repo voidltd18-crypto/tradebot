@@ -317,7 +317,6 @@ def install_v190_crypto_v2(app, m) -> None:
     global _started, _original_live_buy
 
     m.V18232_CRYPTO_SHADOW_ENABLED = False
-    m.V18234_CRYPTO_LIVE_ENABLED = False
     m.V18307_SHADOW_EXTERNAL_MARKETS_ENABLED = False
 
     if hasattr(m, "_v18234_live_buy"):
@@ -344,7 +343,7 @@ def install_v190_crypto_v2(app, m) -> None:
         threading.Thread(target=_worker, args=(m,), daemon=True, name="v19-crypto-v2-shadow").start()
 
     print(
-        f"{VERSION} CRYPTO CLEAN REBUILD | old_shadow=OFF old_live_entries=OFF "
-        "new_engine=SHADOW_ONLY stock_logic=UNCHANGED",
+        f"{VERSION} CRYPTO CLEAN REBUILD | old_shadow=OFF old_live_entries=BLOCKED "
+        "legacy_exit_protection=ON new_engine=SHADOW_ONLY stock_logic=UNCHANGED",
         flush=True,
     )
