@@ -8,8 +8,6 @@ import type { ActionFn, AnyObj, PositionStyleFn } from "../lib/types";
 
 export function OverviewPage({ data, banking, message, positions, trades, rate, bestCandidate, aiConfidence, marketRegime, riskLabel, currentAction, botHealth, aiReasons, positionSettings, fetchData, action, positionGlowStyle, onExportFullBot, exportBusy, authToken }: { data: AnyObj; banking: AnyObj; message: string; positions: AnyObj[]; trades: AnyObj[]; rate: number; bestCandidate?: AnyObj; aiConfidence: number; marketRegime: string; riskLabel: string; currentAction: string; botHealth: number; aiReasons: string[]; positionSettings: AnyObj; fetchData: (force?: boolean) => Promise<void>; action: ActionFn; positionGlowStyle: PositionStyleFn; onExportFullBot: () => void; exportBusy: boolean; authToken: string }) {
   const [taxCentre, setTaxCentre] = useState<AnyObj | null>(null);
-  const [cryptoBridge, setCryptoBridge] = useState<AnyObj | null>(null);
-  const [cryptoAccelerator, setCryptoAccelerator] = useState<AnyObj | null>(null);
   const [capitalLadder, setCapitalLadder] = useState<AnyObj | null>(null);
   const [replay, setReplay] = useState<ReplayTarget | null>(null);
   const [piggyResetBusy, setPiggyResetBusy] = useState(false);
@@ -29,32 +27,6 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
     };
     loadTax();
     const id = window.setInterval(loadTax, 30000);
-    return () => { alive = false; window.clearInterval(id); };
-  }, [authToken]);
-  useEffect(() => {
-    let alive = true;
-    const loadBridge = async () => {
-      try {
-        const res = await fetch(`${API_URL}/v18/crypto-bridge`, { cache: "no-store", headers: { "X-API-Key": authToken, "X-Auth-Token": authToken } });
-        const body = await res.json();
-        if (alive && res.ok && body?.ok !== false) setCryptoBridge(body);
-      } catch { /* home research cards keep their last good snapshot */ }
-    };
-    loadBridge();
-    const id = window.setInterval(loadBridge, 10000);
-    return () => { alive = false; window.clearInterval(id); };
-  }, [authToken]);
-  useEffect(() => {
-    let alive = true;
-    const loadAccelerator = async () => {
-      try {
-        const res = await fetch(`${API_URL}/v18/crypto-evidence-accelerator`, { cache: "no-store", headers: { "X-API-Key": authToken } });
-        const body = await res.json();
-        if (alive && res.ok && body?.ok !== false) setCryptoAccelerator(body);
-      } catch { /* home card keeps last good accelerator snapshot */ }
-    };
-    loadAccelerator();
-    const id = window.setInterval(loadAccelerator, 10000);
     return () => { alive = false; window.clearInterval(id); };
   }, [authToken]);
   useEffect(() => {
@@ -174,30 +146,6 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
         <span className="report-icon">▤</span>
         <span><strong>{exportBusy ? "BUILDING FULL BOT REPORT..." : "EXPORT FULL BOT REPORT PDF"}</strong><small>Everything included · V17.9 · V18 · V18.1 · all AI systems</small></span>
       </button>
-    </section>
-
-    <section className="home-research-showcase">
-      <div className="home-shadow-card">
-        <div className="home-research-title"><span className="home-research-icon">⚡</span><div><small>V18.3.55 · EVIDENCE ACCELERATOR</small><h2>Filtered Shadow Research</h2><p>Fresh post-accelerator evidence · live crypto remains off</p></div><span className="home-research-pill">SHADOW ONLY</span></div>
-        <div className="home-research-kpis">
-          <div><strong>{Number(cryptoAccelerator?.model?.filteredTrial?.trades || 0)} / 50</strong><span>Fresh filtered closes</span></div>
-          <div><strong className={Number(cryptoAccelerator?.model?.filteredTrial?.expectancyUsd || 0) >= 0 ? "positive" : "negative"}>${Number(cryptoAccelerator?.model?.filteredTrial?.expectancyUsd || 0).toFixed(2)}</strong><span>Filtered expectancy</span></div>
-          <div><strong>{Number(cryptoAccelerator?.model?.filteredTrial?.winRatePct || 0).toFixed(1)}%</strong><span>Filtered win rate</span></div>
-        </div>
-        <div className="home-governor-selection">
-          <span>History mined: {Number(cryptoAccelerator?.model?.outcomes || 0).toLocaleString("en-GB")}</span>
-          <span>Weak blocked: {Number(cryptoAccelerator?.runtime?.exploreBlockedWeakRegime || 0)}</span>
-          <span>Momentum blocked: {Number(cryptoAccelerator?.runtime?.exploreBlockedMomentum || 0)}</span>
-          <span>History blocked: {Number(cryptoAccelerator?.runtime?.exploreBlockedHistorical || 0)}</span>
-          <span>Allowed: {Number(cryptoAccelerator?.runtime?.exploreAllowed || 0)}</span>
-        </div>
-      </div>
-      <div className="home-governor-card">
-        <div className="home-research-title"><span className="home-research-icon governor">⚙</span><div><small>EVIDENCE-MINED STRATEGY</small><h2>Crypto Research</h2><p>Governor controls live-entry permission · safety executor stays ready for exits</p></div><span className="home-research-pill governor">{cryptoBridge?.governorEntryPermission?.allowed ? `${cryptoBridge?.governorEntryPermission?.stage || "LIVE"} · LIVE ON` : "SHADOW · LIVE OFF"}</span></div>
-        <div className="home-governor-generation"><span>Current evidence trial</span><strong>{cryptoBridge?.cryptoGovernor?.preset?.name || "Evidence Mined V2"}</strong><div className="home-governor-progress"><i style={{width:`${Math.min(100, (Number(cryptoBridge?.cryptoGovernor?.research?.trades || 0) / Math.max(1, Number(cryptoBridge?.cryptoGovernor?.researchTargetTrades || 50))) * 100)}%`}} /></div><small>Research evidence: {Number(cryptoBridge?.cryptoGovernor?.research?.trades || 0)} / {Number(cryptoBridge?.cryptoGovernor?.researchTargetTrades || 50)} · separate from REAL Pilot</small></div>
-        <div className="home-governor-kpis"><div><strong className={Number(cryptoBridge?.cryptoGovernor?.pilotStats?.expectancyUsd || 0) >= 0 ? "positive" : "negative"}>${Number(cryptoBridge?.cryptoGovernor?.pilotStats?.expectancyUsd || 0).toFixed(2)}</strong><span>REAL Pilot expectancy · {Number(cryptoBridge?.cryptoGovernor?.pilotStats?.trades || 0)} exits</span></div><div><strong>{Number(cryptoBridge?.cryptoGovernor?.evidenceModel?.qualifiedEvidenceTrades ?? cryptoBridge?.cryptoGovernor?.evidenceModel?.pairedTrades ?? 0).toLocaleString()}</strong><span>Qualified outcomes mined</span></div><div><strong>{Number(cryptoBridge?.cryptoGovernor?.evidenceModel?.positiveSymbols?.length || 0)}</strong><span>Positive symbol cohorts</span></div></div>
-        <div className="home-governor-selection"><span>Exploratory tests excluded: {Number(cryptoBridge?.cryptoGovernor?.evidenceModel?.exploratoryTradesExcluded || 0).toLocaleString()}</span><span>Positive score bands: {Number(cryptoBridge?.cryptoGovernor?.evidenceModel?.positiveScoreBins?.length || 0)}</span><span>Blocked negative symbols: {Number(cryptoBridge?.cryptoGovernor?.evidenceModel?.blockedNegativeSymbols?.length || 0)}</span><span>{String(cryptoBridge?.cryptoGovernor?.mode || "SHADOW_RESEARCH").replaceAll("_", " ")} · {Number(cryptoBridge?.cryptoGovernor?.researchMaxHoldMinutes || 45)}m max hold</span></div>
-      </div>
     </section>
 
     <Card title="Quick Actions" wide className="quick-actions-card">
