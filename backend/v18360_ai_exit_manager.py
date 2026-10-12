@@ -291,6 +291,19 @@ def _worker(m) -> None:
     while True:
         try:
             positions = [p for p in list(m.get_all_positions() or []) if "/" not in str(p.get("symbol") or "")]
+            try:
+                market_open = bool(getattr(m.trading_client.get_clock(), "is_open", False))
+            except Exception:
+                market_open = True
+            if not positions and not market_open:
+                with _lock:
+                    _runtime["lastRunAt"] = _now()
+                    _runtime["lastError"] = None
+                    _runtime["cycles"] = int(_runtime.get("cycles") or 0) + 1
+                    _runtime["positionsSeen"] = 0
+                    _runtime["decisions"] = {}
+                time.sleep(60)
+                continue
             decisions = {}
             for p in positions:
                 row = _decision(m, p)

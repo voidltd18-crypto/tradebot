@@ -302,6 +302,21 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
         runtime["started"] = True
         while not stop_flag.is_set():
             try:
+                # Replay capture is observational only. When the market is closed
+                # and there are no stock positions, avoid a 10-second DB/schema
+                # churn loop that adds pressure to the small Render instance.
+                try:
+                    market_open = bool(getattr(m.trading_client.get_clock(), "is_open", False))
+                except Exception:
+                    market_open = True
+                if not market_open:
+                    positions = position_snapshot()
+                    if not positions:
+                        runtime["openSessions"] = 0
+                        runtime["lastCycleAt"] = now_iso()
+                        runtime["lastError"] = ""
+                        stop_flag.wait(60)
+                        continue
                 cycle()
             except Exception as exc:
                 runtime["lastError"] = f"{type(exc).__name__}: {exc}"

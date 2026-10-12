@@ -392,6 +392,16 @@ def _worker(m) -> None:
     while True:
         try:
             is_open = _market_open(m)
+            if not is_open:
+                # No scoring horizon advances while the exchange is closed.
+                # Avoid repeatedly walking the research tables every 10 seconds.
+                with _lock:
+                    _runtime["lastRunAt"] = _now()
+                    _runtime["lastError"] = None
+                    _runtime["cycles"] = _i(_runtime.get("cycles")) + 1
+                    _runtime["marketOpen"] = False
+                time.sleep(60)
+                continue
             _accept_new_anchors(m, is_open)
             _advance_open_time(m, is_open)
             _score_due(m, is_open)
