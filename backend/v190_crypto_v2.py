@@ -14,7 +14,7 @@ from typing import Any, Dict, List
 
 import requests
 
-VERSION = "V19.0.2"
+VERSION = "V19.0.4"
 REFRESH_SECONDS = 60
 MAX_SHADOW_POSITIONS = 4
 SHADOW_START_USD = 1000.0
@@ -39,6 +39,10 @@ _runtime: Dict[str, Any] = {
     "shadowRealisedPnlUsd": 0.0,
     "shadowPositions": {},
     "shadowTrades": [],
+    "shadowEvidence": {
+        "buyEvents": 0,
+        "completedTrades": 0,
+    },
 }
 
 
@@ -51,6 +55,203 @@ def _num(value: Any, default: float = 0.0) -> float:
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _ensure_shadow_tables(m) -> None:
+    conn = m.db_connect()
+    try:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS v190_crypto_shadow_events (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   timestamp TEXT NOT NULL,
+                   symbol TEXT NOT NULL,
+                   side TEXT NOT NULL,
+                   price REAL NOT NULL,
+                   qty REAL NOT NULL,
+                   notional_usd REAL,
+                   entry_price REAL,
+                   entry_score REAL,
+                   opened_at TEXT,
+                   closed_at TEXT,
+                   pnl_usd REAL,
+                   pnl_pct REAL,
+                   reason TEXT
+               )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS v190_crypto_shadow_positions (
+                   symbol TEXT PRIMARY KEY,
+                   entry REAL NOT NULL,
+                   price REAL NOT NULL,
+                   high REAL NOT NULL,
+                   qty REAL NOT NULL,
+                   notional_usd REAL NOT NULL,
+                   opened_at TEXT NOT NULL,
+                   pnl_pct REAL NOT NULL DEFAULT 0,
+                   entry_score REAL NOT NULL DEFAULT 0
+               )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS v190_crypto_shadow_meta (
+                   key TEXT PRIMARY KEY,
+                   value REAL NOT NULL
+               )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_v190_crypto_shadow_events_side "
+            "ON v190_crypto_shadow_events(side, id)"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO v190_crypto_shadow_meta(key,value) VALUES ('cashUsd',?)",
+            (SHADOW_START_USD,),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO v190_crypto_shadow_meta(key,value) VALUES ('realisedPnlUsd',0)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _restore_shadow_state(m) -> None:
+    _ensure_shadow_tables(m)
+    conn = m.db_connect()
+    try:
+        meta = {
+            str(row["key"]): _num(row["value"])
+            for row in conn.execute("SELECT key,value FROM v190_crypto_shadow_meta").fetchall()
+        }
+        positions: Dict[str, Dict[str, Any]] = {}
+        for raw in conn.execute(
+            """SELECT symbol,entry,price,high,qty,notional_usd,opened_at,pnl_pct,entry_score
+               FROM v190_crypto_shadow_positions"""
+        ).fetchall():
+            row = dict(raw)
+            symbol = str(row.get("symbol") or "")
+            if not symbol:
+                continue
+            positions[symbol] = {
+                "symbol": symbol,
+                "entry": _num(row.get("entry")),
+                "price": _num(row.get("price")),
+                "high": _num(row.get("high")),
+                "qty": _num(row.get("qty")),
+                "notionalUsd": _num(row.get("notional_usd")),
+                "openedAt": str(row.get("opened_at") or ""),
+                "pnlPct": _num(row.get("pnl_pct")),
+                "entryScore": _num(row.get("entry_score")),
+            }
+
+        rows = conn.execute(
+            """SELECT timestamp,symbol,side,price,qty,notional_usd,entry_price,entry_score,
+                      opened_at,closed_at,pnl_usd,pnl_pct,reason
+               FROM v190_crypto_shadow_events ORDER BY id DESC LIMIT 200"""
+        ).fetchall()
+        trades = []
+        for raw in reversed(rows):
+            row = dict(raw)
+            trades.append({
+                "timestamp": row.get("timestamp"),
+                "symbol": row.get("symbol"),
+                "side": row.get("side"),
+                "price": _num(row.get("price")),
+                "qty": _num(row.get("qty")),
+                "notionalUsd": None if row.get("notional_usd") is None else _num(row.get("notional_usd")),
+                "entryPrice": None if row.get("entry_price") is None else _num(row.get("entry_price")),
+                "entryScore": None if row.get("entry_score") is None else _num(row.get("entry_score")),
+                "openedAt": row.get("opened_at"),
+                "closedAt": row.get("closed_at"),
+                "pnlUsd": None if row.get("pnl_usd") is None else _num(row.get("pnl_usd")),
+                "pnlPct": None if row.get("pnl_pct") is None else _num(row.get("pnl_pct")),
+                "reason": row.get("reason"),
+            })
+
+        counts = conn.execute(
+            """SELECT
+                   SUM(CASE WHEN side='BUY' THEN 1 ELSE 0 END) AS buys,
+                   SUM(CASE WHEN side='SELL' THEN 1 ELSE 0 END) AS sells
+               FROM v190_crypto_shadow_events"""
+        ).fetchone()
+        with _lock:
+            _runtime["shadowCashUsd"] = _num(meta.get("cashUsd"), SHADOW_START_USD)
+            _runtime["shadowRealisedPnlUsd"] = _num(meta.get("realisedPnlUsd"))
+            _runtime["shadowPositions"] = positions
+            _runtime["shadowTrades"] = trades
+            _runtime["shadowEvidence"] = {
+                "buyEvents": int((counts["buys"] if counts else 0) or 0),
+                "completedTrades": int((counts["sells"] if counts else 0) or 0),
+            }
+    finally:
+        conn.close()
+
+
+def _persist_shadow_state(
+    m,
+    positions: Dict[str, Dict[str, Any]],
+    cash: float,
+    realised_pnl: float,
+    events: List[Dict[str, Any]],
+) -> None:
+    conn = m.db_connect()
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            """INSERT INTO v190_crypto_shadow_meta(key,value) VALUES ('cashUsd',?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (cash,),
+        )
+        conn.execute(
+            """INSERT INTO v190_crypto_shadow_meta(key,value) VALUES ('realisedPnlUsd',?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (realised_pnl,),
+        )
+        conn.execute("DELETE FROM v190_crypto_shadow_positions")
+        for pos in positions.values():
+            conn.execute(
+                """INSERT INTO v190_crypto_shadow_positions
+                   (symbol,entry,price,high,qty,notional_usd,opened_at,pnl_pct,entry_score)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(pos.get("symbol") or ""),
+                    _num(pos.get("entry")),
+                    _num(pos.get("price")),
+                    _num(pos.get("high")),
+                    _num(pos.get("qty")),
+                    _num(pos.get("notionalUsd")),
+                    str(pos.get("openedAt") or _now()),
+                    _num(pos.get("pnlPct")),
+                    _num(pos.get("entryScore")),
+                ),
+            )
+
+        for event in events:
+            conn.execute(
+                """INSERT INTO v190_crypto_shadow_events
+                   (timestamp,symbol,side,price,qty,notional_usd,entry_price,entry_score,
+                    opened_at,closed_at,pnl_usd,pnl_pct,reason)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(event.get("timestamp") or _now()),
+                    str(event.get("symbol") or ""),
+                    str(event.get("side") or ""),
+                    _num(event.get("price")),
+                    _num(event.get("qty")),
+                    event.get("notionalUsd"),
+                    event.get("entryPrice"),
+                    event.get("entryScore"),
+                    event.get("openedAt"),
+                    event.get("closedAt"),
+                    event.get("pnlUsd"),
+                    event.get("pnlPct"),
+                    str(event.get("reason") or ""),
+                ),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def _headers(m) -> Dict[str, str]:
@@ -183,12 +384,14 @@ def _refresh(m, *, wait: bool = True) -> Dict[str, Any]:
         _scan_lock.release()
 
 
-def _shadow_step() -> None:
+def _shadow_step(m) -> None:
     with _lock:
         scans = list(_runtime.get("scans") or [])
         positions = dict(_runtime.get("shadowPositions") or {})
         cash = _num(_runtime.get("shadowCashUsd"), SHADOW_START_USD)
+        realised_pnl = _num(_runtime.get("shadowRealisedPnlUsd"))
         by_symbol = {str(row.get("symbol")): row for row in scans}
+        new_events: List[Dict[str, Any]] = []
 
         for symbol, pos in list(positions.items()):
             scan = by_symbol.get(symbol)
@@ -217,11 +420,21 @@ def _shadow_step() -> None:
                 proceeds = qty * price
                 pnl = proceeds - _num(pos.get("notionalUsd"))
                 cash += proceeds
-                _runtime["shadowRealisedPnlUsd"] = _num(_runtime.get("shadowRealisedPnlUsd")) + pnl
-                _runtime["shadowTrades"].append({
-                    "timestamp": _now(), "symbol": symbol, "side": "SELL",
-                    "price": round(price, 8), "qty": round(qty, 12),
-                    "pnlUsd": round(pnl, 4), "pnlPct": round(pnl_pct, 4),
+                realised_pnl += pnl
+                closed_at = _now()
+                new_events.append({
+                    "timestamp": closed_at,
+                    "symbol": symbol,
+                    "side": "SELL",
+                    "price": round(price, 8),
+                    "qty": round(qty, 12),
+                    "notionalUsd": round(_num(pos.get("notionalUsd")), 2),
+                    "entryPrice": round(entry, 8),
+                    "entryScore": round(_num(pos.get("entryScore")), 4),
+                    "openedAt": pos.get("openedAt"),
+                    "closedAt": closed_at,
+                    "pnlUsd": round(pnl, 4),
+                    "pnlPct": round(pnl_pct, 4),
                     "reason": exit_reason,
                 })
                 positions.pop(symbol, None)
@@ -239,6 +452,8 @@ def _shadow_step() -> None:
                     break
                 qty = spend / price
                 symbol = str(row.get("symbol"))
+                opened_at = _now()
+                entry_score = _num(row.get("score"))
                 positions[symbol] = {
                     "symbol": symbol,
                     "entry": price,
@@ -246,21 +461,43 @@ def _shadow_step() -> None:
                     "high": price,
                     "qty": qty,
                     "notionalUsd": spend,
-                    "openedAt": _now(),
+                    "openedAt": opened_at,
                     "pnlPct": 0.0,
-                    "entryScore": _num(row.get("score")),
+                    "entryScore": entry_score,
                 }
                 cash -= spend
-                _runtime["shadowTrades"].append({
-                    "timestamp": _now(), "symbol": symbol, "side": "BUY",
-                    "price": round(price, 8), "qty": round(qty, 12),
+                new_events.append({
+                    "timestamp": opened_at,
+                    "symbol": symbol,
+                    "side": "BUY",
+                    "price": round(price, 8),
+                    "qty": round(qty, 12),
                     "notionalUsd": round(spend, 2),
+                    "entryPrice": round(price, 8),
+                    "entryScore": round(entry_score, 4),
+                    "openedAt": opened_at,
+                    "closedAt": None,
+                    "pnlUsd": None,
+                    "pnlPct": None,
                     "reason": "TOP_RANKED_QUALIFIED",
                 })
 
+        _persist_shadow_state(m, positions, cash, realised_pnl, new_events)
+
         _runtime["shadowPositions"] = positions
         _runtime["shadowCashUsd"] = cash
-        _runtime["shadowTrades"] = list(_runtime.get("shadowTrades") or [])[-200:]
+        _runtime["shadowRealisedPnlUsd"] = realised_pnl
+        _runtime["shadowTrades"] = (
+            list(_runtime.get("shadowTrades") or []) + new_events
+        )[-200:]
+        evidence = dict(_runtime.get("shadowEvidence") or {})
+        evidence["buyEvents"] = int(evidence.get("buyEvents") or 0) + sum(
+            1 for event in new_events if event.get("side") == "BUY"
+        )
+        evidence["completedTrades"] = int(evidence.get("completedTrades") or 0) + sum(
+            1 for event in new_events if event.get("side") == "SELL"
+        )
+        _runtime["shadowEvidence"] = evidence
 
 
 def _payload() -> Dict[str, Any]:
@@ -271,6 +508,9 @@ def _payload() -> Dict[str, Any]:
         unrealised = 0.0
         for pos in positions:
             unrealised += (_num(pos.get("price")) - _num(pos.get("entry"))) * _num(pos.get("qty"))
+        evidence = dict(_runtime.get("shadowEvidence") or {})
+        completed = int(evidence.get("completedTrades") or 0)
+        next_target = 20 if completed < 20 else (50 if completed < 50 else (100 if completed < 100 else None))
         return {
             "ok": True,
             "version": VERSION,
@@ -290,6 +530,15 @@ def _payload() -> Dict[str, Any]:
                 "unrealisedPnlUsd": round(unrealised, 2),
                 "positions": positions,
                 "trades": list(_runtime.get("shadowTrades") or [])[-50:],
+                "evidence": {
+                    "buyEvents": int(evidence.get("buyEvents") or 0),
+                    "completedTrades": completed,
+                    "nextTarget": next_target,
+                    "progress20Pct": round(min(100.0, completed / 20.0 * 100.0), 1),
+                    "progress50Pct": round(min(100.0, completed / 50.0 * 100.0), 1),
+                    "progress100Pct": round(min(100.0, completed / 100.0 * 100.0), 1),
+                    "persistent": True,
+                },
                 "maxPositions": MAX_SHADOW_POSITIONS,
                 "positionUsd": SHADOW_POSITION_USD,
             },
@@ -308,7 +557,7 @@ def _worker(m) -> None:
     while True:
         try:
             _refresh(m)
-            _shadow_step()
+            _shadow_step(m)
             print(
                 f"{VERSION} CRYPTO V2 | discovered={len(_runtime.get('universe') or [])} "
                 f"scanned={len(_runtime.get('scans') or [])} "
@@ -332,6 +581,8 @@ def install_v190_crypto_v2(app, m) -> None:
     # 5-second worker cannot duplicate crypto discovery and consume scarce RAM.
     m.V18234_CRYPTO_LIVE_ENABLED = False
 
+    _restore_shadow_state(m)
+
     if hasattr(m, "_v18234_live_buy"):
         _original_live_buy = m._v18234_live_buy
 
@@ -349,7 +600,7 @@ def install_v190_crypto_v2(app, m) -> None:
     def crypto_v2_refresh():
         result = _refresh(m, wait=False)
         if not result.get("refreshBusy"):
-            _shadow_step()
+            _shadow_step(m)
         return result
 
     if not _started:
