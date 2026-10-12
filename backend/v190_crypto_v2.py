@@ -562,7 +562,9 @@ def _worker(m) -> None:
                 f"{VERSION} CRYPTO V2 | discovered={len(_runtime.get('universe') or [])} "
                 f"scanned={len(_runtime.get('scans') or [])} "
                 f"qualified={sum(1 for r in (_runtime.get('scans') or []) if r.get('qualified'))} "
-                f"shadow_positions={len(_runtime.get('shadowPositions') or {})} live_orders=False",
+                f"shadow_positions={len(_runtime.get('shadowPositions') or {})} "
+                f"completed_trades={int((_runtime.get('shadowEvidence') or {}).get('completedTrades') or 0)} "
+                "live_orders=False",
                 flush=True,
             )
         except Exception as exc:
@@ -609,6 +611,7 @@ def install_v190_crypto_v2(app, m) -> None:
 
     print(
         f"{VERSION} CRYPTO CLEAN REBUILD | old_shadow=OFF old_live_executor=OFF "
-        "legacy_exit_protection=OFF new_engine=SHADOW_ONLY stock_logic=UNCHANGED",
+        "legacy_exit_protection=OFF new_engine=SHADOW_ONLY evidence=SQLITE_PERSISTENT "
+        "stock_logic=UNCHANGED",
         flush=True,
     )
