@@ -73,6 +73,8 @@ export function CryptoV2Page({ authToken }: { authToken: string }) {
         <div className="crypto-metric"><span>Realised P&L</span><strong>{money(data?.shadow?.realisedPnlUsd)}</strong></div>
         <div className="crypto-metric"><span>Unrealised P&L</span><strong>{money(data?.shadow?.unrealisedPnlUsd)}</strong></div>
         <div className="crypto-metric"><span>Positions</span><strong>{positions.length} / {Number(data?.shadow?.maxPositions || 0)}</strong></div>
+        <div className="crypto-metric"><span>Completed trades</span><strong>{Number(data?.shadow?.evidence?.completedTrades || 0)}</strong></div>
+        <div className="crypto-metric"><span>Evidence target</span><strong>{data?.shadow?.evidence?.nextTarget ? `${Number(data?.shadow?.evidence?.completedTrades || 0)} / ${Number(data?.shadow?.evidence?.nextTarget)}` : "100+ ✓"}</strong></div>
       </div>
     </section>
 
@@ -135,7 +137,12 @@ export function CryptoV2Page({ authToken }: { authToken: string }) {
     </section>
 
     <section className="crypto-panel">
-      <div className="crypto-panel-head"><div><h3>V2 Trade Log</h3></div></div>
+      <div className="crypto-panel-head">
+        <div>
+          <h3>V2 Trade Log</h3>
+          <p>Persistent evidence: BUY/SELL events and open shadow positions survive Render restarts and deployments.</p>
+        </div>
+      </div>
       <div className="crypto-table-wrap">
         <table className="crypto-scanner-table">
           <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Price</th><th>P&L</th><th>Reason</th></tr></thead>
