@@ -14,7 +14,7 @@ from typing import Any, Dict, List
 
 import requests
 
-VERSION = "V19.0.0"
+VERSION = "V19.0.2"
 REFRESH_SECONDS = 60
 MAX_SHADOW_POSITIONS = 4
 SHADOW_START_USD = 1000.0
@@ -26,6 +26,7 @@ MAX_SPREAD_PCT = 1.25
 MIN_NOTIONAL_24H_USD = 5000.0
 
 _lock = threading.RLock()
+_scan_lock = threading.Lock()
 _started = False
 _original_live_buy = None
 _runtime: Dict[str, Any] = {
@@ -89,14 +90,14 @@ def _snapshot_batch(m, symbols: List[str]) -> Dict[str, Any]:
     if not symbols:
         return {}
     url = "https://data.alpaca.markets/v1beta3/crypto/us/snapshots"
-    r = requests.get(
+    with requests.get(
         url,
         headers=_headers(m),
         params={"symbols": ",".join(symbols)},
         timeout=12,
-    )
-    r.raise_for_status()
-    body = r.json() if r.content else {}
+    ) as r:
+        r.raise_for_status()
+        body = r.json() if r.content else {}
     snapshots = body.get("snapshots") if isinstance(body, dict) else {}
     return snapshots if isinstance(snapshots, dict) else {}
 
@@ -150,27 +151,36 @@ def _scan_symbol(symbol: str, snap: Dict[str, Any]) -> Dict[str, Any] | None:
     }
 
 
-def _refresh(m) -> Dict[str, Any]:
-    symbols = _discover_tradable_usd(m)
-    rows: List[Dict[str, Any]] = []
-    for offset in range(0, len(symbols), 40):
-        batch = symbols[offset:offset + 40]
-        snapshots = _snapshot_batch(m, batch)
-        for symbol in batch:
-            snap = snapshots.get(symbol) or snapshots.get(symbol.replace("/", "")) or {}
-            if not isinstance(snap, dict):
-                continue
-            row = _scan_symbol(symbol, snap)
-            if row:
-                rows.append(row)
-    rows.sort(key=lambda x: (-int(bool(x.get("qualified"))), -_num(x.get("score")), x.get("symbol", "")))
-    with _lock:
-        _runtime["universe"] = symbols
-        _runtime["scans"] = rows
-        _runtime["lastRefreshAt"] = _now()
-        _runtime["lastError"] = None
-        _runtime["cycles"] = int(_runtime.get("cycles") or 0) + 1
-    return _payload()
+def _refresh(m, *, wait: bool = True) -> Dict[str, Any]:
+    acquired = _scan_lock.acquire(blocking=wait)
+    if not acquired:
+        payload = _payload()
+        payload["refreshBusy"] = True
+        return payload
+    try:
+        symbols = _discover_tradable_usd(m)
+        rows: List[Dict[str, Any]] = []
+        for offset in range(0, len(symbols), 40):
+            batch = symbols[offset:offset + 40]
+            snapshots = _snapshot_batch(m, batch)
+            for symbol in batch:
+                snap = snapshots.get(symbol) or snapshots.get(symbol.replace("/", "")) or {}
+                if not isinstance(snap, dict):
+                    continue
+                row = _scan_symbol(symbol, snap)
+                if row:
+                    rows.append(row)
+            snapshots.clear()
+        rows.sort(key=lambda x: (-int(bool(x.get("qualified"))), -_num(x.get("score")), x.get("symbol", "")))
+        with _lock:
+            _runtime["universe"] = symbols
+            _runtime["scans"] = rows
+            _runtime["lastRefreshAt"] = _now()
+            _runtime["lastError"] = None
+            _runtime["cycles"] = int(_runtime.get("cycles") or 0) + 1
+        return _payload()
+    finally:
+        _scan_lock.release()
 
 
 def _shadow_step() -> None:
@@ -318,6 +328,9 @@ def install_v190_crypto_v2(app, m) -> None:
 
     m.V18232_CRYPTO_SHADOW_ENABLED = False
     m.V18307_SHADOW_EXTERNAL_MARKETS_ENABLED = False
+    # V19 owns crypto research now. Keep the legacy live executor dormant so its
+    # 5-second worker cannot duplicate crypto discovery and consume scarce RAM.
+    m.V18234_CRYPTO_LIVE_ENABLED = False
 
     if hasattr(m, "_v18234_live_buy"):
         _original_live_buy = m._v18234_live_buy
@@ -334,8 +347,9 @@ def install_v190_crypto_v2(app, m) -> None:
 
     @app.post("/v19/crypto-v2/refresh")
     def crypto_v2_refresh():
-        result = _refresh(m)
-        _shadow_step()
+        result = _refresh(m, wait=False)
+        if not result.get("refreshBusy"):
+            _shadow_step()
         return result
 
     if not _started:
@@ -343,7 +357,7 @@ def install_v190_crypto_v2(app, m) -> None:
         threading.Thread(target=_worker, args=(m,), daemon=True, name="v19-crypto-v2-shadow").start()
 
     print(
-        f"{VERSION} CRYPTO CLEAN REBUILD | old_shadow=OFF old_live_entries=BLOCKED "
-        "legacy_exit_protection=ON new_engine=SHADOW_ONLY stock_logic=UNCHANGED",
+        f"{VERSION} CRYPTO CLEAN REBUILD | old_shadow=OFF old_live_executor=OFF "
+        "legacy_exit_protection=OFF new_engine=SHADOW_ONLY stock_logic=UNCHANGED",
         flush=True,
     )
