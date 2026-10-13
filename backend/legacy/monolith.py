@@ -2229,11 +2229,11 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
     notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
 
 
-def _v1905_wait_for_stock_sell_fill(order, fallback_qty: float) -> Dict[str, Any]:
+def _v1905_wait_for_stock_sell_fill(order, fallback_qty: float, attempts: int = 8, delay: float = 0.25) -> Dict[str, Any]:
     """Read-only fill confirmation used only for realised accounting."""
     order_id = str(getattr(order, "id", "") or "")
     latest = order
-    for _ in range(8):
+    for _ in range(max(1, int(attempts))):
         try:
             filled_price = float(getattr(latest, "filled_avg_price", 0) or 0)
             filled_qty = float(getattr(latest, "filled_qty", 0) or 0)
@@ -2245,7 +2245,7 @@ def _v1905_wait_for_stock_sell_fill(order, fallback_qty: float) -> Dict[str, Any
         if not order_id:
             break
         try:
-            time.sleep(0.25)
+            time.sleep(max(0.05, float(delay)))
             latest = trading_client.get_order_by_id(order_id)
         except Exception:
             break
@@ -2256,6 +2256,94 @@ def _v1905_wait_for_stock_sell_fill(order, fallback_qty: float) -> Dict[str, Any
         "qty": float(fallback_qty or 0.0),
         "status": str(getattr(latest, "status", "") or ""),
     }
+
+
+def _v1905_record_realised_stock_sell(
+    symbol: str,
+    entry: float,
+    fill_price: float,
+    fill_qty: float,
+    order_id: str,
+    reason: str,
+) -> Dict[str, Any]:
+    """Persist/account a SELL only after Alpaca supplies the actual fill."""
+    pnl = (fill_price - entry) * fill_qty if entry > 0 and fill_price > 0 and fill_qty > 0 else 0.0
+    pnl_pct = ((fill_price / entry) - 1.0) * 100.0 if entry > 0 and fill_price > 0 else 0.0
+    event = {
+        "alpacaOrderId": str(order_id or ""),
+        "day": today_str(),
+        "time": now_time(),
+        "side": "SELL",
+        "symbol": symbol,
+        "qty": fill_qty,
+        "price": fill_price,
+        "reason": reason,
+        "pnl": round(pnl, 4),
+        "pnlGbp": round(money_gbp(pnl), 4),
+        "pnlPct": round(pnl_pct, 4),
+        "pnlPending": False,
+    }
+    trade_events.append(event)
+    add_trade_history_event(event)
+    update_stock_memory_from_sell(symbol, pnl, pnl_pct)
+
+    try:
+        if "_v18255_record_tax_disposal" in globals():
+            fx_rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
+            _v18255_record_tax_disposal(
+                "STOCK", symbol, fill_qty, max(0.0, fill_price * fill_qty),
+                pnl, fx_rate, reason,
+            )
+    except Exception as tax_exc:
+        print(f"V18.2.55 STOCK TAX LEDGER ERROR | symbol={symbol} error={tax_exc}", flush=True)
+
+    if pnl > 0 and "profit_vault_bank_realised_profit" in globals():
+        try:
+            profit_vault_bank_realised_profit(pnl, symbol=symbol, reason=reason)
+        except Exception as vault_exc:
+            print(f"V17.6 PROFIT VAULT BANK ERROR | symbol={symbol} error={vault_exc}")
+
+    try:
+        if "_v18333_record_stock_exit" in globals():
+            _v18333_record_stock_exit(symbol, entry, fill_price, fill_qty, reason)
+    except Exception as learning_exc:
+        print(f"V18.3.33 EXIT LEARNER RECORD ERROR | {symbol} {learning_exc}", flush=True)
+
+    print(
+        f"V19.0.5 STOCK SELL FILL | {symbol} order_id={order_id or '-'} "
+        f"fill={fill_price:.4f} qty={fill_qty:.6f} realised={pnl_pct:.2f}%",
+        flush=True,
+    )
+    return event
+
+
+def _v1905_reconcile_pending_stock_sell(
+    order,
+    symbol: str,
+    entry: float,
+    fallback_qty: float,
+    reason: str,
+) -> None:
+    """Background accounting reconciliation; never submits or changes an order."""
+    try:
+        fill = _v1905_wait_for_stock_sell_fill(order, fallback_qty, attempts=60, delay=0.5)
+        if not fill.get("ok"):
+            print(
+                f"V19.0.5 STOCK SELL FILL STILL PENDING | {symbol} "
+                f"order_id={fill.get('orderId') or '-'} source_of_truth=ALPACA_BACKFILL",
+                flush=True,
+            )
+            return
+        _v1905_record_realised_stock_sell(
+            symbol,
+            float(entry or 0.0),
+            float(fill.get("price") or 0.0),
+            float(fill.get("qty") or fallback_qty),
+            str(fill.get("orderId") or ""),
+            reason,
+        )
+    except Exception as exc:
+        print(f"V19.0.5 STOCK SELL RECONCILE ERROR | {symbol} {exc}", flush=True)
 
 
 def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 0.0, reason="AUTO SELL"):
@@ -2290,75 +2378,54 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
             add_alpaca_rejection_event(symbol, reason, err)
             raise
 
+    # Position/UI reconciliation starts as soon as the broker accepts the order.
+    _v18328_live_event_refresh("SELL", symbol)
+    lock_symbol_until_tomorrow(symbol)
+
     fill = _v1905_wait_for_stock_sell_fill(submitted_order, rounded_qty)
-    actual_price = float(fill.get("price") or 0.0)
-    actual_qty = float(fill.get("qty") or rounded_qty)
-    order_id = str(fill.get("orderId") or "")
-    realised_ready = actual_price > 0 and actual_qty > 0 and entry > 0
-
-    if realised_ready:
-        pnl = (actual_price - entry) * actual_qty
-        pnl_pct = ((actual_price / entry) - 1.0) * 100.0
-    else:
-        pnl = 0.0
-        pnl_pct = 0.0
-        print(
-            f"V19.0.5 STOCK SELL FILL PENDING | {symbol} order_id={order_id or '-'} "
-            f"trigger_price={float(price or 0.0):.4f} accounting_deferred=True",
-            flush=True,
+    if fill.get("ok") and entry > 0:
+        event = _v1905_record_realised_stock_sell(
+            symbol,
+            float(entry),
+            float(fill.get("price") or 0.0),
+            float(fill.get("qty") or rounded_qty),
+            str(fill.get("orderId") or ""),
+            reason,
         )
+        notify(
+            f"🔴 {reason}: {symbol} | qty={event['qty']} | "
+            f"realised PnL {event['pnl']} ({event['pnlPct']:.2f}%)"
+        )
+        return
 
-    event = {
-        "alpacaOrderId": order_id,
+    # Never save a zero-price/estimated SELL row under the Alpaca order ID:
+    # doing so would mask the later real fill during backfill. Keep only an
+    # in-memory pending marker and reconcile the actual fill asynchronously.
+    pending = {
         "day": today_str(),
         "time": now_time(),
         "side": "SELL",
         "symbol": symbol,
-        "qty": actual_qty,
-        "price": actual_price,
+        "qty": rounded_qty,
         "reason": reason,
-        "pnl": round(pnl, 4),
-        "pnlGbp": round(money_gbp(pnl), 4),
-        "pnlPct": round(pnl_pct, 4),
-        "pnlPending": not realised_ready,
+        "pnlPending": True,
         "triggerPrice": float(price or 0.0),
+        "alpacaOrderId": str(fill.get("orderId") or ""),
     }
-    trade_events.append(event)
-    add_trade_history_event(event)
-    _v18328_live_event_refresh("SELL", symbol)
-
-    # Realised-only consumers must never use the quote that triggered a market
-    # order. If the fill is still pending, Alpaca backfill/reports remain the
-    # source of truth and these derived ledgers are not fed a fabricated result.
-    if realised_ready:
-        update_stock_memory_from_sell(symbol, pnl, pnl_pct)
-        try:
-            if "_v18255_record_tax_disposal" in globals():
-                fx_rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
-                _v18255_record_tax_disposal("STOCK", symbol, actual_qty, max(0.0, actual_price * actual_qty), pnl, fx_rate, reason)
-        except Exception as tax_exc:
-            print(f"V18.2.55 STOCK TAX LEDGER ERROR | symbol={symbol} error={tax_exc}", flush=True)
-        if pnl > 0 and "profit_vault_bank_realised_profit" in globals():
-            try:
-                profit_vault_bank_realised_profit(pnl, symbol=symbol, reason=reason)
-            except Exception as vault_exc:
-                print(f"V17.6 PROFIT VAULT BANK ERROR | symbol={symbol} error={vault_exc}")
-        try:
-            if "_v18333_record_stock_exit" in globals():
-                _v18333_record_stock_exit(symbol, entry, actual_price, actual_qty, reason)
-        except Exception as learning_exc:
-            print(f"V18.3.33 EXIT LEARNER RECORD ERROR | {symbol} {learning_exc}", flush=True)
-        print(
-            f"V19.0.5 STOCK SELL FILL | {symbol} order_id={order_id or '-'} "
-            f"fill={actual_price:.4f} qty={actual_qty:.6f} realised={pnl_pct:.2f}%",
-            flush=True,
-        )
-
-    lock_symbol_until_tomorrow(symbol)
-    if realised_ready:
-        notify(f"🔴 {reason}: {symbol} | qty={actual_qty} | realised PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
-    else:
-        notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | fill pending; realised PnL will come from Alpaca")
+    trade_events.append(pending)
+    print(
+        f"V19.0.5 STOCK SELL FILL PENDING | {symbol} "
+        f"order_id={fill.get('orderId') or '-'} trigger_price={float(price or 0.0):.4f} "
+        "realised_accounting_deferred=True",
+        flush=True,
+    )
+    threading.Thread(
+        target=_v1905_reconcile_pending_stock_sell,
+        args=(submitted_order, symbol, float(entry or 0.0), rounded_qty, reason),
+        daemon=True,
+        name=f"v1905-stock-fill-{symbol}",
+    ).start()
+    notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | fill pending; realised PnL will come from Alpaca")
 
 
 def close_position(position, reason="MANUAL SELL"):
