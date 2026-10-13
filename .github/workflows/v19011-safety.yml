@@ -1,0 +1,17 @@
+name: V19.0.11 Sell Telemetry Safety
+on:
+  push:
+    branches: [v19-0-11-sell-execution-telemetry]
+  pull_request:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install fastapi
+      - run: python -m py_compile backend/v19011_sell_telemetry.py backend/main.py
+      - run: python -m unittest discover -s tests -p 'test_v19011_sell_telemetry.py' -v
