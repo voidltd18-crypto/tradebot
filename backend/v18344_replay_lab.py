@@ -55,6 +55,108 @@ def install_v18344_replay_lab(app, m) -> None:
                 "exitTime":exit_time.isoformat() if exit_time else None,
                 "peakPct":((peak/entry)-1.0)*100.0}
 
+
+    def _simulate_recovery_watch(
+        points, entry, qty, actual_exit,
+        trigger_pct=-1.50, hard_floor_pct=-4.00,
+        watch_seconds=180.0, extension_seconds=120.0,
+        bounce_required_pct=0.60, clear_on_recovery=False,
+    ):
+        """Replay-only approximation of V18.3.75 recovery-watch timing.
+
+        The live hard floor requires two simultaneous price sources. Replay has
+        one sampled path, so two consecutive below-floor samples are used only
+        as a conservative proxy for confirmation. No live rule is changed.
+        """
+        if not points or entry <= 0 or qty <= 0:
+            return None
+        exit_price = actual_exit
+        exit_reason = "ACTUAL END"
+        exit_time = _dt(points[-1].get("point_time"))
+        active = False
+        deadline = None
+        worst_loss = None
+        extension_used = False
+        triggered = False
+        hard_floor_samples = 0
+        watch_starts = 0
+        recovery_clears = 0
+
+        for p in points:
+            price = float(p.get("price") or 0)
+            now = _dt(p.get("point_time"))
+            if price <= 0 or now is None:
+                continue
+            pnl_pct = ((price / entry) - 1.0) * 100.0
+
+            # Live V18.3.75 requires broker+quote agreement. Replay cannot
+            # reproduce independent sources, so require two consecutive samples
+            # below the floor rather than one sampled print.
+            if pnl_pct <= hard_floor_pct:
+                hard_floor_samples += 1
+            else:
+                hard_floor_samples = 0
+            if hard_floor_samples >= 2:
+                triggered = True
+                exit_price, exit_reason, exit_time = price, "HARD FLOOR PROXY", now
+                break
+
+            if not active:
+                if pnl_pct <= trigger_pct:
+                    triggered = True
+                    active = True
+                    watch_starts += 1
+                    deadline = now + timedelta(seconds=float(watch_seconds))
+                    worst_loss = pnl_pct
+                continue
+
+            # This switch is intentional. False mirrors the current wrapper
+            # semantics: once price recovers above the loss-guard threshold, the
+            # guard no longer calls the wrapper, so its in-memory watch cannot
+            # execute the code path that clears itself. True models the stated
+            # intent in V18.3.75 comments/docstring.
+            if pnl_pct > trigger_pct:
+                if clear_on_recovery:
+                    active = False
+                    deadline = None
+                    worst_loss = None
+                    extension_used = False
+                    recovery_clears += 1
+                continue
+
+            worst_loss = min(float(worst_loss if worst_loss is not None else pnl_pct), pnl_pct)
+            if deadline is None or now < deadline:
+                continue
+
+            bounce = pnl_pct - float(worst_loss)
+            if (not extension_used) and bounce >= bounce_required_pct:
+                extension_used = True
+                deadline = now + timedelta(seconds=float(extension_seconds))
+                continue
+
+            exit_price, exit_reason, exit_time = price, "RECOVERY EXPIRED PROXY", now
+            break
+
+        sim_pnl_usd = (exit_price-entry)*qty
+        sim_pnl_pct = ((exit_price/entry)-1.0)*100.0 if entry > 0 else 0.0
+        return {
+            "triggered": bool(triggered),
+            "exitPrice": exit_price,
+            "pnlUsd": sim_pnl_usd,
+            "pnlPct": sim_pnl_pct,
+            "exitReason": exit_reason,
+            "exitTime": exit_time.isoformat() if exit_time else None,
+            "watchStarts": watch_starts,
+            "recoveryClears": recovery_clears,
+            "extensionUsed": bool(extension_used),
+            "clearOnRecovery": bool(clear_on_recovery),
+            "watchSeconds": float(watch_seconds),
+            "extensionSeconds": float(extension_seconds),
+            "triggerPct": float(trigger_pct),
+            "hardFloorPct": float(hard_floor_pct),
+            "bounceRequiredPct": float(bounce_required_pct),
+        }
+
     @app.get("/v18/replay-lab")
     def api_v18344_replay_lab(request: Request, days: int = 31, limit: int = 5000):
         m.verify_api_key(request)
@@ -135,10 +237,32 @@ def install_v18344_replay_lab(app, m) -> None:
                     if s:
                         s["pnlGbp"]=s["pnlUsd"]*fx; s["deltaGbp"]=s["pnlGbp"]-actual_gbp
                         sims[cfg["key"]]=s
+
+                recovery_sims={}
+                recovery_cfgs=[
+                    {"key":"current_code_180","name":"Current-code recovery watch 180s","watch":180,"extend":120,"clear":False},
+                    {"key":"intended_clear_180","name":"Clear-on-recovery 180s","watch":180,"extend":120,"clear":True},
+                    {"key":"intended_clear_120","name":"Clear-on-recovery 120s","watch":120,"extend":90,"clear":True},
+                    {"key":"intended_clear_240","name":"Clear-on-recovery 240s","watch":240,"extend":120,"clear":True},
+                ]
+                for rcfg in recovery_cfgs:
+                    rs=_simulate_recovery_watch(
+                        pts,entry,qty,actual_exit,
+                        trigger_pct=-1.50,hard_floor_pct=-4.00,
+                        watch_seconds=rcfg["watch"],extension_seconds=rcfg["extend"],
+                        bounce_required_pct=0.60,clear_on_recovery=rcfg["clear"],
+                    )
+                    if rs:
+                        rs["name"]=rcfg["name"]
+                        rs["pnlGbp"]=rs["pnlUsd"]*fx
+                        rs["deltaGbp"]=rs["pnlGbp"]-actual_gbp
+                        recovery_sims[rcfg["key"]]=rs
+
                 trade_id=int(t.get("id") or 0)
                 replay_paths[trade_id]={"points":pts,"entry":entry,"actualExit":actual_exit}
                 usable.append({"id":trade_id,"symbol":str(t.get("symbol") or ""),"timestamp":t.get("timestamp"),
-                               "actualPnlGbp":actual_gbp,"actualPnlPct":float(t.get("pnl_pct") or 0),"replayLink":link,"simulations":sims})
+                               "actualPnlGbp":actual_gbp,"actualPnlPct":float(t.get("pnl_pct") or 0),"replayLink":link,
+                               "simulations":sims,"recoverySimulations":recovery_sims})
             results=[]
             for cfg in configs:
                 sims=[(r,r["simulations"].get(cfg["key"])) for r in usable if r["simulations"].get(cfg["key"])]
@@ -175,6 +299,62 @@ def install_v18344_replay_lab(app, m) -> None:
                 reverse=True,
             )
             payoff_research_lead=(ranked_payoff[0] if ranked_payoff else None)
+
+            # V19.0.7 STOP/recovery calibration. This compares the simplistic
+            # immediate-stop proxy with replay approximations of the actual
+            # V18.3.75 watch timing. Ranking here is by closeness to realised
+            # results, NOT by simulated profit, so it cannot silently optimise a
+            # live trading rule.
+            stop_mode_defs=[
+                ("current_code_180","Current-code recovery watch 180s"),
+                ("intended_clear_180","Clear-on-recovery 180s"),
+                ("intended_clear_120","Clear-on-recovery 120s"),
+                ("intended_clear_240","Clear-on-recovery 240s"),
+            ]
+            stop_calibration_rows=[]
+            for key,name in stop_mode_defs:
+                pairs=[]
+                for r in usable:
+                    s=(r.get("recoverySimulations") or {}).get(key)
+                    if s and bool(s.get("triggered")):
+                        pairs.append((r,s))
+                if not pairs:
+                    continue
+                sim_total=sum(float(s.get("pnlGbp") or 0) for _,s in pairs)
+                actual_total=sum(float(r.get("actualPnlGbp") or 0) for r,_ in pairs)
+                abs_err=sum(abs(float(s.get("pnlGbp") or 0)-float(r.get("actualPnlGbp") or 0)) for r,s in pairs)
+                reason_counts={}
+                for _,s in pairs:
+                    rr=str(s.get("exitReason") or "UNKNOWN")
+                    reason_counts[rr]=reason_counts.get(rr,0)+1
+                stop_calibration_rows.append({
+                    "key":key,"name":name,"trades":len(pairs),
+                    "actualPnlGbp":actual_total,"simPnlGbp":sim_total,
+                    "deltaGbp":sim_total-actual_total,
+                    "meanAbsoluteErrorGbp":abs_err/len(pairs),
+                    "exitReasons":reason_counts,
+                    "researchOnly":True,"liveTradingChanged":False,
+                })
+            stop_calibration_rows=sorted(stop_calibration_rows,key=lambda r:float(r.get("meanAbsoluteErrorGbp") or 1e9))
+            stop_calibration_lead=stop_calibration_rows[0] if stop_calibration_rows else None
+
+            immediate_stop_pairs=[]
+            for r in usable:
+                s=(r.get("simulations") or {}).get("current_proxy")
+                if s and str(s.get("exitReason") or "")=="STOP":
+                    immediate_stop_pairs.append((r,s))
+            immediate_stop_summary=None
+            if immediate_stop_pairs:
+                sim_total=sum(float(s.get("pnlGbp") or 0) for _,s in immediate_stop_pairs)
+                actual_total=sum(float(r.get("actualPnlGbp") or 0) for r,_ in immediate_stop_pairs)
+                abs_err=sum(abs(float(s.get("pnlGbp") or 0)-float(r.get("actualPnlGbp") or 0)) for r,s in immediate_stop_pairs)
+                immediate_stop_summary={
+                    "key":"immediate_stop","name":"Immediate -1.50% STOP proxy",
+                    "trades":len(immediate_stop_pairs),"actualPnlGbp":actual_total,
+                    "simPnlGbp":sim_total,"deltaGbp":sim_total-actual_total,
+                    "meanAbsoluteErrorGbp":abs_err/len(immediate_stop_pairs),
+                    "researchOnly":True,"liveTradingChanged":False,
+                }
             # V18.3.45 forensic view: expose every replayable trade and group
             # proxy divergence by the rule that fired.
             detail=[]
@@ -394,6 +574,20 @@ def install_v18344_replay_lab(app, m) -> None:
                         "lead":payoff_research_lead,
                         "minimumTradesForLead":20,
                         "note":"Research lead only; no live thresholds are changed or auto-promoted."},
+                    "stopRecoveryCalibration":{
+                        "version":"V19.0.7","mode":"REPLAY_SHADOW","liveAuthority":False,
+                        "triggerPct":-1.50,"hardFloorPct":-4.00,
+                        "liveWatchSeconds":180,"liveBounceExtensionSeconds":120,
+                        "liveBounceRequiredPct":0.60,
+                        "currentCodeWatchPersistence":True,
+                        "codeFinding":"V18.3.75 can clear a watch only inside its wrapped loss-guard call. When price recovers above the -1.50% guard threshold, the guard stops invoking the wrapper, so an existing in-memory watch can persist until a later guard event.",
+                        "immediateStop":immediate_stop_summary,
+                        "recoveryModes":stop_calibration_rows,
+                        "closestToRealised":stop_calibration_lead,
+                        "rankingBasis":"lowest mean absolute GBP error versus realised trade outcome",
+                        "limitation":"Replay has one sampled price path; live hard-floor confirmation uses broker plus quote. Two consecutive replay samples below the hard floor are used only as a conservative approximation. Replay also ends at the actual exit, so it cannot prove what would happen after a counterfactual later hold.",
+                        "note":"Calibration only. No live stop, recovery-watch, order or execution rule is changed."
+                    },
                     "largestChanges":detail[:20],
                     "tradeForensics":detail,"proxyReasonSummary":reasons,
                     "exitIntelligence":exit_intelligence,"exitIntelligenceSummary":exit_summary,
@@ -401,7 +595,7 @@ def install_v18344_replay_lab(app, m) -> None:
                     "liveExitValidation":live_validation,"liveExitValidationSummary":live_validation_summary,
                     "liveExitValidationSince":validation_since.isoformat(),
                     "freshReplayCoverage":fresh_coverage,"freshReplayCoverageSummary":fresh_coverage_summary,
-                    "warning":"Counterfactual replay is diagnostic, not a guarantee. It uses recorded sampled prices, so exits can only trigger on saved replay points. V19.0.6 payoff candidates are research-only and cannot alter live exits.",
+                    "warning":"Counterfactual replay is diagnostic, not a guarantee. It uses recorded sampled prices, so exits can only trigger on saved replay points. V19.0.6 payoff candidates and V19.0.7 STOP calibration are research-only and cannot alter live exits.",
                     "liveTradingChanged":False,"payoffResearchOnly":True,
                     "pointTimingMode":"recorded" if time_col else "synthesized-10s"}
         finally: conn.close()
