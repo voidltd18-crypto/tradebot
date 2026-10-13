@@ -294,6 +294,39 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })} · {Number(reports?.closedTradeRowsReturned || closedTrades.length).toLocaleString("en-GB")} closed rows loaded</p>}
     </Card>
 
+    <Card title="V19.0.8 Profitability Recovery Audit" wide>
+      <div className="actions">
+        <button onClick={loadReplayLab} disabled={replayLabLoading}>{replayLabLoading ? "Refreshing audit..." : "Refresh Profitability Audit"}</button>
+      </div>
+      {replayLabLoading && <p className="muted">Loading recorded trade economics…</p>}
+      {replayLabError && <p className="notice loss">{replayLabError}</p>}
+      {replayLab?.profitabilityAudit ? (() => {
+        const audit = replayLab.profitabilityAudit;
+        const number = (value: any, decimals = 2) => value == null || !Number.isFinite(Number(value)) ? "—" : Number(value).toFixed(decimals);
+        const pnl = audit.recordedPnlGbp;
+        return <>
+          <p className="notice">Research only · Last {Number(replayLab.days || 31)} days · No live trading rule changes · Recorded P&amp;L may exclude costs.</p>
+          <section className="stats">
+            <Stat label="Recorded P&amp;L (GBP)" value={pnl == null ? "—" : gbp(Number(pnl))} className={tone(Number(pnl || 0))} sub={`${audit.validTrades ?? 0} valid completed trades`}/>
+            <Stat label="Win rate" value={audit.winRatePct == null ? "—" : `${number(audit.winRatePct)}%`} sub={`${audit.wins ?? 0} wins / ${audit.losses ?? 0} losses`}/>
+            <Stat label="Profit factor" value={number(audit.profitFactor)} sub="Gross recorded wins ÷ gross recorded losses"/>
+            <Stat label="Expectancy / trade" value={audit.recordedExpectancyGbpPerTrade == null ? "—" : gbp(Number(audit.recordedExpectancyGbpPerTrade))} className={tone(Number(audit.recordedExpectancyGbpPerTrade || 0))}/>
+          </section>
+          <div className="table-wrap"><table className="compact-table"><tbody>
+            <tr><th>Average win</th><td>{gbp(Number(audit.averageWinGbp || 0))}</td><th>Average loss</th><td>{gbp(Number(audit.averageLossGbp || 0))}</td></tr>
+            <tr><th>Payoff ratio</th><td>{number(audit.payoffRatio)}</td><th>Break-even win rate</th><td>{audit.breakEvenWinRatePct == null ? "—" : `${number(audit.breakEvenWinRatePct)}%`}</td></tr>
+            <tr><th>Invalid rows excluded</th><td>{audit.invalidTrades ?? 0}</td><th>Replay-covered trades</th><td>{audit.sampledPeakLeakage?.replayTrades ?? 0}</td></tr>
+          </tbody></table></div>
+          <h3>Largest sampled peak-to-exit givebacks</h3>
+          <div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>Peak</th><th>Exit</th><th>Giveback</th></tr></thead><tbody>
+            {(audit.sampledPeakLeakage?.largest || []).slice(0,10).map((r:AnyObj, i:number) => <tr key={`profit-leak-${r.tradeId ?? i}`}><td><b>{r.symbol}</b></td><td>{number(r.sampledPeakPct)}%</td><td>{number(r.realisedExitPct)}%</td><td className="loss">{number(r.peakToExitPp)}pp</td></tr>)}
+            {!(audit.sampledPeakLeakage?.largest || []).length && <tr><td colSpan={4}>No givebacks over 1 percentage point found in replay-covered trades.</td></tr>}
+          </tbody></table></div>
+          <p className="muted">{audit.limitations} Strategy validated: <b>No</b>. Automatic promotion: <b>Blocked</b>.</p>
+        </>;
+      })() : !replayLabLoading && !replayLabError && <p className="muted">Audit not loaded yet. Press Refresh Profitability Audit; check that the V19.0.8 backend is live.</p>}
+    </Card>
+
     <Card title="V18.3.50 Stock Exit Incident Audit" wide>
       <div className="actions"><button onClick={loadIncidentAudit} disabled={incidentAuditLoading}>{incidentAuditLoading ? "Auditing…" : "Run Incident Audit"}</button></div>
       {incidentAuditError && <p className="notice loss">{incidentAuditError}</p>}
