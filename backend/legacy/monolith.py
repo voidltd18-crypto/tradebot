@@ -1444,15 +1444,36 @@ def get_all_positions():
 
             quote_price = 0.0
             spread = 0.0
+            broker_price = 0.0
+            price_source = "IEX_MID"
+            price_divergence_pct = 0.0
+            try:
+                broker_price = float(getattr(pos, "current_price", 0) or 0)
+            except Exception:
+                broker_price = 0.0
             try:
                 quote = get_quote(symbol)
                 quote_price = quote["mid"]
                 spread = quote["spread"]
             except Exception:
-                try:
-                    quote_price = float(pos.current_price)
-                except Exception:
-                    quote_price = 0.0
+                quote_price = broker_price
+                price_source = "ALPACA_POSITION_FALLBACK"
+
+            # V19.0.5: a transient/stale IEX midpoint must not make the live
+            # position look materially better/worse than Alpaca's own position
+            # mark. Gross >1% disagreement is treated as bad market data, not as
+            # trading evidence. This does not change thresholds or strategy.
+            if quote_price > 0 and broker_price > 0:
+                price_divergence_pct = abs((quote_price / broker_price) - 1.0) * 100.0
+                if price_divergence_pct > 1.0:
+                    print(
+                        f"V19.0.5 STOCK PRICE SANITY FALLBACK | {symbol} "
+                        f"iex={quote_price:.4f} broker={broker_price:.4f} "
+                        f"divergence={price_divergence_pct:.2f}%",
+                        flush=True,
+                    )
+                    quote_price = broker_price
+                    price_source = "ALPACA_POSITION_OUTLIER_FALLBACK"
 
             pnl = 0.0
             pnl_pct = 0.0
@@ -1486,6 +1507,9 @@ def get_all_positions():
                 "qty": qty,
                 "entry": entry,
                 "price": quote_price,
+                "brokerPrice": broker_price,
+                "priceSource": price_source,
+                "priceDivergencePct": price_divergence_pct,
                 "marketValue": market_value,
                 "marketValueGbp": money_gbp(market_value),
                 "pnl": pnl,
@@ -1535,11 +1559,58 @@ def get_all_positions():
 # =========================
 # HISTORY / MEMORY
 # =========================
+def _latest_persisted_buy_event(symbol: str):
+    """Recover the most recent BUY timestamp from SQLite after a restart/deploy."""
+    if not SQLITE_ENABLED:
+        return None
+    sym = str(symbol or "").upper().strip()
+    if not sym:
+        return None
+    conn = None
+    try:
+        init_db()
+        conn = db_connect()
+        row = conn.execute(
+            """SELECT timestamp,day,time,symbol,side
+               FROM trades
+               WHERE UPPER(symbol)=? AND UPPER(side)='BUY'
+               ORDER BY timestamp DESC,id DESC LIMIT 1""",
+            (sym,),
+        ).fetchone()
+        if not row:
+            return None
+        event = dict(row)
+        event["symbol"] = sym
+        event["side"] = "BUY"
+        if (not event.get("day") or not event.get("time")) and event.get("timestamp"):
+            try:
+                dt = _v6_parse_utc(event.get("timestamp"))
+                if dt:
+                    event["day"] = event.get("day") or dt.astimezone(UTC).strftime("%Y-%m-%d")
+                    event["time"] = event.get("time") or dt.astimezone(UTC).strftime("%H:%M:%S")
+            except Exception:
+                pass
+        return event
+    except Exception as exc:
+        print(f"V19.0.5 BUY AGE DB FALLBACK ERROR | {sym} {exc}", flush=True)
+        return None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def get_today_buy_event(symbol: str):
+    sym = str(symbol or "").upper().strip()
     today = today_str()
     for event in reversed(trade_events + trade_history[-100:]):
-        if event.get("symbol") == symbol and event.get("side") == "BUY" and event.get("day") == today:
+        if str(event.get("symbol") or "").upper() == sym and str(event.get("side") or "").upper() == "BUY" and event.get("day") == today:
             return event
+    persisted = _latest_persisted_buy_event(sym)
+    if persisted and str(persisted.get("day") or "") == today:
+        return persisted
     return None
 
 
@@ -1548,14 +1619,23 @@ def was_bought_today(symbol: str):
 
 
 def minutes_since_today_buy(symbol: str):
-    buy = get_today_buy_event(symbol)
+    # Prefer same-day memory, then durable SQLite history. Unknown age is -1:
+    # age-based soft exits must fail closed rather than treating it as 999999m.
+    buy = get_today_buy_event(symbol) or _latest_persisted_buy_event(symbol)
     if not buy:
-        return 999999
+        return -1
     try:
-        buy_time = datetime.strptime(f"{buy['day']} {buy['time']}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
-        return max(0, int((datetime.now(UTC) - buy_time).total_seconds() / 60))
+        if buy.get("timestamp"):
+            buy_time = _v6_parse_utc(buy.get("timestamp"))
+        else:
+            buy_time = datetime.strptime(f"{buy['day']} {buy['time']}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        if buy_time is None:
+            return -1
+        if buy_time.tzinfo is None:
+            buy_time = buy_time.replace(tzinfo=UTC)
+        return max(0, int((datetime.now(UTC) - buy_time.astimezone(UTC)).total_seconds() / 60))
     except Exception:
-        return 0
+        return -1
 
 
 def today_buy_count():
@@ -2149,17 +2229,48 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
     notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
 
 
+def _v1905_wait_for_stock_sell_fill(order, fallback_qty: float) -> Dict[str, Any]:
+    """Read-only fill confirmation used only for realised accounting."""
+    order_id = str(getattr(order, "id", "") or "")
+    latest = order
+    for _ in range(8):
+        try:
+            filled_price = float(getattr(latest, "filled_avg_price", 0) or 0)
+            filled_qty = float(getattr(latest, "filled_qty", 0) or 0)
+            status = str(getattr(latest, "status", "") or "").lower()
+            if filled_price > 0 and filled_qty > 0:
+                return {"ok": True, "orderId": order_id, "price": filled_price, "qty": filled_qty, "status": status}
+        except Exception:
+            pass
+        if not order_id:
+            break
+        try:
+            time.sleep(0.25)
+            latest = trading_client.get_order_by_id(order_id)
+        except Exception:
+            break
+    return {
+        "ok": False,
+        "orderId": order_id,
+        "price": 0.0,
+        "qty": float(fallback_qty or 0.0),
+        "status": str(getattr(latest, "status", "") or ""),
+    }
+
+
 def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 0.0, reason="AUTO SELL"):
     rounded_qty = floor_qty(qty, 6)
     if rounded_qty <= 0:
         return
 
+    submitted_order = None
+
     def submit(q):
         order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
-        trading_client.submit_order(order)
+        return trading_client.submit_order(order)
 
     try:
-        submit(rounded_qty)
+        submitted_order = submit(rounded_qty)
     except Exception as e:
         err = str(e)
         if is_insufficient_qty_error(err):
@@ -2167,7 +2278,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
             retry_qty = floor_qty(available, 6) if available else 0
             if retry_qty > 0 and retry_qty < rounded_qty:
                 try:
-                    submit(retry_qty)
+                    submitted_order = submit(retry_qty)
                     rounded_qty = retry_qty
                 except Exception as retry_error:
                     add_alpaca_rejection_event(symbol, reason, f"Initial: {err} | Retry: {retry_error}")
@@ -2179,41 +2290,75 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
             add_alpaca_rejection_event(symbol, reason, err)
             raise
 
-    pnl = (price - entry) * rounded_qty if entry > 0 and price > 0 else 0.0
-    pnl_pct = ((price / entry) - 1.0) * 100.0 if entry > 0 and price > 0 else 0.0
+    fill = _v1905_wait_for_stock_sell_fill(submitted_order, rounded_qty)
+    actual_price = float(fill.get("price") or 0.0)
+    actual_qty = float(fill.get("qty") or rounded_qty)
+    order_id = str(fill.get("orderId") or "")
+    realised_ready = actual_price > 0 and actual_qty > 0 and entry > 0
+
+    if realised_ready:
+        pnl = (actual_price - entry) * actual_qty
+        pnl_pct = ((actual_price / entry) - 1.0) * 100.0
+    else:
+        pnl = 0.0
+        pnl_pct = 0.0
+        print(
+            f"V19.0.5 STOCK SELL FILL PENDING | {symbol} order_id={order_id or '-'} "
+            f"trigger_price={float(price or 0.0):.4f} accounting_deferred=True",
+            flush=True,
+        )
+
     event = {
+        "alpacaOrderId": order_id,
         "day": today_str(),
         "time": now_time(),
         "side": "SELL",
         "symbol": symbol,
-        "qty": rounded_qty,
+        "qty": actual_qty,
+        "price": actual_price,
         "reason": reason,
         "pnl": round(pnl, 4),
         "pnlGbp": round(money_gbp(pnl), 4),
         "pnlPct": round(pnl_pct, 4),
+        "pnlPending": not realised_ready,
+        "triggerPrice": float(price or 0.0),
     }
     trade_events.append(event)
     add_trade_history_event(event)
     _v18328_live_event_refresh("SELL", symbol)
-    update_stock_memory_from_sell(symbol, pnl, pnl_pct)
-    try:
-        if "_v18255_record_tax_disposal" in globals():
-            fx_rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
-            _v18255_record_tax_disposal("STOCK", symbol, rounded_qty, max(0.0, price * rounded_qty), pnl, fx_rate, reason)
-    except Exception as tax_exc:
-        print(f"V18.2.55 STOCK TAX LEDGER ERROR | symbol={symbol} error={tax_exc}", flush=True)
-    if pnl > 0 and "profit_vault_bank_realised_profit" in globals():
+
+    # Realised-only consumers must never use the quote that triggered a market
+    # order. If the fill is still pending, Alpaca backfill/reports remain the
+    # source of truth and these derived ledgers are not fed a fabricated result.
+    if realised_ready:
+        update_stock_memory_from_sell(symbol, pnl, pnl_pct)
         try:
-            profit_vault_bank_realised_profit(pnl, symbol=symbol, reason=reason)
-        except Exception as vault_exc:
-            print(f"V17.6 PROFIT VAULT BANK ERROR | symbol={symbol} error={vault_exc}")
-    try:
-        if "_v18333_record_stock_exit" in globals():
-            _v18333_record_stock_exit(symbol, entry, price, rounded_qty, reason)
-    except Exception as learning_exc:
-        print(f"V18.3.33 EXIT LEARNER RECORD ERROR | {symbol} {learning_exc}", flush=True)
+            if "_v18255_record_tax_disposal" in globals():
+                fx_rate = float(get_usd_to_gbp_rate() or FX_FALLBACK_USD_TO_GBP)
+                _v18255_record_tax_disposal("STOCK", symbol, actual_qty, max(0.0, actual_price * actual_qty), pnl, fx_rate, reason)
+        except Exception as tax_exc:
+            print(f"V18.2.55 STOCK TAX LEDGER ERROR | symbol={symbol} error={tax_exc}", flush=True)
+        if pnl > 0 and "profit_vault_bank_realised_profit" in globals():
+            try:
+                profit_vault_bank_realised_profit(pnl, symbol=symbol, reason=reason)
+            except Exception as vault_exc:
+                print(f"V17.6 PROFIT VAULT BANK ERROR | symbol={symbol} error={vault_exc}")
+        try:
+            if "_v18333_record_stock_exit" in globals():
+                _v18333_record_stock_exit(symbol, entry, actual_price, actual_qty, reason)
+        except Exception as learning_exc:
+            print(f"V18.3.33 EXIT LEARNER RECORD ERROR | {symbol} {learning_exc}", flush=True)
+        print(
+            f"V19.0.5 STOCK SELL FILL | {symbol} order_id={order_id or '-'} "
+            f"fill={actual_price:.4f} qty={actual_qty:.6f} realised={pnl_pct:.2f}%",
+            flush=True,
+        )
+
     lock_symbol_until_tomorrow(symbol)
-    notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
+    if realised_ready:
+        notify(f"🔴 {reason}: {symbol} | qty={actual_qty} | realised PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
+    else:
+        notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | fill pending; realised PnL will come from Alpaca")
 
 
 def close_position(position, reason="MANUAL SELL"):
@@ -2342,6 +2487,9 @@ def hold_ai_blocks_soft_exit(position: Dict[str, Any], exit_reason: str):
     minutes = int(position.get("minutesSinceBuy") or 999999)
     min_hold = hold_ai_min_hold_minutes(symbol)
     profile = hold_ai_symbol_profile(symbol)
+
+    if minutes < 0:
+        return True, f"HOLD AI age unknown for {symbol}; soft exit blocked ({exit_reason})"
 
     # Never soft-sell the same day unless it is a hard stop. This protects the
     # account from PDT churn and stops the bot from scalping tiny moves.
@@ -2723,6 +2871,8 @@ def should_stall_exit(position: Dict[str, Any]):
     ai_min = hold_ai_min_hold_minutes(symbol) if HOLD_AI_ENABLED else STALL_EXIT_AFTER_MINUTES
     effective_stall = max(STALL_EXIT_AFTER_MINUTES, ai_min)
 
+    if minutes < 0:
+        return False, "stall exit blocked: position age unknown"
     if minutes < effective_stall:
         return False, f"held {minutes}m below swing stall timer {effective_stall}m"
 
