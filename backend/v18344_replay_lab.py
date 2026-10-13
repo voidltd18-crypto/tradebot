@@ -6,6 +6,7 @@ change live entry/exit rules.
 from datetime import datetime, UTC, timedelta
 from typing import Any, Dict, List
 from fastapi import Request
+from backend.v1908_profitability_audit import profitability_audit
 
 
 def install_v18344_replay_lab(app, m) -> None:
@@ -588,6 +589,7 @@ def install_v18344_replay_lab(app, m) -> None:
                         "limitation":"Replay has one sampled price path; live hard-floor confirmation uses broker plus quote. Two consecutive replay samples below the hard floor are used only as a conservative approximation. Replay also ends at the actual exit, so it cannot prove what would happen after a counterfactual later hold.",
                         "note":"Calibration only. No live stop, recovery-watch, order or execution rule is changed."
                     },
+                    "profitabilityAudit":profitability_audit(trades,detail),
                     "largestChanges":detail[:20],
                     "tradeForensics":detail,"proxyReasonSummary":reasons,
                     "exitIntelligence":exit_intelligence,"exitIntelligenceSummary":exit_summary,
