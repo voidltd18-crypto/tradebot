@@ -243,6 +243,8 @@ def install_v18344_replay_lab(app, m) -> None:
                 recovery_cfgs=[
                     {"key":"current_code_180","name":"Current-code recovery watch 180s","watch":180,"extend":120,"clear":False},
                     {"key":"intended_clear_180","name":"Clear-on-recovery 180s","watch":180,"extend":120,"clear":True},
+                    {"key":"intended_clear_60","name":"Clear-on-recovery 60s (research)","watch":60,"extend":60,"clear":True},
+                    {"key":"intended_clear_90","name":"Clear-on-recovery 90s (research)","watch":90,"extend":60,"clear":True},
                     {"key":"intended_clear_120","name":"Clear-on-recovery 120s","watch":120,"extend":90,"clear":True},
                     {"key":"intended_clear_240","name":"Clear-on-recovery 240s","watch":240,"extend":120,"clear":True},
                 ]
@@ -309,6 +311,8 @@ def install_v18344_replay_lab(app, m) -> None:
             stop_mode_defs=[
                 ("current_code_180","Current-code recovery watch 180s"),
                 ("intended_clear_180","Clear-on-recovery 180s"),
+                ("intended_clear_60","Clear-on-recovery 60s (research)"),
+                ("intended_clear_90","Clear-on-recovery 90s (research)"),
                 ("intended_clear_120","Clear-on-recovery 120s"),
                 ("intended_clear_240","Clear-on-recovery 240s"),
             ]
@@ -580,14 +584,15 @@ def install_v18344_replay_lab(app, m) -> None:
                         "triggerPct":-1.50,"hardFloorPct":-4.00,
                         "liveWatchSeconds":180,"liveBounceExtensionSeconds":120,
                         "liveBounceRequiredPct":0.60,
-                        "currentCodeWatchPersistence":True,
+                        "historicCodeWatchPersistence":True,
+                        "currentCodeWatchPersistence":False,
                         "codeFinding":"V18.3.75 can clear a watch only inside its wrapped loss-guard call. When price recovers above the -1.50% guard threshold, the guard stops invoking the wrapper, so an existing in-memory watch can persist until a later guard event.",
                         "immediateStop":immediate_stop_summary,
                         "recoveryModes":stop_calibration_rows,
                         "closestToRealised":stop_calibration_lead,
-                        "rankingBasis":"lowest mean absolute GBP error versus realised trade outcome",
+                        "rankingBasis":"lowest mean absolute GBP error versus realised trade outcome (NOT optimal future profit)",
                         "limitation":"Replay has one sampled price path; live hard-floor confirmation uses broker plus quote. Two consecutive replay samples below the hard floor are used only as a conservative approximation. Replay also ends at the actual exit, so it cannot prove what would happen after a counterfactual later hold.",
-                        "note":"Calibration only. No live stop, recovery-watch, order or execution rule is changed."
+                        "note":"V19.0.14 extends research to 60s and 90s. The 60/90s candidates change both watch and extension duration. Price paths end at the actual exit, so a longer hold cannot be evaluated fairly. No live stop or recovery-watch duration is changed."
                     },
                     "profitabilityAudit":profitability_audit(trades,detail),
                     "largestChanges":detail[:20],
