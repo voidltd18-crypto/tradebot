@@ -19,8 +19,13 @@ class TelemetryTests(unittest.TestCase):
         result=m.market_sell_qty("AAPL",2,entry=100,price=99,reason="TEST")
         self.assertEqual(result,{"id":"order-one"})
         self.assertEqual(received,[ (("AAPL",2),{"entry":100,"price":99,"reason":"TEST"}) ])
-        self.assertEqual(t._events[-1]["outcome"],"returned")
+        self.assertEqual(t._events[-1]["outcome"],"returned_unverified")
         self.assertFalse(t._events[-1]["brokerFillVerified"])
+    def test_none_return_means_no_order_result(self):
+        m=SimpleNamespace(market_sell_qty=lambda *args,**kwargs:None)
+        t.install_v19011_sell_telemetry(FakeApp(),m)
+        self.assertIsNone(m.market_sell_qty("ONDS",1,reason="LOSS GUARD"))
+        self.assertEqual(t._events[-1]["outcome"],"deferred_no_order_result")
     def test_preserves_exception(self):
         def sell(*args,**kwargs): raise ValueError("failed")
         m=SimpleNamespace(market_sell_qty=sell)
