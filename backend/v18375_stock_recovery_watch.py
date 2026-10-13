@@ -184,6 +184,7 @@ def install_v18375_stock_recovery_watch(app, m) -> None:
                     worst = min(worst, quote_loss)
                 watch = {
                     "startedAt": now,
+                    "entryPrice": entry,
                     "deadline": now + WATCH_SECONDS,
                     "firstLossPct": trigger_loss,
                     "worstLossPct": worst,
@@ -284,6 +285,57 @@ def install_v18375_stock_recovery_watch(app, m) -> None:
                 f"V18.3.75 RECOVERY EXPIRED | {reason}",
             )
 
+    # V19.0.9: Reconcile watches on the already-running position polls.
+    # Previously a recovered position could stop invoking the loss-guard
+    # entirely, leaving an orphaned recovery watch in _watch indefinitely.
+    # Never place orders here; only clear a watch after TWO separate polls
+    # with both fresh broker and quote prices above the trigger.
+    original_get_all_positions = m.get_all_positions
+
+    def reconciled_get_all_positions(*args, **kwargs):
+        positions = original_get_all_positions(*args, **kwargs)
+        try:
+            by_symbol = {
+                str(p.get("symbol") or "").upper().strip(): p
+                for p in positions if isinstance(p, dict)
+            }
+            with _lock:
+                watched_symbols = tuple(_watch)
+            for sym in watched_symbols:
+                position = by_symbol.get(sym)
+                if not position:
+                    # Don't silently clear if a temporary API result is empty.
+                    continue
+                with _lock:
+                    watch = _watch.get(sym)
+                    entry = _num(watch.get("entryPrice")) if watch else 0.0
+                if not watch or entry <= 0:
+                    continue
+                broker_price = _num(position.get("price") or position.get("current_price"))
+                quote_price = _fresh_quote_price(m, sym)
+                recovered = (
+                    broker_price > 0 and quote_price > 0
+                    and _loss_pct(broker_price, entry) > RECOVERY_TRIGGER_PCT + 0.15
+                    and _loss_pct(quote_price, entry) > RECOVERY_TRIGGER_PCT + 0.15
+                )
+                with _lock:
+                    current = _watch.get(sym)
+                    if current is not watch:
+                        continue
+                    count = int(current.get("recoveryPolls", 0)) + 1 if recovered else 0
+                    current["recoveryPolls"] = count
+                    if count >= 2:
+                        _watch.pop(sym, None)
+                        print(f"V19.0.9 RECOVERY WATCH CLEARED | {sym} "
+                              f"broker={_loss_pct(broker_price,entry):.2f}% "
+                              f"quote={_loss_pct(quote_price,entry):.2f}% "
+                              "confirmed_polls=2 live_sell=False")
+        except Exception as exc:
+            # A reconciliation failure must never break normal position polling.
+            print(f"V19.0.9 RECOVERY RECONCILE ERROR | {type(exc).__name__}")
+        return positions
+
+    m.get_all_positions = reconciled_get_all_positions
     m.market_sell_qty = recovery_market_sell_qty
 
     print(
