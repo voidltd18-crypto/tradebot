@@ -37,11 +37,11 @@ def install_v19011_sell_telemetry(app,m):
                 del _events[:-_MAX_EVENTS]
             print(f"V19.0.11 SELL CALL | symbol={ev['symbol']} outcome=exception duration_ms={ev['callDurationMs']} error={ev['exceptionType']}",flush=True)
             raise
-        ev=_event(symbol,reason,time.monotonic()-start,"returned")
+        ev=_event(symbol,reason,time.monotonic()-start,"deferred_no_order_result" if result is None else "returned_unverified")
         with _lock:
             _events.append(ev)
             del _events[:-_MAX_EVENTS]
-        print(f"V19.0.11 SELL CALL | symbol={ev['symbol']} outcome=returned duration_ms={ev['callDurationMs']} broker_fill=NOT_VERIFIED",flush=True)
+        print(f"V19.0.11 SELL CALL | symbol={ev['symbol']} outcome={ev['outcome']} duration_ms={ev['callDurationMs']} broker_fill=NOT_VERIFIED",flush=True)
         return result
     m.market_sell_qty=observed_sell
     @app.get("/v19/sell-execution-telemetry")
@@ -51,4 +51,4 @@ def install_v19011_sell_telemetry(app,m):
             events=list(_events[-max(1,min(int(limit),_MAX_EVENTS)):])
         return {"ok":True,"version":"V19.0.11","records":list(reversed(events)),
                 "liveTradingRulesChanged":False,
-                "note":"Only records sell-function call duration and exception; success does not establish order fill or execution price. In-memory rolling buffer resets on deploy."}
+                "note":"Records sell-function duration, including deferred None results; even non-None returns do not establish order submission, fill or execution price. In-memory rolling buffer resets on deploy."}
