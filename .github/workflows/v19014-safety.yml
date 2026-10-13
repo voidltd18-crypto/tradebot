@@ -1,0 +1,16 @@
+name: V19.0.14 Watch Duration Calibration
+on:
+  push:
+    branches: [v19-0-14-watch-duration-calibration]
+  pull_request:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m py_compile backend/v18344_replay_lab.py
+      - run: python -m unittest discover -s tests -p 'test_v19014_watch_duration.py' -v
