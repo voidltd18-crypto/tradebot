@@ -25,6 +25,7 @@ from backend.v18375_stock_recovery_watch import install_v18375_stock_recovery_wa
 from backend.v18376_keep_buying_after_loss import install_v18376_keep_buying_after_loss
 from backend.v18373_buy_execution_recovery import install_v18373_buy_execution_recovery
 from backend.v190_crypto_v2 import install_v190_crypto_v2
+from backend.v19010_exit_forensics import install_v19010_exit_forensics
 
 app = monolith.app
 install_v18371_global_stock_discovery(app, monolith)
@@ -32,6 +33,7 @@ install_v18375_stock_recovery_watch(app, monolith)
 install_v18376_keep_buying_after_loss(app, monolith)
 install_v18373_buy_execution_recovery(app, monolith)
 install_v190_crypto_v2(app, monolith)
+install_v19010_exit_forensics(app, monolith)
 install_v18343(app, monolith)
 install_v18344_replay_lab(app, monolith)
 install_v18350_exit_incident_audit(app, monolith)
