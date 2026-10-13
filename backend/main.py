@@ -26,6 +26,7 @@ from backend.v18376_keep_buying_after_loss import install_v18376_keep_buying_aft
 from backend.v18373_buy_execution_recovery import install_v18373_buy_execution_recovery
 from backend.v190_crypto_v2 import install_v190_crypto_v2
 from backend.v19010_exit_forensics import install_v19010_exit_forensics
+from backend.v19011_sell_telemetry import install_v19011_sell_telemetry
 
 app = monolith.app
 install_v18371_global_stock_discovery(app, monolith)
@@ -46,5 +47,6 @@ install_v18364_ai_exit_pilot_guardian(app, monolith)
 install_v18365_ai_exit_pilot_simulator(app, monolith)
 install_v18366_autonomous_ai_exit_promotion(app, monolith)
 install_v18363_ai_exit_live_pilot(app, monolith)
+install_v19011_sell_telemetry(app, monolith)
 
 __all__ = ["app"]
