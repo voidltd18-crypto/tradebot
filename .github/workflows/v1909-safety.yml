@@ -1,0 +1,21 @@
+name: V19.0.9 Recovery Watch Safety
+on:
+  push:
+    branches:
+      - v19-0-9-exit-integrity
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+jobs:
+  safety-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compile changed modules
+        run: python -m py_compile backend/v18375_stock_recovery_watch.py tests/test_v1909_recovery_watch.py
+      - name: Run recovery watch regression tests
+        run: python -m unittest discover -s tests -p 'test_v1909_recovery_watch.py' -v
