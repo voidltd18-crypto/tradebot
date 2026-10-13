@@ -50,7 +50,8 @@ def install_v18344_replay_lab(app, m) -> None:
                     exit_price, exit_reason, exit_time = price, "STALE", now
                     break
         sim_pnl_usd = (exit_price-entry)*qty
-        return {"exitPrice":exit_price,"pnlUsd":sim_pnl_usd,"exitReason":exit_reason,
+        sim_pnl_pct = ((exit_price/entry)-1.0)*100.0 if entry > 0 else 0.0
+        return {"exitPrice":exit_price,"pnlUsd":sim_pnl_usd,"pnlPct":sim_pnl_pct,"exitReason":exit_reason,
                 "exitTime":exit_time.isoformat() if exit_time else None,
                 "peakPct":((peak/entry)-1.0)*100.0}
 
@@ -91,11 +92,20 @@ def install_v18344_replay_lab(app, m) -> None:
                         best=s; score=delta+diff*600
                 return (best,"reconciled") if best else (None,None)
 
-            # Baseline mirrors the current protective stack concepts, while the
-            # candidates deliberately vary one dimension at a time.
+            # V19.0.6 Payoff Research. These are counterfactual replay profiles
+            # only: they never change live orders or live exit thresholds.
+            #
+            # The new candidates explicitly test the failure mode seen in recent
+            # trading: many very small winners paired with materially larger
+            # losers. The research question is whether giving proven winners more
+            # room while containing losers improves payoff ratio/expectancy.
             configs=[
               {"key":"current_proxy","name":"Current-rule proxy","stop":1.50,"arm":1.25,"giveback":0.55,"stale":60,"stalePeak":0.75},
               {"key":"loss_125","name":"Tighter loss cap 1.25%","stop":1.25,"arm":1.25,"giveback":0.55,"stale":60,"stalePeak":0.75},
+              {"key":"winner_room_150","name":"Winner room 1.50% arm / 0.60pp giveback","stop":1.25,"arm":1.50,"giveback":0.60,"stale":75,"stalePeak":0.75},
+              {"key":"winner_room_175","name":"Winner room 1.75% arm / 0.70pp giveback","stop":1.25,"arm":1.75,"giveback":0.70,"stale":90,"stalePeak":0.75},
+              {"key":"asym_100_150","name":"Asymmetric 1.00% loss / 1.50% winner arm","stop":1.00,"arm":1.50,"giveback":0.60,"stale":75,"stalePeak":0.75},
+              {"key":"asym_125_175","name":"Asymmetric 1.25% loss / 1.75% winner arm","stop":1.25,"arm":1.75,"giveback":0.65,"stale":90,"stalePeak":0.75},
               {"key":"lock_100","name":"Earlier peak lock 1.00%","stop":1.50,"arm":1.00,"giveback":0.55,"stale":60,"stalePeak":0.75},
               {"key":"giveback_040","name":"Tighter giveback 0.40pp","stop":1.50,"arm":1.25,"giveback":0.40,"stale":60,"stalePeak":0.75},
               {"key":"stale_45","name":"Earlier stale exit 45m","stop":1.50,"arm":1.25,"giveback":0.55,"stale":45,"stalePeak":0.75},
@@ -133,14 +143,38 @@ def install_v18344_replay_lab(app, m) -> None:
             for cfg in configs:
                 sims=[(r,r["simulations"].get(cfg["key"])) for r in usable if r["simulations"].get(cfg["key"])]
                 pnls=[s["pnlGbp"] for _,s in sims]; actuals=[r["actualPnlGbp"] for r,_ in sims]
+                pnl_pcts=[float(s.get("pnlPct") or 0.0) for _,s in sims]
                 wins=[x for x in pnls if x>0]; losses=[x for x in pnls if x<0]
+                win_pcts=[x for x in pnl_pcts if x>0]; loss_pcts=[x for x in pnl_pcts if x<0]
+                avg_win=sum(wins)/len(wins) if wins else 0
+                avg_loss=sum(losses)/len(losses) if losses else 0
+                payoff=(avg_win/abs(avg_loss)) if avg_win>0 and avg_loss<0 else 0
+                breakeven=(100.0/(1.0+payoff)) if payoff>0 else 100.0
+                expectancy=(sum(pnls)/len(pnls)) if pnls else 0
+                expectancy_pct=(sum(pnl_pcts)/len(pnl_pcts)) if pnl_pcts else 0
                 results.append({"key":cfg["key"],"name":cfg["name"],"trades":len(pnls),
+                    "researchOnly":True,"liveTradingChanged":False,
                     "simPnlGbp":sum(pnls),"actualPnlGbp":sum(actuals),"deltaGbp":sum(pnls)-sum(actuals),
                     "winRatePct":len(wins)/len(pnls)*100 if pnls else 0,
-                    "avgWinGbp":sum(wins)/len(wins) if wins else 0,"avgLossGbp":sum(losses)/len(losses) if losses else 0,
-                    "payoffRatio":((sum(wins)/len(wins))/abs(sum(losses)/len(losses)) if wins and losses else 0),
+                    "avgWinGbp":avg_win,"avgLossGbp":avg_loss,
+                    "avgWinPct":sum(win_pcts)/len(win_pcts) if win_pcts else 0,
+                    "avgLossPct":sum(loss_pcts)/len(loss_pcts) if loss_pcts else 0,
+                    "payoffRatio":payoff,"breakEvenWinRatePct":breakeven,
+                    "expectancyGbpPerTrade":expectancy,"expectancyPctPerTrade":expectancy_pct,
                     "tailLossesOver10Gbp":sum(1 for x in losses if x<=-10),
                     "worstLossGbp":min(losses,default=0)})
+
+            # Do not auto-promote anything. Surface the strongest replay result
+            # only as a research lead, and require a reasonable sample before it
+            # is even labelled worth further shadow study.
+            ranked_payoff=sorted(
+                [r for r in results if int(r.get("trades") or 0)>=20],
+                key=lambda r:(float(r.get("expectancyGbpPerTrade") or 0),
+                              float(r.get("payoffRatio") or 0),
+                              -float(r.get("breakEvenWinRatePct") or 100)),
+                reverse=True,
+            )
+            payoff_research_lead=(ranked_payoff[0] if ranked_payoff else None)
             # V18.3.45 forensic view: expose every replayable trade and group
             # proxy divergence by the rule that fired.
             detail=[]
@@ -353,14 +387,21 @@ def install_v18344_replay_lab(app, m) -> None:
                 "missingReplay":coverage_missing,
                 "coveragePct":((len(fresh_coverage)-coverage_missing)/len(fresh_coverage)*100.0 if fresh_coverage else 0.0)}
 
-            return {"ok":True,"version":"V18.3.49","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
-                    "skippedNoReplay":skipped,"results":results,"largestChanges":detail[:20],
+            return {"ok":True,"version":"V19.0.6","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
+                    "skippedNoReplay":skipped,"results":results,
+                    "payoffResearch":{"mode":"REPLAY_SHADOW","liveAuthority":False,
+                        "problem":"small winners versus larger losers",
+                        "lead":payoff_research_lead,
+                        "minimumTradesForLead":20,
+                        "note":"Research lead only; no live thresholds are changed or auto-promoted."},
+                    "largestChanges":detail[:20],
                     "tradeForensics":detail,"proxyReasonSummary":reasons,
                     "exitIntelligence":exit_intelligence,"exitIntelligenceSummary":exit_summary,
                     "recoveryAwareResearch":recovery_research,"recoveryAwareSummary":recovery_summary,
                     "liveExitValidation":live_validation,"liveExitValidationSummary":live_validation_summary,
                     "liveExitValidationSince":validation_since.isoformat(),
                     "freshReplayCoverage":fresh_coverage,"freshReplayCoverageSummary":fresh_coverage_summary,
-                    "warning":"Counterfactual replay is diagnostic, not a guarantee. It uses recorded sampled prices, so exits can only trigger on saved replay points.",
-                    "liveTradingChanged":False,"pointTimingMode":"recorded" if time_col else "synthesized-10s"}
+                    "warning":"Counterfactual replay is diagnostic, not a guarantee. It uses recorded sampled prices, so exits can only trigger on saved replay points. V19.0.6 payoff candidates are research-only and cannot alter live exits.",
+                    "liveTradingChanged":False,"payoffResearchOnly":True,
+                    "pointTimingMode":"recorded" if time_col else "synthesized-10s"}
         finally: conn.close()
