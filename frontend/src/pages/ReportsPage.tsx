@@ -310,7 +310,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       </>}
     </Card>
 
-    <Card title="V18.3.49 Live Replay Coverage + Trigger Snapshot" wide>
+    <Card title="V19.0.7 Replay + STOP Recovery Calibration" wide>
       <div className="actions"><button onClick={loadReplayLab} disabled={replayLabLoading}>{replayLabLoading ? "Replaying…" : "Run Replay Lab"}</button></div>
       {replayLabError && <p className="notice loss">{replayLabError}</p>}
       {replayLab?.results && <>
@@ -318,6 +318,53 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
         <div className="table-wrap"><table className="compact-table"><thead><tr><th>Scenario</th><th>Trades</th><th>Actual</th><th>Replay</th><th>Difference</th><th>Win rate</th><th>Avg win</th><th>Avg loss</th><th>Payoff</th><th>£10+ losses</th></tr></thead><tbody>
           {replayLab.results.map((row:AnyObj)=><tr key={row.key}><td><b>{row.name}</b></td><td>{row.trades}</td><td>{gbp(Number(row.actualPnlGbp||0))}</td><td className={tone(row.simPnlGbp)}>{gbp(Number(row.simPnlGbp||0))}</td><td className={tone(row.deltaGbp)}>{gbp(Number(row.deltaGbp||0))}</td><td>{Number(row.winRatePct||0).toFixed(1)}%</td><td className="profit">{gbp(Number(row.avgWinGbp||0))}</td><td className="loss">{gbp(Number(row.avgLossGbp||0))}</td><td>{Number(row.payoffRatio||0).toFixed(2)}×</td><td>{Number(row.tailLossesOver10Gbp||0)}</td></tr>)}
         </tbody></table></div>
+        {replayLab.stopRecoveryCalibration && <>
+          <h3>V19.0.7 STOP Recovery Calibration</h3>
+          <p className="notice">
+            Read-only replay calibration of the live -1.50% recovery-watch path · no live stop or order rule changed.
+          </p>
+          <section className="stats">
+            <Stat
+              label="Immediate STOP error"
+              value={replayLab.stopRecoveryCalibration.immediateStop ? gbp(Number(replayLab.stopRecoveryCalibration.immediateStop.meanAbsoluteErrorGbp||0)) : "—"}
+              sub="Mean absolute error vs realised"
+            />
+            <Stat
+              label="Closest recovery model"
+              value={replayLab.stopRecoveryCalibration.closestToRealised?.name || "—"}
+              sub={replayLab.stopRecoveryCalibration.closestToRealised ? `${Number(replayLab.stopRecoveryCalibration.closestToRealised.trades||0)} trigger trades` : "Waiting for replay evidence"}
+            />
+            <Stat
+              label="Closest model error"
+              value={replayLab.stopRecoveryCalibration.closestToRealised ? gbp(Number(replayLab.stopRecoveryCalibration.closestToRealised.meanAbsoluteErrorGbp||0)) : "—"}
+              sub="Calibration accuracy, not profit ranking"
+            />
+            <Stat
+              label="Watch persistence"
+              value={replayLab.stopRecoveryCalibration.currentCodeWatchPersistence ? "DETECTED" : "—"}
+              className={replayLab.stopRecoveryCalibration.currentCodeWatchPersistence ? "loss" : undefined}
+              sub="Current V18.3.75 control-flow finding"
+            />
+          </section>
+          <p className="muted">{replayLab.stopRecoveryCalibration.codeFinding}</p>
+          <div className="table-wrap"><table className="compact-table"><thead><tr>
+            <th>Recovery model</th><th>Trades</th><th>Actual</th><th>Replay</th><th>Difference</th><th>Avg abs error</th><th>Exit mix</th>
+          </tr></thead><tbody>
+            {[
+              ...(replayLab.stopRecoveryCalibration.immediateStop ? [replayLab.stopRecoveryCalibration.immediateStop] : []),
+              ...(Array.isArray(replayLab.stopRecoveryCalibration.recoveryModes) ? replayLab.stopRecoveryCalibration.recoveryModes : [])
+            ].map((row:AnyObj)=><tr key={row.key}>
+              <td><b>{row.name}</b></td>
+              <td>{Number(row.trades||0)}</td>
+              <td className={tone(row.actualPnlGbp)}>{gbp(Number(row.actualPnlGbp||0))}</td>
+              <td className={tone(row.simPnlGbp)}>{gbp(Number(row.simPnlGbp||0))}</td>
+              <td className={tone(row.deltaGbp)}>{gbp(Number(row.deltaGbp||0))}</td>
+              <td>{gbp(Number(row.meanAbsoluteErrorGbp||0))}</td>
+              <td>{row.exitReasons ? Object.entries(row.exitReasons).map(([k,v])=>`${k}: ${v}`).join(" · ") : "—"}</td>
+            </tr>)}
+          </tbody></table></div>
+          <p className="muted">{replayLab.stopRecoveryCalibration.limitation}</p>
+        </>}
         {Array.isArray(replayLab.proxyReasonSummary) && replayLab.proxyReasonSummary.length > 0 && <>
           <h3>Why the proxy diverges</h3>
           <div className="table-wrap"><table className="compact-table"><thead><tr><th>Proxy trigger</th><th>Trades</th><th>Actual PnL</th><th>Proxy PnL</th><th>Difference</th></tr></thead><tbody>
