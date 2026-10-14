@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 from fastapi import Request
 from backend.v1908_profitability_audit import profitability_audit
 from backend.v19015_replay_integrity import evidence_quality, quality_summary
+from backend.v19016_replay_bounds import bound_replay_to_exit
 
 
 def install_v18344_replay_lab(app, m) -> None:
@@ -226,7 +227,13 @@ def install_v18344_replay_lab(app, m) -> None:
                     raw=[dict(r) for r in conn.execute(sql,(int(sess["id"]),)).fetchall()]
                     start=_dt(sess.get("started_at"))
                     pts=[{**p,"point_time":(start+timedelta(seconds=i*10)).isoformat() if start else None} for i,p in enumerate(raw)]
-                if len(pts)<2: skipped+=1; continue
+                # Never allow observations from after the actual trade's exit
+                # to affect counterfactual loss or profit-lock decisions.
+                pts, bound_status = bound_replay_to_exit(pts,t.get("timestamp"))
+                if bound_status != "BOUNDED_TO_EXIT":
+                    skipped += 1
+                    continue
+
                 entry=float(t.get("entry_price") or 0); qty=float(t.get("qty") or 0); actual_exit=float(t.get("exit_price") or 0)
                 if entry<=0 or qty<=0 or actual_exit<=0: skipped+=1; continue
                 fx=float(t.get("fx_rate") or 0)
