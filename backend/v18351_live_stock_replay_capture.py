@@ -127,35 +127,36 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
         return "UNKNOWN", "position_observer", ""
 
     def reconcile_closed_trade(conn, symbol, entry_price, closed_at):
+        """Link only when one unique nearby closed trade is demonstrably eligible.
+
+        A heuristic match is not a broker-order causal ID. Such matches are
+        recorded in the audit but NOT promoted to a direct replay link.
+        """
+        from datetime import timedelta
         try:
-            rows = conn.execute(
-                """SELECT * FROM closed_trades
-                   WHERE symbol=? ORDER BY timestamp DESC LIMIT 12""",
+            end = m._v6_parse_utc(closed_at)
+            rows = [dict(r) for r in conn.execute(
+                """SELECT * FROM closed_trades WHERE symbol=? ORDER BY timestamp DESC LIMIT 25""",
                 (symbol,),
-            ).fetchall()
+            ).fetchall()]
         except Exception:
             return None
-        best = None
-        best_score = 1e99
-        for raw in rows:
-            r = dict(raw)
+        eligible=[]
+        for r in rows:
             try:
-                td = m._v6_parse_utc(r.get("timestamp"))
-                cd = m._v6_parse_utc(closed_at)
-                if not td or not cd:
+                td=m._v6_parse_utc(r.get("timestamp"))
+                ep=float(r.get("entry_price") or 0)
+                if not td or not end or not ep or not entry_price:
                     continue
-                seconds = abs((td - cd).total_seconds())
-                if seconds > 3600:
-                    continue
-                ep = float(r.get("entry_price") or 0)
-                diff = abs(ep-entry_price)/entry_price if ep > 0 and entry_price > 0 else 0.0
-                score = seconds + diff * 600.0
-                if diff <= 0.05 and score < best_score:
-                    best = r
-                    best_score = score
-            except Exception:
+                # Timestamp proximity and entry price are insufficient proof
+                # of identity; return candidate only for informational purposes.
+                lag=abs((td-end).total_seconds())
+                relative=abs(ep-entry_price)/entry_price
+                if lag<=60 and relative<=0.01:
+                    eligible.append(r)
+            except (TypeError,ValueError,OverflowError):
                 continue
-        return best
+        return eligible[0] if len(eligible)==1 else None
 
     def position_snapshot():
         runtime["positionError"] = ""
@@ -273,7 +274,7 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
                 closed_at = now_iso()
                 entry = float(sess.get("entry_price") or 0)
                 closed_trade = reconcile_closed_trade(conn, sym, entry, closed_at)
-                closed_trade_id = int(closed_trade.get("id") or 0) if closed_trade else None
+                # No order-id causal link is available here. Never persist a\n                # guessed trade ID in the direct-link column.\n                closed_trade_id = None
                 update_dynamic(
                     conn,
                     "trade_replay_sessions",
@@ -288,7 +289,7 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
                     (sid, closed_trade_id, sym, closed_at, reason, source, payload),
                 )
                 runtime["sessionsClosed"] += 1
-                diag("SESSION_CLOSED", symbol=sym, sessionId=sid, closedTradeId=closed_trade_id, reason=reason, source=source)
+                diag("SESSION_CLOSED", symbol=sym, sessionId=sid, closedTradeId=closed_trade_id, candidateTradeId=(closed_trade or {}).get("id"), reason=reason, source=source)
 
             conn.commit()
             runtime["openSessions"] = len(positions)
