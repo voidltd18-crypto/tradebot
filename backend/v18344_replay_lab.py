@@ -584,6 +584,30 @@ def install_v18344_replay_lab(app, m) -> None:
                 "missingReplay":coverage_missing,
                 "coveragePct":((len(fresh_coverage)-coverage_missing)/len(fresh_coverage)*100.0 if fresh_coverage else 0.0)}
 
+            # V19 Render-first observability: summary only, no trade or account IDs.
+            # Emitted whenever an authenticated Reports replay finishes.
+            try:
+                quality=quality_summary(evidence_rows)
+                stops=stop_validation_summary(stop_validation_rows)
+                short_modes=[
+                    {"mode":r.get("key"),"trades":r.get("trades"),
+                     "deltaGbp":round(float(r.get("deltaGbp") or 0),2)}
+                    for r in stop_calibration_rows
+                ]
+                print(
+                    "V19 REPLAY AUDIT SUMMARY | "
+                    f"trades_scanned={len(trades)} replay_covered={len(usable)} "
+                    f"clean_evidence={quality.get('cleanEvidenceCount')} "
+                    f"integrity_flags={quality.get('flagCounts')} "
+                    f"sampled_stops={stops.get('sampledStops')} "
+                    f"direct_links={stops.get('directReplayLinks')} "
+                    f"watch_modes={short_modes} "
+                    "research_only=True live_changes=False",
+                    flush=True,
+                )
+            except Exception as audit_exc:
+                print(f"V19 REPLAY AUDIT SUMMARY ERROR | {type(audit_exc).__name__}",flush=True)
+
             return {"ok":True,"version":"V19.0.6","days":days,"tradesScanned":len(trades),"replayTrades":len(usable),
                     "skippedNoReplay":skipped,"results":results,
                     "payoffResearch":{"mode":"REPLAY_SHADOW","liveAuthority":False,
