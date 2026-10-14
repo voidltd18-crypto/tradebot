@@ -294,6 +294,39 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })} · {Number(reports?.closedTradeRowsReturned || closedTrades.length).toLocaleString("en-GB")} closed rows loaded</p>}
     </Card>
 
+    <Card title="V19.0.15 Replay Evidence Integrity" wide>
+      <div className="actions"><button onClick={loadReplayLab} disabled={replayLabLoading}>{replayLabLoading ? "Checking evidence..." : "Refresh Integrity Audit"}</button></div>
+      <p className="notice">Read-only diagnostics. Recorded price snapshots are not executable quotes, and a clean result does not validate strategy profitability.</p>
+      {replayLabLoading && <p className="muted">Checking replay coverage…</p>}
+      {replayLabError && <p className="notice loss">{replayLabError}</p>}
+      {replayLab?.replayIntegrityAudit ? (() => {
+        const audit = replayLab.replayIntegrityAudit;
+        const flagged = audit.topFlagged || [];
+        const reasons = Object.entries(audit.flagCounts || {}).sort((a, b) => Number(b[1]) - Number(a[1]));
+        return <>
+          <section className="stats">
+            <Stat label="Trades examined" value={String(audit.tradesChecked ?? 0)}/>
+            <Stat label="No evidence flags" value={String(audit.cleanEvidenceCount ?? 0)} sub="Not proof of executable fills"/>
+            <Stat label="Flagged trades (sample)" value={String(flagged.length)} sub="Top 30 by number of flags"/>
+          </section>
+          <h3>Evidence warnings</h3>
+          <div className="table-wrap"><table className="compact-table"><thead><tr><th>Problem</th><th>Trades</th></tr></thead><tbody>
+            {reasons.map(([reason,count])=><tr key={reason}><td>{reason.replaceAll("_"," ")}</td><td>{String(count)}</td></tr>)}
+            {!reasons.length && <tr><td colSpan={2}>No integrity flags detected in this sample.</td></tr>}
+          </tbody></table></div>
+          <h3>Trades needing review</h3>
+          <div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>Trade ID</th><th>Replay link</th><th>Samples</th><th>Last sample to exit</th><th>Warnings</th></tr></thead><tbody>
+            {flagged.map((trade:any,index:number)=><tr key={String(trade.tradeId || index)}>
+              <td>{String(trade.symbol || "—")}</td><td>{String(trade.tradeId ?? "—")}</td><td>{String(trade.link || "—")}</td><td>{String(trade.samples ?? "—")}</td>
+              <td>{trade.lastSampleToExitSeconds == null ? "—" : `${Number(trade.lastSampleToExitSeconds).toFixed(1)}s`}</td>
+              <td>{(trade.flags || []).join(", ").replaceAll("_"," ")}</td>
+            </tr>)}
+            {!flagged.length && <tr><td colSpan={6}>No flagged trades in the current audit.</td></tr>}
+          </tbody></table></div>
+        </>;
+      })() : !replayLabLoading && !replayLabError && <p className="muted">Run Replay Lab to load evidence integrity findings.</p>}
+    </Card>
+
     <Card title="V19.0.8 Profitability Recovery Audit" wide>
       <div className="actions">
         <button onClick={loadReplayLab} disabled={replayLabLoading}>{replayLabLoading ? "Refreshing audit..." : "Refresh Profitability Audit"}</button>
