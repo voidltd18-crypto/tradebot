@@ -294,6 +294,35 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })} · {Number(reports?.closedTradeRowsReturned || closedTrades.length).toLocaleString("en-GB")} closed rows loaded</p>}
     </Card>
 
+    <Card title="V19.0.17 STOP Price vs Fill Validation" wide>
+      <div className="actions"><button onClick={loadReplayLab} disabled={replayLabLoading}>{replayLabLoading ? "Loading validation..." : "Refresh STOP Validation"}</button></div>
+      <p className="notice">Read-only. Sampled stop marks are not executable quotes. Differences do not prove broker delay or identify a profitable rule change.</p>
+      {replayLabError && <p className="notice loss">{replayLabError}</p>}
+      {replayLab?.stopReplayValidation ? (() => {
+        const data = replayLab.stopReplayValidation;
+        const rows = data.largestMarkFillDifferences || [];
+        return <>
+          <section className="stats">
+            <Stat label="Trades checked" value={String(data.tradesChecked ?? 0)}/>
+            <Stat label="Sampled STOP triggers" value={String(data.sampledStops ?? 0)}/>
+            <Stat label="Direct replay links" value={String(data.directReplayLinks ?? 0)}/>
+          </section>
+          <h3>Largest sampled STOP price versus recorded exit differences</h3>
+          <div className="table-wrap"><table className="compact-table"><thead><tr><th>Symbol</th><th>Trade ID</th><th>Replay link</th><th>First stop mark</th><th>Actual exit</th><th>Difference (pp)</th><th>Mark to exit</th><th>Evidence limitations</th></tr></thead><tbody>
+            {rows.map((row:any,index:number)=><tr key={String(row.tradeId ?? index)}>
+              <td>{String(row.symbol || "—")}</td><td>{String(row.tradeId ?? "—")}</td><td>{String(row.replayLink || "—")}</td>
+              <td>{row.firstStopMarkPct == null ? "—" : `${Number(row.firstStopMarkPct).toFixed(2)}%`}</td>
+              <td>{row.actualExitPct == null ? "—" : `${Number(row.actualExitPct).toFixed(2)}%`}</td>
+              <td>{row.markVsFillPp == null ? "—" : Number(row.markVsFillPp).toFixed(2)}</td>
+              <td>{row.markToRecordedExitSeconds == null ? "—" : `${Number(row.markToRecordedExitSeconds).toFixed(1)}s`}</td>
+              <td>{(row.issues || []).join(", ").replaceAll("_", " ") || "Unverified execution"}</td>
+            </tr>)}
+            {!rows.length && <tr><td colSpan={8}>No sampled STOP discrepancies in the available replay.</td></tr>}
+          </tbody></table></div>
+        </>;
+      })() : !replayLabLoading && <p className="muted">Refresh the Replay Lab to load STOP validation results.</p>}
+    </Card>
+
     <Card title="V19.0.15 Replay Evidence Integrity" wide>
       <div className="actions"><button onClick={loadReplayLab} disabled={replayLabLoading}>{replayLabLoading ? "Checking evidence..." : "Refresh Integrity Audit"}</button></div>
       <p className="notice">Read-only diagnostics. Recorded price snapshots are not executable quotes, and a clean result does not validate strategy profitability.</p>
