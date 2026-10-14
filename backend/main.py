@@ -28,6 +28,7 @@ from backend.v190_crypto_v2 import install_v190_crypto_v2
 from backend.v19010_exit_forensics import install_v19010_exit_forensics
 from backend.v19011_sell_telemetry import install_v19011_sell_telemetry
 from backend.v19012_broker_reconciliation import install_v19012_broker_reconciliation
+from backend.v19018_replay_health import install_v19018_replay_health
 
 app = monolith.app
 install_v18371_global_stock_discovery(app, monolith)
@@ -50,5 +51,6 @@ install_v18366_autonomous_ai_exit_promotion(app, monolith)
 install_v18363_ai_exit_live_pilot(app, monolith)
 install_v19011_sell_telemetry(app, monolith)
 install_v19012_broker_reconciliation(app, monolith)
+install_v19018_replay_health(app, monolith)
 
 __all__ = ["app"]
