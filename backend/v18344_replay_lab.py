@@ -9,6 +9,7 @@ from fastapi import Request
 from backend.v1908_profitability_audit import profitability_audit
 from backend.v19015_replay_integrity import evidence_quality, quality_summary
 from backend.v19016_replay_bounds import bound_replay_to_exit
+from backend.v19017_stop_replay_validation import stop_discrepancy, summary as stop_validation_summary
 
 
 def install_v18344_replay_lab(app, m) -> None:
@@ -215,7 +216,7 @@ def install_v18344_replay_lab(app, m) -> None:
               {"key":"giveback_040","name":"Tighter giveback 0.40pp","stop":1.50,"arm":1.25,"giveback":0.40,"stale":60,"stalePeak":0.75},
               {"key":"stale_45","name":"Earlier stale exit 45m","stop":1.50,"arm":1.25,"giveback":0.55,"stale":45,"stalePeak":0.75},
             ]
-            usable=[]; skipped=0; replay_paths={}; evidence_rows=[]
+            usable=[]; skipped=0; replay_paths={}; evidence_rows=[]; stop_validation_rows=[]
             for t in trades:
                 sess,link=match(t)
                 if not sess: skipped+=1; continue
@@ -239,6 +240,7 @@ def install_v18344_replay_lab(app, m) -> None:
                 fx=float(t.get("fx_rate") or 0)
                 fx_source="recorded" if fx>0 else "estimated"
                 evidence_rows.append(evidence_quality(t,sess,pts,link,fx_source))
+                stop_validation_rows.append(stop_discrepancy(t,pts,link))
                 actual_gbp=float(t.get("pnl_gbp") or 0)
                 if fx<=0:
                     usd=float(t.get("pnl") or 0); fx=(actual_gbp/usd) if usd else 0.75
@@ -606,6 +608,7 @@ def install_v18344_replay_lab(app, m) -> None:
                     },
                     "profitabilityAudit":profitability_audit(trades,detail),
                     "replayIntegrityAudit":quality_summary(evidence_rows),
+                    "stopReplayValidation":stop_validation_summary(stop_validation_rows),
                     "largestChanges":detail[:20],
                     "tradeForensics":detail,"proxyReasonSummary":reasons,
                     "exitIntelligence":exit_intelligence,"exitIntelligenceSummary":exit_summary,
