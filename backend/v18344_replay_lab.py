@@ -7,6 +7,7 @@ from datetime import datetime, UTC, timedelta
 from typing import Any, Dict, List
 from fastapi import Request
 from backend.v1908_profitability_audit import profitability_audit
+from backend.v19015_replay_integrity import evidence_quality, quality_summary
 
 
 def install_v18344_replay_lab(app, m) -> None:
@@ -213,7 +214,7 @@ def install_v18344_replay_lab(app, m) -> None:
               {"key":"giveback_040","name":"Tighter giveback 0.40pp","stop":1.50,"arm":1.25,"giveback":0.40,"stale":60,"stalePeak":0.75},
               {"key":"stale_45","name":"Earlier stale exit 45m","stop":1.50,"arm":1.25,"giveback":0.55,"stale":45,"stalePeak":0.75},
             ]
-            usable=[]; skipped=0; replay_paths={}
+            usable=[]; skipped=0; replay_paths={}; evidence_rows=[]
             for t in trades:
                 sess,link=match(t)
                 if not sess: skipped+=1; continue
@@ -229,6 +230,8 @@ def install_v18344_replay_lab(app, m) -> None:
                 entry=float(t.get("entry_price") or 0); qty=float(t.get("qty") or 0); actual_exit=float(t.get("exit_price") or 0)
                 if entry<=0 or qty<=0 or actual_exit<=0: skipped+=1; continue
                 fx=float(t.get("fx_rate") or 0)
+                fx_source="recorded" if fx>0 else "estimated"
+                evidence_rows.append(evidence_quality(t,sess,pts,link,fx_source))
                 actual_gbp=float(t.get("pnl_gbp") or 0)
                 if fx<=0:
                     usd=float(t.get("pnl") or 0); fx=(actual_gbp/usd) if usd else 0.75
@@ -595,6 +598,7 @@ def install_v18344_replay_lab(app, m) -> None:
                         "note":"V19.0.14 extends research to 60s and 90s. The 60/90s candidates change both watch and extension duration. Price paths end at the actual exit, so a longer hold cannot be evaluated fairly. No live stop or recovery-watch duration is changed."
                     },
                     "profitabilityAudit":profitability_audit(trades,detail),
+                    "replayIntegrityAudit":quality_summary(evidence_rows),
                     "largestChanges":detail[:20],
                     "tradeForensics":detail,"proxyReasonSummary":reasons,
                     "exitIntelligence":exit_intelligence,"exitIntelligenceSummary":exit_summary,
