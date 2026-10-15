@@ -12385,6 +12385,17 @@ def load_profit_vault_state() -> Dict[str, Any]:
                     data = json.load(f)
                 default = _profit_vault_default_state()
                 default.update(data if isinstance(data, dict) else {})
+                # Explicit one-time operator-approved release (preserves lifetime history).
+                # Only activates when the Render release environment flag is set.
+                if os.getenv("PROFIT_VAULT_RELEASE_ALL_ONCE", "").strip().lower() in ("1", "true", "yes", "on") and not default.get("releaseAllAppliedAt"):
+                    released = max(0.0, float(default.get("bankedProfitGbp") or 0.0))
+                    default["bankedProfitGbp"] = 0.0
+                    default["enabled"] = False
+                    default["releaseAllAppliedAt"] = datetime.now(UTC).isoformat()
+                    default["releasedProfitGbp"] = round(released, 4)
+                    # Atomic save; the one-shot marker prevents a repeat on restarts.
+                    save_profit_vault_state(default)
+                    print(f"PROFIT VAULT ONE-TIME RELEASE | released_gbp={released:.2f} lifetime_gbp={float(default.get('lifetimeBankedGbp') or 0.0):.2f}", flush=True)
                 default["enabled"] = bool(default.get("enabled", PROFIT_VAULT_ENABLED))
                 default["baselineGbp"] = round(max(float(PROFIT_VAULT_DEFAULT_BASELINE_GBP), float(default.get("baselineGbp") or 0.0)), 2)  # milestones may promote, never demote
                 default["bankPct"] = max(0.0, min(1.0, float(default.get("bankPct") if default.get("bankPct") is not None else PROFIT_VAULT_BANK_PCT)))
