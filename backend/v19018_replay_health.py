@@ -58,7 +58,12 @@ def replay_health_snapshot(conn):
         linked_valid=linked_missing=linked_symbol_mismatch=linked_time_mismatch=linked_time_unknown=None
     return {"sessionCount":sessions,"closedSessions":closed,
             "directLinkedSessions":direct,"pointCount":points,
-            "closedTrades":trades,"linkedWithin1hAndSameSymbol":linked_valid,\n            "linkedMissingTrade":linked_missing,\n            "linkedSymbolMismatch":linked_symbol_mismatch,\n            "linkedOver1hApart":linked_time_mismatch,\n            "linkedUnknownTime":linked_time_unknown,\n            "readOnly":True}
+            "closedTrades":trades,"linkedWithin1hAndSameSymbol":linked_valid,
+            "linkedMissingTrade":linked_missing,
+            "linkedSymbolMismatch":linked_symbol_mismatch,
+            "linkedOver1hApart":linked_time_mismatch,
+            "linkedUnknownTime":linked_time_unknown,
+            "readOnly":True}
 
 def install_v19018_replay_health(app,m):
     stop=threading.Event()
