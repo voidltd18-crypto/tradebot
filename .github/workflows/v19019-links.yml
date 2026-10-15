@@ -1,0 +1,16 @@
+name: V19.0.19 Replay Link Verification
+on:
+  push:
+    branches: [v19-0-19-replay-link-verification]
+  pull_request:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m py_compile backend/main.py backend/v19018_replay_health.py
+      - run: python -m unittest discover -s tests -p 'test_v19019_links.py' -v
