@@ -11609,6 +11609,94 @@ def _score_dynamic_quote(q: Dict[str, Any], source: str) -> Optional[Dict[str, A
     }
 
 
+# Alpaca-wide discovery: inventory all active tradable US equities and screen
+# snapshots in bounded batches.  A persistent cursor covers every symbol over
+# consecutive refreshes instead of repeatedly checking a fixed shortlist.
+FULL_MARKET_DISCOVERY_ENABLED = os.getenv("FULL_MARKET_DISCOVERY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+FULL_MARKET_BATCH_SIZE = max(25, min(200, int(os.getenv("FULL_MARKET_BATCH_SIZE", "100"))))
+FULL_MARKET_BATCHES_PER_REFRESH = max(1, min(20, int(os.getenv("FULL_MARKET_BATCHES_PER_REFRESH", "10"))))
+_FULL_MARKET_ASSET_CACHE = {"symbols": [], "expires": 0.0}
+
+
+def _full_market_symbols() -> List[str]:
+    now = time.time()
+    if _FULL_MARKET_ASSET_CACHE["symbols"] and now < _FULL_MARKET_ASSET_CACHE["expires"]:
+        return list(_FULL_MARKET_ASSET_CACHE["symbols"])
+    assets = trading_client.get_all_assets()
+    symbols = sorted({
+        str(getattr(a, "symbol", "")).upper()
+        for a in assets
+        if bool(getattr(a, "tradable", False))
+        and str(getattr(getattr(a, "status", ""), "value", getattr(a, "status", ""))).lower() == "active"
+        and str(getattr(getattr(a, "asset_class", ""), "value", getattr(a, "asset_class", ""))).lower() == "us_equity"
+        and _clean_dynamic_symbol(getattr(a, "symbol", ""))
+    })
+    if not symbols:
+        raise RuntimeError("No active tradable US stocks returned by Alpaca")
+    _FULL_MARKET_ASSET_CACHE.update(symbols=symbols, expires=now + 86400)
+    return symbols
+
+
+def _full_market_scan(prior_cache: Dict[str, Any]) -> Dict[str, Any]:
+    symbols = _full_market_symbols()
+    cursor = int(prior_cache.get("fullMarketCursor") or 0) % len(symbols)
+    scanned = 0
+    new_rows = {}
+    deadline = time.monotonic() + 45.0
+    headers = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET}
+    for _ in range(FULL_MARKET_BATCHES_PER_REFRESH):
+        if time.monotonic() >= deadline:
+            break
+        batch = [symbols[(cursor + j) % len(symbols)] for j in range(min(FULL_MARKET_BATCH_SIZE, len(symbols)))]
+        response = requests.get(
+            "https://data.alpaca.markets/v2/stocks/snapshots",
+            params={"symbols": ",".join(batch), "feed": "iex"},
+            headers=headers,
+            timeout=12,
+        )
+        response.raise_for_status()
+        snapshots = response.json().get("snapshots") or {}
+        for symbol, snap in snapshots.items():
+            if not isinstance(snap, dict) or symbol in BLOCKED_WEAK_TICKERS:
+                continue
+            today = snap.get("dailyBar") or {}
+            previous = snap.get("prevDailyBar") or {}
+            trade = snap.get("latestTrade") or {}
+            quote = snap.get("latestQuote") or {}
+            price = float(trade.get("p") or today.get("c") or 0)
+            volume = float(today.get("v") or 0)
+            prev_close = float(previous.get("c") or 0)
+            bid, ask = float(quote.get("bp") or 0), float(quote.get("ap") or 0)
+            if not DYNAMIC_MARKET_MIN_PRICE <= price <= DYNAMIC_MARKET_MAX_PRICE or volume < DYNAMIC_MARKET_MIN_VOLUME:
+                continue
+            if bid > 0 and ask >= bid and ((ask - bid) / bid) > DYNAMIC_MARKET_MAX_SPREAD:
+                continue
+            change = (price / prev_close - 1) * 100 if prev_close > 0 else 0.0
+            score = max(-8, min(12, change)) * 1.25 + min(10, math.log10(max(volume, 1)) * 1.15)
+            new_rows[symbol] = {
+                "symbol": symbol, "score": round(score, 4),
+                "reason": f"Alpaca full-market scan | change={change:.2f}% | volume={int(volume):,}",
+                "source": "alpaca-full-market", "status": "active", "dynamicPick": True,
+                "changePct": round(change, 4), "volume": int(volume), "price": price,
+            }
+        cursor = (cursor + len(batch)) % len(symbols)
+        scanned += len(batch)
+        if cursor == 0:
+            break
+    # Preserve candidates from previously screened batches until a full pass
+    # completes; each live trading decision still uses fresh broker quotes.
+    retained = {
+        str(r.get("symbol") or ""): r for r in (prior_cache.get("fullMarketCandidates") or [])
+        if isinstance(r, dict) and r.get("source") == "alpaca-full-market"
+    }
+    retained.update(new_rows)
+    best = sorted(retained.values(), key=lambda r: float(r.get("score") or 0), reverse=True)[:500]
+    return {
+        "fullMarketUniverseSize": len(symbols), "fullMarketScannedThisRefresh": scanned,
+        "fullMarketCursor": cursor, "fullMarketCandidates": best,
+    }
+
+
 def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
     if not DYNAMIC_MARKET_SCANNER_ENABLED:
         data = {"enabled": False, "symbols": [], "rows": [], "source": "disabled", "updatedAt": datetime.now(UTC).isoformat(), "error": ""}
@@ -11622,6 +11710,19 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
     prior_rows = list(prior_cache.get("rows") or [])
     rows_by_symbol: Dict[str, Dict[str, Any]] = {}
     errors = []
+    full_market = {}
+    if FULL_MARKET_DISCOVERY_ENABLED:
+        try:
+            full_market = _full_market_scan(prior_cache)
+            for row in full_market.get("fullMarketCandidates", []):
+                rows_by_symbol[row["symbol"]] = row
+            print(f"FULL MARKET DISCOVERY | universe={full_market['fullMarketUniverseSize']} scanned={full_market['fullMarketScannedThisRefresh']} cursor={full_market['fullMarketCursor']} candidates={len(rows_by_symbol)}", flush=True)
+        except Exception as e:
+            errors.append(f"Alpaca full-market discovery: {e}")
+            print(f"FULL MARKET DISCOVERY ERROR | {e}", flush=True)
+            for row in prior_cache.get("fullMarketCandidates", []):
+                if isinstance(row, dict) and row.get("symbol"):
+                    rows_by_symbol[row["symbol"]] = row
 
     for screen in DYNAMIC_MARKET_YAHOO_SCREENS:
         try:
@@ -11689,7 +11790,8 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
         "updatedAt": datetime.now(UTC).isoformat(),
         "refreshSeconds": DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS,
         "maxSymbols": DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS,
-        "source": fallback_mode or ",".join(DYNAMIC_MARKET_YAHOO_SCREENS),
+        **full_market,
+        "source": fallback_mode or ("alpaca-full-market+" if full_market else "") + ",".join(DYNAMIC_MARKET_YAHOO_SCREENS),
         "providerCooldown": bool(time.monotonic() < _DYNAMIC_SCANNER_YAHOO_BLOCKED_UNTIL),
         "symbols": [r["symbol"] for r in rows],
         "rows": rows,
