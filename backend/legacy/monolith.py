@@ -2458,6 +2458,46 @@ def _v2_session_due_at(observed_at: datetime, horizon_hours: int) -> datetime:
     return due.astimezone(UTC)
 
 
+def _v179_session_due_at(observed_at: datetime, horizon_minutes: int) -> datetime:
+    """Return an advisory audit checkpoint measured in regular-session minutes.
+
+    This keeps 15m/30m/60m/120m research checkpoints out of nights, weekends
+    and known NYSE holidays/early closes. It does not affect live trading.
+    """
+    et = ZoneInfo("America/New_York")
+    current = _v6_parse_utc(observed_at).astimezone(et)
+    remaining = max(1, int(horizon_minutes))
+
+    def _session_bounds(day):
+        holidays = _nyse_regular_holidays(day.year)
+        if day.weekday() >= 5 or day in holidays:
+            return None
+        close_hour = 13 if day in _nyse_early_close_dates(day.year) else 16
+        base = datetime.combine(day, datetime.min.time(), tzinfo=et)
+        return (
+            base.replace(hour=9, minute=30, second=0, microsecond=0),
+            base.replace(hour=close_hour, minute=0, second=0, microsecond=0),
+        )
+
+    while True:
+        bounds = _session_bounds(current.date())
+        if bounds is None:
+            current = (current + timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
+            continue
+        session_open, session_close = bounds
+        if current < session_open:
+            current = session_open
+        elif current >= session_close:
+            current = (current + timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
+            continue
+
+        available = max(0, int((session_close - current).total_seconds() // 60))
+        if remaining <= available:
+            return (current + timedelta(minutes=remaining)).astimezone(UTC)
+        remaining -= available
+        current = (current + timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
+
+
 def _v2_sample_key(symbol: str, stage: str, decision: str, observed_at: datetime) -> str:
     bucket_seconds = max(60, V2_INDEPENDENT_SAMPLE_MINUTES * 60)
     bucket = int(observed_at.timestamp()) // bucket_seconds
@@ -2654,7 +2694,7 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
                        VALUES (?,?,?,?,?,?,?,?,?,?,'PENDING')""",
                     (decision_id,symbol,audit_at.isoformat(),str(stage),str(reason)[:1000],float(scan.get("price") or 0.0),
                      float(scan.get("confidence") or 0.0),float(scan.get("quality_score") or 0.0),audit_minutes,
-                     (audit_at + timedelta(minutes=audit_minutes)).isoformat()),
+                     _v179_session_due_at(audit_at, audit_minutes).isoformat()),
                 )
         _v114_trace(trace_id, symbol, writer, "BASE_DECISION_WRITTEN", stage, decision, decision_id=decision_id,
                     success=decision_id > 0, detail="v2_setup_decisions insert completed", conn=conn)
@@ -3195,29 +3235,52 @@ def v179_evaluate_decision_audit(limit: int = 200) -> Dict[str, Any]:
     evaluated=errors=0
     try:
         init_db(); conn=db_connect()
+        now_utc = datetime.now(UTC)
         rows=conn.execute("SELECT * FROM v179_decision_audit WHERE status='PENDING' AND due_at<=? ORDER BY due_at LIMIT ?",
-                          (datetime.now(UTC).isoformat(),max(1,min(int(limit),1000)))).fetchall()
+                          (now_utc.isoformat(),max(1,min(int(limit),1000)))).fetchall()
+        deferred=0
+        error_reasons: Dict[str, int] = {}
+        error_samples: List[str] = []
         for row in rows:
             try:
-                cp=_v6_historical_checkpoint_price(str(row["symbol"]),row["due_at"])
+                # Older rows used wall-clock offsets, which produced checkpoints
+                # during nights/weekends and then retried them every minute.
+                expected_due = _v179_session_due_at(_v6_parse_utc(row["decision_at"]), int(row["due_minutes"] or 1))
+                stored_due = _v6_parse_utc(row["due_at"])
+                if abs((expected_due - stored_due).total_seconds()) >= 60:
+                    conn.execute("UPDATE v179_decision_audit SET due_at=?, error=NULL WHERE id=?",
+                                 (expected_due.isoformat(), int(row["id"])))
+                    conn.commit()
+                    if expected_due > now_utc:
+                        deferred += 1
+                        continue
+
+                cp=_v6_historical_checkpoint_price(str(row["symbol"]), expected_due.isoformat())
                 entry=float(row["entry_price"] or 0); price=float(cp["price"] or 0)
                 if entry <= 0 or price <= 0: raise RuntimeError("invalid_audit_price")
                 ret=((price/entry)-1.0)*100.0
-                conn.execute("""UPDATE v179_decision_audit SET evaluated_at=?,outcome_price=?,return_pct=?,
+                conn.execute("""UPDATE v179_decision_audit SET due_at=?, evaluated_at=?,outcome_price=?,return_pct=?,
                     best_move_pct=?,worst_move_pct=?,classification=?,status='COMPLETE',error=NULL,source=? WHERE id=?""",
-                    (cp.get("barAt"),price,ret,max(0.0,ret),min(0.0,ret),_v179_classify(ret),cp.get("source"),int(row["id"])))
-                # Release the SQLite writer before the next historical-price
-                # lookup, which may involve slow external market-data calls.
+                    (expected_due.isoformat(),cp.get("barAt"),price,ret,max(0.0,ret),min(0.0,ret),_v179_classify(ret),cp.get("source"),int(row["id"])))
                 conn.commit()
                 evaluated += 1
             except Exception as exc:
                 errors += 1
                 conn.rollback()
-                conn.execute("UPDATE v179_decision_audit SET error=? WHERE id=?",(str(exc)[:500],int(row["id"])))
+                reason = str(exc)[:500] or exc.__class__.__name__
+                reason_key = reason.split(":", 1)[0]
+                error_reasons[reason_key] = error_reasons.get(reason_key, 0) + 1
+                if len(error_samples) < 5:
+                    error_samples.append(f"{str(row['symbol']).upper()}@{row['due_at']}={reason}")
+                conn.execute("UPDATE v179_decision_audit SET error=? WHERE id=?",(reason,int(row["id"])))
                 conn.commit()
         conn.close()
-        if evaluated or errors: print(f"V17.9 DECISION AUDIT | evaluated={evaluated} errors={errors}")
-        return {"ok":True,"evaluated":evaluated,"errors":errors}
+        if evaluated or errors or deferred:
+            reason_text = ",".join(f"{k}:{v}" for k,v in sorted(error_reasons.items())) or "none"
+            print(f"V17.9 DECISION AUDIT | evaluated={evaluated} errors={errors} deferred={deferred} reasons={reason_text}")
+            if error_samples:
+                print("V17.9 DECISION AUDIT ERROR SAMPLES | " + " | ".join(error_samples))
+        return {"ok":True,"evaluated":evaluated,"errors":errors,"deferred":deferred,"errorReasons":error_reasons}
     except Exception as exc:
         try: conn.close()
         except Exception: pass
@@ -3436,14 +3499,16 @@ def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
             keys = row.keys() if hasattr(row, "keys") else []
             previous_error = str(row["error"] or "")
             previous_retry = int(row["retry_count"] or 0) if "retry_count" in keys else 0
-            if previous_error:
-                conn.execute("UPDATE v2_observation_outcomes SET error=NULL WHERE id=?", (int(row["id"]),))
             try:
+                # Do the network lookup before beginning a SQLite write, then
+                # commit this row before the next potentially slow lookup.
                 checkpoint = _v6_write_historical_outcome(conn,row)
+                conn.commit()
                 evaluated += 1
                 if previous_error or previous_retry > 0 or checkpoint.get("feedFallback"):
                     recovered += 1
             except Exception as row_error:
+                conn.rollback()
                 reason = str(row_error)[:500] or row_error.__class__.__name__
                 reason_key = reason.split(":", 1)[0]
                 next_retry = previous_retry + 1
@@ -3464,7 +3529,8 @@ def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
                     conn.execute("""UPDATE v2_observation_outcomes
                         SET error=?, retry_count=?, last_error_at=? WHERE id=?""",
                         (reason,next_retry,now_iso,int(row["id"])))
-        conn.commit(); conn.close()
+                conn.commit()
+        conn.close()
         if evaluated or errors or abandoned:
             reason_text = ",".join(f"{k}:{v}" for k,v in sorted(error_reasons.items())) or "none"
             print(f"V17.8.2 OUTCOME RECOVERY | completed={evaluated} recovered={recovered} retrying={retried} abandoned={abandoned} reasons={reason_text}")
