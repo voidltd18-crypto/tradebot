@@ -11467,7 +11467,7 @@ def api_clear_loser_cooldown(request: Request):
 # DYNAMIC MARKET SCANNER v1.0
 # =========================
 DYNAMIC_MARKET_SCANNER_ENABLED = os.getenv("DYNAMIC_MARKET_SCANNER_ENABLED", "true").lower() == "true"
-DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS = int(os.getenv("DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS", "24"))
+DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS = int(os.getenv("DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS", "60"))
 DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS = int(os.getenv("DYNAMIC_MARKET_SCANNER_REFRESH_SECONDS", str(60 * 30)))
 DYNAMIC_MARKET_SCANNER_FILE = os.path.join("backend", "state", "dynamic_market_scanner.json")
 DYNAMIC_MARKET_MIN_PRICE = float(os.getenv("DYNAMIC_MARKET_MIN_PRICE", "3"))
@@ -11658,6 +11658,30 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
                 "dynamicPick": False,
                 "source": "fallback",
             })
+
+    # Broaden cached discovery when Yahoo is rate-limited.  Reuse the existing
+    # fallback universe; never bypass the normal trade eligibility gates.
+    # Rotate its starting point each UK trading day so one fixed subset does
+    # not monopolise the candidate slots.
+    if fallback_mode or errors:
+        pool = list(dict.fromkeys(str(v).upper() for v in globals().get("LOCKED_UNIVERSE_FALLBACK_POOL", []) if v))
+        if pool:
+            rotation = int(datetime.now(UTC).strftime("%j")) % len(pool)
+            rotated = pool[rotation:] + pool[:rotation]
+            present = {str(r.get("symbol") or "").upper() for r in rows}
+            for sym in rotated:
+                if len(rows) >= DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS:
+                    break
+                if sym in present or sym in globals().get("BLOCKED_WEAK_TICKERS", set()):
+                    continue
+                rows.append({
+                    "symbol": sym, "score": 0.0,
+                    "reason": "broad fallback discovery | normal entry checks still required",
+                    "status": "active", "dynamicPick": False,
+                    "source": "broad-fallback",
+                })
+                present.add(sym)
+            print(f"DYNAMIC SCANNER BROAD FALLBACK | symbols={len(rows)} source={fallback_mode or 'partial-yahoo'}")
 
     payload = {
         "enabled": True,
