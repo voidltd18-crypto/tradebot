@@ -10078,7 +10078,8 @@ def _discover_locked_universe_replacements(active_symbols: set[str], need: int) 
                             if previous is None or float(row.get("score") or 0.0) > float(previous.get("score") or 0.0):
                                 rows_by_symbol[sym] = dict(row)
                     except Exception as screen_exc:
-                        print(f"V17.0.11 LOCKED UNIVERSE DISCOVERY SOURCE ERROR {screen}: {screen_exc}")
+                        if "Yahoo cooldown active" not in str(screen_exc):
+                            print(f"V17.0.11 LOCKED UNIVERSE DISCOVERY SOURCE ERROR {screen}: {screen_exc}")
         except Exception as exc:
             print(f"V17.0.11 LOCKED UNIVERSE DISCOVERY ERROR: {exc}")
         locked_universe_runtime_cache["lastDiscoveryTs"] = now_ts
@@ -11630,7 +11631,8 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
                     rows_by_symbol[row["symbol"]] = row
         except Exception as e:
             errors.append(f"{screen}: {e}")
-            print(f"DYNAMIC SCANNER SOURCE ERROR {screen}: {e}")
+            if "Yahoo cooldown active" not in str(e):
+                print(f"DYNAMIC SCANNER SOURCE ERROR {screen}: {e}")
 
     rows = sorted(rows_by_symbol.values(), key=lambda r: float(r.get("score") or 0), reverse=True)[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]
 
