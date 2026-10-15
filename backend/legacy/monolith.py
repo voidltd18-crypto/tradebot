@@ -3206,11 +3206,16 @@ def v179_evaluate_decision_audit(limit: int = 200) -> Dict[str, Any]:
                 conn.execute("""UPDATE v179_decision_audit SET evaluated_at=?,outcome_price=?,return_pct=?,
                     best_move_pct=?,worst_move_pct=?,classification=?,status='COMPLETE',error=NULL,source=? WHERE id=?""",
                     (cp.get("barAt"),price,ret,max(0.0,ret),min(0.0,ret),_v179_classify(ret),cp.get("source"),int(row["id"])))
+                # Release the SQLite writer before the next historical-price
+                # lookup, which may involve slow external market-data calls.
+                conn.commit()
                 evaluated += 1
             except Exception as exc:
                 errors += 1
+                conn.rollback()
                 conn.execute("UPDATE v179_decision_audit SET error=? WHERE id=?",(str(exc)[:500],int(row["id"])))
-        conn.commit(); conn.close()
+                conn.commit()
+        conn.close()
         if evaluated or errors: print(f"V17.9 DECISION AUDIT | evaluated={evaluated} errors={errors}")
         return {"ok":True,"evaluated":evaluated,"errors":errors}
     except Exception as exc:
