@@ -175,7 +175,8 @@ PEAK_EXHAUSTION_MARKET_OPEN_ONLY = os.getenv("PEAK_EXHAUSTION_MARKET_OPEN_ONLY",
 
 MAX_DAILY_LOSS = -100.00
 MAX_TRADES_PER_DAY = 12
-DUST_THRESHOLD = 0.1
+DUST_THRESHOLD = 0.000001  # Ignore microscopic share remnants, not valid fractional holdings
+POSITION_DUST_VALUE_USD = 0.01  # Do not count sub-cent broker residues as active positions
 
 STRICT_ONE_CYCLE_PER_STOCK_PER_DAY = True
 ALLOW_CUSTOM_BUY = True
@@ -1256,7 +1257,9 @@ def get_all_positions():
             entry = float(pos.avg_entry_price)
             market_value = float(pos.market_value)
 
-            if qty <= DUST_THRESHOLD:
+            # A genuine fractional position can be smaller than 0.1 shares.
+            # Ignore only sub-cent residues in the consolidated active list.
+            if qty <= 0 or abs(market_value) < POSITION_DUST_VALUE_USD:
                 continue
 
             ensure_symbol_state(symbol)
