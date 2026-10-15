@@ -10,6 +10,7 @@ from backend.v1908_profitability_audit import profitability_audit
 from backend.v19015_replay_integrity import evidence_quality, quality_summary
 from backend.v19016_replay_bounds import bound_replay_to_exit
 from backend.v19017_stop_replay_validation import stop_discrepancy, summary as stop_validation_summary
+from backend.v19020_replay_identity import unique_direct_sessions
 
 
 def install_v18344_replay_lab(app, m) -> None:
@@ -179,7 +180,7 @@ def install_v18344_replay_lab(app, m) -> None:
                    AND symbol NOT LIKE '%/%' ORDER BY timestamp DESC LIMIT ?""",
                 (cutoff,m.PHANTOM_CLOSED_TRADE_QTY_EPSILON,m.PHANTOM_CLOSED_TRADE_MIN_NOTIONAL_USD,limit)).fetchall()]
             sessions=[dict(r) for r in conn.execute("SELECT * FROM trade_replay_sessions WHERE started_at>=? ORDER BY started_at DESC",(cutoff,)).fetchall()]
-            direct={int(s["closed_trade_id"]):s for s in sessions if s.get("closed_trade_id") is not None}
+            direct=unique_direct_sessions(trades,sessions)
             bysym={}
             for s in sessions: bysym.setdefault(str(s.get("symbol") or "").upper(),[]).append(s)
             def match(t):

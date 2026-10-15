@@ -1,0 +1,16 @@
+name: V19.0.20 Replay Identity Guard
+on:
+  push:
+    branches: [v19-0-20-safe-replay-identity]
+  pull_request:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m py_compile backend/v19020_replay_identity.py backend/v18344_replay_lab.py
+      - run: python -m unittest discover -s tests -p 'test_v19020_identity.py' -v
