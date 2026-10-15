@@ -274,7 +274,9 @@ def install_v18351_live_stock_replay_capture(app, m) -> None:
                 closed_at = now_iso()
                 entry = float(sess.get("entry_price") or 0)
                 closed_trade = reconcile_closed_trade(conn, sym, entry, closed_at)
-                # No order-id causal link is available here. Never persist a\n                # guessed trade ID in the direct-link column.\n                closed_trade_id = None
+                # No order-id causal link is available here. Never persist a
+                # guessed trade ID in the direct-link column.
+                closed_trade_id = None
                 update_dynamic(
                     conn,
                     "trade_replay_sessions",
