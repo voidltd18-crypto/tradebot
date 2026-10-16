@@ -4,6 +4,7 @@ import time
 import secrets
 import hashlib
 import shutil
+import gc
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "200") or 200)
 
 import sqlite3
@@ -44,6 +45,34 @@ from alpaca.data.enums import DataFeed
 # - Stock memory
 # - Persistent trade timeline
 # ============================================================
+
+
+# =========================
+# PROCESS MEMORY HYGIENE
+# =========================
+def _release_transient_memory(reason: str = "") -> None:
+    """Return large temporary research/scanner allocations to the OS when possible.
+
+    This is operational hygiene only. It does not change trading decisions,
+    thresholds, order sizing, or execution.
+    """
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    trimmed = False
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        trim_fn = getattr(libc, "malloc_trim", None)
+        if trim_fn is not None:
+            trim_fn.argtypes = [ctypes.c_size_t]
+            trim_fn.restype = ctypes.c_int
+            trimmed = bool(trim_fn(0))
+    except Exception:
+        trimmed = False
+    if reason:
+        print(f"V18.2.29 MEMORY TRIM | reason={reason} allocator_trimmed={trimmed}", flush=True)
 
 
 # =========================
@@ -10080,6 +10109,7 @@ def closed_market_ai_research_worker() -> None:
                 "live_changes=False"
             )
             _cycle_monitor_finish("research", _research_cycle_started, True)
+            _release_transient_memory("closed-market-research-cycle")
         except Exception as exc:
             if "_research_cycle_started" in locals():
                 _cycle_monitor_finish("research", _research_cycle_started, False, str(exc))
@@ -11705,6 +11735,9 @@ def _full_market_symbols() -> List[str]:
     if not symbols:
         raise RuntimeError("No active tradable US stocks returned by Alpaca")
     _FULL_MARKET_ASSET_CACHE.update(symbols=symbols, expires=now + 86400)
+    # Alpaca returns rich Asset model objects; only symbols are retained.
+    del assets
+    _release_transient_memory("full-market-assets")
     return symbols
 
 
@@ -11725,31 +11758,41 @@ def _full_market_scan(prior_cache: Dict[str, Any]) -> Dict[str, Any]:
             headers=headers,
             timeout=12,
         )
-        response.raise_for_status()
-        snapshots = response.json().get("snapshots") or {}
-        for symbol, snap in snapshots.items():
-            if not isinstance(snap, dict) or symbol in BLOCKED_WEAK_TICKERS:
-                continue
-            today = snap.get("dailyBar") or {}
-            previous = snap.get("prevDailyBar") or {}
-            trade = snap.get("latestTrade") or {}
-            quote = snap.get("latestQuote") or {}
-            price = float(trade.get("p") or today.get("c") or 0)
-            volume = float(today.get("v") or 0)
-            prev_close = float(previous.get("c") or 0)
-            bid, ask = float(quote.get("bp") or 0), float(quote.get("ap") or 0)
-            if not DYNAMIC_MARKET_MIN_PRICE <= price <= DYNAMIC_MARKET_MAX_PRICE or volume < DYNAMIC_MARKET_MIN_VOLUME:
-                continue
-            if bid > 0 and ask >= bid and ((ask - bid) / bid) > DYNAMIC_MARKET_MAX_SPREAD:
-                continue
-            change = (price / prev_close - 1) * 100 if prev_close > 0 else 0.0
-            score = max(-8, min(12, change)) * 1.25 + min(10, math.log10(max(volume, 1)) * 1.15)
-            new_rows[symbol] = {
-                "symbol": symbol, "score": round(score, 4),
-                "reason": f"Alpaca full-market scan | change={change:.2f}% | volume={int(volume):,}",
-                "source": "alpaca-full-market", "status": "active", "dynamicPick": True,
-                "changePct": round(change, 4), "volume": int(volume), "price": price,
-            }
+        try:
+            response.raise_for_status()
+            snapshots = response.json().get("snapshots") or {}
+            for symbol, snap in snapshots.items():
+                if not isinstance(snap, dict) or symbol in BLOCKED_WEAK_TICKERS:
+                    continue
+                today = snap.get("dailyBar") or {}
+                previous = snap.get("prevDailyBar") or {}
+                trade = snap.get("latestTrade") or {}
+                quote = snap.get("latestQuote") or {}
+                price = float(trade.get("p") or today.get("c") or 0)
+                volume = float(today.get("v") or 0)
+                prev_close = float(previous.get("c") or 0)
+                bid, ask = float(quote.get("bp") or 0), float(quote.get("ap") or 0)
+                if not DYNAMIC_MARKET_MIN_PRICE <= price <= DYNAMIC_MARKET_MAX_PRICE or volume < DYNAMIC_MARKET_MIN_VOLUME:
+                    continue
+                if bid > 0 and ask >= bid and ((ask - bid) / bid) > DYNAMIC_MARKET_MAX_SPREAD:
+                    continue
+                change = (price / prev_close - 1) * 100 if prev_close > 0 else 0.0
+                score = max(-8, min(12, change)) * 1.25 + min(10, math.log10(max(volume, 1)) * 1.15)
+                new_rows[symbol] = {
+                    "symbol": symbol, "score": round(score, 4),
+                    "reason": f"Alpaca full-market scan | change={change:.2f}% | volume={int(volume):,}",
+                    "source": "alpaca-full-market", "status": "active", "dynamicPick": True,
+                    "changePct": round(change, 4), "volume": int(volume), "price": price,
+                }
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
+            try:
+                del snapshots
+            except Exception:
+                pass
         cursor = (cursor + len(batch)) % len(symbols)
         scanned += len(batch)
         if cursor == 0:
@@ -11762,10 +11805,13 @@ def _full_market_scan(prior_cache: Dict[str, Any]) -> Dict[str, Any]:
     }
     retained.update(new_rows)
     best = sorted(retained.values(), key=lambda r: float(r.get("score") or 0), reverse=True)[:500]
-    return {
+    result = {
         "fullMarketUniverseSize": len(symbols), "fullMarketScannedThisRefresh": scanned,
         "fullMarketCursor": cursor, "fullMarketCandidates": best,
     }
+    del retained, new_rows
+    _release_transient_memory("full-market-scan")
+    return result
 
 
 def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
@@ -13648,9 +13694,28 @@ def v6_sync_brains(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = 1
     conn=None
     try:
         rows=_v6_source_rows(horizon,limit)
+        source_count=len(rows)
         brains=_v6_brains(); inserted=0; accepted=0; valid_rows=0; rejected_invalid=0
         now=datetime.now(UTC).isoformat(); pending=[]
-        # V18.2.12: validate/calculate outside any write transaction.
+        # V18.2.29: keep only one bounded write batch in memory. The previous
+        # implementation accumulated up to limit x brain-count tuples before
+        # writing, which could push the 512 MiB Render instance into OOM.
+        def flush_pending() -> None:
+            nonlocal conn, inserted, pending
+            if not pending:
+                return
+            conn=db_connect()
+            try:
+                before=conn.total_changes
+                conn.executemany("""INSERT OR IGNORE INTO v6_brain_observations
+                    (brain_key,brain_name,decision_id,symbol,observed_at,market_regime,horizon_hours,accepted,return_pct,confidence,quality,momentum,pullback,spread,config_json,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", pending)
+                inserted += conn.total_changes-before
+                conn.commit()
+            finally:
+                conn.close(); conn=None
+            pending.clear()
+
         for row in rows:
             validation=_v6_validate_source_row(row)
             if not validation["valid"]:
@@ -13664,19 +13729,13 @@ def v6_sync_brains(horizon_hours: int = V6_DEFAULT_HORIZON_HOURS, limit: int = 1
                      row.get("market_regime") or "unknown",horizon,passed,float(row["net_return_pct"]),
                      float(row.get("confidence") or 0),float(row.get("quality") or 0),float(row.get("momentum") or 0),
                      float(row.get("pullback") or 0),float(row.get("spread") or 0),json.dumps(brain),now))
-        for offset in range(0,len(pending),batch_size):
-            conn=db_connect()
-            try:
-                before=conn.total_changes
-                conn.executemany("""INSERT OR IGNORE INTO v6_brain_observations
-                    (brain_key,brain_name,decision_id,symbol,observed_at,market_regime,horizon_hours,accepted,return_pct,confidence,quality,momentum,pullback,spread,config_json,created_at)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", pending[offset:offset+batch_size])
-                inserted += conn.total_changes-before
-                conn.commit()
-            finally:
-                conn.close(); conn=None
+                if len(pending) >= batch_size:
+                    flush_pending()
+        flush_pending()
+        rows.clear()
+        _release_transient_memory("v6-sync-brains")
         return {"ok":True,"version":"V6.4","advisoryOnly":True,"horizonHours":horizon,
-                "independentSourceObservations":len(rows),"validLearningObservations":valid_rows,
+                "independentSourceObservations":source_count,"validLearningObservations":valid_rows,
                 "invalidObservationsRejected":rejected_invalid,"brains":len(brains),
                 "newShadowRows":inserted,"acceptedEvaluations":accepted,"liveGateChanged":False}
     except Exception as e:
