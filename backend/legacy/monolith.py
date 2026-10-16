@@ -1901,11 +1901,21 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
     if allow_hard_stop and pnl_pct <= HARD_STOP_LOSS_PCT:
         add_pdt_warning(symbol, f"hard stop override: attempting sell despite same-day buy, pnl={pnl_pct:.2f}%")
         return False
-    mins = minutes_since_today_buy(symbol)
-    if "ROTATE" in reason.upper() and AVOID_SAME_DAY_ROTATION_SELLS:
+    reason_upper = str(reason or "").upper()
+    if "ROTATE" in reason_upper and AVOID_SAME_DAY_ROTATION_SELLS:
         add_pdt_warning(symbol, f"rotation skipped because bought today; hold until next day reset")
         return True
-    if ("TRAILING" in reason.upper() or "PROFIT" in reason.upper()) and AVOID_SAME_DAY_PROFIT_SELLS:
+    # V18.2.30: once a genuine profit-protection rule has fired, do not let
+    # the bot's soft same-day/PDT guard turn a live gain into a later stop-loss.
+    # The broker remains authoritative and can still reject the order if the
+    # account is genuinely restricted from making the day trade.
+    if pnl_pct > 0 and ("TRAILING" in reason_upper or "PROFIT" in reason_upper):
+        add_pdt_warning(
+            symbol,
+            f"profit protection override: attempting sell despite same-day buy, pnl={pnl_pct:.2f}% reason={reason}",
+        )
+        return False
+    if ("TRAILING" in reason_upper or "PROFIT" in reason_upper) and AVOID_SAME_DAY_PROFIT_SELLS:
         add_pdt_warning(symbol, f"profit sell skipped because bought today; hold until next day reset")
         return True
     return False
