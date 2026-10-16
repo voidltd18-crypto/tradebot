@@ -10646,6 +10646,7 @@ def run_bot_loop():
                     print("Market closed. Waiting...")
                     update_status(BOT_NAME, latest_scans)
                     _cycle_monitor_finish("bot", _cycle_started, True)
+                    _release_transient_memory("bot-cycle-market-closed")
                     time.sleep(CHECK_INTERVAL)
                     continue
 
@@ -10708,11 +10709,16 @@ def run_bot_loop():
                 update_status(BOT_NAME, scans)
 
             _cycle_monitor_finish("bot", _cycle_started, True)
+            # The status/analytics/scanner cycle creates large temporary Python
+            # objects. Return freed arenas before the next live cycle instead
+            # of letting RSS accumulate against Render's 512 MiB ceiling.
+            _release_transient_memory("bot-cycle")
             time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
             _cycle_monitor_finish("bot", _cycle_started, False, str(e))
             print(f"Main loop error: {e}")
+            _release_transient_memory("bot-cycle-error")
             time.sleep(10)
 
 
