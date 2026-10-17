@@ -29,7 +29,7 @@ def test_daily_lock_applies_to_every_symbol():
 
 def test_no_mara_unlock_on_sell_or_restart():
     assert 'locked_today.pop(sym, None)' not in function_text("lock_symbol_until_tomorrow")
-    assert 'locked_today.pop(symbol, None)' not in function_text("restore_daily_locks_from_trades")
+    assert 'locked_today.pop(symbol, None)' not in function_text("restore_today_sell_locks_from_db")
 
 if __name__ == "__main__":
     for name, func in sorted(globals().items()):
