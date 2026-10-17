@@ -815,7 +815,7 @@ def reset_daily_flags_if_needed():
 # The first MARA exit deliberately does not arm the next-day symbol lock; after
 # the second MARA entry/exit the normal daily lock applies again. All normal
 # entry gates, max-position limits, sizing, stops and exit rules remain intact.
-MARA_DAILY_ENTRY_LIMIT = max(2, int(os.getenv("TRADEBOT_MARA_DAILY_ENTRY_LIMIT", "2") or 2))
+MARA_DAILY_ENTRY_LIMIT = 1  # V19: no symbol-specific second-entry exception
 _MARA_DB_BUY_COUNT_CACHE = {"day": "", "count": 0, "checked_at": 0.0}
 
 
@@ -900,31 +900,14 @@ def lock_symbol_until_tomorrow(symbol: str):
     if not STRICT_ONE_CYCLE_PER_STOCK_PER_DAY:
         return
     sym = str(symbol or "").upper().strip()
-    if sym == "MARA":
-        buys = today_symbol_buy_count(sym)
-        if buys < MARA_DAILY_ENTRY_LIMIT:
-            # First MARA cycle is complete: explicitly keep MARA unlocked so it
-            # can compete for one fresh, fully-qualified second setup.
-            locked_today.pop(sym, None)
-            print(
-                f"V18.2.27 MARA DAILY ALLOWANCE | filled_entries={buys}/{MARA_DAILY_ENTRY_LIMIT} "
-                "second_entry_eligible=True daily_lock=BYPASSED_FOR_MARA_ONLY"
-            )
-            return
-        locked_today[sym] = today_str()
-        print(
-            f"V18.2.27 MARA DAILY ALLOWANCE | filled_entries={buys}/{MARA_DAILY_ENTRY_LIMIT} "
-            "daily_lock=ACTIVE unlock=NEXT_TRADING_DAY"
-        )
-        return
     locked_today[sym] = today_str()
 
 
 def is_locked_today(symbol: str):
     sym = str(symbol or "").upper().strip()
-    if sym == "MARA" and today_symbol_buy_count(sym) < MARA_DAILY_ENTRY_LIMIT:
-        return False
-    return locked_today.get(sym) == today_str()
+    return locked_today.get(sym) == today_str() or (
+        STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and today_symbol_buy_count(sym) >= 1
+    )
 
 
 def floor_qty(qty: float, decimals: int = 6):
@@ -1824,13 +1807,10 @@ def proposed_buy_qty(scan: Dict[str, Any]) -> float:
 
 def can_buy_symbol(symbol: str):
     sym = str(symbol or "").upper().strip()
-    # V18.2.27: MARA may submit at most two successful entries in one trading
-    # day. This hard cap is checked independently of the sell-driven lock so an
-    # external/manual position close cannot accidentally create a third entry.
-    if sym == "MARA" and today_symbol_buy_count(sym) >= MARA_DAILY_ENTRY_LIMIT:
+    if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and (
+        is_locked_today(sym) or today_symbol_buy_count(sym) >= 1
+    ):
         locked_today[sym] = today_str()
-        return False, f"{sym} locked until tomorrow (MARA daily entries {MARA_DAILY_ENTRY_LIMIT}/{MARA_DAILY_ENTRY_LIMIT})"
-    if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and is_locked_today(sym):
         return False, f"{sym} locked until tomorrow"
     if has_open_order(sym):
         return False, f"{sym} existing open order"
@@ -7230,7 +7210,7 @@ def restore_today_sell_locks_from_db() -> List[str]:
             # V18.2.27: a restart after MARA's first completed cycle must not
             # resurrect the old one-cycle lock. Only restore MARA after its
             # second daily entry has been used. Other symbols are unchanged.
-            if symbol == "MARA" and today_symbol_buy_count(symbol) < MARA_DAILY_ENTRY_LIMIT:
+            if False:  # V19: MARA no longer bypasses restored daily locks
                 locked_today.pop(symbol, None)
                 continue
             if not is_locked_today(symbol):
@@ -11735,7 +11715,7 @@ ADAPTIVE_UNIVERSE_ENABLED = os.getenv("ADAPTIVE_UNIVERSE_ENABLED", "true").lower
 # here bypasses account/PDT/daily locks, reputation, Sniper, A+, trigger, V2,
 # portfolio score, or the final execution lock.
 FIRST_DIBS_SYMBOL = str(os.getenv("TRADEBOT_FIRST_DIBS_SYMBOL", "MARA") or "MARA").upper().strip()
-FIRST_DIBS_ENABLED = os.getenv("TRADEBOT_FIRST_DIBS_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+FIRST_DIBS_ENABLED = False  # V19: disabled even if an old Render env override remains
 
 def _first_dibs_symbol() -> str:
     return FIRST_DIBS_SYMBOL if FIRST_DIBS_ENABLED else ""
