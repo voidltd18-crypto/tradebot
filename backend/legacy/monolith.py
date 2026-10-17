@@ -1408,8 +1408,14 @@ def get_memory(symbol: str):
     return stock_memory[symbol]
 
 
-def update_stock_memory_from_sell(symbol: str, pnl: float, pnl_pct: float):
+def update_stock_memory_from_sell(symbol: str, pnl: float, pnl_pct: float, order_id: str = ""):
     if not STOCK_MEMORY_ENABLED:
+        return
+    symbol = str(symbol or "").upper().strip()
+    order_id = str(order_id or "").strip()
+    processed = stock_memory.setdefault("_processedSellOrderIds", [])
+    if order_id and order_id in processed:
+        print(f"STOCK MEMORY SELL DEDUP | symbol={symbol} order_id={order_id}")
         return
     m = get_memory(symbol)
     m["trades"] += 1
@@ -1432,6 +1438,10 @@ def update_stock_memory_from_sell(symbol: str, pnl: float, pnl_pct: float):
         m["trust"] = "BAD"
     else:
         m["trust"] = "NEUTRAL"
+    if order_id:
+        processed = stock_memory.setdefault("_processedSellOrderIds", [])
+        processed.append(order_id)
+        stock_memory["_processedSellOrderIds"] = processed[-5000:]
     save_stock_memory()
     refresh_blacklist_from_memory(symbol)
 
@@ -12815,8 +12825,13 @@ def profit_vault_deployable_usd(account_equity: float, buying_power: Optional[fl
             pass
     return max(0.0, working)
 
-def profit_vault_bank_realised_profit(pnl_usd: float, symbol: str = "", reason: str = "") -> Dict[str, Any]:
+def profit_vault_bank_realised_profit(pnl_usd: float, symbol: str = "", reason: str = "", order_id: str = "") -> Dict[str, Any]:
     state = load_profit_vault_state()
+    order_id = str(order_id or "").strip()
+    processed = state.get("processedSellOrderIds") or []
+    if order_id and order_id in processed:
+        print(f"V17.6 PROFIT VAULT SELL DEDUP | symbol={str(symbol or '').upper()} order_id={order_id}")
+        return state
     if not state.get("enabled"):
         return state
     try:
@@ -12831,6 +12846,10 @@ def profit_vault_bank_realised_profit(pnl_usd: float, symbol: str = "", reason: 
         return state
     state["bankedProfitGbp"] = round(float(state.get("bankedProfitGbp") or 0.0) + bank_amount, 4)
     state["lifetimeBankedGbp"] = round(float(state.get("lifetimeBankedGbp") or 0.0) + bank_amount, 4)
+    if order_id:
+        processed = list(state.get("processedSellOrderIds") or [])
+        processed.append(order_id)
+        state["processedSellOrderIds"] = processed[-5000:]
     state["lastBankedAt"] = datetime.now(UTC).isoformat()
     state["lastBankedSymbol"] = str(symbol or "").upper()
     state["lastBankedReason"] = str(reason or "")
