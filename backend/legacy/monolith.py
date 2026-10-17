@@ -1950,6 +1950,30 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
     notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
 
 
+def register_pending_sell_order(order_id: str, symbol: str, qty: float, reason: str, status: str = "") -> bool:
+    """Persist only sell orders submitted by this version for safe fill reconciliation."""
+    if not SQLITE_ENABLED or not order_id:
+        return False
+    try:
+        init_db()
+        now = datetime.now(UTC).isoformat()
+        conn = db_connect()
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_sell_orders "
+            "(alpaca_order_id, symbol, requested_qty, reason, submitted_at, initial_status, "
+            "accounting_status, accounted_qty, accounted_pnl, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 0, 0, ?)",
+            (str(order_id), str(symbol or "").upper(), float(qty or 0.0),
+             str(reason or ""), now, str(status or ""), now),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as exc:
+        print(f"SELL PENDING REGISTRATION ERROR | symbol={symbol} order_id={order_id} error={exc}")
+        return False
+
+
 def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 0.0, reason="AUTO SELL"):
     rounded_qty = floor_qty(qty, 6)
     if rounded_qty <= 0:
@@ -1989,6 +2013,8 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
         f"status={order_status} qty={rounded_qty:.6f} reason={reason} "
         f"NOTE=broker_ack_not_fill"
     )
+    if not register_pending_sell_order(order_id, symbol, rounded_qty, reason, order_status):
+        print(f"SELL ACCOUNTING WARNING | symbol={symbol} order_id={order_id} pending_order_not_persisted")
     pnl = (price - entry) * rounded_qty if entry > 0 and price > 0 else 0.0
     pnl_pct = ((price / entry) - 1.0) * 100.0 if entry > 0 and price > 0 else 0.0
     event = {
@@ -6103,6 +6129,26 @@ def _init_db_impl():
             fx_rate REAL,
             source TEXT DEFAULT 'bot'
         )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_sell_orders (
+            alpaca_order_id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            requested_qty REAL NOT NULL DEFAULT 0,
+            reason TEXT,
+            submitted_at TEXT NOT NULL,
+            initial_status TEXT,
+            accounting_status TEXT NOT NULL DEFAULT 'PENDING',
+            accounted_qty REAL NOT NULL DEFAULT 0,
+            accounted_pnl REAL NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_pending_sell_status
+        ON pending_sell_orders(accounting_status, submitted_at)
     """)
 
     cur.execute("""
