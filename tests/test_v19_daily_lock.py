@@ -68,6 +68,14 @@ def test_replay_is_advisory_and_closed_trade_links_are_written():
     assert "conn.commit()" in text
 
 
+def test_historical_fetch_precedes_database_writes():
+    text = function_text("v2_evaluate_due_outcomes")
+    assert text.index("checkpoints: Dict[int, Any]") < text.index("conn.execute(\"UPDATE v2_observation_outcomes SET error=NULL")
+    assert "_v6_write_historical_outcome(conn,row,prefetched)" in text
+    writer = function_text("_v6_write_historical_outcome")
+    assert "if checkpoint is None:" in writer
+
+
 if __name__ == "__main__":
     for name, func in sorted(globals().items()):
         if name.startswith("test_") and callable(func):
