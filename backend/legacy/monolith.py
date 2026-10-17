@@ -4635,10 +4635,14 @@ def manage_money_mode_positions():
                     # One shallow confirmation check lets a strong winner recover
                     # from a brief floor touch without lowering the protected floor.
                     continue
-                ai_block, ai_reason = hold_ai_blocks_soft_exit(p, "MONEY MODE TRAILING PROFIT")
-                if ai_block:
-                    print(ai_reason)
-                    continue
+                # Once a confirmed trailing floor is breached while still in
+                # profit, HOLD AI must not veto the protective exit. It can
+                # otherwise hold a winner through the floor until it turns red.
+                if float(p.get("pnlPct") or 0.0) <= 0:
+                    ai_block, ai_reason = hold_ai_blocks_soft_exit(p, "MONEY MODE TRAILING PROFIT")
+                    if ai_block:
+                        print(ai_reason)
+                        continue
                 try:
                     if pdt_aware_should_avoid_sell(symbol, "MONEY MODE TRAILING PROFIT", p["pnlPct"]):
                         continue
