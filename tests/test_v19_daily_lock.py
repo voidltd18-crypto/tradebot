@@ -60,6 +60,14 @@ def test_database_wal_and_writer_retries_are_preserved():
     assert "_DB_BUSY_TIMEOUT_MS" in text
 
 
+def test_replay_is_advisory_and_closed_trade_links_are_written():
+    text = function_text("v5_run_replay")
+    assert '"advisoryOnly": True' in text
+    text = function_text("_trade_replay_close_for_trade")
+    assert "closed_trade_id=COALESCE(?,closed_trade_id)" in text
+    assert "conn.commit()" in text
+
+
 if __name__ == "__main__":
     for name, func in sorted(globals().items()):
         if name.startswith("test_") and callable(func):
