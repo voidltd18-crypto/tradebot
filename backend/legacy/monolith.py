@@ -7477,9 +7477,51 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
                 f"closed={rebuild_result.get('matchedClosedTrades', 0)}"
             )
 
+        # Apply realised sell PnL to stock memory and the profit vault only
+        # after FIFO matching proves the broker-filled quantity is fully matched.
+        # Both destinations deduplicate by Alpaca order ID, so retries after a
+        # process restart cannot credit the same sell twice.
+        fill_accounting = {"checked": 0, "applied": 0, "unmatched": 0, "errors": 0}
+        if SQLITE_ENABLED:
+            for order in orders:
+                try:
+                    oid = get_order_id(order)
+                    if not oid or get_order_side(order) != "SELL" or not order_is_filled(order):
+                        continue
+                    filled_qty = get_order_qty(order)
+                    symbol = get_order_symbol(order)
+                    conn = db_connect()
+                    matched = conn.execute(
+                        "SELECT COALESCE(SUM(qty),0), COALESCE(SUM(pnl),0), "
+                        "COALESCE(SUM(pnl_pct * qty),0) FROM closed_trades "
+                        "WHERE source_sell_order_id=?",
+                        (oid,),
+                    ).fetchone()
+                    conn.close()
+                    matched_qty = float(matched[0] or 0.0)
+                    fill_accounting["checked"] += 1
+                    if filled_qty <= 0 or matched_qty + 1e-6 < filled_qty:
+                        fill_accounting["unmatched"] += 1
+                        continue
+                    realised_pnl = float(matched[1] or 0.0)
+                    realised_pct = float(matched[2] or 0.0) / matched_qty if matched_qty > 0 else 0.0
+                    update_stock_memory_from_sell(symbol, realised_pnl, realised_pct, order_id=oid)
+                    if "profit_vault_bank_realised_profit" in globals():
+                        profit_vault_bank_realised_profit(
+                            realised_pnl, symbol=symbol,
+                            reason="CONFIRMED ALPACA SELL FILL", order_id=oid
+                        )
+                    fill_accounting["applied"] += 1
+                except Exception as accounting_error:
+                    fill_accounting["errors"] += 1
+                    print(f"FILL ACCOUNTING ERROR | order_id={get_order_id(order)} error={accounting_error}")
+        if fill_accounting["checked"]:
+            print(f"FILL ACCOUNTING RECONCILIATION | {fill_accounting}")
+
         auto_report_last_result = {
             "ok": True,
             "automatic": True,
+            "fillAccounting": fill_accounting,
             "ordersChecked": len(orders),
             "imported": imported,
             "existing": existing,
