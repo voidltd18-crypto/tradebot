@@ -7207,12 +7207,6 @@ def restore_today_sell_locks_from_db() -> List[str]:
             symbol = str(row["symbol"] or "").upper().strip()
             if not symbol:
                 continue
-            # V18.2.27: a restart after MARA's first completed cycle must not
-            # resurrect the old one-cycle lock. Only restore MARA after its
-            # second daily entry has been used. Other symbols are unchanged.
-            if False:  # V19: MARA no longer bypasses restored daily locks
-                locked_today.pop(symbol, None)
-                continue
             if not is_locked_today(symbol):
                 locked_today[symbol] = today_str()
                 restored.append(symbol)
