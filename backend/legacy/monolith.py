@@ -2006,7 +2006,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     # Actual fills are imported via Alpaca backfill and matched by order ID.
     # Do not update stock memory or the profit vault from a quote estimate.
     lock_symbol_until_tomorrow(symbol)
-    notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
+    notify(f"🔴 SELL SUBMITTED: {symbol} | qty={rounded_qty} | broker status={order_status} | fill/PnL pending")
 
 
 def close_position(position, reason="MANUAL SELL"):
@@ -7447,6 +7447,11 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
                     "fxRate": rate,
                 }
                 save_trade_to_db(event, source="alpaca_auto_sync")
+                print(
+                    f"ALPACA FILL SYNC | symbol={symbol} side={side} order_id={oid} "
+                    f"filled_qty={qty:.6f} filled_price={price:.6f} "
+                    f"source=broker_execution"
+                )
                 imported += 1
             except Exception as order_error:
                 errors += 1
