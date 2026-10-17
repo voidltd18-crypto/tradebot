@@ -7519,6 +7519,14 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
                         continue
                     filled_qty = get_order_qty(order)
                     symbol = get_order_symbol(order)
+                    try:
+                        actual_fill_price = float(getattr(order, "filled_avg_price", 0) or 0.0)
+                    except Exception:
+                        actual_fill_price = 0.0
+                    if actual_fill_price <= 0:
+                        fill_accounting["unmatched"] += 1
+                        print(f"FILL ACCOUNTING WAIT | symbol={symbol} order_id={oid} reason=missing_actual_fill_price")
+                        continue
                     conn = db_connect()
                     matched = conn.execute(
                         "SELECT COALESCE(SUM(qty),0), COALESCE(SUM(pnl),0), "
