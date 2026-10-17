@@ -169,3 +169,59 @@ def test_partially_filled_cancelled_order_accounts_once(tmp_path):
     assert vault == [("order-2", 0.5)]
     assert sync(force=True)["ok"]
     assert len(memory) == len(vault) == 1
+
+
+def test_actual_fifo_matcher_uses_confirmed_prices(tmp_path):
+    from typing import List
+    db_path = tmp_path / "fifo.sqlite3"
+    def connect():
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    conn = connect()
+    conn.executescript("""
+        CREATE TABLE trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, alpaca_order_id TEXT,
+            timestamp TEXT, day TEXT, time TEXT, symbol TEXT, side TEXT,
+            qty REAL, price REAL, amount REAL
+        );
+        CREATE TABLE closed_trades (
+            source_sell_order_id TEXT, source_buy_order_id TEXT, symbol TEXT,
+            qty REAL, entry_price REAL, exit_price REAL, pnl REAL, pnl_pct REAL
+        );
+        INSERT INTO trades (alpaca_order_id, timestamp, day, time, symbol, side, qty, price)
+        VALUES ('buy-1','2026-10-17T10:00:00+00:00','2026-10-17','10:00:00','MARA','BUY',2,10);
+        INSERT INTO trades (alpaca_order_id, timestamp, day, time, symbol, side, qty, price)
+        VALUES ('sell-1','2026-10-17T11:00:00+00:00','2026-10-17','11:00:00','MARA','SELL',1,12);
+    """)
+    conn.commit()
+    conn.close()
+    def save_closed(trade):
+        conn = connect()
+        conn.execute(
+            "INSERT INTO closed_trades VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (trade["sourceSellOrderId"], trade["sourceBuyOrderId"],
+             trade["symbol"], trade["qty"], trade["entryPrice"],
+             trade["exitPrice"], trade["pnl"], trade["pnlPct"]),
+        )
+        conn.commit()
+        conn.close()
+    def clear():
+        conn = connect()
+        conn.execute("DELETE FROM closed_trades")
+        conn.commit()
+        conn.close()
+    ns = {
+        "SQLITE_ENABLED": True, "init_db": lambda: None,
+        "db_connect": connect, "clear_closed_trades": clear,
+        "get_usd_to_gbp_rate": lambda: 0.75,
+        "save_closed_trade_to_db": save_closed,
+        "Dict": Dict, "List": List, "Any": Any,
+    }
+    rebuild = extract("rebuild_closed_trades_from_orders", ns)
+    result = rebuild()
+    assert result["matchedClosedTrades"] == 1
+    conn = connect()
+    row = conn.execute("SELECT qty, entry_price, exit_price, pnl FROM closed_trades").fetchone()
+    assert tuple(row) == (1.0, 10.0, 12.0, 2.0)
+    conn.close()
