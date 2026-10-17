@@ -3410,9 +3410,10 @@ def _v18_build_review(days=V18_WINDOW_DAYS, persist=True):
 def api_v18_weekly_review(days: int=V18_WINDOW_DAYS):
     return _v18_build_review(days,True)
 
-def _v6_write_historical_outcome(conn: sqlite3.Connection, row: Any) -> Dict[str, Any]:
+def _v6_write_historical_outcome(conn: sqlite3.Connection, row: Any, checkpoint: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     symbol=str(row["symbol"]).upper()
-    checkpoint=_v6_historical_checkpoint_price(symbol,row["due_at"])
+    if checkpoint is None:
+        checkpoint=_v6_historical_checkpoint_price(symbol,row["due_at"])
     outcome_price=float(checkpoint["price"]); entry_price=float(row["entry_price"] or 0.0)
     if entry_price <= 0:
         raise RuntimeError("missing_or_invalid_entry_price")
@@ -3441,6 +3442,16 @@ def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
         rows=conn.execute("""SELECT * FROM v2_observation_outcomes
             WHERE status='PENDING' AND due_at<=? ORDER BY due_at ASC LIMIT ?""",
             (datetime.now(UTC).isoformat(),batch)).fetchall()
+        # Fetch remote market data before opening any write transaction.
+        # This prevents slow Alpaca calls from holding the SQLite writer lock.
+        checkpoints: Dict[int, Any] = {}
+        for row in rows:
+            try:
+                checkpoints[int(row["id"])] = _v6_historical_checkpoint_price(
+                    str(row["symbol"]).upper(), row["due_at"]
+                )
+            except Exception as fetch_error:
+                checkpoints[int(row["id"])] = fetch_error
         error_reasons: Dict[str, int] = {}
         error_samples: List[str] = []
         for row in rows:
@@ -3450,7 +3461,10 @@ def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
             if previous_error:
                 conn.execute("UPDATE v2_observation_outcomes SET error=NULL WHERE id=?", (int(row["id"]),))
             try:
-                checkpoint = _v6_write_historical_outcome(conn,row)
+                prefetched = checkpoints[int(row["id"])]
+                if isinstance(prefetched, Exception):
+                    raise prefetched
+                checkpoint = _v6_write_historical_outcome(conn,row,prefetched)
                 evaluated += 1
                 if previous_error or previous_retry > 0 or checkpoint.get("feedFallback"):
                     recovered += 1
