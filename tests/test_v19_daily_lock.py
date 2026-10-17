@@ -39,6 +39,12 @@ def test_profit_protection_can_pass_soft_pdt_guard():
     assert "broker remains authoritative" in text.lower()
 
 
+def test_memory_cleanup_at_cycle_boundaries():
+    assert "def _release_transient_memory" in source
+    assert '_release_transient_memory("bot-cycle")' in source
+    assert '_release_transient_memory("bot-cycle-error")' in source
+
+
 if __name__ == "__main__":
     for name, func in sorted(globals().items()):
         if name.startswith("test_") and callable(func):
