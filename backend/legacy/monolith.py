@@ -1945,12 +1945,14 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     if rounded_qty <= 0:
         return
 
+    submitted_order = None
+
     def submit(q):
         order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
-        trading_client.submit_order(order)
+        return trading_client.submit_order(order)
 
     try:
-        submit(rounded_qty)
+        submitted_order = submit(rounded_qty)
     except Exception as e:
         err = str(e)
         if is_insufficient_qty_error(err):
@@ -1958,7 +1960,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
             retry_qty = floor_qty(available, 6) if available else 0
             if retry_qty > 0 and retry_qty < rounded_qty:
                 try:
-                    submit(retry_qty)
+                    submitted_order = submit(retry_qty)
                     rounded_qty = retry_qty
                 except Exception as retry_error:
                     add_alpaca_rejection_event(symbol, reason, f"Initial: {err} | Retry: {retry_error}")
@@ -1970,6 +1972,13 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
             add_alpaca_rejection_event(symbol, reason, err)
             raise
 
+    order_id = str(getattr(submitted_order, "id", "") or "")
+    order_status = str(getattr(submitted_order, "status", "submitted") or "submitted")
+    print(
+        f"SELL ORDER SUBMITTED | symbol={symbol} order_id={order_id} "
+        f"status={order_status} qty={rounded_qty:.6f} reason={reason} "
+        f"NOTE=broker_ack_not_fill"
+    )
     pnl = (price - entry) * rounded_qty if entry > 0 and price > 0 else 0.0
     pnl_pct = ((price / entry) - 1.0) * 100.0 if entry > 0 and price > 0 else 0.0
     event = {
