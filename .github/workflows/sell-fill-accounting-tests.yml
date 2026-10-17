@@ -5,6 +5,7 @@ on:
     paths:
       - 'backend/legacy/monolith.py'
       - 'tests/test_sell_fill_accounting.py'
+      - 'tests/test_sell_fill_sync_integration.py'
       - '.github/workflows/sell-fill-accounting-tests.yml'
   push:
     branches:
@@ -12,6 +13,7 @@ on:
     paths:
       - 'backend/legacy/monolith.py'
       - 'tests/test_sell_fill_accounting.py'
+      - 'tests/test_sell_fill_sync_integration.py'
       - '.github/workflows/sell-fill-accounting-tests.yml'
 
 permissions:
@@ -30,4 +32,4 @@ jobs:
       - name: Compile trading module without importing or starting the bot
         run: python -m py_compile backend/legacy/monolith.py
       - name: Run isolated sell accounting tests
-        run: python -m pytest tests/test_sell_fill_accounting.py -q
+        run: python -m pytest tests/test_sell_fill_accounting.py tests/test_sell_fill_sync_integration.py -q
