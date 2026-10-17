@@ -1,0 +1,18 @@
+name: V19 Recovery Checks
+on:
+  push:
+    branches:
+      - recovery-v19-2026-09-03-baseline
+  workflow_dispatch:
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate Python syntax
+        run: python -m compileall -q backend tests
+      - name: Verify V19 daily-entry policy
+        run: python tests/test_v19_daily_lock.py
