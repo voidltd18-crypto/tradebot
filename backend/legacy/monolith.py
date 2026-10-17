@@ -1840,9 +1840,8 @@ def proposed_buy_qty(scan: Dict[str, Any]) -> float:
 
 def can_buy_symbol(symbol: str):
     sym = str(symbol or "").upper().strip()
-    # V18.2.27: MARA may submit at most two successful entries in one trading
-    # day. This hard cap is checked independently of the sell-driven lock so an
-    # external/manual position close cannot accidentally create a third entry.
+    # MARA: one successful buy per trading day, even if the position is sold
+    # manually or the service restarts. This is independent of the daily lock.
     if sym == "MARA" and today_symbol_buy_count(sym) >= MARA_DAILY_ENTRY_LIMIT:
         locked_today[sym] = today_str()
         return False, f"{sym} locked until tomorrow (MARA daily entries {MARA_DAILY_ENTRY_LIMIT}/{MARA_DAILY_ENTRY_LIMIT})"
