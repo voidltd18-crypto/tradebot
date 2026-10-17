@@ -31,6 +31,14 @@ def test_no_mara_unlock_on_sell_or_restart():
     assert 'locked_today.pop(sym, None)' not in function_text("lock_symbol_until_tomorrow")
     assert 'locked_today.pop(symbol, None)' not in function_text("restore_today_sell_locks_from_db")
 
+def test_profit_protection_can_pass_soft_pdt_guard():
+    text = function_text("pdt_aware_should_avoid_sell")
+    assert 'pnl_pct > 0' in text
+    assert '"TRAILING" in reason_upper' in text
+    assert '"PROFIT" in reason_upper' in text
+    assert "broker remains authoritative" in text.lower()
+
+
 if __name__ == "__main__":
     for name, func in sorted(globals().items()):
         if name.startswith("test_") and callable(func):
