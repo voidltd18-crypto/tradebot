@@ -12870,28 +12870,33 @@ def profit_vault_deployable_usd(account_equity: float, buying_power: Optional[fl
 def profit_vault_bank_realised_profit(pnl_usd: float, symbol: str = "", reason: str = "", order_id: str = "") -> Dict[str, Any]:
     state = load_profit_vault_state()
     order_id = str(order_id or "").strip()
-    processed = state.get("processedSellOrderIds") or []
+    processed = list(state.get("processedSellOrderIds") or [])
     if order_id and order_id in processed:
         print(f"V17.6 PROFIT VAULT SELL DEDUP | symbol={str(symbol or '').upper()} order_id={order_id}")
         return state
+    def mark_sell_order_processed():
+        if order_id:
+            state["processedSellOrderIds"] = (processed + [order_id])[-5000:]
+            save_profit_vault_state(state)
     if not state.get("enabled"):
+        mark_sell_order_processed()
         return state
     try:
         pnl_usd = float(pnl_usd or 0.0)
     except Exception:
         pnl_usd = 0.0
     if pnl_usd <= 0:
+        mark_sell_order_processed()
         return state
     pnl_gbp = max(0.0, float(money_gbp(pnl_usd)))
     bank_amount = round(pnl_gbp * max(0.0, min(1.0, float(state.get("bankPct") or PROFIT_VAULT_BANK_PCT))), 4)
     if bank_amount <= 0:
+        mark_sell_order_processed()
         return state
     state["bankedProfitGbp"] = round(float(state.get("bankedProfitGbp") or 0.0) + bank_amount, 4)
     state["lifetimeBankedGbp"] = round(float(state.get("lifetimeBankedGbp") or 0.0) + bank_amount, 4)
     if order_id:
-        processed = list(state.get("processedSellOrderIds") or [])
-        processed.append(order_id)
-        state["processedSellOrderIds"] = processed[-5000:]
+        state["processedSellOrderIds"] = (processed + [order_id])[-5000:]
     state["lastBankedAt"] = datetime.now(UTC).isoformat()
     state["lastBankedSymbol"] = str(symbol or "").upper()
     state["lastBankedReason"] = str(reason or "")
