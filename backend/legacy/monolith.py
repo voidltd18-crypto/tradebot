@@ -7563,6 +7563,16 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
                     oid = get_order_id(order)
                     if not oid or get_order_side(order) != "SELL" or not order_execution_is_final(order):
                         continue
+                    # Only account orders registered by this version at submission.
+                    # This prevents first-run backfills from re-crediting old profits.
+                    conn = db_connect()
+                    pending = conn.execute(
+                        "SELECT accounting_status FROM pending_sell_orders WHERE alpaca_order_id=?",
+                        (oid,),
+                    ).fetchone()
+                    conn.close()
+                    if not pending or str(pending["accounting_status"] or "") != "PENDING":
+                        continue
                     filled_qty = get_order_qty(order)
                     symbol = get_order_symbol(order)
                     try:
@@ -7583,8 +7593,13 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
                     conn.close()
                     matched_qty = float(matched[0] or 0.0)
                     fill_accounting["checked"] += 1
-                    if filled_qty <= 0 or matched_qty + 1e-6 < filled_qty:
+                    tolerance = max(1e-6, filled_qty * 1e-5)
+                    if filled_qty <= 0 or abs(matched_qty - filled_qty) > tolerance:
                         fill_accounting["unmatched"] += 1
+                        print(
+                            f"FILL ACCOUNTING WAIT | symbol={symbol} order_id={oid} "
+                            f"broker_filled_qty={filled_qty:.6f} fifo_matched_qty={matched_qty:.6f}"
+                        )
                         continue
                     realised_pnl = float(matched[1] or 0.0)
                     realised_pct = float(matched[2] or 0.0) / matched_qty if matched_qty > 0 else 0.0
@@ -7594,6 +7609,15 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
                             realised_pnl, symbol=symbol,
                             reason="CONFIRMED ALPACA SELL FILL", order_id=oid
                         )
+                    conn = db_connect()
+                    conn.execute(
+                        "UPDATE pending_sell_orders SET accounting_status='PROCESSED', "
+                        "accounted_qty=?, accounted_pnl=?, updated_at=? WHERE alpaca_order_id=? "
+                        "AND accounting_status='PENDING'",
+                        (filled_qty, realised_pnl, datetime.now(UTC).isoformat(), oid),
+                    )
+                    conn.commit()
+                    conn.close()
                     fill_accounting["applied"] += 1
                 except Exception as accounting_error:
                     fill_accounting["errors"] += 1
