@@ -1992,14 +1992,19 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
         "pnlGbp": round(money_gbp(pnl), 4),
         "pnlPct": round(pnl_pct, 4),
     }
+    # An accepted order is not a fill. Keep submission visible in the
+    # activity feed, but do not write a realised trade or credit the vault
+    # until the broker confirms an execution.
+    event["alpacaOrderId"] = order_id
+    event["orderStatus"] = order_status
+    event["accountingStatus"] = "PENDING_FILL_RECONCILIATION"
+    event["estimatedPnl"] = event.pop("pnl")
+    event["estimatedPnlGbp"] = event.pop("pnlGbp")
+    event["estimatedPnlPct"] = event.pop("pnlPct")
     trade_events.append(event)
-    add_trade_history_event(event)
-    update_stock_memory_from_sell(symbol, pnl, pnl_pct)
-    if pnl > 0 and "profit_vault_bank_realised_profit" in globals():
-        try:
-            profit_vault_bank_realised_profit(pnl, symbol=symbol, reason=reason)
-        except Exception as vault_exc:
-            print(f"V17.6 PROFIT VAULT BANK ERROR | symbol={symbol} error={vault_exc}")
+    print(f"SELL ACCOUNTING DEFERRED | symbol={symbol} order_id={order_id} status={order_status}")
+    # Actual fills are imported via Alpaca backfill and matched by order ID.
+    # Do not update stock memory or the profit vault from a quote estimate.
     lock_symbol_until_tomorrow(symbol)
     notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
 
