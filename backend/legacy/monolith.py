@@ -4,6 +4,7 @@ import time
 import secrets
 import hashlib
 import shutil
+import gc
 MAX_TRADING_CAPITAL = float(os.getenv("MAX_TRADING_CAPITAL", "200") or 200)
 
 import sqlite3
@@ -44,6 +45,34 @@ from alpaca.data.enums import DataFeed
 # - Stock memory
 # - Persistent trade timeline
 # ============================================================
+
+
+# =========================
+# PROCESS MEMORY HYGIENE
+# =========================
+def _release_transient_memory(reason: str = "") -> None:
+    """Return large temporary research/scanner allocations to the OS when possible.
+
+    This is operational hygiene only. It does not change trading decisions,
+    thresholds, order sizing, or execution.
+    """
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    trimmed = False
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        trim_fn = getattr(libc, "malloc_trim", None)
+        if trim_fn is not None:
+            trim_fn.argtypes = [ctypes.c_size_t]
+            trim_fn.restype = ctypes.c_int
+            trimmed = bool(trim_fn(0))
+    except Exception:
+        trimmed = False
+    if reason:
+        print(f"V18.2.29 MEMORY TRIM | reason={reason} allocator_trimmed={trimmed}", flush=True)
 
 
 # =========================
@@ -10587,11 +10616,13 @@ def run_bot_loop():
                 update_status(BOT_NAME, scans)
 
             _cycle_monitor_finish("bot", _cycle_started, True)
+            _release_transient_memory("bot-cycle")
             time.sleep(CHECK_INTERVAL)
 
         except Exception as e:
             _cycle_monitor_finish("bot", _cycle_started, False, str(e))
             print(f"Main loop error: {e}")
+            _release_transient_memory("bot-cycle-error")
             time.sleep(10)
 
 
