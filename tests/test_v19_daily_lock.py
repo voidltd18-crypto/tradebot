@@ -45,6 +45,21 @@ def test_memory_cleanup_at_cycle_boundaries():
     assert '_release_transient_memory("bot-cycle-error")' in source
 
 
+def test_scanner_rate_limit_fallback_is_preserved():
+    text = function_text("_yahoo_dynamic_screen")
+    assert "response.status_code == 429" in text
+    assert "_DYNAMIC_SCANNER_YAHOO_BLOCKED_UNTIL" in text
+    assert "DYNAMIC_SCANNER_YAHOO_COOLDOWN_SECONDS" in text
+    assert "response.raise_for_status()" in text
+
+
+def test_database_wal_and_writer_retries_are_preserved():
+    text = function_text("db_connect")
+    assert "PRAGMA journal_mode=WAL" in text
+    assert "PRAGMA busy_timeout" in text
+    assert "_DB_BUSY_TIMEOUT_MS" in text
+
+
 if __name__ == "__main__":
     for name, func in sorted(globals().items()):
         if name.startswith("test_") and callable(func):
