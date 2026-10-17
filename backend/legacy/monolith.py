@@ -6964,11 +6964,22 @@ def stock_memory_from_closed_trades():
 
 
 def order_is_filled(order):
+    """True when Alpaca reports any executed quantity (including partial fills)."""
     try:
         filled_qty = float(getattr(order, "filled_qty", 0) or 0)
         return filled_qty > 0
     except Exception:
         return False
+
+
+def order_execution_is_final(order):
+    """Only account a sell's cumulative PnL after its broker order is terminal."""
+    if not order_is_filled(order):
+        return False
+    raw = getattr(order, "status", "")
+    raw = getattr(raw, "value", raw)
+    status = str(raw or "").strip().lower().split(".")[-1]
+    return status in {"filled", "canceled", "cancelled", "expired", "rejected"}
 
 
 def get_order_side(order):
@@ -7504,7 +7515,7 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
             for order in orders:
                 try:
                     oid = get_order_id(order)
-                    if not oid or get_order_side(order) != "SELL" or not order_is_filled(order):
+                    if not oid or get_order_side(order) != "SELL" or not order_execution_is_final(order):
                         continue
                     filled_qty = get_order_qty(order)
                     symbol = get_order_symbol(order)
