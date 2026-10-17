@@ -7417,9 +7417,27 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
                     skipped += 1
                     continue
 
-                if _trade_order_exists(oid):
-                    existing += 1
-                    continue
+                existing_order = _trade_order_exists(oid)
+                if existing_order:
+                    conn = db_connect()
+                    stored = conn.execute(
+                        "SELECT qty, price FROM trades WHERE alpaca_order_id=? LIMIT 1",
+                        (oid,),
+                    ).fetchone()
+                    conn.close()
+                    stored_qty = float(stored["qty"] or 0.0) if stored else 0.0
+                    stored_price = float(stored["price"] or 0.0) if stored else 0.0
+                    # Alpaca may report cumulative partial fills over several cycles.
+                    # Refresh the same order row when its confirmed filled quantity
+                    # or average execution price changes; never count it as a new order.
+                    if abs(stored_qty - qty) <= 1e-8 and abs(stored_price - price) <= 1e-8:
+                        existing += 1
+                        continue
+                    print(
+                        f"ALPACA FILL UPDATE | symbol={symbol} side={side} order_id={oid} "
+                        f"old_qty={stored_qty:.6f} new_qty={qty:.6f} "
+                        f"old_price={stored_price:.6f} new_price={price:.6f}"
+                    )
 
                 timestamp_obj = parse_order_timestamp(order)
                 if hasattr(timestamp_obj, "isoformat"):
