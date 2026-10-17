@@ -1413,11 +1413,11 @@ def update_stock_memory_from_sell(symbol: str, pnl: float, pnl_pct: float, order
         return
     symbol = str(symbol or "").upper().strip()
     order_id = str(order_id or "").strip()
-    processed = stock_memory.setdefault("_processedSellOrderIds", [])
+    m = get_memory(symbol)
+    processed = m.setdefault("_processedSellOrderIds", [])
     if order_id and order_id in processed:
         print(f"STOCK MEMORY SELL DEDUP | symbol={symbol} order_id={order_id}")
         return
-    m = get_memory(symbol)
     m["trades"] += 1
     m["totalPnl"] += float(pnl)
     m["totalPnlPct"] += float(pnl_pct)
@@ -1439,9 +1439,9 @@ def update_stock_memory_from_sell(symbol: str, pnl: float, pnl_pct: float, order
     else:
         m["trust"] = "NEUTRAL"
     if order_id:
-        processed = stock_memory.setdefault("_processedSellOrderIds", [])
+        processed = m.setdefault("_processedSellOrderIds", [])
         processed.append(order_id)
-        stock_memory["_processedSellOrderIds"] = processed[-5000:]
+        m["_processedSellOrderIds"] = processed[-5000:]
     save_stock_memory()
     refresh_blacklist_from_memory(symbol)
 
