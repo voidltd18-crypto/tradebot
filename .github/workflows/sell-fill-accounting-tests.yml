@@ -1,0 +1,35 @@
+name: Sell fill accounting regression tests
+
+on:
+  pull_request:
+    paths:
+      - 'backend/legacy/monolith.py'
+      - 'tests/test_sell_fill_accounting.py'
+      - 'tests/test_sell_fill_sync_integration.py'
+      - '.github/workflows/sell-fill-accounting-tests.yml'
+  push:
+    branches:
+      - fix/defer-unfilled-sell-accounting-20261017
+    paths:
+      - 'backend/legacy/monolith.py'
+      - 'tests/test_sell_fill_accounting.py'
+      - 'tests/test_sell_fill_sync_integration.py'
+      - '.github/workflows/sell-fill-accounting-tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  accounting-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install test runner
+        run: python -m pip install pytest
+      - name: Compile trading module without importing or starting the bot
+        run: python -m py_compile backend/legacy/monolith.py
+      - name: Run isolated sell accounting tests
+        run: python -m pytest tests/test_sell_fill_accounting.py tests/test_sell_fill_sync_integration.py -q

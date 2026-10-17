@@ -1408,10 +1408,16 @@ def get_memory(symbol: str):
     return stock_memory[symbol]
 
 
-def update_stock_memory_from_sell(symbol: str, pnl: float, pnl_pct: float):
+def update_stock_memory_from_sell(symbol: str, pnl: float, pnl_pct: float, order_id: str = ""):
     if not STOCK_MEMORY_ENABLED:
         return
+    symbol = str(symbol or "").upper().strip()
+    order_id = str(order_id or "").strip()
     m = get_memory(symbol)
+    processed = m.setdefault("_processedSellOrderIds", [])
+    if order_id and order_id in processed:
+        print(f"STOCK MEMORY SELL DEDUP | symbol={symbol} order_id={order_id}")
+        return
     m["trades"] += 1
     m["totalPnl"] += float(pnl)
     m["totalPnlPct"] += float(pnl_pct)
@@ -1432,6 +1438,10 @@ def update_stock_memory_from_sell(symbol: str, pnl: float, pnl_pct: float):
         m["trust"] = "BAD"
     else:
         m["trust"] = "NEUTRAL"
+    if order_id:
+        processed = m.setdefault("_processedSellOrderIds", [])
+        processed.append(order_id)
+        m["_processedSellOrderIds"] = processed[-5000:]
     save_stock_memory()
     refresh_blacklist_from_memory(symbol)
 
@@ -1940,6 +1950,30 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
     notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
 
 
+def register_pending_sell_order(order_id: str, symbol: str, qty: float, reason: str, status: str = "") -> bool:
+    """Persist only sell orders submitted by this version for safe fill reconciliation."""
+    if not SQLITE_ENABLED or not order_id:
+        return False
+    try:
+        init_db()
+        now = datetime.now(UTC).isoformat()
+        conn = db_connect()
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_sell_orders "
+            "(alpaca_order_id, symbol, requested_qty, reason, submitted_at, initial_status, "
+            "accounting_status, accounted_qty, accounted_pnl, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 0, 0, ?)",
+            (str(order_id), str(symbol or "").upper(), float(qty or 0.0),
+             str(reason or ""), now, str(status or ""), now),
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as exc:
+        print(f"SELL PENDING REGISTRATION ERROR | symbol={symbol} order_id={order_id} error={exc}")
+        return False
+
+
 def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 0.0, reason="AUTO SELL"):
     rounded_qty = floor_qty(qty, 6)
     if rounded_qty <= 0:
@@ -1979,6 +2013,8 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
         f"status={order_status} qty={rounded_qty:.6f} reason={reason} "
         f"NOTE=broker_ack_not_fill"
     )
+    if not register_pending_sell_order(order_id, symbol, rounded_qty, reason, order_status):
+        print(f"SELL ACCOUNTING WARNING | symbol={symbol} order_id={order_id} pending_order_not_persisted")
     pnl = (price - entry) * rounded_qty if entry > 0 and price > 0 else 0.0
     pnl_pct = ((price / entry) - 1.0) * 100.0 if entry > 0 and price > 0 else 0.0
     event = {
@@ -1992,16 +2028,21 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
         "pnlGbp": round(money_gbp(pnl), 4),
         "pnlPct": round(pnl_pct, 4),
     }
+    # An accepted order is not a fill. Keep submission visible in the
+    # activity feed, but do not write a realised trade or credit the vault
+    # until the broker confirms an execution.
+    event["alpacaOrderId"] = order_id
+    event["orderStatus"] = order_status
+    event["accountingStatus"] = "PENDING_FILL_RECONCILIATION"
+    event["estimatedPnl"] = event.pop("pnl")
+    event["estimatedPnlGbp"] = event.pop("pnlGbp")
+    event["estimatedPnlPct"] = event.pop("pnlPct")
     trade_events.append(event)
-    add_trade_history_event(event)
-    update_stock_memory_from_sell(symbol, pnl, pnl_pct)
-    if pnl > 0 and "profit_vault_bank_realised_profit" in globals():
-        try:
-            profit_vault_bank_realised_profit(pnl, symbol=symbol, reason=reason)
-        except Exception as vault_exc:
-            print(f"V17.6 PROFIT VAULT BANK ERROR | symbol={symbol} error={vault_exc}")
+    print(f"SELL ACCOUNTING DEFERRED | symbol={symbol} order_id={order_id} status={order_status}")
+    # Actual fills are imported via Alpaca backfill and matched by order ID.
+    # Do not update stock memory or the profit vault from a quote estimate.
     lock_symbol_until_tomorrow(symbol)
-    notify(f"🔴 {reason}: {symbol} | qty={rounded_qty} | est PnL {round(pnl, 4)} ({round(pnl_pct, 2)}%)")
+    notify(f"🔴 SELL SUBMITTED: {symbol} | qty={rounded_qty} | broker status={order_status} | fill/PnL pending")
 
 
 def close_position(position, reason="MANUAL SELL"):
@@ -6091,6 +6132,26 @@ def _init_db_impl():
     """)
 
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS pending_sell_orders (
+            alpaca_order_id TEXT PRIMARY KEY,
+            symbol TEXT NOT NULL,
+            requested_qty REAL NOT NULL DEFAULT 0,
+            reason TEXT,
+            submitted_at TEXT NOT NULL,
+            initial_status TEXT,
+            accounting_status TEXT NOT NULL DEFAULT 'PENDING',
+            accounted_qty REAL NOT NULL DEFAULT 0,
+            accounted_pnl REAL NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_pending_sell_status
+        ON pending_sell_orders(accounting_status, submitted_at)
+    """)
+
+    cur.execute("""
         CREATE INDEX IF NOT EXISTS idx_trades_timestamp
         ON trades(timestamp)
     """)
@@ -6949,11 +7010,22 @@ def stock_memory_from_closed_trades():
 
 
 def order_is_filled(order):
+    """True when Alpaca reports any executed quantity (including partial fills)."""
     try:
         filled_qty = float(getattr(order, "filled_qty", 0) or 0)
         return filled_qty > 0
     except Exception:
         return False
+
+
+def order_execution_is_final(order):
+    """Only account a sell's cumulative PnL after its broker order is terminal."""
+    if not order_is_filled(order):
+        return False
+    raw = getattr(order, "status", "")
+    raw = getattr(raw, "value", raw)
+    status = str(raw or "").strip().lower().split(".")[-1]
+    return status in {"filled", "canceled", "cancelled", "expired", "rejected"}
 
 
 def get_order_side(order):
@@ -7402,9 +7474,27 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
                     skipped += 1
                     continue
 
-                if _trade_order_exists(oid):
-                    existing += 1
-                    continue
+                existing_order = _trade_order_exists(oid)
+                if existing_order:
+                    conn = db_connect()
+                    stored = conn.execute(
+                        "SELECT qty, price FROM trades WHERE alpaca_order_id=? LIMIT 1",
+                        (oid,),
+                    ).fetchone()
+                    conn.close()
+                    stored_qty = float(stored["qty"] or 0.0) if stored else 0.0
+                    stored_price = float(stored["price"] or 0.0) if stored else 0.0
+                    # Alpaca may report cumulative partial fills over several cycles.
+                    # Refresh the same order row when its confirmed filled quantity
+                    # or average execution price changes; never count it as a new order.
+                    if abs(stored_qty - qty) <= 1e-8 and abs(stored_price - price) <= 1e-8:
+                        existing += 1
+                        continue
+                    print(
+                        f"ALPACA FILL UPDATE | symbol={symbol} side={side} order_id={oid} "
+                        f"old_qty={stored_qty:.6f} new_qty={qty:.6f} "
+                        f"old_price={stored_price:.6f} new_price={price:.6f}"
+                    )
 
                 timestamp_obj = parse_order_timestamp(order)
                 if hasattr(timestamp_obj, "isoformat"):
@@ -7442,6 +7532,11 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
                     "fxRate": rate,
                 }
                 save_trade_to_db(event, source="alpaca_auto_sync")
+                print(
+                    f"ALPACA FILL SYNC | symbol={symbol} side={side} order_id={oid} "
+                    f"filled_qty={qty:.6f} filled_price={price:.6f} "
+                    f"source=broker_execution"
+                )
                 imported += 1
             except Exception as order_error:
                 errors += 1
@@ -7457,9 +7552,83 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
                 f"closed={rebuild_result.get('matchedClosedTrades', 0)}"
             )
 
+        # Apply realised sell PnL to stock memory and the profit vault only
+        # after FIFO matching proves the broker-filled quantity is fully matched.
+        # Both destinations deduplicate by Alpaca order ID, so retries after a
+        # process restart cannot credit the same sell twice.
+        fill_accounting = {"checked": 0, "applied": 0, "unmatched": 0, "errors": 0}
+        if SQLITE_ENABLED:
+            for order in orders:
+                try:
+                    oid = get_order_id(order)
+                    if not oid or get_order_side(order) != "SELL" or not order_execution_is_final(order):
+                        continue
+                    # Only account orders registered by this version at submission.
+                    # This prevents first-run backfills from re-crediting old profits.
+                    conn = db_connect()
+                    pending = conn.execute(
+                        "SELECT accounting_status FROM pending_sell_orders WHERE alpaca_order_id=?",
+                        (oid,),
+                    ).fetchone()
+                    conn.close()
+                    if not pending or str(pending["accounting_status"] or "") != "PENDING":
+                        continue
+                    filled_qty = get_order_qty(order)
+                    symbol = get_order_symbol(order)
+                    try:
+                        actual_fill_price = float(getattr(order, "filled_avg_price", 0) or 0.0)
+                    except Exception:
+                        actual_fill_price = 0.0
+                    if actual_fill_price <= 0:
+                        fill_accounting["unmatched"] += 1
+                        print(f"FILL ACCOUNTING WAIT | symbol={symbol} order_id={oid} reason=missing_actual_fill_price")
+                        continue
+                    conn = db_connect()
+                    matched = conn.execute(
+                        "SELECT COALESCE(SUM(qty),0), COALESCE(SUM(pnl),0), "
+                        "COALESCE(SUM(pnl_pct * qty),0) FROM closed_trades "
+                        "WHERE source_sell_order_id=?",
+                        (oid,),
+                    ).fetchone()
+                    conn.close()
+                    matched_qty = float(matched[0] or 0.0)
+                    fill_accounting["checked"] += 1
+                    tolerance = max(1e-6, filled_qty * 1e-5)
+                    if filled_qty <= 0 or abs(matched_qty - filled_qty) > tolerance:
+                        fill_accounting["unmatched"] += 1
+                        print(
+                            f"FILL ACCOUNTING WAIT | symbol={symbol} order_id={oid} "
+                            f"broker_filled_qty={filled_qty:.6f} fifo_matched_qty={matched_qty:.6f}"
+                        )
+                        continue
+                    realised_pnl = float(matched[1] or 0.0)
+                    realised_pct = float(matched[2] or 0.0) / matched_qty if matched_qty > 0 else 0.0
+                    update_stock_memory_from_sell(symbol, realised_pnl, realised_pct, order_id=oid)
+                    if "profit_vault_bank_realised_profit" in globals():
+                        profit_vault_bank_realised_profit(
+                            realised_pnl, symbol=symbol,
+                            reason="CONFIRMED ALPACA SELL FILL", order_id=oid
+                        )
+                    conn = db_connect()
+                    conn.execute(
+                        "UPDATE pending_sell_orders SET accounting_status='PROCESSED', "
+                        "accounted_qty=?, accounted_pnl=?, updated_at=? WHERE alpaca_order_id=? "
+                        "AND accounting_status='PENDING'",
+                        (filled_qty, realised_pnl, datetime.now(UTC).isoformat(), oid),
+                    )
+                    conn.commit()
+                    conn.close()
+                    fill_accounting["applied"] += 1
+                except Exception as accounting_error:
+                    fill_accounting["errors"] += 1
+                    print(f"FILL ACCOUNTING ERROR | order_id={get_order_id(order)} error={accounting_error}")
+        if fill_accounting["checked"]:
+            print(f"FILL ACCOUNTING RECONCILIATION | {fill_accounting}")
+
         auto_report_last_result = {
             "ok": True,
             "automatic": True,
+            "fillAccounting": fill_accounting,
             "ordersChecked": len(orders),
             "imported": imported,
             "existing": existing,
@@ -12805,22 +12974,36 @@ def profit_vault_deployable_usd(account_equity: float, buying_power: Optional[fl
             pass
     return max(0.0, working)
 
-def profit_vault_bank_realised_profit(pnl_usd: float, symbol: str = "", reason: str = "") -> Dict[str, Any]:
+def profit_vault_bank_realised_profit(pnl_usd: float, symbol: str = "", reason: str = "", order_id: str = "") -> Dict[str, Any]:
     state = load_profit_vault_state()
+    order_id = str(order_id or "").strip()
+    processed = list(state.get("processedSellOrderIds") or [])
+    if order_id and order_id in processed:
+        print(f"V17.6 PROFIT VAULT SELL DEDUP | symbol={str(symbol or '').upper()} order_id={order_id}")
+        return state
+    def mark_sell_order_processed():
+        if order_id:
+            state["processedSellOrderIds"] = (processed + [order_id])[-5000:]
+            save_profit_vault_state(state)
     if not state.get("enabled"):
+        mark_sell_order_processed()
         return state
     try:
         pnl_usd = float(pnl_usd or 0.0)
     except Exception:
         pnl_usd = 0.0
     if pnl_usd <= 0:
+        mark_sell_order_processed()
         return state
     pnl_gbp = max(0.0, float(money_gbp(pnl_usd)))
     bank_amount = round(pnl_gbp * max(0.0, min(1.0, float(state.get("bankPct") or PROFIT_VAULT_BANK_PCT))), 4)
     if bank_amount <= 0:
+        mark_sell_order_processed()
         return state
     state["bankedProfitGbp"] = round(float(state.get("bankedProfitGbp") or 0.0) + bank_amount, 4)
     state["lifetimeBankedGbp"] = round(float(state.get("lifetimeBankedGbp") or 0.0) + bank_amount, 4)
+    if order_id:
+        state["processedSellOrderIds"] = (processed + [order_id])[-5000:]
     state["lastBankedAt"] = datetime.now(UTC).isoformat()
     state["lastBankedSymbol"] = str(symbol or "").upper()
     state["lastBankedReason"] = str(reason or "")
