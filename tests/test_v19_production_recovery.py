@@ -44,9 +44,20 @@ def test_memory_instrumentation_is_read_only():
     assert "market_sell" not in cleanup
 
 
+def test_sampled_memory_diagnostics_have_no_trading_side_effects():
+    fn = body("_v19_memory_snapshot")
+    assert "gc.get_count()" in fn
+    assert "_v19_process_rss_mb()" in fn
+    assert "_V19_MEMORY_SAMPLE_EVERY" in fn
+    assert "submit_order" not in fn
+    assert "db_connect" not in fn
+    assert "_v19_memory_snapshot(reason)" in body("_release_transient_memory")
+
+
 if __name__ == "__main__":
     test_historical_lookup_separate_from_write()
     test_live_accounting_and_mara_guards_preserved()
     test_mara_single_entry_and_sell_lock()
     test_memory_instrumentation_is_read_only()
+    test_sampled_memory_diagnostics_have_no_trading_side_effects()
     print("V19 production-based checks passed")
