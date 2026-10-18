@@ -24,7 +24,16 @@ def test_live_accounting_and_mara_guards_preserved():
     assert "FIRST_DIBS_ENABLED" in text
     assert "_release_transient_memory" in text
 
+def test_mara_single_entry_and_sell_lock():
+    buy = body("can_buy_symbol")
+    locked = body("is_locked_today")
+    assert "today_symbol_buy_count(sym) >= MARA_DAILY_ENTRY_LIMIT" in buy
+    assert "today_symbol_buy_count(sym) >= 1" in locked
+    assert "MARA_DAILY_ENTRY_LIMIT = 1" in text
+
+
 if __name__ == "__main__":
     test_historical_lookup_separate_from_write()
     test_live_accounting_and_mara_guards_preserved()
+    test_mara_single_entry_and_sell_lock()
     print("V19 production-based checks passed")
