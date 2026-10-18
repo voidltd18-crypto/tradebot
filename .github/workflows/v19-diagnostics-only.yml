@@ -1,0 +1,32 @@
+name: V19 Diagnostics Only
+
+on:
+  push:
+    branches:
+      - v19-memory-diagnostics-only-20261018
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile standalone diagnostics
+        run: |
+          python -m py_compile backend/v19_memory_sampler.py tests/test_v19_memory_sampler.py tests/test_v19_memory_repeated_cycles.py tests/test_v19_research_memory_inventory.py
+      - name: Run sampler tests
+        run: |
+          python -m unittest discover -s tests -p 'test_v19_memory_*.py' -v
+      - name: Run static inventory
+        run: |
+          python tests/test_v19_research_memory_inventory.py
