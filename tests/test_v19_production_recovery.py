@@ -63,6 +63,15 @@ def test_scanner_memory_probe_preserves_candidate_selection():
     assert "return saved_payload" in scanner
 
 
+def test_scanner_reuses_readonly_cache_containers():
+    scanner = body("refresh_dynamic_market_candidates")
+    assert "prior_cache = _load_dynamic_scanner_cache() or {}" in scanner
+    assert 'prior_rows = prior_cache.get("rows") or []' in scanner
+    assert "dict(_load_dynamic_scanner_cache()" not in scanner
+    assert 'rows = prior_rows[:DYNAMIC_MARKET_SCANNER_MAX_SYMBOLS]' in scanner
+    assert "rows_by_symbol: Dict[str, Dict[str, Any]] = {}" in scanner
+
+
 if __name__ == "__main__":
     test_historical_lookup_separate_from_write()
     test_live_accounting_and_mara_guards_preserved()
@@ -70,4 +79,5 @@ if __name__ == "__main__":
     test_memory_instrumentation_is_read_only()
     test_sampled_memory_diagnostics_have_no_trading_side_effects()
     test_scanner_memory_probe_preserves_candidate_selection()
+    test_scanner_reuses_readonly_cache_containers()
     print("V19 production-based checks passed")
