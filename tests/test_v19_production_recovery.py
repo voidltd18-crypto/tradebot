@@ -54,10 +54,20 @@ def test_sampled_memory_diagnostics_have_no_trading_side_effects():
     assert "_v19_memory_snapshot(reason)" in body("_release_transient_memory")
 
 
+def test_scanner_memory_probe_preserves_candidate_selection():
+    scanner = body("refresh_dynamic_market_candidates")
+    assert "_v19_scanner_rss_start = _v19_process_rss_mb()" in scanner
+    assert "_v19_scanner_rss_end = _v19_process_rss_mb()" in scanner
+    assert "V19 SCANNER MEMORY" in scanner
+    assert "saved_payload = _save_dynamic_scanner_cache(payload)" in scanner
+    assert "return saved_payload" in scanner
+
+
 if __name__ == "__main__":
     test_historical_lookup_separate_from_write()
     test_live_accounting_and_mara_guards_preserved()
     test_mara_single_entry_and_sell_lock()
     test_memory_instrumentation_is_read_only()
     test_sampled_memory_diagnostics_have_no_trading_side_effects()
+    test_scanner_memory_probe_preserves_candidate_selection()
     print("V19 production-based checks passed")
