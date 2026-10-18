@@ -15,3 +15,4 @@ jobs:
       - run: python tests/test_v19_production_recovery.py
       - run: python -m pip install pytest
       - run: python -m pytest tests/test_sell_fill_accounting.py tests/test_sell_fill_sync_integration.py -q
+      - run: python tests/v19_memory_soak.py
