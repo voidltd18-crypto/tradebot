@@ -12003,14 +12003,17 @@ def _full_market_scan(prior_cache: Dict[str, Any]) -> Dict[str, Any]:
                     "changePct": round(change, 4), "volume": int(volume), "price": price,
                 }
         finally:
-            try:
-                response.close()
-            except Exception:
-                pass
+            # Release the parsed snapshot tree and response body before the next
+            # Alpaca batch, rather than retaining the previous batch in locals.
             try:
                 del snapshots
             except Exception:
                 pass
+            try:
+                response.close()
+            except Exception:
+                pass
+            del response
         cursor = (cursor + len(batch)) % len(symbols)
         scanned += len(batch)
         if cursor == 0:
