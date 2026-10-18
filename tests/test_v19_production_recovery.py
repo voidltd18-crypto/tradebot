@@ -32,8 +32,21 @@ def test_mara_single_entry_and_sell_lock():
     assert "MARA_DAILY_ENTRY_LIMIT = 1" in text
 
 
+def test_memory_instrumentation_is_read_only():
+    probe = body("_v19_process_rss_mb")
+    cleanup = body("_release_transient_memory")
+    assert '"/proc/self/status"' in probe
+    assert 'line.startswith("VmRSS:")' in probe
+    assert "rss_before_mb = _v19_process_rss_mb()" in cleanup
+    assert "rss_after_mb = _v19_process_rss_mb()" in cleanup
+    assert cleanup.index("rss_before_mb =") < cleanup.index("gc.collect()") < cleanup.index("rss_after_mb =")
+    assert "submit_order" not in cleanup
+    assert "market_sell" not in cleanup
+
+
 if __name__ == "__main__":
     test_historical_lookup_separate_from_write()
     test_live_accounting_and_mara_guards_preserved()
     test_mara_single_entry_and_sell_lock()
+    test_memory_instrumentation_is_read_only()
     print("V19 production-based checks passed")
