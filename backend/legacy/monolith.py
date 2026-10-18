@@ -50,6 +50,32 @@ from alpaca.data.enums import DataFeed
 # =========================
 # PROCESS MEMORY HYGIENE
 # =========================
+def _v19_optional_memory_snapshot(reason: str) -> None:
+    """Opt-in, best-effort collection counts; never touch trading decisions."""
+    if os.getenv("V19_COLLECTION_TELEMETRY_ENABLED", "false").strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    try:
+        from backend.v19_memory_sampler import sample_collections
+        names = (
+            "locked_universe_runtime_cache",
+            "adaptive_universe_runtime_cache",
+            "latest_scans",
+            "trade_history",
+            "stock_memory",
+            "trade_events",
+            "equity_curve",
+        )
+        collections = {name: globals().get(name) for name in names}
+        reading = sample_collections(collections)
+        print(
+            f"V19 COLLECTION SAMPLE | reason={reason} "
+            f"rss_mb={reading['rss_mb']} lengths={reading['collection_lengths']}",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
 def _release_transient_memory(reason: str = "") -> None:
     """Return large temporary research/scanner allocations to the OS when possible.
 
@@ -73,6 +99,7 @@ def _release_transient_memory(reason: str = "") -> None:
         trimmed = False
     if reason:
         print(f"V18.2.29 MEMORY TRIM | reason={reason} allocator_trimmed={trimmed}", flush=True)
+        _v19_optional_memory_snapshot(reason)
 
 
 # =========================
