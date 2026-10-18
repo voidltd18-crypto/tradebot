@@ -72,6 +72,17 @@ def test_scanner_reuses_readonly_cache_containers():
     assert "rows_by_symbol: Dict[str, Dict[str, Any]] = {}" in scanner
 
 
+def test_alpaca_snapshot_batch_releases_response():
+    scanner = body("_full_market_scan")
+    assert "response.raise_for_status()" in scanner
+    assert 'snapshots = response.json().get("snapshots") or {}' in scanner
+    assert "del snapshots" in scanner
+    assert "response.close()" in scanner
+    assert "del response" in scanner
+    assert scanner.index("del snapshots") < scanner.index("del response") < scanner.index("cursor = (cursor + len(batch))")
+    assert "retained.update(new_rows)" in scanner
+
+
 if __name__ == "__main__":
     test_historical_lookup_separate_from_write()
     test_live_accounting_and_mara_guards_preserved()
@@ -80,4 +91,5 @@ if __name__ == "__main__":
     test_sampled_memory_diagnostics_have_no_trading_side_effects()
     test_scanner_memory_probe_preserves_candidate_selection()
     test_scanner_reuses_readonly_cache_containers()
+    test_alpaca_snapshot_batch_releases_response()
     print("V19 production-based checks passed")
