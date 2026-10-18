@@ -73,6 +73,27 @@ def _v19_memory_snapshot(reason: str) -> None:
     if _v19_memory_sample_count % _V19_MEMORY_SAMPLE_EVERY:
         return
     try:
+        if os.getenv("V19_COLLECTION_TELEMETRY_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"):
+            # Diagnostic only: count top-level entries; do not copy or serialise evidence.
+            from backend.v19_memory_sampler import sample_collections
+            collections = {
+                name: globals().get(name)
+                for name in (
+                    "locked_universe_runtime_cache",
+                    "adaptive_universe_runtime_cache",
+                    "latest_scans",
+                    "trade_history",
+                    "stock_memory",
+                    "trade_events",
+                    "equity_curve",
+                )
+            }
+            reading = sample_collections(collections)
+            print(
+                f"V19 COLLECTION SAMPLE | reason={reason} rss_mb={reading['rss_mb']} "
+                f"lengths={reading['collection_lengths']}",
+                flush=True,
+            )
         counts = gc.get_count()
         print(
             f"V19 MEMORY SAMPLE | reason={reason} rss_mb={_v19_process_rss_mb()} "
