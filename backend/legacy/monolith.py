@@ -62,6 +62,27 @@ def _v19_process_rss_mb() -> Optional[float]:
     return None
 
 
+_V19_MEMORY_SAMPLE_EVERY = max(1, int(os.getenv("V19_MEMORY_SAMPLE_EVERY", "20")))
+_v19_memory_sample_count = 0
+
+
+def _v19_memory_snapshot(reason: str) -> None:
+    """Emit occasional RSS and GC counters; diagnostics only."""
+    global _v19_memory_sample_count
+    _v19_memory_sample_count += 1
+    if _v19_memory_sample_count % _V19_MEMORY_SAMPLE_EVERY:
+        return
+    try:
+        counts = gc.get_count()
+        print(
+            f"V19 MEMORY SAMPLE | reason={reason} rss_mb={_v19_process_rss_mb()} "
+            f"gc_gen0={counts[0]} gc_gen1={counts[1]} gc_gen2={counts[2]}",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
 def _release_transient_memory(reason: str = "") -> None:
     """Return large temporary research/scanner allocations to the OS when possible.
 
@@ -87,6 +108,7 @@ def _release_transient_memory(reason: str = "") -> None:
     if reason:
         rss_after_mb = _v19_process_rss_mb()
         print(f"V18.2.29 MEMORY TRIM | reason={reason} allocator_trimmed={trimmed} rss_before_mb={rss_before_mb} rss_after_mb={rss_after_mb}", flush=True)
+        _v19_memory_snapshot(reason)
 
 
 # =========================
