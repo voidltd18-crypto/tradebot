@@ -3534,9 +3534,10 @@ def _v18_build_review(days=V18_WINDOW_DAYS, persist=True):
 def api_v18_weekly_review(days: int=V18_WINDOW_DAYS):
     return _v18_build_review(days,True)
 
-def _v6_write_historical_outcome(conn: sqlite3.Connection, row: Any) -> Dict[str, Any]:
+def _v6_write_historical_outcome(conn: sqlite3.Connection, row: Any, checkpoint: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     symbol=str(row["symbol"]).upper()
-    checkpoint=_v6_historical_checkpoint_price(symbol,row["due_at"])
+    if checkpoint is None:
+        checkpoint=_v6_historical_checkpoint_price(symbol,row["due_at"])
     outcome_price=float(checkpoint["price"]); entry_price=float(row["entry_price"] or 0.0)
     if entry_price <= 0:
         raise RuntimeError("missing_or_invalid_entry_price")
@@ -3574,7 +3575,10 @@ def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
             try:
                 # Do the network lookup before beginning a SQLite write, then
                 # commit this row before the next potentially slow lookup.
-                checkpoint = _v6_write_historical_outcome(conn,row)
+                checkpoint_data = _v6_historical_checkpoint_price(
+                    str(row["symbol"]).upper(), row["due_at"]
+                )
+                checkpoint = _v6_write_historical_outcome(conn,row,checkpoint_data)
                 conn.commit()
                 evaluated += 1
                 if previous_error or previous_retry > 0 or checkpoint.get("feedFallback"):
