@@ -42,9 +42,41 @@ def test_inventory_does_not_import_trading_application():
     assert "from backend.legacy import monolith" not in source
     assert "submit_order(" not in source
 
+
+def references():
+    """Find direct collection references and common in-place mutations, statically."""
+    found = {name: {"readers": set(), "writers": set()} for name in TARGETS}
+    for node in ast.walk(TREE):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name) and child.id in found:
+                kind = "writers" if isinstance(child.ctx, (ast.Store, ast.Del)) else "readers"
+                found[child.id][kind].add(node.name)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+                owner = child.func.value
+                if isinstance(owner, ast.Name) and owner.id in found and child.func.attr in {
+                    "append", "extend", "insert", "pop", "clear", "update", "setdefault", "remove", "sort", "reverse"
+                }:
+                    found[owner.id]["writers"].add(node.name)
+            if isinstance(child, (ast.Assign, ast.AugAssign)):
+                targets = child.targets if isinstance(child, ast.Assign) else [child.target]
+                for target in targets:
+                    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name) and target.value.id in found:
+                        found[target.value.id]["writers"].add(node.name)
+    return {name: {kind: sorted(values) for kind, values in uses.items()} for name, uses in found.items()}
+
+def test_reference_report_covers_all_collections():
+    report = references()
+    assert set(report) == set(TARGETS)
+    assert all(isinstance(item["readers"], list) and isinstance(item["writers"], list) for item in report.values())
+
 if __name__ == "__main__":
     test_memory_inventory_is_complete()
     test_inventory_does_not_import_trading_application()
+    test_reference_report_covers_all_collections()
     for name, metadata in inventory().items():
         print(f"V19 MEMORY INVENTORY | name={name} line={metadata['line']} initialiser={metadata['initialiser']}")
+    for name, uses in references().items():
+        print(f"V19 MEMORY REFERENCES | name={name} readers={len(uses['readers'])} writers={len(uses['writers'])}")
     print("V19 research-memory inventory checks passed")
