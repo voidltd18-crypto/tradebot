@@ -37,10 +37,18 @@ def test_memory_inventory_is_complete():
     assert len(found) == len(TARGETS)
 
 def test_inventory_does_not_import_trading_application():
-    source = Path(__file__).read_text(encoding="utf-8")
-    assert "import backend.legacy.monolith" not in source
-    assert "from backend.legacy import monolith" not in source
-    assert "submit_order(" not in source
+    # Inspect executable syntax, not text: literal forbidden strings in assertions
+    # would otherwise match themselves and make this check fail unconditionally.
+    test_tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(test_tree):
+        if isinstance(node, ast.Import):
+            assert all(not alias.name.startswith("backend.legacy") for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert not (node.module or "").startswith("backend.legacy")
+        elif isinstance(node, ast.Call):
+            called = node.func
+            assert not (isinstance(called, ast.Name) and called.id == "submit_order")
+            assert not (isinstance(called, ast.Attribute) and called.attr == "submit_order")
 
 
 def references():
