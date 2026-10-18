@@ -50,12 +50,67 @@ from alpaca.data.enums import DataFeed
 # =========================
 # PROCESS MEMORY HYGIENE
 # =========================
+def _v19_process_rss_mb() -> Optional[float]:
+    """Read current Linux process RSS without allocating a large object."""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024.0, 2)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+_V19_MEMORY_SAMPLE_EVERY = max(1, int(os.getenv("V19_MEMORY_SAMPLE_EVERY", "20")))
+_v19_memory_sample_count = 0
+
+
+def _v19_memory_snapshot(reason: str) -> None:
+    """Emit occasional RSS and GC counters; diagnostics only."""
+    global _v19_memory_sample_count
+    _v19_memory_sample_count += 1
+    if _v19_memory_sample_count % _V19_MEMORY_SAMPLE_EVERY:
+        return
+    try:
+        if os.getenv("V19_COLLECTION_TELEMETRY_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"):
+            # Diagnostic only: count top-level entries; do not copy or serialise evidence.
+            from backend.v19_memory_sampler import sample_collections
+            collections = {
+                name: globals().get(name)
+                for name in (
+                    "locked_universe_runtime_cache",
+                    "adaptive_universe_runtime_cache",
+                    "latest_scans",
+                    "trade_history",
+                    "stock_memory",
+                    "trade_events",
+                    "equity_curve",
+                )
+            }
+            reading = sample_collections(collections)
+            print(
+                f"V19 COLLECTION SAMPLE | reason={reason} rss_mb={reading['rss_mb']} "
+                f"lengths={reading['collection_lengths']}",
+                flush=True,
+            )
+        counts = gc.get_count()
+        print(
+            f"V19 MEMORY SAMPLE | reason={reason} rss_mb={_v19_process_rss_mb()} "
+            f"gc_gen0={counts[0]} gc_gen1={counts[1]} gc_gen2={counts[2]}",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
 def _release_transient_memory(reason: str = "") -> None:
     """Return large temporary research/scanner allocations to the OS when possible.
 
     This is operational hygiene only. It does not change trading decisions,
     thresholds, order sizing, or execution.
     """
+    rss_before_mb = _v19_process_rss_mb()
     try:
         gc.collect()
     except Exception:
@@ -72,7 +127,9 @@ def _release_transient_memory(reason: str = "") -> None:
     except Exception:
         trimmed = False
     if reason:
-        print(f"V18.2.29 MEMORY TRIM | reason={reason} allocator_trimmed={trimmed}", flush=True)
+        rss_after_mb = _v19_process_rss_mb()
+        print(f"V18.2.29 MEMORY TRIM | reason={reason} allocator_trimmed={trimmed} rss_before_mb={rss_before_mb} rss_after_mb={rss_after_mb}", flush=True)
+        _v19_memory_snapshot(reason)
 
 
 # =========================
@@ -3534,9 +3591,10 @@ def _v18_build_review(days=V18_WINDOW_DAYS, persist=True):
 def api_v18_weekly_review(days: int=V18_WINDOW_DAYS):
     return _v18_build_review(days,True)
 
-def _v6_write_historical_outcome(conn: sqlite3.Connection, row: Any) -> Dict[str, Any]:
+def _v6_write_historical_outcome(conn: sqlite3.Connection, row: Any, checkpoint: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     symbol=str(row["symbol"]).upper()
-    checkpoint=_v6_historical_checkpoint_price(symbol,row["due_at"])
+    if checkpoint is None:
+        checkpoint=_v6_historical_checkpoint_price(symbol,row["due_at"])
     outcome_price=float(checkpoint["price"]); entry_price=float(row["entry_price"] or 0.0)
     if entry_price <= 0:
         raise RuntimeError("missing_or_invalid_entry_price")
@@ -3574,7 +3632,10 @@ def v2_evaluate_due_outcomes(limit: Optional[int] = None) -> Dict[str, Any]:
             try:
                 # Do the network lookup before beginning a SQLite write, then
                 # commit this row before the next potentially slow lookup.
-                checkpoint = _v6_write_historical_outcome(conn,row)
+                checkpoint_data = _v6_historical_checkpoint_price(
+                    str(row["symbol"]).upper(), row["due_at"]
+                )
+                checkpoint = _v6_write_historical_outcome(conn,row,checkpoint_data)
                 conn.commit()
                 evaluated += 1
                 if previous_error or previous_retry > 0 or checkpoint.get("feedFallback"):
@@ -11963,14 +12024,17 @@ def _full_market_scan(prior_cache: Dict[str, Any]) -> Dict[str, Any]:
                     "changePct": round(change, 4), "volume": int(volume), "price": price,
                 }
         finally:
-            try:
-                response.close()
-            except Exception:
-                pass
+            # Release the parsed snapshot tree and response body before the next
+            # Alpaca batch, rather than retaining the previous batch in locals.
             try:
                 del snapshots
             except Exception:
                 pass
+            try:
+                response.close()
+            except Exception:
+                pass
+            del response
         cursor = (cursor + len(batch)) % len(symbols)
         scanned += len(batch)
         if cursor == 0:
@@ -12001,8 +12065,11 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
         return _load_dynamic_scanner_cache()
 
     _scanner_cycle_started = _cycle_monitor_start("scanner")
-    prior_cache = dict(_load_dynamic_scanner_cache() or {})
-    prior_rows = list(prior_cache.get("rows") or [])
+    _v19_scanner_rss_start = _v19_process_rss_mb()
+    # Read-only reference: avoid duplicating the complete cached candidate tree.
+    # The refresh builds a new payload and never mutates prior_cache or prior_rows.
+    prior_cache = _load_dynamic_scanner_cache() or {}
+    prior_rows = prior_cache.get("rows") or []
     rows_by_symbol: Dict[str, Dict[str, Any]] = {}
     errors = []
     full_market = {}
@@ -12099,6 +12166,8 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
         "error": " | ".join(errors[-3:]),
     }
     saved_payload = _save_dynamic_scanner_cache(payload)
+    _v19_scanner_rss_end = _v19_process_rss_mb()
+    print(f"V19 SCANNER MEMORY | before_mb={_v19_scanner_rss_start} after_mb={_v19_scanner_rss_end} candidates={len(rows_by_symbol)} selected={len(rows)}", flush=True)
     _cycle_monitor_finish("scanner", _scanner_cycle_started, True)
     return saved_payload
 

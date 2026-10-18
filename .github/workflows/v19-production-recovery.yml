@@ -1,0 +1,18 @@
+name: V19 Production-Based Recovery
+on:
+  push:
+    branches: [recovery-v19-on-current-main]
+  workflow_dispatch:
+jobs:
+  recovery-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m compileall -q backend tests
+      - run: python tests/test_v19_production_recovery.py
+      - run: python -m pip install pytest
+      - run: python -m pytest tests/test_sell_fill_accounting.py tests/test_sell_fill_sync_integration.py -q
+      - run: python tests/v19_memory_soak.py
