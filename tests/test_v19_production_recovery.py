@@ -83,6 +83,16 @@ def test_alpaca_snapshot_batch_releases_response():
     assert "retained.update(new_rows)" in scanner
 
 
+def test_night_research_drops_result_trees_before_trim():
+    worker = body("closed_market_ai_research_worker")
+    drop = "del seeded, outcomes, v179_audit, v18_review, v6_result, v11_result"
+    assert drop in worker
+    assert worker.index('"AI NIGHT RESEARCH | "') < worker.index(drop)
+    assert worker.index(drop) < worker.index('_release_transient_memory("closed-market-research-cycle")')
+    assert "market_buy" not in worker
+    assert "submit_order" not in worker
+
+
 if __name__ == "__main__":
     test_historical_lookup_separate_from_write()
     test_live_accounting_and_mara_guards_preserved()
@@ -92,4 +102,5 @@ if __name__ == "__main__":
     test_scanner_memory_probe_preserves_candidate_selection()
     test_scanner_reuses_readonly_cache_containers()
     test_alpaca_snapshot_batch_releases_response()
+    test_night_research_drops_result_trees_before_trim()
     print("V19 production-based checks passed")
