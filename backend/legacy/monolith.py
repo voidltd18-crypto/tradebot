@@ -50,12 +50,25 @@ from alpaca.data.enums import DataFeed
 # =========================
 # PROCESS MEMORY HYGIENE
 # =========================
+def _v19_process_rss_mb() -> Optional[float]:
+    """Read current Linux process RSS without allocating a large object."""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return round(int(line.split()[1]) / 1024.0, 2)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def _release_transient_memory(reason: str = "") -> None:
     """Return large temporary research/scanner allocations to the OS when possible.
 
     This is operational hygiene only. It does not change trading decisions,
     thresholds, order sizing, or execution.
     """
+    rss_before_mb = _v19_process_rss_mb()
     try:
         gc.collect()
     except Exception:
@@ -72,7 +85,8 @@ def _release_transient_memory(reason: str = "") -> None:
     except Exception:
         trimmed = False
     if reason:
-        print(f"V18.2.29 MEMORY TRIM | reason={reason} allocator_trimmed={trimmed}", flush=True)
+        rss_after_mb = _v19_process_rss_mb()
+        print(f"V18.2.29 MEMORY TRIM | reason={reason} allocator_trimmed={trimmed} rss_before_mb={rss_before_mb} rss_after_mb={rss_after_mb}", flush=True)
 
 
 # =========================
