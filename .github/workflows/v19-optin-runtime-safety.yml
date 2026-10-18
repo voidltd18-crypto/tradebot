@@ -1,0 +1,32 @@
+name: V19 Opt-in Runtime Safety
+
+on:
+  push:
+    branches:
+      - v19-optin-runtime-telemetry-20261018
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Compile without importing trading app
+        run: |
+          python -m py_compile backend/legacy/monolith.py backend/v19_memory_sampler.py tests/test_v19_optin_runtime_safety.py
+      - name: Run opt-in safety regression
+        run: |
+          python -m unittest discover -s tests -p 'test_v19_optin_runtime_safety.py' -v
+      - name: Run standalone sampler regression
+        run: |
+          python -m unittest discover -s tests -p 'test_v19_memory_*.py' -v
