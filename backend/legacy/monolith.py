@@ -12041,6 +12041,7 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
         return _load_dynamic_scanner_cache()
 
     _scanner_cycle_started = _cycle_monitor_start("scanner")
+    _v19_scanner_rss_start = _v19_process_rss_mb()
     prior_cache = dict(_load_dynamic_scanner_cache() or {})
     prior_rows = list(prior_cache.get("rows") or [])
     rows_by_symbol: Dict[str, Dict[str, Any]] = {}
@@ -12139,6 +12140,8 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
         "error": " | ".join(errors[-3:]),
     }
     saved_payload = _save_dynamic_scanner_cache(payload)
+    _v19_scanner_rss_end = _v19_process_rss_mb()
+    print(f"V19 SCANNER MEMORY | before_mb={_v19_scanner_rss_start} after_mb={_v19_scanner_rss_end} candidates={len(rows_by_symbol)} selected={len(rows)}", flush=True)
     _cycle_monitor_finish("scanner", _scanner_cycle_started, True)
     return saved_payload
 
