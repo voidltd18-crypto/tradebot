@@ -10321,6 +10321,10 @@ def closed_market_ai_research_worker() -> None:
                 "live_changes=False"
             )
             _cycle_monitor_finish("research", _research_cycle_started, True)
+            # Long-lived worker locals otherwise retain the prior cycle's
+            # result trees during the sleep interval and into the next cycle.
+            # All required summary values have already been logged above.
+            del seeded, outcomes, v179_audit, v18_review, v6_result, v11_result
             _release_transient_memory("closed-market-research-cycle")
         except Exception as exc:
             if "_research_cycle_started" in locals():
