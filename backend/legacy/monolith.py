@@ -12042,8 +12042,10 @@ def refresh_dynamic_market_candidates(force: bool = False) -> Dict[str, Any]:
 
     _scanner_cycle_started = _cycle_monitor_start("scanner")
     _v19_scanner_rss_start = _v19_process_rss_mb()
-    prior_cache = dict(_load_dynamic_scanner_cache() or {})
-    prior_rows = list(prior_cache.get("rows") or [])
+    # Read-only reference: avoid duplicating the complete cached candidate tree.
+    # The refresh builds a new payload and never mutates prior_cache or prior_rows.
+    prior_cache = _load_dynamic_scanner_cache() or {}
+    prior_rows = prior_cache.get("rows") or []
     rows_by_symbol: Dict[str, Dict[str, Any]] = {}
     errors = []
     full_market = {}
