@@ -28,3 +28,31 @@ def swing_review_due(entry_date: date, as_of: date, sessions: list[date], max_se
     if max_sessions < 1:
         raise ValueError("max_sessions must be positive")
     return trading_session_number(entry_date, as_of, sessions) >= max_sessions
+
+
+def alpaca_trading_sessions(get_calendar, start: date, end: date) -> list[date]:
+    """Fetch exchange sessions from a supplied Alpaca calendar method.
+
+    Caller supplies TradingClient.get_calendar; this module never constructs
+    a client, accesses credentials, or submits trades. No weekday fallback.
+    """
+    if end < start:
+        raise ValueError("calendar end precedes start")
+    from alpaca.trading.requests import GetCalendarRequest
+
+    rows = get_calendar(GetCalendarRequest(start=start, end=end))
+    if rows is None:
+        raise ValueError("Alpaca returned no calendar")
+    sessions = []
+    for row in rows:
+        day = row.date
+        if isinstance(day, str):
+            day = date.fromisoformat(day)
+        if not isinstance(day, date):
+            raise ValueError("unexpected Alpaca calendar date")
+        if not start <= day <= end:
+            raise ValueError("Alpaca calendar returned an out-of-range session")
+        sessions.append(day)
+    if not sessions or sessions != sorted(set(sessions)):
+        raise ValueError("Alpaca calendar is empty, unsorted or duplicated")
+    return sessions
