@@ -72,3 +72,15 @@ def test_review_is_never_an_order_instruction():
     assert due["action"] == "REVIEW_ONLY"
     assert due["reviewDue"] is True
     assert "sell" not in due and "order" not in due
+
+
+def test_entry_date_uses_new_york_exchange_timezone():
+    from backend.v19_swing_review import entry_session_from_fill
+    assert entry_session_from_fill("2026-10-20T00:15:00Z") == d("2026-10-19")
+    assert entry_session_from_fill("2026-10-20T14:00:00+00:00") == d("2026-10-20")
+
+
+def test_entry_date_rejects_naive_timestamp():
+    from backend.v19_swing_review import entry_session_from_fill
+    with pytest.raises(ValueError):
+        entry_session_from_fill("2026-10-19T14:00:00")
