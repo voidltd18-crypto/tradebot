@@ -2297,6 +2297,11 @@ def should_one_hour_profit_exit(position: Dict[str, Any]):
 
 
 def should_stall_exit(position: Dict[str, Any]):
+    # Five-session swing mode: do not liquidate a holding solely because its
+    # short-term stall timer expired. Emergency stops, ordinary stops, peak
+    # exhaustion and profit trailing are evaluated independently and unchanged.
+    if os.getenv("TRADEBOT_FIVE_SESSION_SWING_HOLD", "false").lower() in ("true", "1", "yes"):
+        return False, "five-session swing hold: timer-based stall exit suppressed"
     if not FAST_EXIT_MODE_ENABLED or not STALL_EXIT_ENABLED:
         return False, "stall exit disabled"
 
