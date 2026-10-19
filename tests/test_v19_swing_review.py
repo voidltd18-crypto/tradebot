@@ -112,3 +112,20 @@ def test_missing_fills_fail_closed():
         current_position_entry_fill(incomplete, "MARA", 2)
     with pytest.raises(ValueError):
         current_position_entry_fill(incomplete, "MARA", 0.5)
+
+
+def test_diagnostic_status_verified_and_unverified():
+    from types import SimpleNamespace
+    from backend.v19_swing_review import safe_position_swing_review
+
+    sessions = list(map(d, ["2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23"]))
+    fills = [SimpleNamespace(symbol="MSFT", status="filled", side="buy", filled_qty="2", filled_at="2026-10-19T14:00:00Z")]
+    good = safe_position_swing_review(fills, "MSFT", 2, d("2026-10-23"), sessions)
+    assert good["status"] == "verified"
+    assert good["holdingTradingDay"] == 5
+    assert good["action"] == "REVIEW_ONLY"
+
+    bad = safe_position_swing_review(fills, "MSFT", 3, d("2026-10-23"), sessions)
+    assert bad["status"] == "unverified"
+    assert bad["reviewDue"] is False
+    assert bad["action"] == "NO_ACTION"
