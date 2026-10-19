@@ -74,3 +74,20 @@ def swing_review_snapshot(entry_date: date, as_of: date, sessions: list[date], m
         "maxTradingDays": max_sessions,
         "action": "REVIEW_ONLY" if day >= max_sessions else "HOLD_WINDOW",
     }
+
+
+def entry_session_from_fill(filled_at) -> date:
+    """Convert a broker fill timestamp into its New York exchange date.
+
+    Never infer an entry from the current date or from process-local state.
+    The caller must first identify the opening fill for the *current* holding,
+    including any intervening full close and re-entry.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    if isinstance(filled_at, str):
+        filled_at = datetime.fromisoformat(filled_at.replace("Z", "+00:00"))
+    if not isinstance(filled_at, datetime) or filled_at.tzinfo is None or filled_at.utcoffset() is None:
+        raise ValueError("entry fill requires a timezone-aware timestamp")
+    return filled_at.astimezone(ZoneInfo("America/New_York")).date()
