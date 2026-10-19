@@ -91,3 +91,63 @@ def entry_session_from_fill(filled_at) -> date:
     if not isinstance(filled_at, datetime) or filled_at.tzinfo is None or filled_at.utcoffset() is None:
         raise ValueError("entry fill requires a timezone-aware timestamp")
     return filled_at.astimezone(ZoneInfo("America/New_York")).date()
+
+
+def current_position_entry_fill(orders, symbol: str, current_qty: float):
+    """Reconstruct opening fill for current long holding from complete fills.
+
+    Orders must be complete, chronologically ordered executed fills for this
+    symbol, including partial executions. A mismatch with broker position
+    quantity fails closed. Never infer a fill from order submission/update.
+    """
+    from datetime import datetime
+    from decimal import Decimal, InvalidOperation
+
+    if not symbol or current_qty <= 0:
+        raise ValueError("active symbol and positive quantity required")
+    events = []
+    for order in orders:
+        if str(getattr(order, "symbol", "")).upper() != symbol.upper():
+            continue
+        status = str(getattr(order, "status", "")).lower()
+        if status not in {"filled", "orderstatus.filled"}:
+            raise ValueError("incomplete or non-filled order in fill history")
+        stamp = getattr(order, "filled_at", None)
+        if stamp is None:
+            raise ValueError("missing confirmed fill timestamp")
+        if isinstance(stamp, str):
+            stamp = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if not isinstance(stamp, datetime) or stamp.tzinfo is None or stamp.utcoffset() is None:
+            raise ValueError("fill timestamp must be timezone-aware")
+        try:
+            qty = Decimal(str(getattr(order, "filled_qty", None)))
+        except (InvalidOperation, TypeError):
+            raise ValueError("invalid filled quantity")
+        if not qty.is_finite() or qty <= 0:
+            raise ValueError("invalid filled quantity")
+        side = str(getattr(order, "side", "")).lower()
+        if side in {"orderside.buy", "buy"}:
+            sign = 1
+        elif side in {"orderside.sell", "sell"}:
+            sign = -1
+        else:
+            raise ValueError("unknown fill side")
+        events.append((stamp, sign, qty))
+    if not events or events != sorted(events, key=lambda row: row[0]):
+        raise ValueError("fill history missing or not chronologically ordered")
+    balance = Decimal("0")
+    entry = None
+    for stamp, sign, qty in events:
+        if sign == 1:
+            if balance == 0:
+                entry = stamp
+            balance += qty
+        else:
+            balance -= qty
+            if balance < 0:
+                raise ValueError("fill history incomplete or includes short selling")
+            if balance == 0:
+                entry = None
+    if abs(balance - Decimal(str(current_qty))) > Decimal("0.000001") or entry is None:
+        raise ValueError("fills do not reconcile to current broker position")
+    return entry
