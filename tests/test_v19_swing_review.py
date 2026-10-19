@@ -84,3 +84,31 @@ def test_entry_date_rejects_naive_timestamp():
     from backend.v19_swing_review import entry_session_from_fill
     with pytest.raises(ValueError):
         entry_session_from_fill("2026-10-19T14:00:00")
+
+
+def test_reentry_uses_new_opening_fill():
+    from types import SimpleNamespace
+    from backend.v19_swing_review import current_position_entry_fill, entry_session_from_fill
+
+    def fill(day, side, qty):
+        return SimpleNamespace(symbol="MARA", status="filled", side=side, filled_qty=str(qty), filled_at=day)
+
+    orders = [
+        fill("2026-10-12T14:00:00+00:00", "buy", 2),
+        fill("2026-10-13T14:00:00+00:00", "sell", 2),
+        fill("2026-10-19T14:00:00+00:00", "buy", 1),
+        fill("2026-10-20T14:00:00+00:00", "buy", 1),
+        fill("2026-10-21T14:00:00+00:00", "sell", 0.5),
+    ]
+    assert entry_session_from_fill(current_position_entry_fill(orders, "MARA", 1.5)) == d("2026-10-19")
+
+
+def test_missing_fills_fail_closed():
+    from types import SimpleNamespace
+    from backend.v19_swing_review import current_position_entry_fill
+
+    incomplete = [SimpleNamespace(symbol="MARA", status="filled", side="buy", filled_qty="1", filled_at="2026-10-19T14:00:00Z")]
+    with pytest.raises(ValueError):
+        current_position_entry_fill(incomplete, "MARA", 2)
+    with pytest.raises(ValueError):
+        current_position_entry_fill(incomplete, "MARA", 0.5)
