@@ -151,3 +151,23 @@ def current_position_entry_fill(orders, symbol: str, current_qty: float):
     if abs(balance - Decimal(str(current_qty))) > Decimal("0.000001") or entry is None:
         raise ValueError("fills do not reconcile to current broker position")
     return entry
+
+
+def safe_position_swing_review(orders, symbol: str, current_qty: float, as_of: date, sessions: list[date], max_sessions: int = 5) -> dict:
+    """Diagnostic-only adapter: unknown data never produces a due-review signal.
+
+    Supply complete confirmed fills for this symbol and a verified exchange
+    calendar. This function neither fetches orders nor performs trading.
+    """
+    try:
+        entry_fill = current_position_entry_fill(orders, symbol, current_qty)
+        entry_day = entry_session_from_fill(entry_fill)
+        snapshot = swing_review_snapshot(entry_day, as_of, sessions, max_sessions)
+        return {"symbol": symbol, "entrySession": entry_day.isoformat(), "status": "verified", **snapshot}
+    except (ValueError, TypeError, AttributeError, OverflowError) as exc:
+        return {
+            "symbol": symbol, "entrySession": None, "status": "unverified",
+            "holdingTradingDay": None, "reviewDue": False,
+            "maxTradingDays": max_sessions, "action": "NO_ACTION",
+            "reason": str(exc),
+        }
