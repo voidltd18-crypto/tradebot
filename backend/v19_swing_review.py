@@ -56,3 +56,21 @@ def alpaca_trading_sessions(get_calendar, start: date, end: date) -> list[date]:
     if not sessions or sessions != sorted(set(sessions)):
         raise ValueError("Alpaca calendar is empty, unsorted or duplicated")
     return sessions
+
+
+def swing_review_snapshot(entry_date: date, as_of: date, sessions: list[date], max_sessions: int = 5) -> dict:
+    """Read-only status for UI/diagnostics, not a sell signal.
+
+    A due review cannot override emergency stops, hard stops, profit trails,
+    broker PDT checks, or entry lockouts. Those remain owned by the trading
+    engine and are intentionally not called here.
+    """
+    day = trading_session_number(entry_date, as_of, sessions)
+    if max_sessions < 1:
+        raise ValueError("max_sessions must be positive")
+    return {
+        "holdingTradingDay": day,
+        "reviewDue": day >= max_sessions,
+        "maxTradingDays": max_sessions,
+        "action": "REVIEW_ONLY" if day >= max_sessions else "HOLD_WINDOW",
+    }
