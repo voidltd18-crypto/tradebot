@@ -111,7 +111,7 @@ def current_position_entry_fill(orders, symbol: str, current_qty: float):
             continue
         status = str(getattr(order, "status", "")).lower()
         if status not in {"filled", "orderstatus.filled"}:
-            raise ValueError("incomplete or non-filled order in fill history")
+            raise ValueError("non-final or partially executed order requires execution-level fill history")
         stamp = getattr(order, "filled_at", None)
         if stamp is None:
             raise ValueError("missing confirmed fill timestamp")
