@@ -129,3 +129,19 @@ def test_diagnostic_status_verified_and_unverified():
     assert bad["status"] == "unverified"
     assert bad["reviewDue"] is False
     assert bad["action"] == "NO_ACTION"
+
+
+@pytest.mark.parametrize("status", ["partially_filled", "canceled", "expired"])
+def test_partial_or_cancelled_order_cannot_verify_entry(status):
+    from types import SimpleNamespace
+    from backend.v19_swing_review import safe_position_swing_review
+
+    order = SimpleNamespace(
+        symbol="MSFT", status=status, side="buy",
+        filled_qty="0.5", filled_at="2026-10-19T14:00:00Z"
+    )
+    sessions = list(map(d, ["2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23"]))
+    result = safe_position_swing_review([order], "MSFT", 0.5, d("2026-10-23"), sessions)
+    assert result["status"] == "unverified"
+    assert result["action"] == "NO_ACTION"
+    assert result["reviewDue"] is False
