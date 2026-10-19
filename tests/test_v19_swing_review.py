@@ -61,3 +61,14 @@ def test_alpaca_calendar_failure_never_falls_back_to_weekdays():
 
     with pytest.raises(ValueError):
         alpaca_trading_sessions(unavailable, d("2026-10-19"), d("2026-10-26"))
+
+
+def test_review_is_never_an_order_instruction():
+    from backend.v19_swing_review import swing_review_snapshot
+    sessions = list(map(d, ["2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23"]))
+    early = swing_review_snapshot(d("2026-10-19"), d("2026-10-22"), sessions)
+    due = swing_review_snapshot(d("2026-10-19"), d("2026-10-23"), sessions)
+    assert early["action"] == "HOLD_WINDOW"
+    assert due["action"] == "REVIEW_ONLY"
+    assert due["reviewDue"] is True
+    assert "sell" not in due and "order" not in due
