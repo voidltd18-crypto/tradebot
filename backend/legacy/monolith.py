@@ -9900,7 +9900,7 @@ def api_final_gate_monitor(request: Request):
 def get_swing_review():
     """Read-only five-session review. Never submits or changes an order."""
     from datetime import datetime, timedelta, timezone
-    from backend.v19_swing_review import alpaca_trading_sessions, safe_position_swing_review
+    from backend.v19_swing_review import alpaca_trading_sessions, safe_position_swing_review, sideways_review_assessment
 
     try:
         positions = trading_client.get_all_positions()
@@ -9932,9 +9932,15 @@ def get_swing_review():
         sessions = alpaca_trading_sessions(trading_client.get_calendar, start, today_ny)
         result = []
         for position in positions:
-            result.append(safe_position_swing_review(
+            review = safe_position_swing_review(
                 orders, str(position.symbol), float(position.qty), today_ny, sessions
-            ))
+            )
+            try:
+                unrealized_pct = float(position.unrealized_plpc) * 100.0
+            except (TypeError, ValueError, AttributeError):
+                unrealized_pct = float("nan")
+            review["sidewaysAssessment"] = sideways_review_assessment(review, unrealized_pct)
+            result.append(review)
         return {"status": "ok", "readOnly": True, "positions": result}
     except Exception as exc:
         return {"status": "unverified", "readOnly": True,
