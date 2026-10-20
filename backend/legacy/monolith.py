@@ -9896,6 +9896,55 @@ def api_final_gate_monitor(request: Request):
     return _v174_final_gate_monitor_payload()
 
 
+@app.get("/swing-review")
+def get_swing_review():
+    """Read-only five-session review. Never submits or changes an order."""
+    from datetime import datetime, timedelta, timezone
+    from backend.v19_swing_review import alpaca_trading_sessions, safe_position_swing_review
+
+    try:
+        positions = trading_client.get_all_positions()
+    except Exception as exc:
+        return {"status": "unavailable", "reason": str(exc), "positions": []}
+
+    if not positions:
+        return {"status": "ok", "positions": []}
+    try:
+        # Broker order history can be incomplete due to API pagination/retention.
+        # In that case the reconciliation helper fails closed (no due-review).
+        orders = trading_client.get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.ALL, limit=500, direction="asc"
+        ))
+        if len(orders) >= 500:
+            raise ValueError("order history reached page limit; review not verified")
+        today_ny = datetime.now(timezone.utc).astimezone(
+            __import__("zoneinfo").ZoneInfo("America/New_York")
+        ).date()
+        earliest = min(
+            (getattr(order, "filled_at", None) for order in orders
+             if getattr(order, "filled_at", None) is not None),
+            default=None,
+        )
+        if earliest is None:
+            raise ValueError("no confirmed broker fills")
+        from backend.v19_swing_review import entry_session_from_fill
+        start = entry_session_from_fill(earliest)
+        sessions = alpaca_trading_sessions(trading_client.get_calendar, start, today_ny)
+        result = []
+        for position in positions:
+            result.append(safe_position_swing_review(
+                orders, str(position.symbol), float(position.qty), today_ny, sessions
+            ))
+        return {"status": "ok", "readOnly": True, "positions": result}
+    except Exception as exc:
+        return {"status": "unverified", "readOnly": True,
+                "reason": str(exc), "positions": [
+                    {"symbol": str(p.symbol), "status": "unverified",
+                     "reviewDue": False, "action": "NO_ACTION"}
+                    for p in positions
+                ]}
+
+
 @app.get("/status")
 def get_status():
     # V18.2.8 FAST DASHBOARD LOAD
