@@ -4701,7 +4701,10 @@ def manage_money_mode_positions():
         adaptive_trail_start_pct = abs(float(risk_profile.get("trailStartPct") or ((TRAIL_START - 1.0) * 100.0)))
         adaptive_giveback_pct = abs(float(risk_profile.get("trailGivebackPct") or ((1.0 - TRAIL_GIVEBACK) * 100.0)))
         trail_start_price = entry * (1.0 + adaptive_trail_start_pct / 100.0)
-        if price >= trail_start_price and highest is not None:
+        # Arm the trailing exit when the recorded peak reaches the threshold,
+        # not only while the CURRENT quote remains above it. Otherwise a
+        # pullback through the activation price can silently disable protection.
+        if highest is not None and float(highest) >= trail_start_price:
             if has_taken_partial_profit(symbol):
                 giveback = POST_PARTIAL_TRAIL_GIVEBACK
             else:
