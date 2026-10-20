@@ -11936,14 +11936,27 @@ def _full_market_symbols() -> List[str]:
     now = time.time()
     if _FULL_MARKET_ASSET_CACHE["symbols"] and now < _FULL_MARKET_ASSET_CACHE["expires"]:
         return list(_FULL_MARKET_ASSET_CACHE["symbols"])
-    assets = trading_client.get_all_assets()
+    # Read the raw Alpaca assets JSON. The SDK rejects the entire response if
+    # Alpaca introduces an enum value unknown to the installed SDK version.
+    # Validate individual records instead of losing full-market discovery.
+    response = requests.get(
+        "https://paper-api.alpaca.markets/v2/assets" if PAPER else "https://api.alpaca.markets/v2/assets",
+        params={"status": "active", "asset_class": "us_equity"},
+        headers={"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET},
+        timeout=20,
+    )
+    response.raise_for_status()
+    assets = response.json()
+    if not isinstance(assets, list):
+        raise ValueError("Alpaca assets response must be a list")
     symbols = sorted({
-        str(getattr(a, "symbol", "")).upper()
+        str(a.get("symbol", "")).upper()
         for a in assets
-        if bool(getattr(a, "tradable", False))
-        and str(getattr(getattr(a, "status", ""), "value", getattr(a, "status", ""))).lower() == "active"
-        and str(getattr(getattr(a, "asset_class", ""), "value", getattr(a, "asset_class", ""))).lower() == "us_equity"
-        and _clean_dynamic_symbol(getattr(a, "symbol", ""))
+        if isinstance(a, dict)
+        and a.get("tradable") is True
+        and str(a.get("status", "")).lower() == "active"
+        and str(a.get("class", a.get("asset_class", ""))).lower() == "us_equity"
+        and _clean_dynamic_symbol(a.get("symbol", ""))
     })
     if not symbols:
         raise RuntimeError("No active tradable US stocks returned by Alpaca")
