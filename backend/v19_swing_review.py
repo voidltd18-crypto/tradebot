@@ -171,3 +171,18 @@ def safe_position_swing_review(orders, symbol: str, current_qty: float, as_of: d
             "maxTradingDays": max_sessions, "action": "NO_ACTION",
             "reason": str(exc),
         }
+
+
+def sideways_review_assessment(review: dict, unrealized_pct: float, flat_band_pct: float = 0.5) -> dict:
+    """Diagnostic only. A flat position is a review candidate, never a sell order."""
+    from math import isfinite
+
+    if not isinstance(review, dict) or review.get("status") != "verified" or not review.get("reviewDue"):
+        return {"status": "not_due_or_unverified", "action": "NO_ACTION"}
+    if not isinstance(unrealized_pct, (float, int)) or not isfinite(unrealized_pct):
+        return {"status": "unverified", "action": "NO_ACTION"}
+    if not isinstance(flat_band_pct, (float, int)) or not isfinite(flat_band_pct) or flat_band_pct < 0:
+        raise ValueError("flat band must be finite and nonnegative")
+    if abs(unrealized_pct) <= flat_band_pct:
+        return {"status": "sideways", "action": "CONSIDER_ROTATION"}
+    return {"status": "moving", "action": "REVIEW_ONLY"}
