@@ -9912,11 +9912,38 @@ def get_swing_review():
     try:
         # Broker order history can be incomplete due to API pagination/retention.
         # In that case the reconciliation helper fails closed (no due-review).
-        orders = trading_client.get_orders(filter=GetOrdersRequest(
-            status=QueryOrderStatus.ALL, limit=500, direction="asc"
-        ))
-        if len(orders) >= 500:
-            raise ValueError("order history reached page limit; review not verified")
+        # Fetch complete pages using Alpaca's order-id page token. Never
+        # treat a truncated history as verified.
+        from types import SimpleNamespace
+        orders = []
+        page_token = None
+        seen_tokens = set()
+        for _page in range(40):
+            params = {"status": "all", "limit": 500, "direction": "asc"}
+            if page_token:
+                params["page_token"] = page_token
+            response = requests.get(
+                "https://paper-api.alpaca.markets/v2/orders" if PAPER else "https://api.alpaca.markets/v2/orders",
+                params=params,
+                headers={"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET},
+                timeout=20,
+            )
+            try:
+                response.raise_for_status()
+                batch = response.json()
+            finally:
+                response.close()
+            if not isinstance(batch, list):
+                raise ValueError("unexpected Alpaca orders response")
+            orders.extend(SimpleNamespace(**item) for item in batch if isinstance(item, dict))
+            if len(batch) < 500:
+                break
+            page_token = str(batch[-1].get("id") or "")
+            if not page_token or page_token in seen_tokens:
+                raise ValueError("Alpaca order pagination stalled")
+            seen_tokens.add(page_token)
+        else:
+            raise ValueError("order history exceeds safe pagination cap")
         today_ny = datetime.now(timezone.utc).astimezone(
             __import__("zoneinfo").ZoneInfo("America/New_York")
         ).date()
