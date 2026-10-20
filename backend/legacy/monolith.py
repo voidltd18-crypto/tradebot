@@ -4586,6 +4586,7 @@ def manage_money_mode_positions():
 
         fast_stop, fast_stop_reason = should_fast_stop(p)
         if fast_stop:
+            print(f"FAST STOP DECISION | symbol={symbol} {fast_stop_reason} entry={entry:.4f} price={price:.4f} qty={qty:.6f}")
             try:
                 if pdt_aware_should_avoid_sell(symbol, "FAST EXIT STOP LOSS", p["pnlPct"], allow_hard_stop=True):
                     continue
