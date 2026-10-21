@@ -110,6 +110,22 @@ def current_position_entry_fill(orders, symbol: str, current_qty: float):
         if str(getattr(order, "symbol", "")).upper() != symbol.upper():
             continue
         status = str(getattr(order, "status", "")).lower()
+        # A terminal order with zero executed shares cannot affect position
+        # inventory. Partially executed orders still require fill-level history.
+        try:
+            reported_qty = Decimal(str(getattr(order, "filled_qty", None)))
+        except (InvalidOperation, TypeError):
+            raise ValueError("invalid filled quantity")
+        if not reported_qty.is_finite() or reported_qty < 0:
+            raise ValueError("invalid filled quantity")
+        terminal_unfilled = {
+            "canceled", "cancelled", "expired", "rejected", "replaced",
+            "done_for_day", "orderstatus.canceled", "orderstatus.cancelled",
+            "orderstatus.expired", "orderstatus.rejected",
+            "orderstatus.replaced", "orderstatus.done_for_day",
+        }
+        if status in terminal_unfilled and reported_qty == 0:
+            continue
         if status not in {"filled", "orderstatus.filled"}:
             raise ValueError("non-final or partially executed order requires execution-level fill history")
         stamp = getattr(order, "filled_at", None)
