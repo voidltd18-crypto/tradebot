@@ -11618,6 +11618,13 @@ def api_trade_replay_status():
         return {"ok": False, "enabled": TRADE_REPLAY_ENABLED, "error": str(exc)}
 
 
+@app.get("/diagnostics/small-wins")
+def get_small_wins_diagnostics():
+    """Read-only realised trade expectancy, not an entry filter."""
+    from backend.v19_profit_expectancy_audit import small_wins_audit
+    return small_wins_audit(closed_trades_from_db(10000))
+
+
 @app.get("/reports")
 def reports():
     now_mono = time.monotonic()
