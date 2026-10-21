@@ -55,6 +55,8 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const [momentFilter, setMomentFilter] = useState<{from:number; to:number; label:string} | null>(null);
   const totalDeposited = Number(reports?.totalDeposited || 0);
   const totalGainLoss = Number(reports?.totalGainLoss || 0);
+  const expectancy = reports?.recentTradeExpectancy || {};
+
   const earned = Number(reports?.earnedSinceDeposit || 0);
   const lost = Number(reports?.lostSinceDeposit || 0);
   const equityHistory = Array.isArray(reports?.equityHistory) ? reports.equityHistory : Array.isArray(data?.tradeTimeline) ? data.tradeTimeline : [];
@@ -208,6 +210,18 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
     </Card>
 
     <Card title="Performance Summary" wide><section className="stats"><Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={usd(totalDeposited)}/><Stat label="Earned" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)}/><Stat label="Lost" value={gbp(lost * rate)} sub={usd(lost)} className="loss"/><Stat label="Current Equity" value={gbp(Number(reports?.currentEquity ?? data?.account?.equity ?? 0) * rate)} sub={usd(reports?.currentEquity ?? data?.account?.equity ?? 0)}/></section><p className={tone(totalGainLoss)}>Total gain/loss: {gbp(totalGainLoss * rate)}</p></Card>
+
+    <Card title="Recent Trade Reward vs Risk" wide>
+      <p className="muted">Read-only · Latest {Number(expectancy?.sampleTrades || 0)} closed trades · Not lifetime performance</p>
+      <section className="stats">
+        <Stat label="Average Win" value={expectancy?.averageWinnerGbp == null ? "—" : gbp(expectancy.averageWinnerGbp)} />
+        <Stat label="Average Loss" value={expectancy?.averageLoserGbp == null ? "—" : gbp(expectancy.averageLoserGbp)} />
+        <Stat label="Win Rate" value={expectancy?.winRatePct == null ? "—" : `${Number(expectancy.winRatePct).toFixed(1)}%`} />
+        <Stat label="Break-even Win Rate" value={expectancy?.breakEvenWinRatePct == null ? "—" : `${Number(expectancy.breakEvenWinRatePct).toFixed(1)}%`} />
+        <Stat label="Net Realised" value={expectancy?.sampleTrades ? gbp(expectancy.netRealisedGbp) : "—"} className={tone(expectancy?.netRealisedGbp || 0)} />
+      </section>
+      <p className="muted">Historical results only. No changes to live entries or exits.</p>
+    </Card>
 
     <Card title="Account Value" wide>
       <div className="report-toolbar">
