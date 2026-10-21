@@ -11434,7 +11434,12 @@ def _build_reports_payload() -> Dict[str, Any]:
     total_withdrawn = _safe_num(performance.get("totalWithdrawn"))
     total_deposited = _safe_num(performance.get("totalDeposited"))
     total_gain_loss = _safe_num(performance.get("totalGainLoss"))
-    closed = closed_trades_from_db(200) if "closed_trades_from_db" in globals() else (status.get("closedTrades") or [])
+    closed_raw = closed_trades_from_db(500) if "closed_trades_from_db" in globals() else (status.get("closedTrades") or [])
+    # Zero-quantity rows are not executable closed trades. Keep source records
+    # untouched; exclude these artefacts from the Reports trade list only.
+    closed = [row for row in closed_raw
+              if isinstance(row, dict) and _safe_num(row.get("qty")) > 0]
+    zero_qty_report_rows = len(closed_raw) - len(closed)
 
     # V18.2.18: newest historical trade-equity points + a live current-equity point.
     # This guarantees Today can render even on a no-trade day, while Week/Month/Year
@@ -11464,7 +11469,8 @@ def _build_reports_payload() -> Dict[str, Any]:
         "totalGainLoss": total_gain_loss, "earnedSinceDeposit": max(total_gain_loss, 0.0),
         "lostSinceDeposit": abs(min(total_gain_loss, 0.0)), "dayPnl": _safe_num(account.get("pnlDay")),
         "realisedNet": _safe_num(performance.get("lifetimeRealisedPnl", db.get("totalPnl"))),
-        "performanceEngine": performance, "closedTrades": closed[:200] if isinstance(closed, list) else [],
+        "performanceEngine": performance, "closedTrades": closed[:200],
+        "zeroQtyReportRowsExcluded": zero_qty_report_rows,
         "equityHistory": equity_history[-500:], "winRate": _safe_num(performance.get("winRate", db.get("winRate"))) * 100.0,
         "totalTrades": int(_safe_num(performance.get("totalClosedTrades", db.get("totalTrades")))),
     }
