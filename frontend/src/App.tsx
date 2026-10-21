@@ -4,6 +4,7 @@ import { Header } from "./components/Header";
 import { Login } from "./components/Login";
 import { Nav } from "./components/Nav";
 import { Stat } from "./components/Stat";
+import { SwingReviewPanel } from "./components/SwingReviewPanel";
 import { useTradeBot } from "./hooks/useTradeBot";
 import { gbp, tone, usd } from "./lib/format";
 import type { AnyObj, Tab } from "./lib/types";
@@ -95,6 +96,7 @@ export default function App() {
           <Stat label="Positions" value={`${bot.positions.length} / ${maxPositions || "—"}`} sub="Open / Max" />
         </section>
 
+        {(tab === "overview" || tab === "positions") && <SwingReviewPanel authToken={bot.authToken} symbols={bot.positions.map((p: AnyObj) => String(p.symbol))} />}
         {tab === "overview" && <OverviewPage {...bot} positionGlowStyle={positionGlowStyle} onExportFullBot={() => setExportRequested(true)} exportBusy={exportRequested} />}
         {tab === "positions" && <PositionsPage positions={bot.positions} rate={bot.rate} action={bot.action} positionGlowStyle={positionGlowStyle} authToken={bot.authToken} />}
         <Suspense fallback={<PageLoading />}>
