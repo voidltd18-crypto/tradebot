@@ -11559,6 +11559,26 @@ def _build_reports_payload() -> Dict[str, Any]:
     closed = [row for row in closed_raw
               if isinstance(row, dict) and _safe_num(row.get("qty")) > 0]
     zero_qty_report_rows = len(closed_raw) - len(closed)
+    # Diagnostic sample only: no change to broker accounting or live exits.
+    audited = closed[:200]
+    pnls_gbp = [_safe_num(t.get("pnlGbp")) for t in audited]
+    positive_gbp = [x for x in pnls_gbp if x > 0]
+    negative_gbp = [x for x in pnls_gbp if x < 0]
+    small_wins_gbp = [x for x in positive_gbp if x < 5.0]
+    avg_win = sum(positive_gbp) / len(positive_gbp) if positive_gbp else 0.0
+    avg_loss = abs(sum(negative_gbp) / len(negative_gbp)) if negative_gbp else 0.0
+    profit_exit_audit = {
+        "sampleSize": len(audited),
+        "sampleNote": "Newest 200 positive-quantity closed-trade rows; not lifetime totals",
+        "winningTrades": len(positive_gbp),
+        "winsUnderFiveGbp": len(small_wins_gbp),
+        "losingTrades": len(negative_gbp),
+        "averageWinGbp": round(avg_win, 2),
+        "averageLossGbp": round(avg_loss, 2),
+        "netPnlGbp": round(sum(pnls_gbp), 2),
+        "breakEvenWinRatePct": round(100 * avg_loss / (avg_win + avg_loss), 2)
+            if (avg_win + avg_loss) > 0 else None,
+    }
 
     # V18.2.18: newest historical trade-equity points + a live current-equity point.
     # This guarantees Today can render even on a no-trade day, while Week/Month/Year
@@ -11590,6 +11610,7 @@ def _build_reports_payload() -> Dict[str, Any]:
         "realisedNet": _safe_num(performance.get("lifetimeRealisedPnl", db.get("totalPnl"))),
         "performanceEngine": performance, "closedTrades": closed[:200],
         "zeroQtyReportRowsExcluded": zero_qty_report_rows,
+        "profitExitAudit": profit_exit_audit,
         "equityHistory": equity_history[-500:], "winRate": _safe_num(performance.get("winRate", db.get("winRate"))) * 100.0,
         "totalTrades": int(_safe_num(performance.get("totalClosedTrades", db.get("totalTrades")))),
     }
