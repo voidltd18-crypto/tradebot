@@ -57,6 +57,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const totalGainLoss = Number(reports?.totalGainLoss || 0);
   const earned = Number(reports?.earnedSinceDeposit || 0);
   const lost = Number(reports?.lostSinceDeposit || 0);
+  const profitAudit = reports?.profitExitAudit || {};
   const equityHistory = Array.isArray(reports?.equityHistory) ? reports.equityHistory : Array.isArray(data?.tradeTimeline) ? data.tradeTimeline : [];
 
   const reportChart = useMemo(() => {
@@ -208,6 +209,17 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
     </Card>
 
     <Card title="Performance Summary" wide><section className="stats"><Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={usd(totalDeposited)}/><Stat label="Earned" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)}/><Stat label="Lost" value={gbp(lost * rate)} sub={usd(lost)} className="loss"/><Stat label="Current Equity" value={gbp(Number(reports?.currentEquity ?? data?.account?.equity ?? 0) * rate)} sub={usd(reports?.currentEquity ?? data?.account?.equity ?? 0)}/></section><p className={tone(totalGainLoss)}>Total gain/loss: {gbp(totalGainLoss * rate)}</p></Card>
+
+    <Card title="Profit Exit Audit — Last 200 Closed Trades" wide>
+      <p className="muted">Read-only diagnostic using positive-quantity closed-trade records. These figures do not alter selling rules.</p>
+      {Number(profitAudit?.sampleSize || 0) > 0 ? <section className="stats">
+        <Stat label="Wins under £5" value={String(profitAudit.winsUnderFiveGbp ?? "—")} sub={`Of ${profitAudit.winningTrades ?? 0} winning trades`} />
+        <Stat label="Average Winner" value={gbp(profitAudit.averageWinGbp || 0)} sub="Realised per winning row" />
+        <Stat label="Average Loser" value={gbp(profitAudit.averageLossGbp || 0)} sub="Absolute loss per losing row" />
+        <Stat label="Sample Net P&L" value={gbp(profitAudit.netPnlGbp || 0)} sub={`${profitAudit.sampleSize} recent rows`} />
+        <Stat label="Break-even Win Rate" value={profitAudit.breakEvenWinRatePct == null ? "—" : `${Number(profitAudit.breakEvenWinRatePct).toFixed(1)}%`} sub="Before fees and slippage" />
+      </section> : <p className="muted">Profit-exit audit data not available yet.</p>}
+    </Card>
 
     <Card title="Account Value" wide>
       <div className="report-toolbar">
