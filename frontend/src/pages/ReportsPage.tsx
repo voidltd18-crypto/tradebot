@@ -69,18 +69,24 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
     }).filter((p) => p.ts >= start && p.equity > 0).sort((a,b) => a.ts-b.ts);
   }, [equityHistory, chartCurrency, rate, range]);
 
-  const symbols = useMemo(() => Array.from(new Set(closedTrades.map(t => String(t?.symbol || "").toUpperCase()).filter(Boolean))).sort(), [closedTrades]);
+  // Never display non-executed or zero-quantity closed-trade artefacts.
+  // Keep the broker/database records untouched and leave account totals unchanged.
+  const displayedTrades = useMemo(() => closedTrades.filter((trade) => {
+    const qty = Number(trade?.qty);
+    return Number.isFinite(qty) && qty > 0;
+  }), [closedTrades]);
+  const symbols = useMemo(() => Array.from(new Set(displayedTrades.map(t => String(t?.symbol || "").toUpperCase()).filter(Boolean))).sort(), [displayedTrades]);
   const filteredClosedTrades = useMemo(() => {
     const from = fromDate ? new Date(`${fromDate}T00:00:00`).getTime() : 0;
     const to = toDate ? new Date(`${toDate}T23:59:59.999`).getTime() : Number.MAX_SAFE_INTEGER;
-    return [...closedTrades].filter((trade) => {
+    return [...displayedTrades].filter((trade) => {
       const symbol = String(trade?.symbol || "").toUpperCase();
       const ts = tradeTimestamp(trade);
       const dateMatch = (!from || ts >= from) && (!toDate || ts <= to);
       const momentMatch = !momentFilter || (ts >= momentFilter.from && ts <= momentFilter.to);
       return (symbolFilter === "ALL" || symbol === symbolFilter) && dateMatch && momentMatch;
     }).sort((a,b) => tradeTimestamp(b)-tradeTimestamp(a));
-  }, [closedTrades, symbolFilter, fromDate, toDate, momentFilter]);
+  }, [displayedTrades, symbolFilter, fromDate, toDate, momentFilter]);
 
   const filteredPnl = filteredClosedTrades.reduce((sum, t) => sum + Number(t?.pnl || 0), 0);
   const filteredWins = filteredClosedTrades.filter(t => Number(t?.pnl || 0) > 0).length;
@@ -164,11 +170,11 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       from = start.getTime();
       to = end.getTime();
     }
-    return closedTrades.filter((trade) => {
+    return displayedTrades.filter((trade) => {
       const ts = tradeTimestamp(trade);
       return ts >= from && ts <= to;
     }).sort((a,b) => tradeTimestamp(a)-tradeTimestamp(b));
-  }, [chartSelection, closedTrades, range]);
+  }, [chartSelection, displayedTrades, range]);
 
   const viewTradesAtSelection = () => {
     if (!chartSelection) return;
