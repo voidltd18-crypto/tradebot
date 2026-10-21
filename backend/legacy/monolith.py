@@ -11559,6 +11559,8 @@ def _build_reports_payload() -> Dict[str, Any]:
     closed = [row for row in closed_raw
               if isinstance(row, dict) and _safe_num(row.get("qty")) > 0]
     zero_qty_report_rows = len(closed_raw) - len(closed)
+    from backend.reports_expectancy import recent_trade_expectancy
+    trade_expectancy = recent_trade_expectancy(closed[:200])
 
     # V18.2.18: newest historical trade-equity points + a live current-equity point.
     # This guarantees Today can render even on a no-trade day, while Week/Month/Year
@@ -11590,6 +11592,7 @@ def _build_reports_payload() -> Dict[str, Any]:
         "realisedNet": _safe_num(performance.get("lifetimeRealisedPnl", db.get("totalPnl"))),
         "performanceEngine": performance, "closedTrades": closed[:200],
         "zeroQtyReportRowsExcluded": zero_qty_report_rows,
+        "recentTradeExpectancy": trade_expectancy,
         "equityHistory": equity_history[-500:], "winRate": _safe_num(performance.get("winRate", db.get("winRate"))) * 100.0,
         "totalTrades": int(_safe_num(performance.get("totalClosedTrades", db.get("totalTrades")))),
     }
