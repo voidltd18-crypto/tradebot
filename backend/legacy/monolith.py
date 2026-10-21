@@ -11621,6 +11621,24 @@ def api_trade_replay_status():
         return {"ok": False, "enabled": TRADE_REPLAY_ENABLED, "error": str(exc)}
 
 
+@app.get("/low-profit-stock-review")
+def low_profit_stock_review_endpoint():
+    """Read-only stock exclusion candidates, never a trading blacklist."""
+    from backend.low_profit_stock_review import low_profit_stock_review
+
+    history = closed_trades_from_db(10000)
+    rows = low_profit_stock_review(history)
+    return {
+        "ok": True, "readOnly": True, "liveBuyBlockingEnabled": False,
+        "rule": "at least 5 completed trades and no winning trade above GBP 5",
+        "historyRowsLoaded": len(history),
+        "historyLimitReached": len(history) >= 10000,
+        "candidates": [row for row in rows if row["reviewForExclusion"]],
+        "allSymbols": rows,
+        "warning": "Historical result only; do not auto-exclude without assessing position size, trading costs and complete history.",
+    }
+
+
 @app.get("/reports")
 def reports():
     now_mono = time.monotonic()
