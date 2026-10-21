@@ -9913,16 +9913,16 @@ def get_swing_review():
     try:
         # Broker order history can be incomplete due to API pagination/retention.
         # In that case the reconciliation helper fails closed (no due-review).
-        # Fetch complete pages using Alpaca's order-id page token. Never
-        # treat a truncated history as verified.
+        # Alpaca trading orders paginate newest-first with before_order_id.
+        # Require distinct IDs and fail closed rather than trusting a partial feed.
         from types import SimpleNamespace
         orders = []
-        page_token = None
-        seen_tokens = set()
+        before_order_id = None
+        seen_ids = set()
         for _page in range(40):
-            params = {"status": "all", "limit": 500, "direction": "asc"}
-            if page_token:
-                params["page_token"] = page_token
+            params = {"status": "all", "limit": 500, "direction": "desc"}
+            if before_order_id:
+                params["before_order_id"] = before_order_id
             response = requests.get(
                 "https://paper-api.alpaca.markets/v2/orders" if PAPER else "https://api.alpaca.markets/v2/orders",
                 params=params,
@@ -9934,17 +9934,22 @@ def get_swing_review():
                 batch = response.json()
             finally:
                 response.close()
-            if not isinstance(batch, list):
+            if not isinstance(batch, list) or any(not isinstance(item, dict) for item in batch):
                 raise ValueError("unexpected Alpaca orders response")
-            orders.extend(SimpleNamespace(**item) for item in batch if isinstance(item, dict))
+            ids = [str(item.get("id") or "") for item in batch]
+            if not all(ids) or any(order_id in seen_ids for order_id in ids) or len(set(ids)) != len(ids):
+                raise ValueError("Alpaca returned repeated or missing order IDs")
+            seen_ids.update(ids)
+            orders.extend(SimpleNamespace(**item) for item in batch)
             if len(batch) < 500:
                 break
-            page_token = str(batch[-1].get("id") or "")
-            if not page_token or page_token in seen_tokens:
+            next_id = ids[-1]
+            if next_id == before_order_id:
                 raise ValueError("Alpaca order pagination stalled")
-            seen_tokens.add(page_token)
+            before_order_id = next_id
         else:
             raise ValueError("order history exceeds safe pagination cap")
+        orders.reverse()
         today_ny = datetime.now(timezone.utc).astimezone(
             __import__("zoneinfo").ZoneInfo("America/New_York")
         ).date()
