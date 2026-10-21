@@ -9974,6 +9974,68 @@ def get_swing_review():
                 unrealized_pct = float("nan")
             review["sidewaysAssessment"] = sideways_review_assessment(review, unrealized_pct)
             result.append(review)
+        # Execution-level FILL activities provide the correct incremental
+        # quantities for partially filled and subsequently cancelled orders.
+        # This is a diagnostic-only fallback when order summaries cannot verify.
+        if any(row.get("status") != "verified" for row in result):
+            try:
+                from backend.v19_swing_review import execution_activities_as_fills
+                activities = []
+                activity_token = None
+                activity_ids = set()
+                for _page in range(25):
+                    params = {"activity_types": "FILL", "direction": "desc", "page_size": 100}
+                    if activity_token:
+                        params["page_token"] = activity_token
+                    response = requests.get(
+                        "https://paper-api.alpaca.markets/v2/account/activities" if PAPER else "https://api.alpaca.markets/v2/account/activities",
+                        params=params,
+                        headers={"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET},
+                        timeout=12,
+                    )
+                    try:
+                        response.raise_for_status()
+                        batch = response.json()
+                    finally:
+                        response.close()
+                    if not isinstance(batch, list) or any(not isinstance(item, dict) for item in batch):
+                        raise ValueError("invalid Alpaca execution activity response")
+                    ids = [str(item.get("id") or "") for item in batch]
+                    if not all(ids) or len(set(ids)) != len(ids) or any(x in activity_ids for x in ids):
+                        raise ValueError("execution activity pagination repeated or missing IDs")
+                    activity_ids.update(ids)
+                    activities.extend(batch)
+                    if len(batch) < 100:
+                        break
+                    activity_token = ids[-1]
+                else:
+                    raise ValueError("execution activity history exceeded safe page limit")
+                fills = execution_activities_as_fills(activities)
+                if not fills:
+                    raise ValueError("no broker executions available")
+                activity_start = entry_session_from_fill(fills[0].filled_at)
+                fill_sessions = sessions if activity_start >= start else alpaca_trading_sessions(
+                    trading_client.get_calendar, activity_start, today_ny
+                )
+                for index, position in enumerate(positions):
+                    if result[index].get("status") == "verified":
+                        continue
+                    verified = safe_position_swing_review(
+                        fills, str(position.symbol), float(position.qty), today_ny, fill_sessions
+                    )
+                    if verified.get("status") == "verified":
+                        verified["verificationSource"] = "broker_execution_activities"
+                        try:
+                            unrealized_pct = float(position.unrealized_plpc) * 100.0
+                        except (TypeError, ValueError, AttributeError):
+                            unrealized_pct = float("nan")
+                        verified["sidewaysAssessment"] = sideways_review_assessment(verified, unrealized_pct)
+                        result[index] = verified
+            except Exception as exc:
+                # Do not convert an unverified holding into a trading signal.
+                for row in result:
+                    if row.get("status") != "verified":
+                        row["executionHistoryReason"] = str(exc)
         return {"status": "ok", "readOnly": True, "positions": result}
     except Exception as exc:
         return {"status": "unverified", "readOnly": True,

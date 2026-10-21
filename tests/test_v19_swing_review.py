@@ -184,3 +184,37 @@ def test_partial_or_active_order_still_fails_closed(status, qty):
     assert review["status"] == "unverified"
     assert review["reviewDue"] is False
     assert review["action"] == "NO_ACTION"
+
+
+def test_execution_activities_reconstruct_partially_filled_buy():
+    from backend.v19_swing_review import execution_activities_as_fills, safe_position_swing_review
+
+    activities = [
+        {"id": "f3", "activity_type": "FILL", "symbol": "GOOG", "side": "sell",
+         "qty": "0.5", "transaction_time": "2026-10-21T14:00:00Z"},
+        {"id": "f2", "activity_type": "FILL", "symbol": "GOOG", "side": "buy",
+         "qty": "0.5", "transaction_time": "2026-10-19T14:01:00Z"},
+        {"id": "f1", "activity_type": "FILL", "symbol": "GOOG", "side": "buy",
+         "qty": "1", "transaction_time": "2026-10-19T14:00:00Z"},
+    ]
+    sessions = list(map(d, ["2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23"]))
+    fills = execution_activities_as_fills(activities)
+    result = safe_position_swing_review(fills, "GOOG", 1.0, d("2026-10-23"), sessions)
+    assert result["status"] == "verified"
+    assert result["entrySession"] == "2026-10-19"
+    assert result["holdingTradingDay"] == 5
+    assert result["action"] == "REVIEW_ONLY"
+
+
+def test_execution_activities_reject_duplicates_and_missing_inventory():
+    from backend.v19_swing_review import execution_activities_as_fills, safe_position_swing_review
+
+    event = {"id": "f1", "activity_type": "FILL", "symbol": "MARA", "side": "buy",
+             "qty": "0.5", "transaction_time": "2026-10-19T14:00:00Z"}
+    with pytest.raises(ValueError):
+        execution_activities_as_fills([event, event])
+    fills = execution_activities_as_fills([event])
+    sessions = list(map(d, ["2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23"]))
+    result = safe_position_swing_review(fills, "MARA", 1, d("2026-10-23"), sessions)
+    assert result["status"] == "unverified"
+    assert result["action"] == "NO_ACTION"

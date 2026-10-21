@@ -202,3 +202,40 @@ def sideways_review_assessment(review: dict, unrealized_pct: float, flat_band_pc
     if abs(unrealized_pct) <= flat_band_pct:
         return {"status": "sideways", "action": "CONSIDER_ROTATION"}
     return {"status": "moving", "action": "REVIEW_ONLY"}
+
+
+def execution_activities_as_fills(activities: list[dict]) -> list:
+    """Adapt broker FILL executions (including partials) for reconciliation.
+
+    Each activity is an incremental execution, not cumulative order quantity.
+    Reject missing IDs, duplicate activities and invalid records. Read-only.
+    """
+    from datetime import datetime
+    from decimal import Decimal, InvalidOperation
+    from types import SimpleNamespace
+
+    seen = set()
+    events = []
+    for activity in activities:
+        if not isinstance(activity, dict) or str(activity.get("activity_type", "")).upper() != "FILL":
+            raise ValueError("non-fill activity in execution history")
+        activity_id = str(activity.get("id") or "")
+        symbol = str(activity.get("symbol") or "").upper()
+        side = str(activity.get("side") or "").lower()
+        stamp = activity.get("transaction_time")
+        if not activity_id or activity_id in seen or not symbol or side not in {"buy", "sell"}:
+            raise ValueError("missing or duplicate fill activity details")
+        seen.add(activity_id)
+        try:
+            qty = Decimal(str(activity.get("qty")))
+            dt = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        except (InvalidOperation, ValueError, TypeError):
+            raise ValueError("invalid execution quantity or timestamp")
+        if not qty.is_finite() or qty <= 0 or dt.tzinfo is None or dt.utcoffset() is None:
+            raise ValueError("invalid execution quantity or timestamp")
+        events.append((dt, activity_id, SimpleNamespace(
+            symbol=symbol, side=side, status="filled",
+            filled_qty=str(qty), filled_at=dt,
+        )))
+    events.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in events]
