@@ -145,3 +145,42 @@ def test_partial_or_cancelled_order_cannot_verify_entry(status):
     assert result["status"] == "unverified"
     assert result["action"] == "NO_ACTION"
     assert result["reviewDue"] is False
+
+
+@pytest.mark.parametrize("status", ["canceled", "expired", "rejected", "replaced", "done_for_day"])
+def test_zero_fill_terminal_order_does_not_block_verified_holding(status):
+    from types import SimpleNamespace
+    from backend.v19_swing_review import safe_position_swing_review
+
+    sessions = list(map(d, ["2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23"]))
+    orders = [
+        SimpleNamespace(symbol="MSFT", status="filled", side="buy",
+                        filled_qty="2", filled_at="2026-10-19T14:00:00Z"),
+        SimpleNamespace(symbol="MSFT", status=status, side="sell",
+                        filled_qty="0", filled_at=None),
+    ]
+    review = safe_position_swing_review(orders, "MSFT", 2, d("2026-10-23"), sessions)
+    assert review["status"] == "verified"
+    assert review["holdingTradingDay"] == 5
+    assert review["action"] == "REVIEW_ONLY"
+
+
+@pytest.mark.parametrize("status,qty", [
+    ("canceled", "0.5"), ("expired", "0.5"), ("rejected", "0.5"),
+    ("partially_filled", "0.5"), ("new", "0"),
+])
+def test_partial_or_active_order_still_fails_closed(status, qty):
+    from types import SimpleNamespace
+    from backend.v19_swing_review import safe_position_swing_review
+
+    sessions = list(map(d, ["2026-10-19", "2026-10-20", "2026-10-21", "2026-10-22", "2026-10-23"]))
+    orders = [
+        SimpleNamespace(symbol="GOOG", status="filled", side="buy",
+                        filled_qty="2", filled_at="2026-10-19T14:00:00Z"),
+        SimpleNamespace(symbol="GOOG", status=status, side="sell",
+                        filled_qty=qty, filled_at="2026-10-20T14:00:00Z"),
+    ]
+    review = safe_position_swing_review(orders, "GOOG", 2, d("2026-10-23"), sessions)
+    assert review["status"] == "unverified"
+    assert review["reviewDue"] is False
+    assert review["action"] == "NO_ACTION"
