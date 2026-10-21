@@ -1875,8 +1875,59 @@ def proposed_buy_qty(scan: Dict[str, Any]) -> float:
         return 0.0
 
 
+# Repeat-low-profit guard: affect new buys only, never force liquidations.
+LOW_PROFIT_BUY_GUARD_ENABLED = os.getenv("TRADEBOT_LOW_PROFIT_BUY_GUARD_ENABLED", "false").lower() in ("true", "1", "yes")
+_LOW_PROFIT_GUARD_CACHE = {"expires": 0.0, "weak": {}}
+
+
+def low_profit_buy_guard_status():
+    if not LOW_PROFIT_BUY_GUARD_ENABLED or not SQLITE_ENABLED:
+        return {"enabled": LOW_PROFIT_BUY_GUARD_ENABLED, "weak": {}, "source": "disabled"}
+    try:
+        if time.monotonic() >= _LOW_PROFIT_GUARD_CACHE["expires"]:
+            from backend.low_profit_guard import weak_symbols_by_realised_trades
+            init_db()
+            conn = db_connect()
+            try:
+                # Count individual confirmed broker SELL orders, not split FIFO
+                # matches or synthetic zero-quantity report rows.
+                rows = conn.execute("""
+                    SELECT UPPER(symbol), source_sell_order_id, SUM(pnl_gbp)
+                    FROM closed_trades
+                    WHERE qty > 0 AND pnl_gbp IS NOT NULL
+                      AND source_sell_order_id IS NOT NULL
+                      AND TRIM(source_sell_order_id) <> ''
+                    GROUP BY UPPER(symbol), source_sell_order_id
+                """).fetchall()
+            finally:
+                conn.close()
+            _LOW_PROFIT_GUARD_CACHE.update(
+                weak=weak_symbols_by_realised_trades(rows, min_trades=3, profit_threshold_gbp=5.0),
+                expires=time.monotonic() + 300.0,
+            )
+        return {"enabled": True, "weak": _LOW_PROFIT_GUARD_CACHE["weak"], "source": "verified_closed_trades"}
+    except Exception as exc:
+        # Data unavailable: do not fabricate a blacklist.
+        print(f"LOW PROFIT GUARD DATA ERROR | {exc}")
+        return {"enabled": True, "weak": {}, "source": "unavailable"}
+
+
+def low_profit_buy_allowed(symbol: str):
+    info = low_profit_buy_guard_status()
+    row = info["weak"].get(str(symbol or "").upper().strip())
+    if row:
+        return False, (
+            f"historical low-profit stock: {row['trades']} closed sells; "
+            f"best realised trade £{row['bestTradeGbp']:.2f} (needs >£5)"
+        )
+    return True, ""
+
+
 def can_buy_symbol(symbol: str):
     sym = str(symbol or "").upper().strip()
+    low_profit_ok, low_profit_reason = low_profit_buy_allowed(sym)
+    if not low_profit_ok:
+        return False, low_profit_reason
     # MARA: one successful buy per trading day, even if the position is sold
     # manually or the service restarts. This is independent of the daily lock.
     if sym == "MARA" and today_symbol_buy_count(sym) >= MARA_DAILY_ENTRY_LIMIT:
@@ -1942,6 +1993,9 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
 
 
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", scan: Optional[Dict[str, Any]] = None):
+    eligible, block_reason = low_profit_buy_allowed(symbol)
+    if not eligible:
+        raise ValueError(f"BUY BLOCKED | {symbol} {block_reason}")
     order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
     trading_client.submit_order(order)
     if AI_RISK_ENGINE_ENABLED and scan:
@@ -4302,6 +4356,9 @@ def maybe_rotate_weakest_into_best(scans):
     weakest = get_weakest_position_for_rotation()
     if not best or not weakest or best["symbol"] == weakest["symbol"]:
         return "ROTATION SKIP | no useful rotation"
+    eligible, block_reason = low_profit_buy_allowed(best["symbol"])
+    if not eligible:
+        return f"ROTATION SKIP | {best['symbol']} {block_reason}"
     if weakest["pnlPct"] > ROTATE_ONLY_IF_WEAKEST_PNL_BELOW:
         return f"ROTATION SKIP | weakest {weakest['symbol']} still okay"
     if pdt_aware_should_avoid_sell(weakest["symbol"], f"PROFIT MODE ROTATE OUT FOR {best['symbol']}", weakest["pnlPct"]):
