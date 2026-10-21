@@ -1902,7 +1902,7 @@ def low_profit_buy_guard_status():
             finally:
                 conn.close()
             _LOW_PROFIT_GUARD_CACHE.update(
-                weak=weak_symbols_by_realised_trades(rows, min_trades=3, profit_threshold_gbp=5.0),
+                weak=weak_symbols_by_realised_trades(rows, min_trades=5, profit_threshold_gbp=5.0),
                 expires=time.monotonic() + 300.0,
             )
         return {"enabled": True, "weak": _LOW_PROFIT_GUARD_CACHE["weak"], "source": "verified_closed_trades"}
