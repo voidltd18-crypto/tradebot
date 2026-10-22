@@ -1283,6 +1283,45 @@ def has_open_order(symbol: str):
     return len(get_open_orders(symbol)) > 0
 
 
+def _persistent_position_peak(symbol: str, entry: float, observed: float) -> float:
+    """Persist the observed post-entry peak across service restarts.
+
+    Never invent a peak from historical candles. If the database is
+    unavailable, fall back to the caller's observed/in-memory peak.
+    """
+    if not SQLITE_ENABLED or entry <= 0 or observed <= 0:
+        return observed
+    conn = None
+    try:
+        conn = db_connect()
+        conn.execute("""CREATE TABLE IF NOT EXISTS position_peak_state (
+            symbol TEXT PRIMARY KEY,
+            entry_price REAL NOT NULL,
+            highest_price REAL NOT NULL
+        )""")
+        row = conn.execute(
+            "SELECT entry_price, highest_price FROM position_peak_state WHERE symbol=?",
+            (symbol,),
+        ).fetchone()
+        peak = observed
+        if row and abs(float(row["entry_price"]) - entry) <= max(0.0001, entry * 0.00001):
+            peak = max(observed, float(row["highest_price"]))
+        if not row or peak != float(row["highest_price"]) or abs(float(row["entry_price"]) - entry) > max(0.0001, entry * 0.00001):
+            conn.execute(
+                "INSERT INTO position_peak_state(symbol,entry_price,highest_price) VALUES(?,?,?) "
+                "ON CONFLICT(symbol) DO UPDATE SET entry_price=excluded.entry_price,highest_price=excluded.highest_price",
+                (symbol, entry, peak),
+            )
+            conn.commit()
+        return peak
+    except Exception as exc:
+        print(f"POSITION PEAK PERSISTENCE ERROR | {symbol} {exc}")
+        return observed
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def get_all_positions():
     positions = []
     try:
@@ -1323,8 +1362,12 @@ def get_all_positions():
                 pnl_pct = ((quote_price / entry) - 1.0) * 100.0
 
             highest = state[symbol].get("highest_since_entry")
-            if quote_price > 0 and (highest is None or quote_price > highest):
-                state[symbol]["highest_since_entry"] = quote_price
+            observed_peak = max(float(highest or 0.0), quote_price)
+            if observed_peak > 0:
+                # Recover from the durable SQLite file on restart and persist new highs.
+                state[symbol]["highest_since_entry"] = _persistent_position_peak(
+                    symbol, entry, observed_peak
+                )
 
             # V17.1: expose the same adaptive AI risk levels that the live exit
             # manager actually uses. This keeps the dashboard/replay chart from
