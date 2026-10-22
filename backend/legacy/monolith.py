@@ -12304,6 +12304,7 @@ def _full_market_scan(prior_cache: Dict[str, Any]) -> Dict[str, Any]:
     cursor = int(prior_cache.get("fullMarketCursor") or 0) % len(symbols)
     scanned = 0
     new_rows = {}
+    filter_counts = {"snapshots": 0, "bad_data": 0, "price_volume": 0, "spread": 0, "accepted": 0}
     deadline = time.monotonic() + 45.0
     headers = {"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET}
     for _ in range(FULL_MARKET_BATCHES_PER_REFRESH):
@@ -12320,7 +12321,9 @@ def _full_market_scan(prior_cache: Dict[str, Any]) -> Dict[str, Any]:
             response.raise_for_status()
             snapshots = response.json().get("snapshots") or {}
             for symbol, snap in snapshots.items():
+                filter_counts["snapshots"] += 1
                 if not isinstance(snap, dict) or symbol in BLOCKED_WEAK_TICKERS:
+                    filter_counts["bad_data"] += 1
                     continue
                 today = snap.get("dailyBar") or {}
                 previous = snap.get("prevDailyBar") or {}
@@ -12331,9 +12334,12 @@ def _full_market_scan(prior_cache: Dict[str, Any]) -> Dict[str, Any]:
                 prev_close = float(previous.get("c") or 0)
                 bid, ask = float(quote.get("bp") or 0), float(quote.get("ap") or 0)
                 if not DYNAMIC_MARKET_MIN_PRICE <= price <= DYNAMIC_MARKET_MAX_PRICE or volume < DYNAMIC_MARKET_MIN_VOLUME:
+                    filter_counts["price_volume"] += 1
                     continue
                 if bid > 0 and ask >= bid and ((ask - bid) / bid) > DYNAMIC_MARKET_MAX_SPREAD:
+                    filter_counts["spread"] += 1
                     continue
+                filter_counts["accepted"] += 1
                 change = (price / prev_close - 1) * 100 if prev_close > 0 else 0.0
                 score = max(-8, min(12, change)) * 1.25 + min(10, math.log10(max(volume, 1)) * 1.15)
                 new_rows[symbol] = {
@@ -12355,6 +12361,7 @@ def _full_market_scan(prior_cache: Dict[str, Any]) -> Dict[str, Any]:
         scanned += len(batch)
         if cursor == 0:
             break
+    print(f"FULL MARKET FILTER DIAG | scanned={scanned} counts={filter_counts}", flush=True)
     # Preserve candidates from previously screened batches until a full pass
     # completes; each live trading decision still uses fresh broker quotes.
     retained = {
