@@ -1382,7 +1382,7 @@ def get_all_positions():
             trail_floor = (state[symbol].get("highest_since_entry") or 0.0) * (1.0 - trail_giveback_pct / 100.0)
             stop_price = entry * (1.0 - stop_loss_pct / 100.0) if entry > 0 else 0.0
             emergency_stop_price = entry * (1.0 - emergency_stop_pct / 100.0) if entry > 0 else 0.0
-            trailing_active = quote_price >= trail_start_price if quote_price > 0 and trail_start_price > 0 else False
+            trailing_active = bool((state[symbol].get("highest_since_entry") or 0.0) >= trail_start_price) if trail_start_price > 0 else False
 
             positions.append({
                 "symbol": symbol,
@@ -4809,7 +4809,13 @@ def manage_money_mode_positions():
         # Arm the trailing exit when the recorded peak reaches the threshold,
         # not only while the CURRENT quote remains above it. Otherwise a
         # pullback through the activation price can silently disable protection.
-        if highest is not None and float(highest) >= trail_start_price:
+        if highest is None or float(highest) < trail_start_price:
+            if price < entry:
+                print(f"TRAIL EXIT DIAG | symbol={symbol} status=NOT_ARMED price={price:.4f} entry={entry:.4f} highest={float(highest or 0):.4f} trigger={trail_start_price:.4f}")
+        else:
+            # Log when the remembered high arms protection, but the quote has already fallen through the trigger.
+            if price < trail_start_price:
+                print(f"TRAIL EXIT DIAG | symbol={symbol} status=ARMED_PULLED_BACK price={price:.4f} entry={entry:.4f} highest={float(highest):.4f} trigger={trail_start_price:.4f}")
             if has_taken_partial_profit(symbol):
                 giveback = POST_PARTIAL_TRAIL_GIVEBACK
             else:
@@ -4822,6 +4828,7 @@ def manage_money_mode_positions():
             if price <= trail_floor:
                 runner_decision = _v17_runner_trail_decision(p, trail_floor)
                 if not runner_decision.get("sell"):
+                    print(f"TRAIL EXIT DIAG | symbol={symbol} status=RUNNER_GRACE floor={trail_floor:.4f} price={price:.4f} reason={runner_decision.get('reason')}")
                     # One shallow confirmation check lets a strong winner recover
                     # from a brief floor touch without lowering the protected floor.
                     continue
