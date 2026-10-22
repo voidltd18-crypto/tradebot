@@ -12557,8 +12557,10 @@ def _prioritize_first_dibs_rows(rows):
     if not preferred:
         return items
     return sorted(items, key=lambda row: 0 if str((row or {}).get("symbol") or "").upper().strip() == preferred else 1)
-ADAPTIVE_UNIVERSE_TARGET_SIZE = max(6, int(os.getenv("ADAPTIVE_UNIVERSE_TARGET_SIZE", str(AUTO_UNIVERSE_SIZE)) or AUTO_UNIVERSE_SIZE))
-ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS = max(1, min(ADAPTIVE_UNIVERSE_TARGET_SIZE, int(os.getenv("ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS", "8") or 8)))
+# Expand the default scan pool moderately while retaining an operator override.
+# Bounded to 18 by default to avoid repeating prior full-market OOM incidents.
+ADAPTIVE_UNIVERSE_TARGET_SIZE = max(6, int(os.getenv("ADAPTIVE_UNIVERSE_TARGET_SIZE", "18") or 18))
+ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS = max(1, min(ADAPTIVE_UNIVERSE_TARGET_SIZE, int(os.getenv("ADAPTIVE_UNIVERSE_DISCOVERY_SLOTS", "12") or 12)))
 ADAPTIVE_UNIVERSE_CORE_SLOTS = max(0, min(ADAPTIVE_UNIVERSE_TARGET_SIZE, int(os.getenv("ADAPTIVE_UNIVERSE_CORE_SLOTS", "4") or 4)))
 ADAPTIVE_UNIVERSE_REFRESH_SECONDS = max(300, int(os.getenv("ADAPTIVE_UNIVERSE_REFRESH_SECONDS", "1800") or 1800))
 ADAPTIVE_UNIVERSE_FILE = os.path.join("backend", "state", "adaptive_universe.json")
