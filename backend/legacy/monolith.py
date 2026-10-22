@@ -1877,6 +1877,9 @@ def proposed_buy_qty(scan: Dict[str, Any]) -> float:
 
 # Repeat-low-profit guard: affect new buys only, never force liquidations.
 LOW_PROFIT_BUY_GUARD_ENABLED = os.getenv("TRADEBOT_LOW_PROFIT_BUY_GUARD_ENABLED", "false").lower() in ("true", "1", "yes")
+# Independent quality veto for automated portfolio entries; no effect on selling.
+V16_AUTO_MIN_ENTRY_QUALITY = max(0.0, float(os.getenv("TRADEBOT_V16_AUTO_MIN_ENTRY_QUALITY", "0.10")))
+
 _LOW_PROFIT_GUARD_CACHE = {"expires": 0.0, "weak": {}, "verifiedSellOrders": 0}
 
 
@@ -5219,6 +5222,25 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
                 f"V16 DECISION | symbol={symbol} decision=REJECTED reason=BUY_SAFETY_BLOCK "
                 f"detail={block_text} score={score:.3f} confidence={confidence:.3f} quality={quality:.4f}"
             )
+            continue
+
+        # A high confidence/portfolio score cannot override weak raw quality.
+        # Manual planning remains unchanged; this gate is for automatic entries.
+        if not manual and (not math.isfinite(quality) or quality < V16_AUTO_MIN_ENTRY_QUALITY):
+            decisions.append({
+                "scanIndex": scan_index + 1,
+                "symbol": symbol,
+                "decision": "REJECTED",
+                "reasonCode": "QUALITY_BELOW_MINIMUM",
+                "reason": f"Quality {quality:.4f} below independent entry floor {V16_AUTO_MIN_ENTRY_QUALITY:.4f}; retain cash.",
+                "portfolioScore": score,
+                "minimumScore": effective_minimum_score,
+                "confidence": round(confidence, 4),
+                "quality": quality,
+                "spread": spread,
+                "deployableNow": False,
+            })
+            print(f"V16 DECISION | symbol={symbol} decision=REJECTED reason=QUALITY_BELOW_MINIMUM quality={quality:.4f} floor={V16_AUTO_MIN_ENTRY_QUALITY:.4f}")
             continue
 
         if score < effective_minimum_score and not manual:
