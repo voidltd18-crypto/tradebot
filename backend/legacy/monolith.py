@@ -1877,7 +1877,7 @@ def proposed_buy_qty(scan: Dict[str, Any]) -> float:
 
 # Repeat-low-profit guard: affect new buys only, never force liquidations.
 LOW_PROFIT_BUY_GUARD_ENABLED = os.getenv("TRADEBOT_LOW_PROFIT_BUY_GUARD_ENABLED", "false").lower() in ("true", "1", "yes")
-_LOW_PROFIT_GUARD_CACHE = {"expires": 0.0, "weak": {}}
+_LOW_PROFIT_GUARD_CACHE = {"expires": 0.0, "weak": {}, "verifiedSellOrders": 0}
 
 
 def low_profit_buy_guard_status():
@@ -1903,6 +1903,7 @@ def low_profit_buy_guard_status():
                 conn.close()
             _LOW_PROFIT_GUARD_CACHE.update(
                 weak=weak_symbols_by_realised_trades(rows, min_trades=5, profit_threshold_gbp=5.0),
+                verifiedSellOrders=len(rows),
                 expires=time.monotonic() + 300.0,
             )
         return {"enabled": True, "weak": _LOW_PROFIT_GUARD_CACHE["weak"], "source": "verified_closed_trades"}
@@ -11636,6 +11637,31 @@ def low_profit_stock_review_endpoint():
         "candidates": [row for row in rows if row["reviewForExclusion"]],
         "allSymbols": rows,
         "warning": "Historical result only; do not auto-exclude without assessing position size, trading costs and complete history.",
+    }
+
+
+@app.get("/low-profit-buy-guard/status")
+def low_profit_buy_guard_diagnostics():
+    """Read-only view of the actual new-buy guard, without changing trading state."""
+    status = low_profit_buy_guard_status()
+    exclusions = [
+        {"symbol": symbol, **details}
+        for symbol, details in sorted(status["weak"].items())
+    ]
+    source = status.get("source", "unavailable")
+    return {
+        "ok": source != "unavailable",
+        "readOnly": True,
+        "enabled": status["enabled"],
+        "sqliteEnabled": SQLITE_ENABLED,
+        "source": source,
+        "rule": {"minimumVerifiedSellOrders": 5, "maximumBestRealisedPnlGbp": 5.0,
+                 "exclusionComparison": "best trade <= GBP 5"},
+        "verifiedSellOrdersAnalysed": _LOW_PROFIT_GUARD_CACHE["verifiedSellOrders"] if source == "verified_closed_trades" else None,
+        "excludedSymbolCount": len(exclusions),
+        "excludedSymbols": exclusions,
+        "cacheTtlSeconds": 300,
+        "note": "Blocks new buys only. This endpoint never submits orders, changes positions or modifies settings.",
     }
 
 
