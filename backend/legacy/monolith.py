@@ -18282,6 +18282,9 @@ AI_RISK_MAX_POSITION_MULTIPLIER = max(1.0, min(1.50, float(os.getenv("AI_RISK_MA
 # never loosens stop-loss/emergency protection and never raises trail-start
 # above the profile that was approved at entry.
 V17_ADAPTIVE_TRAIL_START_ENABLED = os.getenv("V17_ADAPTIVE_TRAIL_START_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+EARLY_PROFIT_TRAIL_ENABLED = os.getenv("EARLY_PROFIT_TRAIL_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+EARLY_PROFIT_TRAIL_START_PCT = float(os.getenv("EARLY_PROFIT_TRAIL_START_PCT", "1.0"))
+EARLY_PROFIT_TRAIL_GIVEBACK_PCT = float(os.getenv("EARLY_PROFIT_TRAIL_GIVEBACK_PCT", "0.5"))
 V17_ADAPTIVE_TRAIL_MIN_SAMPLES = max(12, int(os.getenv("V17_ADAPTIVE_TRAIL_MIN_SAMPLES", "20") or 20))
 V17_ADAPTIVE_TRAIL_LOW_VOL_PCT = max(0.01, float(os.getenv("V17_ADAPTIVE_TRAIL_LOW_VOL_PCT", "0.08") or 0.08))
 V17_ADAPTIVE_TRAIL_MED_VOL_PCT = max(V17_ADAPTIVE_TRAIL_LOW_VOL_PCT, float(os.getenv("V17_ADAPTIVE_TRAIL_MED_VOL_PCT", "0.18") or 0.18))
@@ -18566,7 +18569,11 @@ def _ai_risk_effective_profile(symbol: str) -> Dict[str, Any]:
             "positionMultiplier": 1.0,
             "rationale": "Fallback to current promoted live configuration."
         }
-    return _v17_adaptive_trail_start(str(symbol or "").upper(), profile)
+    effective = _v17_adaptive_trail_start(str(symbol or "").upper(), profile)
+    if EARLY_PROFIT_TRAIL_ENABLED:
+        effective["trailStartPct"] = min(float(effective["trailStartPct"]), EARLY_PROFIT_TRAIL_START_PCT)
+        effective["trailGivebackPct"] = min(float(effective["trailGivebackPct"]), EARLY_PROFIT_TRAIL_GIVEBACK_PCT)
+    return effective
 
 
 def ai_risk_engine_status() -> Dict[str, Any]:
