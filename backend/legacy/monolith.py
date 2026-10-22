@@ -12319,7 +12319,10 @@ def _full_market_scan(prior_cache: Dict[str, Any]) -> Dict[str, Any]:
         )
         try:
             response.raise_for_status()
-            snapshots = response.json().get("snapshots") or {}
+            payload = response.json()
+            snapshots = payload.get("snapshots") or {}
+            if not snapshots:
+                print(f"FULL MARKET RESPONSE DIAG | http={response.status_code} top_keys={list(payload)[:8] if isinstance(payload, dict) else type(payload).__name__} snapshots_type={type(payload.get('snapshots')).__name__ if isinstance(payload, dict) else 'missing'} content_type={response.headers.get('content-type', '')}", flush=True)
             for symbol, snap in snapshots.items():
                 filter_counts["snapshots"] += 1
                 if not isinstance(snap, dict) or symbol in BLOCKED_WEAK_TICKERS:
