@@ -12568,7 +12568,8 @@ ADAPTIVE_UNIVERSE_FILE = os.path.join("backend", "state", "adaptive_universe.jso
 
 def _adaptive_symbol_buy_allowed(symbol: str) -> bool:
     sym = str(symbol or "").upper().strip()
-    if not sym or sym in globals().get("BLOCKED_WEAK_TICKERS", set()):
+    # Crypto pairs (e.g. GRT/USD) are invalid in Alpaca stock quote scans.
+    if not sym or "/" in sym or sym in globals().get("BLOCKED_WEAK_TICKERS", set()):
         return False
     try:
         if is_locked_today(sym):
