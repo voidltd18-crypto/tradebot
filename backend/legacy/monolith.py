@@ -12619,7 +12619,12 @@ def _adaptive_discovery_rows() -> List[Dict[str, Any]]:
         row.update({"symbol": sym, "adaptiveSource": "DISCOVERY", "coreAnchor": False, "dynamicPick": True})
         rows.append(row)
     rows.sort(key=lambda r: float(r.get("score") or 0.0), reverse=True)
-    return rows
+    primary = [r for r in rows if r.get("source") not in ("fallback", "broad-fallback")]
+    fallback = [r for r in rows if r.get("source") in ("fallback", "broad-fallback")]
+    if fallback:
+        offset = int(time.time() // ADAPTIVE_UNIVERSE_REFRESH_SECONDS) % len(fallback)
+        fallback = fallback[offset:] + fallback[:offset]
+    return primary + fallback
 
 
 def _save_adaptive_universe_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
