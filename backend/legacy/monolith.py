@@ -4813,7 +4813,9 @@ def manage_money_mode_positions():
             if price < entry:
                 print(f"TRAIL EXIT DIAG | symbol={symbol} status=NOT_ARMED price={price:.4f} entry={entry:.4f} highest={float(highest or 0):.4f} trigger={trail_start_price:.4f}")
         else:
-            print(f"TRAIL EXIT DIAG | symbol={symbol} status=ARMED price={price:.4f} entry={entry:.4f} highest={float(highest):.4f} trigger={trail_start_price:.4f}")
+            # Log when the remembered high arms protection, but the quote has already fallen through the trigger.
+            if price < trail_start_price:
+                print(f"TRAIL EXIT DIAG | symbol={symbol} status=ARMED_PULLED_BACK price={price:.4f} entry={entry:.4f} highest={float(highest):.4f} trigger={trail_start_price:.4f}")
             if has_taken_partial_profit(symbol):
                 giveback = POST_PARTIAL_TRAIL_GIVEBACK
             else:
