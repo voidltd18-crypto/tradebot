@@ -6,10 +6,10 @@ def test_quality_forward_analysis_keeps_horizons_separate():
     conn.execute("""CREATE TABLE v179_decision_audit (
         quality REAL, return_pct REAL, due_minutes INTEGER,
         decision_id INTEGER, status TEXT)""")
-    rows = [(0.02, -2.0, 15, 1, "COMPLETED"),
-            (0.04, 1.0, 15, 2, "COMPLETED"),
-            (0.11, 3.0, 15, 3, "COMPLETED"),
-            (0.11, -1.0, 60, 3, "COMPLETED"),
+    rows = [(0.02, -2.0, 15, 1, "COMPLETE"),
+            (0.04, 1.0, 15, 2, "COMPLETE"),
+            (0.11, 3.0, 15, 3, "COMPLETE"),
+            (0.11, -1.0, 60, 3, "COMPLETE"),
             (0.11, 100.0, 15, 4, "PENDING")]
     conn.executemany("INSERT INTO v179_decision_audit VALUES (?,?,?,?,?)", rows)
     result = analyse(conn)
