@@ -17,7 +17,7 @@ def analyse(connection, due_minutes=None):
     if "v179_decision_audit" not in tables:
         return {"ok": False, "reason": "v179_decision_audit table unavailable"}
     sql = ("SELECT quality, return_pct, due_minutes, decision_id "
-           "FROM v179_decision_audit WHERE status='COMPLETED' "
+           "FROM v179_decision_audit WHERE status='COMPLETE' "
            "AND quality IS NOT NULL AND return_pct IS NOT NULL")
     params = []
     if due_minutes is not None:
