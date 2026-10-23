@@ -5186,6 +5186,15 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
     picks = _v16_prepare_real_market_factors(picks)
     score_profiles = _v16_calibrated_score_profiles(picks)
     effective_minimum_score, threshold_mode = _v16_effective_minimum_score(score_profiles, manual=manual)
+    # Read-only calibration: measure quality among candidates that passed the
+    # earlier live gates. No orders, eligibility decisions or risk changes.
+    if not manual:
+        valid_quality = sorted(q for q in (float(p.get("quality_score") or 0.0) for p in picks) if math.isfinite(q))
+        lower = sum(q < 0.03 for q in valid_quality)
+        middle = sum(0.03 <= q < V16_AUTO_MIN_ENTRY_QUALITY for q in valid_quality)
+        passing = sum(q >= V16_AUTO_MIN_ENTRY_QUALITY for q in valid_quality)
+        median = valid_quality[len(valid_quality) // 2] if valid_quality else 0.0
+        print(f"V16 QUALITY CALIBRATION | gate_passed={len(picks)} valid={len(valid_quality)} below_003={lower} mid_range={middle} above_floor={passing} median={median:.4f} max={max(valid_quality, default=0.0):.4f} floor={V16_AUTO_MIN_ENTRY_QUALITY:.4f}", flush=True)
 
     for scan_index, scan in enumerate(picks):
         symbol = str(scan.get("symbol") or "").upper().strip()
