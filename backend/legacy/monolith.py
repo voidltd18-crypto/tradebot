@@ -3556,6 +3556,26 @@ def v179_decision_audit_summary(days: int = 7) -> Dict[str, Any]:
 def api_v179_decision_audit(days: int = 7):
     return v179_decision_audit_summary(days)
 
+
+@app.get("/v17/quality-outcomes")
+def api_v179_quality_outcomes(horizon: int = 60):
+    """Aggregate-only forward quote outcomes by quality band (not realised P&L)."""
+    if horizon not in (15, 30, 60, 120):
+        return {"ok": False, "error": "horizon must be 15, 30, 60 or 120"}
+    if not SQLITE_ENABLED:
+        return {"ok": False, "error": "decision audit SQLite is disabled"}
+    try:
+        from backend.analysis.quality_forward_outcomes import analyse
+        init_db()
+        conn = db_connect()
+        try:
+            return analyse(conn, horizon)
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"QUALITY OUTCOMES ERROR | {exc}")
+        return {"ok": False, "error": "quality outcome analysis unavailable"}
+
 # =========================
 # V18.1 — EVIDENCE & PERFORMANCE OBSERVATORY
 # Read-only evidence aggregation. Never changes live trading.
