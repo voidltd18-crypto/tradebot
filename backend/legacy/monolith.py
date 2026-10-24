@@ -10180,10 +10180,19 @@ def get_swing_review():
         # Establish exchange sessions for fallback activity reconciliation.
         start = entry_session_from_fill(earliest) if earliest else today_ny - timedelta(days=7)
         sessions = alpaca_trading_sessions(trading_client.get_calendar, start, today_ny)
+        def _review_sessions(position, first_day, stock_sessions):
+            # Crypto trades every day; stock exchange calendars exclude weekends.
+            asset_class = str(getattr(position, "asset_class", "")).lower()
+            if "crypto" not in asset_class:
+                return stock_sessions
+            return [first_day + timedelta(days=offset)
+                    for offset in range((today_ny - first_day).days + 1)]
+
         result = []
         for position in positions:
             review = safe_position_swing_review(
-                orders, str(position.symbol), float(position.qty), today_ny, sessions
+                orders, str(position.symbol), float(position.qty), today_ny,
+                _review_sessions(position, start, sessions)
             )
             try:
                 unrealized_pct = float(position.unrealized_plpc) * 100.0
@@ -10241,7 +10250,8 @@ def get_swing_review():
                     if result[index].get("status") == "verified":
                         continue
                     verified = safe_position_swing_review(
-                        fills, str(position.symbol), float(position.qty), today_ny, fill_sessions
+                        fills, str(position.symbol), float(position.qty), today_ny,
+                        _review_sessions(position, activity_start, fill_sessions)
                     )
                     if verified.get("status") == "verified":
                         verified["verificationSource"] = "broker_execution_activities"
