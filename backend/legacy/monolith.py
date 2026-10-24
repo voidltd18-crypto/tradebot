@@ -10179,7 +10179,7 @@ def get_swing_review():
         # An empty/incomplete order feed is not proof of a position's age.
         # Establish exchange sessions for fallback activity reconciliation.
         start = entry_session_from_fill(earliest) if earliest else today_ny - timedelta(days=7)
-        sessions = alpaca_trading_sessions(trading_client.get_calendar, start, today_ny)
+        sessions = alpaca_trading_sessions(trading_client.get_calendar, start - timedelta(days=7), today_ny)
         def _review_sessions(position, first_day, stock_sessions):
             # Crypto trades every day; stock exchange calendars exclude weekends.
             asset_class = str(getattr(position, "asset_class", "")).lower()
@@ -10244,7 +10244,7 @@ def get_swing_review():
                     raise ValueError("no broker executions available")
                 activity_start = entry_session_from_fill(fills[0].filled_at)
                 fill_sessions = sessions if activity_start >= start else alpaca_trading_sessions(
-                    trading_client.get_calendar, activity_start, today_ny
+                    trading_client.get_calendar, activity_start - timedelta(days=7), today_ny
                 )
                 for index, position in enumerate(positions):
                     if result[index].get("status") == "verified":
