@@ -4303,7 +4303,13 @@ def pick_money_mode_stocks(
     log_rejections=False, which means they can reuse the *same* eligibility
     pipeline without creating duplicate learning rows or noisy rejection logs.
     """
+    gate_counts = {}
+
     def persist(scan, decision, stage, reason, profile=None):
+        # Count each candidate at the actual gate that accepted/rejected it.
+        # This is diagnostic-only and does not change eligibility.
+        key = stage if decision == "REJECTED" else "passed"
+        gate_counts[key] = gate_counts.get(key, 0) + 1
         if persist_decisions:
             record_v2_setup_decision(scan, decision, stage, reason, profile)
 
@@ -4363,6 +4369,9 @@ def pick_money_mode_stocks(
         )
         candidates.append(scan)
     candidates.sort(key=lambda x: (-x["confidence"], -x["quality_score"], x["spread"]))
+    if log_rejections:
+        breakdown = ",".join(f"{key}:{value}" for key, value in sorted(gate_counts.items())) or "none"
+        print(f"V17 ENTRY GATE BREAKDOWN | scanned={len(scans)} {breakdown}", flush=True)
     return candidates
 
 
