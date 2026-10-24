@@ -10125,57 +10125,74 @@ def get_swing_review():
         # Alpaca trading orders paginate newest-first with before_order_id.
         # Require distinct IDs and fail closed rather than trusting a partial feed.
         from types import SimpleNamespace
+        # Order pagination may fail independently of the execution feed.
+        # Keep the read-only FILL fallback reachable on that failure.
+        order_history_reason = None
         orders = []
-        before_order_id = None
-        seen_ids = set()
-        for _page in range(40):
-            params = {"status": "all", "limit": 500, "direction": "desc"}
-            if before_order_id:
-                params["before_order_id"] = before_order_id
-            response = requests.get(
-                "https://paper-api.alpaca.markets/v2/orders" if PAPER else "https://api.alpaca.markets/v2/orders",
-                params=params,
-                headers={"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET},
-                timeout=20,
-            )
-            try:
-                response.raise_for_status()
-                batch = response.json()
-            finally:
-                response.close()
-            if not isinstance(batch, list) or any(not isinstance(item, dict) for item in batch):
-                raise ValueError("unexpected Alpaca orders response")
-            ids = [str(item.get("id") or "") for item in batch]
-            if not all(ids) or any(order_id in seen_ids for order_id in ids) or len(set(ids)) != len(ids):
-                raise ValueError("Alpaca returned repeated or missing order IDs")
-            seen_ids.update(ids)
-            orders.extend(SimpleNamespace(**item) for item in batch)
-            if len(batch) < 500:
-                break
-            next_id = ids[-1]
-            if next_id == before_order_id:
-                raise ValueError("Alpaca order pagination stalled")
-            before_order_id = next_id
-        else:
-            raise ValueError("order history exceeds safe pagination cap")
-        orders.reverse()
+        try:
+            orders = []
+            before_order_id = None
+            seen_ids = set()
+            for _page in range(40):
+                params = {"status": "all", "limit": 500, "direction": "desc"}
+                if before_order_id:
+                    params["before_order_id"] = before_order_id
+                response = requests.get(
+                    "https://paper-api.alpaca.markets/v2/orders" if PAPER else "https://api.alpaca.markets/v2/orders",
+                    params=params,
+                    headers={"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": API_SECRET},
+                    timeout=20,
+                )
+                try:
+                    response.raise_for_status()
+                    batch = response.json()
+                finally:
+                    response.close()
+                if not isinstance(batch, list) or any(not isinstance(item, dict) for item in batch):
+                    raise ValueError("unexpected Alpaca orders response")
+                ids = [str(item.get("id") or "") for item in batch]
+                if not all(ids) or any(order_id in seen_ids for order_id in ids) or len(set(ids)) != len(ids):
+                    raise ValueError("Alpaca returned repeated or missing order IDs")
+                seen_ids.update(ids)
+                orders.extend(SimpleNamespace(**item) for item in batch)
+                if len(batch) < 500:
+                    break
+                next_id = ids[-1]
+                if next_id == before_order_id:
+                    raise ValueError("Alpaca order pagination stalled")
+                before_order_id = next_id
+            else:
+                raise ValueError("order history exceeds safe pagination cap")
+            orders.reverse()
+        except Exception as order_exc:
+            order_history_reason = str(order_exc)
+            orders = []
         today_ny = datetime.now(timezone.utc).astimezone(
             __import__("zoneinfo").ZoneInfo("America/New_York")
         ).date()
+        from backend.v19_swing_review import entry_session_from_fill
         earliest = min(
             (getattr(order, "filled_at", None) for order in orders
              if getattr(order, "filled_at", None) is not None),
             default=None,
         )
-        if earliest is None:
-            raise ValueError("no confirmed broker fills")
-        from backend.v19_swing_review import entry_session_from_fill
-        start = entry_session_from_fill(earliest)
-        sessions = alpaca_trading_sessions(trading_client.get_calendar, start, today_ny)
+        # An empty/incomplete order feed is not proof of a position's age.
+        # Establish exchange sessions for fallback activity reconciliation.
+        start = entry_session_from_fill(earliest) if earliest else today_ny - timedelta(days=7)
+        sessions = alpaca_trading_sessions(trading_client.get_calendar, start - timedelta(days=7), today_ny)
+        def _review_sessions(position, first_day, stock_sessions):
+            # Crypto trades every day; stock exchange calendars exclude weekends.
+            asset_class = str(getattr(position, "asset_class", "")).lower()
+            if "crypto" not in asset_class:
+                return stock_sessions
+            return [first_day + timedelta(days=offset)
+                    for offset in range((today_ny - first_day).days + 1)]
+
         result = []
         for position in positions:
             review = safe_position_swing_review(
-                orders, str(position.symbol), float(position.qty), today_ny, sessions
+                orders, str(position.symbol), float(position.qty), today_ny,
+                _review_sessions(position, start, sessions)
             )
             try:
                 unrealized_pct = float(position.unrealized_plpc) * 100.0
@@ -10183,6 +10200,9 @@ def get_swing_review():
                 unrealized_pct = float("nan")
             review["sidewaysAssessment"] = sideways_review_assessment(review, unrealized_pct)
             result.append(review)
+        if order_history_reason:
+            for row in result:
+                row["orderHistoryReason"] = order_history_reason
         # Execution-level FILL activities provide the correct incremental
         # quantities for partially filled and subsequently cancelled orders.
         # This is a diagnostic-only fallback when order summaries cannot verify.
@@ -10224,13 +10244,14 @@ def get_swing_review():
                     raise ValueError("no broker executions available")
                 activity_start = entry_session_from_fill(fills[0].filled_at)
                 fill_sessions = sessions if activity_start >= start else alpaca_trading_sessions(
-                    trading_client.get_calendar, activity_start, today_ny
+                    trading_client.get_calendar, activity_start - timedelta(days=7), today_ny
                 )
                 for index, position in enumerate(positions):
                     if result[index].get("status") == "verified":
                         continue
                     verified = safe_position_swing_review(
-                        fills, str(position.symbol), float(position.qty), today_ny, fill_sessions
+                        fills, str(position.symbol), float(position.qty), today_ny,
+                        _review_sessions(position, activity_start, fill_sessions)
                     )
                     if verified.get("status") == "verified":
                         verified["verificationSource"] = "broker_execution_activities"
