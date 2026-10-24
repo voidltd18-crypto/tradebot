@@ -3557,6 +3557,47 @@ def api_v179_decision_audit(days: int = 7):
     return v179_decision_audit_summary(days)
 
 
+@app.get("/v17/entry-gate-breakdown")
+def api_v17_entry_gate_breakdown(hours: int = 24):
+    """Read-only persisted gate diagnostics; repeat scans are not unique trades."""
+    hours = max(1, min(int(hours), 168))
+    if not SQLITE_ENABLED:
+        return {"ok": False, "error": "SQLite is disabled"}
+    try:
+        cutoff = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+        init_db()
+        conn = db_connect()
+        try:
+            rows = conn.execute(
+                """SELECT COALESCE(stage,'unknown') AS stage, decision,
+                    COUNT(*) AS observations, COUNT(DISTINCT symbol) AS distinct_symbols
+                   FROM v2_setup_decisions WHERE timestamp>=?
+                   GROUP BY COALESCE(stage,'unknown'), decision
+                   ORDER BY observations DESC""", (cutoff,)
+            ).fetchall()
+            latest = conn.execute(
+                """SELECT COALESCE(stage,'unknown') AS stage, decision, COUNT(*) AS symbols
+                   FROM v2_setup_decisions v
+                   WHERE timestamp>=? AND id=(
+                      SELECT MAX(id) FROM v2_setup_decisions
+                      WHERE symbol=v.symbol AND timestamp>=?
+                   )
+                   GROUP BY COALESCE(stage,'unknown'), decision
+                   ORDER BY symbols DESC""", (cutoff, cutoff)
+            ).fetchall()
+            return {
+                "ok": True, "hours": hours, "readOnly": True,
+                "note": "observations include repeated scans; latestBySymbol gives one most recent recorded decision per symbol, not unique trades",
+                "byStage": [dict(row) for row in rows],
+                "latestBySymbol": [dict(row) for row in latest],
+            }
+        finally:
+            conn.close()
+    except Exception as exc:
+        print(f"ENTRY GATE BREAKDOWN ERROR | {exc}")
+        return {"ok": False, "error": "entry-gate breakdown unavailable"}
+
+
 @app.get("/v17/quality-outcomes")
 def api_v179_quality_outcomes(horizon: int = 60):
     """Aggregate-only forward quote outcomes by quality band (not realised P&L)."""
