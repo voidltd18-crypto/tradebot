@@ -67,3 +67,12 @@ from backend.v19_crypto_profit_sell_executor import install_worker as install_cr
 install_crypto_profit_sell_worker(
     app, _legacy.trading_client, _legacy.API_KEY, _legacy.API_SECRET, _legacy.SQLITE_DB_FILE
 )
+
+
+# Read-only worker heartbeat; requires existing dashboard authentication.
+from backend.v19_crypto_profit_sell_executor import profit_sell_worker_status
+
+@app.get("/v19/crypto-profit-sell-status")
+def crypto_profit_sell_status(request: Request):
+    _legacy.verify_api_key(request)
+    return profit_sell_worker_status()
