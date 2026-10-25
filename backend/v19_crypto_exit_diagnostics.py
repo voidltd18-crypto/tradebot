@@ -46,13 +46,17 @@ def crypto_exit_diagnostic(
         return {"symbol": name, "status": "unverified", "action": "NO_ACTION",
                 "reason": str(exc)}
 
-    entry_stop = entry * (1 - stop / 100)
+    entry_stop = entry * (1 - stop / 100)  # display reference only: never a crypto sell trigger
     activation = entry * (1 + start / 100)
     armed = peak >= activation
     trail_floor = peak * (1 - giveback / 100) if armed else None
-    possible_stop = price <= entry_stop
-    possible_trail = bool(armed and price <= trail_floor)
-    observed = ("STOP_LOSS_CONDITION" if possible_stop else
+    # Profit-only policy: negative or break-even holdings stay manual-only.
+    # Require a strict positive gross price difference for any automated exit
+    # candidate; execution must separately validate fees and net proceeds.
+    in_profit = price > entry
+    possible_trail = bool(in_profit and armed and price <= trail_floor)
+    observed = ("HOLD_LOSS_MANUAL_ONLY" if price < entry else
+                "HOLD_BREAK_EVEN_MANUAL_ONLY" if price == entry else
                 "TRAIL_CONDITION" if possible_trail else "HOLD_CONDITION")
     eligible = bool(manage_external or not externally_purchased)
     return {
@@ -64,7 +68,8 @@ def crypto_exit_diagnostic(
         "trailStartPrice": str(activation),
         "trailArmed": armed,
         "trailFloor": str(trail_floor) if trail_floor is not None else None,
-        "condition": observed,
+        "condition": observed, "profitOnly": True,
+        "grossProfitPositive": in_profit, "automaticStopLossEnabled": False,
         "reason": "no automatic order submission; diagnostic only",
         "sellOrderSubmitted": False,
     }
