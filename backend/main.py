@@ -87,3 +87,6 @@ def xrp_repeat_cycle_preview(request: Request):
         pullback_pct=os.getenv("TRADEBOT_XRP_REPEAT_PULLBACK_PCT", "0.5"),
         cooldown_minutes=30,
     )
+
+from backend.v19_xrp_cycle_executor import install_cycle_worker
+install_cycle_worker(app, _legacy.trading_client, _legacy.API_KEY, _legacy.API_SECRET, _legacy.SQLITE_DB_FILE)
