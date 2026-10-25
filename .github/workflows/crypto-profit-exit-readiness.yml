@@ -1,0 +1,19 @@
+name: Crypto Profit Exit Readiness
+on:
+  pull_request:
+    paths:
+      - 'backend/v19_crypto_profit_exit_readiness.py'
+      - 'tests/test_v19_crypto_profit_exit_readiness.py'
+      - '.github/workflows/crypto-profit-exit-readiness.yml'
+  workflow_dispatch:
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install pytest
+      - run: python -m pytest -q tests/test_v19_crypto_profit_exit_readiness.py
+      - run: python -m py_compile backend/v19_crypto_profit_exit_readiness.py
