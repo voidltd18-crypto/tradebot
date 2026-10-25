@@ -1,10 +1,10 @@
 """Read-only Alpaca XRP dip cycle diagnostic.
 
 No broker order submission. Fails closed if the last filled XRP sale or fresh
-ask is unverified. Spend is operator-configured, never full buying power.
+ask is unverified. Spend is operator-configured. ALL uses conservative verified cash, with fee headroom.
 """
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from backend.v19_xrp_repeat_cycle import assess_xrp_dip_entry
 from backend.v19_reports_crypto_rebuy import available_crypto_cash
 
@@ -30,6 +30,24 @@ def _filled_sell(orders):
     return max(candidates, key=lambda item: item[0]) if candidates else None
 
 
+def resolve_cycle_spend(available, configured):
+    """ALL means nearly all verified spendable USD cash, not equity or margin.
+
+    Reserve 1% for unknown fees, rounding and buying power fluctuations.
+    """
+    try:
+        cash = Decimal(str(available))
+        if not cash.is_finite() or cash < 0:
+            return None
+        if str(configured).strip().upper() == "ALL":
+            amount = (cash * Decimal("0.99")).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        else:
+            amount = Decimal(str(configured)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+        return amount if amount >= Decimal("1") and amount <= cash else None
+    except Exception:
+        return None
+
+
 def xrp_cycle_preview(client, data_client, *, spend_usd=None,
                       pullback_pct="0.5", cooldown_minutes=30, now=None):
     base = {"readOnly": True, "canEnter": False, "action": "HOLD"}
@@ -53,14 +71,16 @@ def xrp_cycle_preview(client, data_client, *, spend_usd=None,
         quote = quotes.get("XRP/USD") if isinstance(quotes, dict) else None
         if quote is None:
             return {**base, "reason": "Alpaca XRP/USD quote missing"}
+        available = available_crypto_cash(account)
+        actual_spend = resolve_cycle_spend(available, spend_usd)
         return assess_xrp_dip_entry(
             ask=getattr(quote, "ask_price", None),
             ask_at=getattr(quote, "timestamp", None),
             positions=[getattr(pos, "symbol", "") for pos in positions
                        if "crypto" in str(getattr(pos, "asset_class", "")).lower()],
             open_order_symbols=[getattr(order, "symbol", "") for order in open_orders],
-            available_cash=available_crypto_cash(account),
-            spend_usd=spend_usd, last_sale_price=last[1],
+            available_cash=available,
+            spend_usd=actual_spend, last_sale_price=last[1],
             last_sale_at=last[0], last_sale_filled=True,
             pullback_pct=pullback_pct, cooldown_minutes=cooldown_minutes,
             now=now or datetime.now(timezone.utc),
