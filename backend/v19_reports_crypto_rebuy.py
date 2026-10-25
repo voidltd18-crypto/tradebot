@@ -65,7 +65,7 @@ def _mark(db_path, identifier, state, order_id=None):
 
 
 def rebuy_order(client, *, symbol, amount, confirmation, allowed_ids,
-                request_id=None, db_path=None, enabled=False, allow_live=False):
+                request_id=None, db_path=None, enabled=False, allow_live=False, is_paper=None):
     result = {"ok": False, "orderSubmitted": False}
     if not enabled:
         return {**result, "message": "Reports Buy Again is disabled by default"}
@@ -82,7 +82,7 @@ def rebuy_order(client, *, symbol, amount, confirmation, allowed_ids,
         return {**result, "message": "Another manual re-buy is being processed"}
     try:
         # Refuse a live account unless a separate explicit live opt-in is set.
-        if not bool(getattr(client, "_paper", False)) and not allow_live:
+        if is_paper is not True and not allow_live:
             return {**result, "message": "Live crypto re-buy is not enabled"}
         # Do not reserve the request until basic broker validation completes.
         asset = client.get_asset(sym.replace("/", ""))
@@ -95,6 +95,14 @@ def rebuy_order(client, *, symbol, amount, confirmation, allowed_ids,
             available = Decimal("-1")
         if not available.is_finite() or available < spend:
             return {**result, "message": "Insufficient verified non-marginable buying power"}
+        # Never buy while an existing broker order for this coin remains open.
+        # Read failures block the buy rather than assuming no pending orders.
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        open_orders = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
+        if any(str(getattr(o, "symbol", "")).replace("/", "").upper() == sym.replace("/", "")
+               for o in open_orders):
+            return {**result, "message": "An Alpaca order for this coin is still open. Resolve it before rebuying"}
         # Fail closed if order cannot be durably reserved BEFORE calling Alpaca.
         if not _reserve(db_path, identifier, sym, spend):
             return {**result, "message": "This Buy Again request was already processed or attempted. Check broker order history."}
