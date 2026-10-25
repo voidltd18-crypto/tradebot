@@ -90,6 +90,9 @@ def poll_crypto_alerts(client, state, db_path, *, sender=send_telegram_crypto_al
                 continue
             # Position identity is deliberately based on broker entry+quantity.
             identity = f"{symbol}:{entry}:{qty}"
+            # Persist an observed peak, not a verified since-entry trading high.
+            from backend.v19_crypto_observed_peaks import observe_position_peak
+            observe_position_peak(db_path, symbol=symbol, entry=entry, quantity=qty, observed_price=current)
             if current > entry:
                 pct = ((current / entry) - 1) * 100
                 _notify_once(conn, "profit:" + identity,
