@@ -1,3 +1,4 @@
+from decimal import Decimal
 from types import SimpleNamespace
 from backend.v19_reports_crypto_rebuy import available_crypto_cash, crypto_rebuy_preview, parse_request
 
@@ -34,4 +35,4 @@ def test_preview_fails_closed_on_api_outage():
 
 
 def test_amount_can_exceed_previous_250_cap_but_must_be_cash_backed_at_execution():
-    assert parse_request("BTC/USD", "910.53", "BUY BTC/USD")[1] == 910.53
+    assert parse_request("BTC/USD", "910.53", "BUY BTC/USD")[1] == Decimal("910.53")
