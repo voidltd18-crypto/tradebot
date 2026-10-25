@@ -28,7 +28,16 @@ def telegram_crypto_monitor_status(request: Request):
 
 # Manual Reports crypto re-buy. OFF by default; stock/automatic trading untouched.
 from fastapi import Body
-from backend.v19_reports_crypto_rebuy import rebuy_order, enabled as rebuy_enabled
+from backend.v19_reports_crypto_rebuy import rebuy_order, enabled as rebuy_enabled, crypto_rebuy_preview
+
+@app.get("/v19/reports/crypto-buy-again/available")
+def reports_crypto_buy_again_available(request: Request):
+    _legacy.verify_api_key(request)
+    if not rebuy_enabled():
+        return {"ok": False, "canBuy": False, "availableUsd": None,
+                "message": "Buy Again is disabled"}
+    return crypto_rebuy_preview(_legacy.trading_client)
+
 
 @app.post("/v19/reports/crypto-buy-again")
 def reports_crypto_buy_again(request: Request, payload: dict = Body(...)):

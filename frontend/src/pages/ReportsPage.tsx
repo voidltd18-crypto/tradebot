@@ -49,12 +49,35 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const [rebuySymbol, setRebuySymbol] = useState("");
   const [rebuyRequestId, setRebuyRequestId] = useState("");
   const [rebuyAmount, setRebuyAmount] = useState("25");
+  const [rebuyAvailable, setRebuyAvailable] = useState<number | null>(null);
+  const [rebuyCashLoading, setRebuyCashLoading] = useState(false);
+  const [rebuyCashError, setRebuyCashError] = useState("");
+  async function fetchRebuyCash() {
+    setRebuyCashLoading(true);
+    setRebuyAvailable(null);
+    setRebuyCashError("");
+    try {
+      const response = await fetch(`${API_URL}/v19/reports/crypto-buy-again/available`, {
+        cache: "no-store",
+        headers: {"X-Auth-Token":authToken, "x-api-key":authToken},
+      });
+      const payload = await readJson(response);
+      const amount = Number(payload?.availableUsd);
+      if (!response.ok || !payload?.ok || payload?.availableUsd == null || !Number.isFinite(amount) || amount < 0) {
+        throw new Error(String(payload?.message || "Available cash could not be verified"));
+      }
+      setRebuyAvailable(amount);
+      setRebuyAmount(amount.toFixed(2));
+    } catch (error: any) {
+      setRebuyCashError(String(error?.message || "Available cash could not be verified"));
+    } finally { setRebuyCashLoading(false); }
+  }
   const [rebuyConfirmation, setRebuyConfirmation] = useState("");
   const [rebuyPending, setRebuyPending] = useState(false);
   const [rebuyMessage, setRebuyMessage] = useState("");
   const cryptoPair = (symbol: string) => /^[A-Z0-9]{2,20}\/USD$/.test(symbol.toUpperCase());
   async function submitRebuy() {
-    if (!rebuySymbol || !rebuyRequestId || rebuyPending || rebuyConfirmation !== `BUY ${rebuySymbol}`) return;
+    if (!rebuySymbol || !rebuyRequestId || rebuyPending || rebuyCashLoading || rebuyAvailable === null || Number(rebuyAmount) < 1 || Number(rebuyAmount) > rebuyAvailable || rebuyConfirmation !== `BUY ${rebuySymbol}`) return;
     setRebuyPending(true);
     setRebuyMessage("");
     try {
@@ -274,23 +297,25 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       </div>
       {momentFilter && <div className="moment-filter-banner"><b>Chart selection:</b> {momentFilter.label}<button className="ghost" onClick={()=>setMomentFilter(null)}>Show all dates</button></div>}
       <div className="filter-summary"><b>{filteredClosedTrades.length}</b> matching rows <span>•</span> PnL <strong className={tone(filteredPnl)}>{gbp(filteredPnl * rate)}</strong> <span>•</span> Winning rows {filteredWins}</div>
-      <div className="table-wrap"><table className="compact-table"><thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th><th>Replay</th><th>Rebuy</th></tr></thead><tbody>{filteredClosedTrades.map((trade,index)=><tr key={`${trade.id||index}-${index}`}><td>{tradeDate(trade)}</td><td>{tradeTime(trade)}</td><td><b>{trade.symbol}</b></td><td>{usd(trade.entryPrice)}</td><td>{usd(trade.exitPrice)}</td><td>{Number(trade.qty||0).toFixed(4)}</td><td className={tone(trade.pnl)}>{gbp(trade.pnlGbp ?? Number(trade.pnl||0)*rate)} / {usd(trade.pnl)}</td><td className={tone(trade.pnl)}>{pct(trade.pnlPct)}</td><td><button className="table-action" disabled={!trade.id} onClick={()=>trade.id&&setReplay({mode:"closed",symbol:String(trade.symbol),tradeId:Number(trade.id)})}>View Chart</button></td><td>{cryptoPair(String(trade.symbol || "")) ? <button className="table-action" onClick={()=>{setRebuySymbol(String(trade.symbol).toUpperCase());setRebuyRequestId(crypto.randomUUID());setRebuyAmount("25");setRebuyConfirmation("");setRebuyMessage("");}}>Buy Again</button> : "—"}</td></tr>)}{!filteredClosedTrades.length&&<tr><td colSpan={10}>No trades match these filters.</td></tr>}</tbody></table></div>
+      <div className="table-wrap"><table className="compact-table"><thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th><th>Replay</th><th>Rebuy</th></tr></thead><tbody>{filteredClosedTrades.map((trade,index)=><tr key={`${trade.id||index}-${index}`}><td>{tradeDate(trade)}</td><td>{tradeTime(trade)}</td><td><b>{trade.symbol}</b></td><td>{usd(trade.entryPrice)}</td><td>{usd(trade.exitPrice)}</td><td>{Number(trade.qty||0).toFixed(4)}</td><td className={tone(trade.pnl)}>{gbp(trade.pnlGbp ?? Number(trade.pnl||0)*rate)} / {usd(trade.pnl)}</td><td className={tone(trade.pnl)}>{pct(trade.pnlPct)}</td><td><button className="table-action" disabled={!trade.id} onClick={()=>trade.id&&setReplay({mode:"closed",symbol:String(trade.symbol),tradeId:Number(trade.id)})}>View Chart</button></td><td>{cryptoPair(String(trade.symbol || "")) ? <button className="table-action" onClick={()=>{setRebuySymbol(String(trade.symbol).toUpperCase());setRebuyRequestId(crypto.randomUUID());setRebuyAvailable(null);setRebuyAmount("");void fetchRebuyCash();setRebuyConfirmation("");setRebuyMessage("");}}>Buy Again</button> : "—"}</td></tr>)}{!filteredClosedTrades.length&&<tr><td colSpan={10}>No trades match these filters.</td></tr>}</tbody></table></div>
     </Card></div>
     {rebuySymbol && <div role="dialog" aria-modal="true" aria-label="Buy crypto again" className="report-rebuy-dialog" style={{position:"fixed",inset:0,zIndex:9000,background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
       <div style={{width:"min(450px,100%)",background:"#161b27",border:"1px solid #475569",borderRadius:12,padding:20,color:"#f8fafc"}}>
         <h3>Buy Again — {rebuySymbol}</h3>
         <p>This requests a <strong>new Alpaca market buy</strong> at the current market price, not the historical sale price. It may use real money if the broker account is live and the feature is enabled.</p>
         <label style={{display:"block",marginBottom:12}}>Amount to spend (USD)
-          <input type="number" min="1" max="250" step="0.01" value={rebuyAmount} onChange={e=>setRebuyAmount(e.target.value)} style={{display:"block",width:"100%",marginTop:5}}/>
+          <input type="number" min="1" max={rebuyAvailable ?? undefined} step="0.01" value={rebuyAmount} disabled={rebuyCashLoading || rebuyAvailable === null} onChange={e=>setRebuyAmount(e.target.value)} style={{display:"block",width:"100%",marginTop:5}}/>
         </label>
+        <p role="status" style={{marginTop:-4}}>{rebuyCashLoading ? "Checking Alpaca cash…" : rebuyAvailable !== null ? `Available to buy: ${rebuyAvailable.toFixed(2)} USD` : (rebuyCashError || "No verified buying power available")}</p>
+        <button className="ghost" disabled={rebuyCashLoading || rebuyPending} onClick={()=>{void fetchRebuyCash();}}>Refresh buying power</button>
         <label style={{display:"block",marginBottom:12}}>Type <strong>BUY {rebuySymbol}</strong> to confirm
           <input value={rebuyConfirmation} autoComplete="off" onChange={e=>setRebuyConfirmation(e.target.value)} style={{display:"block",width:"100%",marginTop:5}}/>
         </label>
-        <p>Feature disabled by default until execution safeguards are verified. If disabled, no order will be placed.</p>
+        <p>The available amount comes from Alpaca cash and non-marginable buying power, not your invested positions or vault. Alpaca rechecks cash when you confirm.</p>
         {rebuyMessage && <p role="status">{rebuyMessage}</p>}
         <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
           <button className="ghost" disabled={rebuyPending} onClick={()=>{setRebuySymbol("");setRebuyRequestId("");setRebuyMessage("");}}>Close</button>
-          <button disabled={rebuyPending || rebuyConfirmation !== `BUY ${rebuySymbol}` || !(Number(rebuyAmount)>=1 && Number(rebuyAmount)<=250)} onClick={submitRebuy}>{rebuyPending?"Submitting…":"Confirm Buy"}</button>
+          <button disabled={rebuyPending || rebuyCashLoading || rebuyAvailable === null || rebuyConfirmation !== `BUY ${rebuySymbol}` || !(Number(rebuyAmount)>=1 && Number(rebuyAmount)<=rebuyAvailable)} onClick={submitRebuy}>{rebuyPending?"Submitting…":"Confirm Buy"}</button>
         </div>
       </div>
     </div>}
