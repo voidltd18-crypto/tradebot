@@ -47,6 +47,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const [replay, setReplay] = useState<ReplayTarget | null>(null);
   const [range, setRange] = useState<RangeKey>("month");
   const [symbolFilter, setSymbolFilter] = useState("ALL");
+  const [symbolSearch, setSymbolSearch] = useState("");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
   const [chartSelection, setChartSelection] = useState<{ts:number; equity:number} | null>(null);
@@ -86,9 +87,9 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       const ts = tradeTimestamp(trade);
       const dateMatch = (!from || ts >= from) && (!toDate || ts <= to);
       const momentMatch = !momentFilter || (ts >= momentFilter.from && ts <= momentFilter.to);
-      return (symbolFilter === "ALL" || symbol === symbolFilter) && dateMatch && momentMatch;
+      return (symbolFilter === "ALL" || symbol === symbolFilter) && symbol.includes(symbolSearch.trim().toUpperCase()) && dateMatch && momentMatch;
     }).sort((a,b) => tradeTimestamp(b)-tradeTimestamp(a));
-  }, [displayedTrades, symbolFilter, fromDate, toDate, momentFilter]);
+  }, [displayedTrades, symbolFilter, symbolSearch, fromDate, toDate, momentFilter]);
 
   const filteredPnl = filteredClosedTrades.reduce((sum, t) => sum + Number(t?.pnl || 0), 0);
   const filteredWins = filteredClosedTrades.filter(t => Number(t?.pnl || 0) > 0).length;
@@ -240,10 +241,11 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
 
     <div id="closed-trade-history" className="report-anchor"><Card title="Closed Trade History" wide>
       <div className="trade-filter-panel">
+        <label><span>Search ticker</span><input type="search" aria-label="Search stock symbols" placeholder="e.g. USD, SOL, MARA" value={symbolSearch} onChange={e=>setSymbolSearch(e.target.value)}/></label>
         <label><span>Stock</span><select value={symbolFilter} onChange={e=>setSymbolFilter(e.target.value)}><option value="ALL">All stocks</option>{symbols.map(s=><option key={s} value={s}>{s}</option>)}</select></label>
         <label><span>From</span><input type="date" value={fromDate} onChange={e=>setFromDate(e.target.value)}/></label>
         <label><span>To</span><input type="date" value={toDate} onChange={e=>setToDate(e.target.value)}/></label>
-        <button className="ghost" onClick={()=>{setSymbolFilter("ALL");setFromDate("");setToDate("");setMomentFilter(null);setChartSelection(null);}}>Clear filters</button>
+        <button className="ghost" onClick={()=>{setSymbolFilter("ALL");setSymbolSearch("");setFromDate("");setToDate("");setMomentFilter(null);setChartSelection(null);}}>Clear filters</button>
       </div>
       {momentFilter && <div className="moment-filter-banner"><b>Chart selection:</b> {momentFilter.label}<button className="ghost" onClick={()=>setMomentFilter(null)}>Show all dates</button></div>}
       <div className="filter-summary"><b>{filteredClosedTrades.length}</b> matching rows <span>•</span> PnL <strong className={tone(filteredPnl)}>{gbp(filteredPnl * rate)}</strong> <span>•</span> Winning rows {filteredWins}</div>
