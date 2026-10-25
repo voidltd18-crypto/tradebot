@@ -1,0 +1,28 @@
+name: Reports Buy Again Safety
+on:
+  pull_request:
+    paths:
+      - 'backend/v19_reports_crypto_rebuy.py'
+      - 'backend/main.py'
+      - 'frontend/src/pages/ReportsPage.tsx'
+      - 'tests/test_v19_reports_crypto_rebuy.py'
+      - '.github/workflows/reports-buy-again.yml'
+  workflow_dispatch:
+jobs:
+  buy-again:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install pytest
+      - run: python -m pytest -q tests/test_v19_reports_crypto_rebuy.py
+      - run: python -m py_compile backend/v19_reports_crypto_rebuy.py backend/main.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend

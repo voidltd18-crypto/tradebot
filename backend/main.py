@@ -24,3 +24,28 @@ from backend.v19_crypto_telegram_monitor import crypto_monitor_status
 def telegram_crypto_monitor_status(request: Request):
     _legacy.verify_api_key(request)
     return crypto_monitor_status(_legacy.SQLITE_DB_FILE)
+
+
+# Manual Reports crypto re-buy. OFF by default; stock/automatic trading untouched.
+from fastapi import Body
+from backend.v19_reports_crypto_rebuy import rebuy_order, enabled as rebuy_enabled
+
+@app.post("/v19/reports/crypto-buy-again")
+def reports_crypto_buy_again(request: Request, payload: dict = Body(...)):
+    _legacy.verify_api_key(request)
+    if not rebuy_enabled():
+        return {"ok": False, "orderSubmitted": False,
+                "message": "Buy Again is not enabled yet. No order placed."}
+    # Verify symbol against authoritative closed trade history, not browser input.
+    symbol = str(payload.get("symbol", "")).strip().upper()
+    history = _legacy.closed_trades_from_db(5000)
+    allowed = {str(row.get("symbol", "")).strip().upper() for row in history
+               if str(row.get("symbol", "")).strip().upper() == symbol
+               and float(row.get("qty") or 0) > 0}
+    return rebuy_order(
+        _legacy.trading_client,
+        symbol=symbol, amount=payload.get("amountUsd"),
+        confirmation=payload.get("confirmation"), allowed_ids=allowed,
+        enabled=True,
+        allow_live=__import__("os").environ.get("TRADEBOT_REPORTS_CRYPTO_REBUY_LIVE_ENABLED", "").lower() == "true",
+    )
