@@ -35,11 +35,36 @@ def _notify_once(conn, key, message, *, sender=send_telegram_crypto_alert):
     if conn.execute("SELECT 1 FROM v19_telegram_seen WHERE event_key=?", (key,)).fetchone():
         return False
     if sender(message, enabled=True).get("sent") is not True:
+        _set_meta(conn, "last_delivery_failed_at", datetime.now(timezone.utc).isoformat())
         return False
     conn.execute("INSERT OR IGNORE INTO v19_telegram_seen VALUES (?, ?)",
                  (key, datetime.now(timezone.utc).isoformat()))
-    conn.commit()
+    _set_meta(conn, "last_alert_sent_at", datetime.now(timezone.utc).isoformat())
     return True
+
+
+def _set_meta(conn, key, value):
+    conn.execute("INSERT OR REPLACE INTO v19_telegram_meta(key, value) VALUES (?, ?)", (key, str(value)))
+    conn.commit()
+
+
+def crypto_monitor_status(db_path):
+    """Status is read-only and never fetches broker data or credentials."""
+    conn = _storage(db_path)
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM v19_telegram_meta"))
+        last = meta.get("last_successful_poll_at")
+        nxt = (datetime.fromisoformat(last) + timedelta(seconds=INTERVAL)).isoformat() if last else None
+        return {"enabled": os.getenv(_ENABLED, "").lower() in ("1", "true", "yes"),
+                "intervalSeconds": INTERVAL,
+                "lastSuccessfulPollAt": last,
+                "nextExpectedPollAt": nxt,
+                "lastPositionCount": int(meta.get("last_position_count", "0")) if last else None,
+                "lastAlertSentAt": meta.get("last_alert_sent_at"),
+                "lastDeliveryFailureAt": meta.get("last_delivery_failed_at"),
+                "lastPollFailureAt": meta.get("last_poll_failed_at")}
+    finally:
+        conn.close()
 
 
 def poll_crypto_alerts(client, state, db_path, *, sender=send_telegram_crypto_alert, now=None):
@@ -52,9 +77,11 @@ def poll_crypto_alerts(client, state, db_path, *, sender=send_telegram_crypto_al
             conn.execute("INSERT INTO v19_telegram_meta VALUES ('started', ?)", (now.isoformat(),))
             conn.commit()
         positions = client.get_all_positions()  # raises on failure: do not acknowledge missing positions
+        position_count = 0
         for pos in positions:
             if "crypto" not in str(getattr(pos, "asset_class", "")).lower():
                 continue
+            position_count += 1
             symbol = str(getattr(pos, "symbol", "")).upper()
             qty = _positive(getattr(pos, "qty", None))
             entry = _positive(getattr(pos, "avg_entry_price", None))
@@ -107,6 +134,8 @@ def poll_crypto_alerts(client, state, db_path, *, sender=send_telegram_crypto_al
                          f"TradeBot CONFIRMED CRYPTO SELL: {symbol}, qty {getattr(order, 'filled_qty', '?')}, "
                          f"filled price ${getattr(order, 'filled_avg_price', '?')}. Broker order {oid}.",
                          sender=sender)
+        _set_meta(conn, "last_position_count", position_count)
+        _set_meta(conn, "last_successful_poll_at", datetime.now(timezone.utc).isoformat())
     finally:
         conn.close()
 
@@ -124,6 +153,11 @@ def install_crypto_telegram_worker(app, client, state, db_path):
                     poll_crypto_alerts(client, state, db_path)
                 except Exception as exc:
                     # No sensitive broker response, secrets or account data in logs.
+                    try:
+                        with _storage(db_path) as conn:
+                            _set_meta(conn, "last_poll_failed_at", datetime.now(timezone.utc).isoformat())
+                    except Exception:
+                        pass
                     print("V19 TELEGRAM MONITOR | poll failed:", type(exc).__name__)
                 time.sleep(INTERVAL)
 
