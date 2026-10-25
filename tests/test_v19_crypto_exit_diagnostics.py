@@ -11,9 +11,10 @@ def test_external_sol_detected_but_never_sold():
     assert not result["sellOrderSubmitted"]
 
 
-def test_weekend_stop_is_visible_without_market_open_requirement():
+def test_weekend_loss_is_manual_only_without_market_open_requirement():
     result = review("SOLUSD", 10, 100, 94, 101)
-    assert result["condition"] == "STOP_LOSS_CONDITION"
+    assert result["condition"] == "HOLD_LOSS_MANUAL_ONLY"
+    assert result["automaticStopLossEnabled"] is False
     assert result["action"] == "NO_ACTION"
 
 
@@ -41,3 +42,24 @@ def test_stock_symbol_not_implicitly_included():
     result = review("MARA", 1, 10, 9, 10)
     assert result["status"] == "unsupported"
     assert result["action"] == "NO_ACTION"
+
+
+def test_break_even_never_requests_automatic_exit():
+    result = review("SOLUSD", 1, 100, 100, 110)
+    assert result["condition"] == "HOLD_BREAK_EVEN_MANUAL_ONLY"
+    assert not result["grossProfitPositive"]
+    assert result["action"] == "NO_ACTION"
+
+
+def test_trail_breach_below_entry_stays_manual_only():
+    result = review("SOLUSD", 1, 100, 98, 120, manage_external=True)
+    assert result["trailArmed"]
+    assert result["condition"] == "HOLD_LOSS_MANUAL_ONLY"
+    assert result["action"] == "NO_ACTION"
+
+
+def test_trail_breach_still_positive_is_candidate_only():
+    result = review("SOLUSD", 1, 100, 103, 110, manage_external=True)
+    assert result["condition"] == "TRAIL_CONDITION"
+    assert result["grossProfitPositive"]
+    assert result["sellOrderSubmitted"] is False
