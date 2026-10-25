@@ -1,11 +1,13 @@
-"""Guarded manual crypto re-buy from a closed Reports trade.
+"""Manually confirmed Alpaca crypto re-buy, fail-closed and disabled by default.
 
-Explicit operator confirmation is required. Disabled by default even on live
-accounts. No stock buy path, scanner logic, or autonomous orders are involved.
+Orders are never retried automatically. Persistent request IDs make repeated
+submissions safe across browser retries and Render process restarts.
 """
 import os
 import re
+import sqlite3
 import threading
+import uuid
 from decimal import Decimal, InvalidOperation
 
 _REBUY_LOCK = threading.Lock()
@@ -29,14 +31,41 @@ def parse_request(symbol, amount, confirmation):
     return sym, spend
 
 
-def rebuy_order(client, *, symbol, amount, confirmation, allowed_ids,
-                enabled=False, allow_live=False):
-    """Submit at most one manual buy under a process lock; fail closed.
+def _request_id(value):
+    try:
+        identifier = uuid.UUID(str(value))
+        if identifier.version != 4:
+            return None
+        return str(identifier)
+    except (ValueError, TypeError, AttributeError):
+        return None
 
-    allowed_ids is obtained directly from the closed-trades DB for the authenticated
-    request; the symbol itself must be present there. Client errors never retry
-    automatically because broker outcome can be ambiguous.
-    """
+
+def _reserve(db_path, identifier, symbol, amount):
+    """SQLite atomic reservation; keep even if outcome unknown (no automatic retry)."""
+    with sqlite3.connect(db_path, timeout=15) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS v19_crypto_rebuy_requests (
+            request_id TEXT PRIMARY KEY, symbol TEXT NOT NULL,
+            amount_usd TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'reserved',
+            broker_order_id TEXT
+        )""")
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO v19_crypto_rebuy_requests(request_id, symbol, amount_usd) VALUES (?, ?, ?)",
+            (identifier, symbol, str(amount)),
+        )
+        return cur.rowcount == 1
+
+
+def _mark(db_path, identifier, state, order_id=None):
+    with sqlite3.connect(db_path, timeout=15) as conn:
+        conn.execute(
+            "UPDATE v19_crypto_rebuy_requests SET state=?, broker_order_id=? WHERE request_id=?",
+            (state, order_id, identifier),
+        )
+
+
+def rebuy_order(client, *, symbol, amount, confirmation, allowed_ids,
+                request_id=None, db_path=None, enabled=False, allow_live=False):
     result = {"ok": False, "orderSubmitted": False}
     if not enabled:
         return {**result, "message": "Reports Buy Again is disabled by default"}
@@ -46,32 +75,46 @@ def rebuy_order(client, *, symbol, amount, confirmation, allowed_ids,
         return {**result, "message": str(exc)}
     if sym not in allowed_ids:
         return {**result, "message": "Coin not found in your closed-trade history"}
+    identifier = _request_id(request_id)
+    if not identifier or not db_path:
+        return {**result, "message": "Missing valid one-time request ID or persistent storage"}
     if not _REBUY_LOCK.acquire(blocking=False):
         return {**result, "message": "Another manual re-buy is being processed"}
     try:
+        # Refuse a live account unless a separate explicit live opt-in is set.
         if not bool(getattr(client, "_paper", False)) and not allow_live:
             return {**result, "message": "Live crypto re-buy is not enabled"}
+        # Do not reserve the request until basic broker validation completes.
         asset = client.get_asset(sym.replace("/", ""))
         if "crypto" not in str(getattr(asset, "asset_class", "")).lower() or not getattr(asset, "tradable", False):
             return {**result, "message": "Broker has not verified this coin as tradable"}
         account = client.get_account()
-        available = Decimal(str(getattr(account, "non_marginable_buying_power", "0") or "0"))
+        try:
+            available = Decimal(str(getattr(account, "non_marginable_buying_power", "0") or "0"))
+        except (InvalidOperation, ValueError, TypeError):
+            available = Decimal("-1")
         if not available.is_finite() or available < spend:
             return {**result, "message": "Insufficient verified non-marginable buying power"}
-        # Use a stable client order ID to prevent two submissions of one UI action.
-        # The endpoint additionally requires a valid UUID supplied by the user action.
-        # Notional USD market buys are accepted by Alpaca for supported crypto pairs.
+        # Fail closed if order cannot be durably reserved BEFORE calling Alpaca.
+        if not _reserve(db_path, identifier, sym, spend):
+            return {**result, "message": "This Buy Again request was already processed or attempted. Check broker order history."}
         from alpaca.trading.requests import MarketOrderRequest
         from alpaca.trading.enums import OrderSide, TimeInForce
+        # Client-side identifier is stable on a retry and maps to a broker-side
+        # client order ID for an additional line of duplicate protection.
         order = client.submit_order(MarketOrderRequest(
             symbol=sym, notional=float(spend), side=OrderSide.BUY,
             time_in_force=TimeInForce.GTC,
+            client_order_id="tb-rebuy-" + identifier,
         ))
-        return {"ok": True, "orderSubmitted": True, "orderId": str(order.id),
-                "message": "Buy submitted to Alpaca; verify fill status before assuming ownership"}
+        order_id = str(getattr(order, "id", ""))
+        _mark(db_path, identifier, "submitted", order_id)
+        return {"ok": True, "orderSubmitted": True, "orderId": order_id,
+                "message": "Buy request accepted by Alpaca; check fill status"}
     except Exception:
-        # Do not retry uncertain broker outcomes.
-        return {**result, "message": "Broker request failed or outcome unknown; check Alpaca orders before retrying"}
+        # If outcome is unknown, the durable reservation must remain. Operator
+        # checks broker history; the system NEVER automatically retries.
+        return {**result, "message": "Broker outcome uncertain. Check Alpaca order history before attempting another buy"}
     finally:
         _REBUY_LOCK.release()
 
