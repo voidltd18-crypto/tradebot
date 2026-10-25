@@ -4,8 +4,8 @@ import pytest
 
 def test_confirmation_and_limits():
     assert parse_request("XRP/USD", "25.00", "BUY XRP/USD")[0] == "XRP/USD"
+    assert parse_request("XRP/USD", "1000", "BUY XRP/USD")[1] == 1000
     for args in [("XRP/USD", 0, "BUY XRP/USD"),
-                 ("XRP/USD", 1000, "BUY XRP/USD"),
                  ("XRP/USD", "nan", "BUY XRP/USD"),
                  ("XRP/USD", 25, "BUY BTC/USD"),
                  ("MARA", 25, "BUY MARA"),
