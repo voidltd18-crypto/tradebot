@@ -9,9 +9,9 @@ def test_reports_returns_full_loaded_closed_trades_without_200_row_truncation():
               and node.name == "_build_reports_payload")
     source = ast.unparse(fn)
     assert "closed_trades_from_db(5000)" in source
-    assert '"closedTrades": closed' in source
-    assert '"closedTrades": closed[:200]' not in source
-    assert 'if isinstance(row, dict) and _safe_num(row.get("qty")) > 0' in source
+    assert "'closedTrades': closed" in source
+    assert "'closedTrades': closed[:200]" not in source
+    assert "if isinstance(row, dict) and _safe_num(row.get('qty')) > 0" in source
 
 
 def test_backend_closed_trades_query_orders_newest_and_allows_more_than_500():
