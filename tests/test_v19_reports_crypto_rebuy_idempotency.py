@@ -20,6 +20,9 @@ class FakeBroker:
     def get_account(self):
         return SimpleNamespace(non_marginable_buying_power=self.cash)
 
+    def get_orders(self, filter):
+        return []
+
     def submit_order(self, order):
         self.calls.append(order)
         if self.fail:
@@ -34,6 +37,8 @@ def _mock_alpaca(monkeypatch):
         def __init__(self, **kwargs):
             self.kwargs = kwargs
     requests.MarketOrderRequest = Order
+    requests.GetOrdersRequest = Order
+    enums.QueryOrderStatus = SimpleNamespace(OPEN="open")
     enums.OrderSide = SimpleNamespace(BUY="buy")
     enums.TimeInForce = SimpleNamespace(GTC="gtc")
     monkeypatch.setitem(sys.modules, "alpaca", types.ModuleType("alpaca"))
@@ -46,7 +51,7 @@ def _buy(broker, db_path, request_id):
     return rebuy_order(broker, symbol="XRP/USD", amount="25.00",
                        confirmation="BUY XRP/USD", allowed_ids={"XRP/USD"},
                        request_id=request_id, db_path=str(db_path),
-                       enabled=True)
+                       enabled=True, is_paper=True)
 
 
 def test_one_broker_submission_for_same_request_even_after_restart(tmp_path, monkeypatch):
@@ -87,5 +92,28 @@ def test_live_account_stays_disabled_without_explicit_opt_in(tmp_path, monkeypat
     _mock_alpaca(monkeypatch)
     broker = FakeBroker()
     broker._paper = False
-    assert not _buy(broker, tmp_path / "db.sqlite", str(uuid.uuid4()))["orderSubmitted"]
+    out = rebuy_order(broker, symbol="XRP/USD", amount="25.00",
+                      confirmation="BUY XRP/USD", allowed_ids={"XRP/USD"},
+                      request_id=str(uuid.uuid4()), db_path=str(tmp_path / "db.sqlite"),
+                      enabled=True, is_paper=False, allow_live=False)
+    assert not out["orderSubmitted"]
+    assert not broker.calls
+
+def test_pending_broker_order_blocks_rebuy(tmp_path, monkeypatch):
+    _mock_alpaca(monkeypatch)
+    broker = FakeBroker()
+    broker.get_orders = lambda filter: [SimpleNamespace(symbol="XRPUSD")]
+    out = _buy(broker, tmp_path / "db.sqlite", str(uuid.uuid4()))
+    assert not out["orderSubmitted"]
+    assert not broker.calls
+
+
+def test_broker_order_lookup_error_fails_closed(tmp_path, monkeypatch):
+    _mock_alpaca(monkeypatch)
+    broker = FakeBroker()
+    def fail(filter):
+        raise ConnectionError("orders unavailable")
+    broker.get_orders = fail
+    out = _buy(broker, tmp_path / "db.sqlite", str(uuid.uuid4()))
+    assert not out["orderSubmitted"]
     assert not broker.calls
