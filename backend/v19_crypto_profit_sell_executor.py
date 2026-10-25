@@ -7,6 +7,7 @@ import os
 import sqlite3
 import threading
 import time
+from copy import deepcopy
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_UP
@@ -14,6 +15,27 @@ from pathlib import Path
 
 _ENABLED = "TRADEBOT_CRYPTO_PROFIT_SELL_ENABLED"
 _MUTEX = threading.Lock()
+_STATUS_LOCK = threading.Lock()
+_STATUS = {"state": "not_started", "lastPollAt": None, "lastErrorAt": None, "lastErrorType": None, "submittedSymbols": [], "blocked": [], "lastPollSucceeded": False}
+
+
+def _publish(**values):
+    with _STATUS_LOCK:
+        _STATUS.update(values)
+
+
+def profit_sell_worker_status():
+    """Read-only in-process heartbeat. No market or broker side effects."""
+    with _STATUS_LOCK:
+        snapshot = deepcopy(_STATUS)
+    snapshot["configuredEnabled"] = os.getenv(_ENABLED, "").lower() == "true"
+    snapshot["liveApproved"] = os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_LIVE_APPROVED", "").lower() == "true"
+    snapshot["allowedSymbols"] = [x.strip() for x in os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_SYMBOLS", "").split(",") if x.strip()]
+    snapshot["gainTriggerPct"] = os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_GAIN_PCT", "2.0")
+    snapshot["estimatedCostBufferPct"] = os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_COST_BUFFER_PCT", "1.0")
+    snapshot["ordersReadOnly"] = True
+    return snapshot
+
 
 
 def _positive(v):
@@ -146,6 +168,7 @@ def install_worker(app, trading_client, api_key, api_secret, db_path):
             return
         from alpaca.data.historical import CryptoHistoricalDataClient
         data_client = CryptoHistoricalDataClient(api_key, api_secret)
+        _publish(state="running")
         def run():
             while True:
                 try:
@@ -154,9 +177,16 @@ def install_worker(app, trading_client, api_key, api_secret, db_path):
                         allowed_symbols=allowed,
                         min_gain_pct=os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_GAIN_PCT", "2.0"),
                         cost_buffer_pct=os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_COST_BUFFER_PCT", "1.0"))
+                    _publish(state="running", lastPollAt=datetime.now(timezone.utc).isoformat(),
+                             lastPollSucceeded=True, submittedSymbols=list(outcome["submitted"]),
+                             blocked=list(outcome["blocked"]), lastErrorType=None)
+                    print("CRYPTO PROFIT SELL | poll complete submitted=%d blocked=%d" %
+                          (len(outcome["submitted"]), len(outcome["blocked"])), flush=True)
                     if outcome["submitted"]:
-                        print("CRYPTO PROFIT SELL | submitted limit order for", ",".join(outcome["submitted"]))
+                        print("CRYPTO PROFIT SELL | submitted limit order for", ",".join(outcome["submitted"]), flush=True)
                 except Exception as e:
-                    print("CRYPTO PROFIT SELL | failed safely:", type(e).__name__)
+                    _publish(state="error", lastPollSucceeded=False,
+                             lastErrorAt=datetime.now(timezone.utc).isoformat(), lastErrorType=type(e).__name__)
+                    print("CRYPTO PROFIT SELL | failed safely:", type(e).__name__, flush=True)
                 time.sleep(60)
         threading.Thread(target=run, name="v19-crypto-profit-sell", daemon=True).start()
