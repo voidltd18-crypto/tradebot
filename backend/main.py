@@ -90,3 +90,12 @@ def xrp_repeat_cycle_preview(request: Request):
 
 from backend.v19_xrp_cycle_executor import install_cycle_worker
 install_cycle_worker(app, _legacy.trading_client, _legacy.API_KEY, _legacy.API_SECRET, _legacy.SQLITE_DB_FILE)
+
+
+# Authenticated, read-only proof of automatic sell worker polling.
+from backend.v19_crypto_profit_sell_executor import worker_health as crypto_profit_sell_health
+
+@app.get("/v19/crypto-profit-sell-health")
+def crypto_profit_sell_health_endpoint(request: Request):
+    _legacy.verify_api_key(request)
+    return crypto_profit_sell_health(_legacy.SQLITE_DB_FILE)
