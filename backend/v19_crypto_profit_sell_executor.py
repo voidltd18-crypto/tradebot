@@ -131,6 +131,50 @@ def poll_profit_sells(client, data_client, db_path, *, now=None, enabled=False,
         _MUTEX.release()
 
 
+def _record_poll(db_path, result=None, error=None):
+    """Write a non-sensitive worker heartbeat. Does not change trading."""
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path, timeout=15) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS v19_crypto_profit_sell_health (
+            worker TEXT PRIMARY KEY, polled_at TEXT NOT NULL, outcome TEXT NOT NULL,
+            submitted_count INTEGER NOT NULL, blocked_count INTEGER NOT NULL,
+            detail TEXT NOT NULL
+        )""")
+        blocked = result.get("blocked", []) if isinstance(result, dict) else []
+        submitted = result.get("submitted", []) if isinstance(result, dict) else []
+        # Keep only sanitized reason text, not prices or private account data.
+        allowed = {"open broker order", "invalid broker position",
+                   "previous sell attempt exists", "broker submission failed/unknown; reserved",
+                   "live bid below target", "bid stale or future-dated", "target reached at fresh bid"}
+        reasons = [reason if reason in allowed else "not eligible"
+                   for _, reason in blocked]
+        outcome = "error" if error else "completed"
+        detail = str(error or (", ".join(sorted(set(reasons))) or "no position qualified"))[:160]
+        conn.execute("""INSERT OR REPLACE INTO v19_crypto_profit_sell_health
+            VALUES (?,?,?,?,?,?)""",
+            ("sell", datetime.now(timezone.utc).isoformat(), outcome,
+             len(submitted), len(blocked), detail))
+
+
+def worker_health(db_path):
+    """Read-only health for authenticated API route."""
+    configured = os.getenv(_ENABLED, "").lower() == "true"
+    approved = os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_LIVE_APPROVED", "").lower() == "true"
+    output = {"enabled": configured and approved, "configuredEnabled": configured,
+              "liveApproved": approved, "lastPoll": None}
+    try:
+        with sqlite3.connect(db_path, timeout=5) as conn:
+            row = conn.execute("""SELECT polled_at,outcome,submitted_count,blocked_count,detail
+                FROM v19_crypto_profit_sell_health WHERE worker='sell'""").fetchone()
+            if row:
+                output["lastPoll"] = {"at": row[0], "outcome": row[1],
+                                      "submittedCount": row[2], "blockedCount": row[3],
+                                      "detail": row[4]}
+    except sqlite3.Error:
+        pass
+    return output
+
+
 def install_worker(app, trading_client, api_key, api_secret, db_path):
     @app.on_event("startup")
     def _start():
@@ -154,9 +198,17 @@ def install_worker(app, trading_client, api_key, api_secret, db_path):
                         allowed_symbols=allowed,
                         min_gain_pct=os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_GAIN_PCT", "2.0"),
                         cost_buffer_pct=os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_COST_BUFFER_PCT", "1.0"))
+                    try:
+                        _record_poll(db_path, result=outcome)
+                    except sqlite3.Error:
+                        print("CRYPTO PROFIT SELL | heartbeat storage unavailable")
                     if outcome["submitted"]:
                         print("CRYPTO PROFIT SELL | submitted limit order for", ",".join(outcome["submitted"]))
                 except Exception as e:
+                    try:
+                        _record_poll(db_path, error=type(e).__name__)
+                    except sqlite3.Error:
+                        pass
                     print("CRYPTO PROFIT SELL | failed safely:", type(e).__name__)
                 time.sleep(60)
         threading.Thread(target=run, name="v19-crypto-profit-sell", daemon=True).start()
