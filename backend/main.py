@@ -60,3 +60,10 @@ def reports_crypto_buy_again(request: Request, payload: dict = Body(...)):
         is_paper=_legacy.PAPER,
         allow_live=__import__("os").environ.get("TRADEBOT_REPORTS_CRYPTO_REBUY_LIVE_ENABLED", "").lower() == "true",
     )
+
+
+# Crypto profit-only LIMIT exits: separate explicit live opt-in; no stop-loss orders.
+from backend.v19_crypto_profit_sell_executor import install_worker as install_crypto_profit_sell_worker
+install_crypto_profit_sell_worker(
+    app, _legacy.trading_client, _legacy.API_KEY, _legacy.API_SECRET, _legacy.SQLITE_DB_FILE
+)
