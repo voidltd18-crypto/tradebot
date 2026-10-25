@@ -131,6 +131,39 @@ def poll_profit_sells(client, data_client, db_path, *, now=None, enabled=False,
         _MUTEX.release()
 
 
+def _record_worker_status(db_path, *, status, detail="", checked=0, submitted=0):
+    """Persist non-sensitive worker heartbeat across HTTP requests and restarts."""
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path, timeout=20) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS v19_crypto_profit_sell_worker_status (
+            id INTEGER PRIMARY KEY CHECK (id=1), updated_at TEXT NOT NULL,
+            status TEXT NOT NULL, detail TEXT NOT NULL,
+            checked INTEGER NOT NULL, submitted INTEGER NOT NULL
+        )""")
+        conn.execute("""INSERT OR REPLACE INTO v19_crypto_profit_sell_worker_status
+            VALUES (1,?,?,?,?,?)""",
+            (datetime.now(timezone.utc).isoformat(), status, detail[:240], checked, submitted))
+
+
+def profit_sell_status(db_path):
+    """Read-only worker heartbeat. No account keys, balances or order execution."""
+    enabled = os.getenv(_ENABLED, "").lower() == "true"
+    approved = os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_LIVE_APPROVED", "").lower() == "true"
+    symbols = [x.strip().upper() for x in os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_SYMBOLS", "").split(",") if x.strip()]
+    result = {"configuredEnabled": enabled, "liveApproved": approved,
+              "symbols": symbols, "intervalSeconds": 60, "lastPoll": None}
+    try:
+        with sqlite3.connect(db_path, timeout=5) as conn:
+            row = conn.execute("""SELECT updated_at, status, detail, checked, submitted
+                FROM v19_crypto_profit_sell_worker_status WHERE id=1""").fetchone()
+        if row:
+            result["lastPoll"] = {"at": row[0], "status": row[1],
+                                  "detail": row[2], "checked": row[3], "submitted": row[4]}
+    except sqlite3.Error:
+        pass
+    return result
+
+
 def install_worker(app, trading_client, api_key, api_secret, db_path):
     @app.on_event("startup")
     def _start():
@@ -154,9 +187,18 @@ def install_worker(app, trading_client, api_key, api_secret, db_path):
                         allowed_symbols=allowed,
                         min_gain_pct=os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_GAIN_PCT", "2.0"),
                         cost_buffer_pct=os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_COST_BUFFER_PCT", "1.0"))
+                    _record_worker_status(
+                        db_path, status="completed",
+                        detail="; ".join(f"{symbol}: {reason}" for symbol, reason in outcome["blocked"]) or "no eligible exit",
+                        checked=len(outcome["blocked"]) + len(outcome["submitted"]),
+                        submitted=len(outcome["submitted"]))
                     if outcome["submitted"]:
                         print("CRYPTO PROFIT SELL | submitted limit order for", ",".join(outcome["submitted"]))
                 except Exception as e:
+                    try:
+                        _record_worker_status(db_path, status="failed", detail=type(e).__name__)
+                    except Exception:
+                        pass
                     print("CRYPTO PROFIT SELL | failed safely:", type(e).__name__)
                 time.sleep(60)
         threading.Thread(target=run, name="v19-crypto-profit-sell", daemon=True).start()
