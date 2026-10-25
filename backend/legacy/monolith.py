@@ -11768,7 +11768,7 @@ def _build_reports_payload() -> Dict[str, Any]:
     total_withdrawn = _safe_num(performance.get("totalWithdrawn"))
     total_deposited = _safe_num(performance.get("totalDeposited"))
     total_gain_loss = _safe_num(performance.get("totalGainLoss"))
-    closed_raw = closed_trades_from_db(500) if "closed_trades_from_db" in globals() else (status.get("closedTrades") or [])
+    closed_raw = closed_trades_from_db(5000) if "closed_trades_from_db" in globals() else (status.get("closedTrades") or [])
     # Zero-quantity rows are not executable closed trades. Keep source records
     # untouched; exclude these artefacts from the Reports trade list only.
     closed = [row for row in closed_raw
@@ -11805,7 +11805,7 @@ def _build_reports_payload() -> Dict[str, Any]:
         "totalGainLoss": total_gain_loss, "earnedSinceDeposit": max(total_gain_loss, 0.0),
         "lostSinceDeposit": abs(min(total_gain_loss, 0.0)), "dayPnl": _safe_num(account.get("pnlDay")),
         "realisedNet": _safe_num(performance.get("lifetimeRealisedPnl", db.get("totalPnl"))),
-        "performanceEngine": performance, "closedTrades": closed[:200],
+        "performanceEngine": performance, "closedTrades": closed,
         "zeroQtyReportRowsExcluded": zero_qty_report_rows,
         "recentTradeExpectancy": trade_expectancy,
         "equityHistory": equity_history[-500:], "winRate": _safe_num(performance.get("winRate", db.get("winRate"))) * 100.0,
