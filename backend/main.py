@@ -67,3 +67,23 @@ from backend.v19_crypto_profit_sell_executor import install_worker as install_cr
 install_crypto_profit_sell_worker(
     app, _legacy.trading_client, _legacy.API_KEY, _legacy.API_SECRET, _legacy.SQLITE_DB_FILE
 )
+
+
+# XRP post-sale dynamic-dip eligibility. Read-only; NEVER submits buys.
+@app.get("/v19/xrp-repeat-cycle-preview")
+def xrp_repeat_cycle_preview(request: Request):
+    _legacy.verify_api_key(request)
+    import os
+    from alpaca.data.historical import CryptoHistoricalDataClient
+    from backend.v19_xrp_repeat_cycle_snapshot import xrp_cycle_preview
+    limit = os.getenv("TRADEBOT_XRP_REPEAT_SPEND_USD", "").strip()
+    if not limit:
+        return {"readOnly": True, "canEnter": False, "action": "HOLD",
+                "reason": "per-cycle USD spending limit not configured"}
+    data_client = CryptoHistoricalDataClient(_legacy.API_KEY, _legacy.API_SECRET)
+    return xrp_cycle_preview(
+        _legacy.trading_client, data_client,
+        spend_usd=limit,
+        pullback_pct=os.getenv("TRADEBOT_XRP_REPEAT_PULLBACK_PCT", "0.5"),
+        cooldown_minutes=30,
+    )
