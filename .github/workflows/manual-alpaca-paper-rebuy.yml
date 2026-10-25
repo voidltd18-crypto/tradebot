@@ -1,0 +1,51 @@
+name: Manual Alpaca Paper Rebuy Verification
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Default dry run; submit sends one $2 PAPER XRP order"
+        required: true
+        type: choice
+        default: dry-run
+        options:
+          - dry-run
+          - submit-paper-order
+      confirmation:
+        description: "For submit-paper-order only: type PAPER XRP $2"
+        required: false
+        type: string
+jobs:
+  paper-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PAPER_ALPACA_API_KEY: ${{ secrets.PAPER_ALPACA_API_KEY }}
+      PAPER_ALPACA_SECRET_KEY: ${{ secrets.PAPER_ALPACA_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require explicit PAPER-only credentials and confirmation
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+          CONFIRM: ${{ inputs.confirmation }}
+        run: |
+          if [ -z "$PAPER_ALPACA_API_KEY" ] || [ -z "$PAPER_ALPACA_SECRET_KEY" ]; then
+            echo "Missing dedicated Alpaca PAPER secrets. No order will be placed."
+            exit 1
+          fi
+          if [ "$TEST_MODE" = "submit-paper-order" ] && [ "$CONFIRM" != 'PAPER XRP $2' ]; then
+            echo "Exact PAPER XRP $2 confirmation required. No order will be placed."
+            exit 1
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install alpaca-py
+      - name: Run isolated Alpaca paper-account test
+        env:
+          TEST_MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$TEST_MODE" = "submit-paper-order" ]; then
+            python scripts/check_crypto_rebuy_paper.py --submit --symbol XRP/USD
+          else
+            python scripts/check_crypto_rebuy_paper.py --symbol XRP/USD
+          fi
