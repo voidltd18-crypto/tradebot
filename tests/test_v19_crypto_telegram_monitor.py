@@ -83,3 +83,26 @@ def test_confirmed_sell_only_after_monitor_activation(tmp_path):
                        now=datetime(2026, 10, 25, 10, 20, tzinfo=timezone.utc))
     assert len(messages) == 1
     assert "CONFIRMED CRYPTO SELL" in messages[0]
+
+
+def test_status_is_read_only_and_tracks_success(tmp_path):
+    from backend.v19_crypto_telegram_monitor import crypto_monitor_status
+    path = str(tmp_path / "status.db")
+    before = crypto_monitor_status(path)
+    assert before["lastSuccessfulPollAt"] is None
+    poll_crypto_alerts(Broker([sol("95")]), {}, path, sender=lambda *_args, **_kw: {"sent": True})
+    after = crypto_monitor_status(path)
+    assert after["lastSuccessfulPollAt"] is not None
+    assert after["nextExpectedPollAt"] is not None
+    assert after["lastPositionCount"] == 1
+    assert after["lastAlertSentAt"] is None
+
+
+def test_status_tracks_delivery_failure_and_retry(tmp_path):
+    from backend.v19_crypto_telegram_monitor import crypto_monitor_status
+    path = str(tmp_path / "status.db")
+    poll_crypto_alerts(Broker([sol("103")]), {}, path,
+                       sender=lambda *_args, **_kwargs: {"sent": False})
+    observed = crypto_monitor_status(path)
+    assert observed["lastDeliveryFailureAt"] is not None
+    assert observed["lastAlertSentAt"] is None
