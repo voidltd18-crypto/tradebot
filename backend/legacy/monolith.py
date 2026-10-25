@@ -10106,6 +10106,48 @@ def api_final_gate_monitor(request: Request):
     return _v174_final_gate_monitor_payload()
 
 
+@app.get("/v19/crypto-exit-diagnostics")
+def v19_crypto_exit_diagnostics(request: Request):
+    """Read-only evaluation of held Alpaca USD crypto, even on weekends."""
+    verify_api_key(request)
+    from backend.v19_crypto_exit_diagnostics import crypto_exit_diagnostic
+
+    # No scanner or stock-market-open guard. External inventory is never
+    # silently adopted into automated management.
+    rows = []
+    try:
+        positions = trading_client.get_all_positions()
+    except Exception as exc:
+        return {"status": "unavailable", "readOnly": True, "reason": str(exc), "positions": []}
+    for position in positions:
+        asset_class = str(getattr(position, "asset_class", "")).lower()
+        if "crypto" not in asset_class:
+            continue
+        try:
+            sym = str(position.symbol).upper()
+            quote_price = getattr(position, "current_price", None)
+            entry = getattr(position, "avg_entry_price", None)
+            qty = getattr(position, "qty", None)
+            # A durable, verified historical high is necessary for an accurate
+            # trail; current quote alone cannot establish trailing eligibility.
+            highest = (state.get(sym) or {}).get("highest_since_entry")
+            if highest is None:
+                rows.append({"symbol": sym, "status": "unverified", "action": "NO_ACTION",
+                             "reason": "confirmed high-water mark unavailable",
+                             "sellOrderSubmitted": False})
+                continue
+            rows.append(crypto_exit_diagnostic(
+                sym, qty, entry, quote_price, highest,
+                externally_purchased=True, manage_external=False,
+            ))
+        except Exception as exc:
+            rows.append({"symbol": str(getattr(position, "symbol", "")),
+                         "status": "unverified", "action": "NO_ACTION",
+                         "reason": str(exc), "sellOrderSubmitted": False})
+    return {"status": "ok", "readOnly": True, "mode": "DIAGNOSTIC_ONLY",
+            "positions": rows}
+
+
 @app.get("/swing-review")
 def get_swing_review():
     """Read-only five-session review. Never submits or changes an order."""
