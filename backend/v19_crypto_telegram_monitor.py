@@ -10,7 +10,7 @@ from pathlib import Path
 from backend.v19_telegram_crypto import send_telegram_crypto_alert
 from backend.v19_crypto_exit_diagnostics import crypto_exit_diagnostic
 
-INTERVAL = 900
+INTERVAL = 60  # One-minute read-only polling; trade execution remains disabled.
 _ENABLED = "TRADEBOT_TELEGRAM_CRYPTO_MONITOR_ENABLED"
 
 
