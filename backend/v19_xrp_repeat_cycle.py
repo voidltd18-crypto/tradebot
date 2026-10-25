@@ -1,9 +1,9 @@
-"""Conservative XRP dip/recovery cycle evaluator, no broker order submission.
+"""Read-only XRP repeat-cycle eligibility from a broker-confirmed filled sale.
 
-Entry and exit are independent; never infer that profit is guaranteed.
+No purchase orders. Never invent a reference price or allow pyramiding.
 """
-from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 
 def _positive(value):
@@ -14,37 +14,59 @@ def _positive(value):
         return None
 
 
-def assess_xrp_dip_entry(*, ask, ask_at, positions, open_order_symbols,
-                         available_cash, spend_usd, threshold="1.29",
-                         completed_exit=True, now=None):
-    """Read-only XRP entry check for an opt-in future execution loop.
+def assess_xrp_dip_entry(
+    *, ask, ask_at, positions, open_order_symbols, available_cash, spend_usd,
+    last_sale_price=None, last_sale_at=None, last_sale_filled=False,
+    pullback_pct="0.5", cooldown_minutes=30, max_sale_age_days=7, now=None,
+):
+    """Produce an entry signal only, never an order.
 
-    Requires a recent executable ask at/below the configured limit.
-    No pyramiding: an existing XRP position or pending XRP order blocks entry.
+    The reference MUST be Alpaca's most recent confirmed XRP filled SELL
+    (filled average price and fill time). A static $1.29 trigger is not used.
     """
-    blocked = {"action": "HOLD", "canEnter": False, "readOnly": True}
+    hold = {"action": "HOLD", "canEnter": False, "readOnly": True, "symbol": "XRP/USD"}
     now = now or datetime.now(timezone.utc)
-    price, available, amount, limit = (_positive(x) for x in
-                                       (ask, available_cash, spend_usd, threshold))
-    if any(x is None for x in (price, available, amount, limit)):
-        return {**blocked, "reason": "missing or invalid price, cash or settings"}
-    if ask_at is None or ask_at.tzinfo is None or ask_at.utcoffset() is None:
-        return {**blocked, "reason": "quote timestamp not verified"}
-    elapsed = (now - ask_at.astimezone(timezone.utc)).total_seconds()
-    if elapsed < 0 or elapsed > 30:
-        return {**blocked, "reason": "stale or future ask"}
-    if not completed_exit:
-        return {**blocked, "reason": "previous cycle sell not broker-confirmed"}
-    symbols = {str(s).upper().replace("/", "") for s in positions}
-    pending = {str(s).upper().replace("/", "") for s in open_order_symbols}
-    if "XRPUSD" in symbols:
-        return {**blocked, "reason": "XRP already held; no averaging down"}
+    if now.tzinfo is None or now.utcoffset() is None:
+        return {**hold, "reason": "current time must be timezone-aware"}
+    price, cash, spend, sold_at_price, pullback = (
+        _positive(x) for x in (ask, available_cash, spend_usd, last_sale_price, pullback_pct)
+    )
+    if not all(x is not None for x in (price, cash, spend, sold_at_price, pullback)):
+        return {**hold, "reason": "missing ask, verified sale, cash or configured spend"}
+    if not (Decimal("0.5") <= pullback <= Decimal("1.0")):
+        return {**hold, "reason": "pullback must be between 0.5% and 1%"}
+    if not isinstance(cooldown_minutes, int) or not 15 <= cooldown_minutes <= 1440:
+        return {**hold, "reason": "cooldown outside allowed range"}
+    if not isinstance(max_sale_age_days, int) or not 1 <= max_sale_age_days <= 30:
+        return {**hold, "reason": "sale age setting invalid"}
+    if not last_sale_filled:
+        return {**hold, "reason": "previous XRP sale not broker-confirmed as filled"}
+    for name, stamp in (("ask", ask_at), ("sale", last_sale_at)):
+        if not isinstance(stamp, datetime) or stamp.tzinfo is None or stamp.utcoffset() is None:
+            return {**hold, "reason": f"{name} timestamp not verified"}
+    quote_age = (now - ask_at.astimezone(timezone.utc)).total_seconds()
+    if not 0 <= quote_age <= 30:
+        return {**hold, "reason": "ask stale or future-dated"}
+    elapsed = now - last_sale_at.astimezone(timezone.utc)
+    if elapsed < timedelta(0) or elapsed > timedelta(days=max_sale_age_days):
+        return {**hold, "reason": "reference sale too old or future-dated"}
+    if elapsed < timedelta(minutes=cooldown_minutes):
+        return {**hold, "reason": "waiting for post-sale cooldown"}
+    held = {str(symbol).upper().replace("/", "") for symbol in positions}
+    pending = {str(symbol).upper().replace("/", "") for symbol in open_order_symbols}
+    if "XRPUSD" in held:
+        return {**hold, "reason": "XRP already held; no averaging down"}
     if "XRPUSD" in pending:
-        return {**blocked, "reason": "XRP order already open"}
-    if amount < Decimal("1") or available < amount:
-        return {**blocked, "reason": "insufficient verified USD cash or order below $1"}
+        return {**hold, "reason": "XRP broker order already open"}
+    if spend < Decimal("1") or spend > cash:
+        return {**hold, "reason": "insufficient verified cash or invalid per-cycle spend"}
+    # The broker must independently confirm the limit and available cash at submission.
+    limit = (sold_at_price * (Decimal("1") - pullback / 100))
+    limit = limit.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
     if price > limit:
-        return {**blocked, "reason": "ask is above dip threshold"}
-    return {**blocked, "action": "ENTRY_CANDIDATE", "canEnter": True,
-            "symbol": "XRP/USD", "limitPrice": str(limit),
-            "spendUsd": str(amount), "reason": "fresh XRP ask at or below threshold; confirmation required"}
+        return {**hold, "reason": "ask has not pulled back enough",
+                "targetAskAtMost": str(limit)}
+    return {**hold, "action": "ENTRY_CANDIDATE", "canEnter": True,
+            "referenceSalePrice": str(sold_at_price),
+            "targetAskAtMost": str(limit), "spendUsd": str(spend),
+            "pullbackPct": str(pullback), "reason": "confirmed sale followed by qualifying dip; no buy placed"}
