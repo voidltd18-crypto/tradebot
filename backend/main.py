@@ -48,5 +48,6 @@ def reports_crypto_buy_again(request: Request, payload: dict = Body(...)):
         confirmation=payload.get("confirmation"), allowed_ids=allowed,
         request_id=payload.get("requestId"), db_path=_legacy.SQLITE_DB_FILE,
         enabled=True,
+        is_paper=_legacy.PAPER,
         allow_live=__import__("os").environ.get("TRADEBOT_REPORTS_CRYPTO_REBUY_LIVE_ENABLED", "").lower() == "true",
     )
