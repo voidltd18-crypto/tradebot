@@ -18,7 +18,7 @@ class FakeBroker:
         return SimpleNamespace(asset_class="crypto", tradable=True)
 
     def get_account(self):
-        return SimpleNamespace(non_marginable_buying_power=self.cash)
+        return SimpleNamespace(cash=self.cash, non_marginable_buying_power=self.cash)
 
     def get_orders(self, filter):
         return []
