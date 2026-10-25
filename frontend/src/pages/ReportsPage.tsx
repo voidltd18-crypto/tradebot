@@ -51,7 +51,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const [rebuyConfirmation, setRebuyConfirmation] = useState("");
   const [rebuyPending, setRebuyPending] = useState(false);
   const [rebuyMessage, setRebuyMessage] = useState("");
-  const cryptoPair = (symbol: string) => /^[A-Z0-9]{2,20}\\/USD$/.test(symbol.toUpperCase());
+  const cryptoPair = (symbol: string) => /^[A-Z0-9]{2,20}\/USD$/.test(symbol.toUpperCase());
   async function submitRebuy() {
     if (!rebuySymbol || rebuyPending || rebuyConfirmation !== `BUY ${rebuySymbol}`) return;
     setRebuyPending(true);
