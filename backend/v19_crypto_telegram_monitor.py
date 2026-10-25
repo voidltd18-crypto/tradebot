@@ -93,8 +93,12 @@ def poll_crypto_alerts(client, state, db_path, *, sender=send_telegram_crypto_al
             if filled_at is None or filled_at < started_at:
                 continue
             symbol = str(getattr(order, "symbol", "")).upper()
-            # Require broker asset class proof, not merely suffix naming.
-            if "crypto" not in str(getattr(order, "asset_class", "")).lower():
+            # Confirm asset classification with broker; orders may lack asset_class.
+            try:
+                asset = client.get_asset(symbol)
+            except Exception:
+                continue
+            if "crypto" not in str(getattr(asset, "asset_class", "")).lower():
                 continue
             oid = str(getattr(order, "id", ""))
             if not oid:
