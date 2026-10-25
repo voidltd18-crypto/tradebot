@@ -5,10 +5,13 @@ on:
       - 'backend/v19_crypto_exit_diagnostics.py'
       - 'backend/v19_crypto_sms.py'
       - 'backend/v19_telegram_crypto.py'
+      - 'backend/v19_crypto_telegram_monitor.py'
+      - 'backend/main.py'
       - 'backend/legacy/monolith.py'
       - 'tests/test_v19_crypto_exit_diagnostics.py'
       - 'tests/test_v19_crypto_sms.py'
       - 'tests/test_v19_telegram_crypto.py'
+      - 'tests/test_v19_crypto_telegram_monitor.py'
       - '.github/workflows/v19-crypto-diagnostics.yml'
   workflow_dispatch:
 jobs:
@@ -19,6 +22,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: python -m pip install pytest
-      - run: python -m pytest -q tests/test_v19_crypto_exit_diagnostics.py tests/test_v19_crypto_sms.py tests/test_v19_telegram_crypto.py
-      - run: python -m py_compile backend/v19_crypto_exit_diagnostics.py backend/v19_crypto_sms.py backend/v19_telegram_crypto.py backend/legacy/monolith.py
+      - run: python -m pip install pytest alpaca-py
+      - run: python -m pytest -q tests/test_v19_crypto_exit_diagnostics.py tests/test_v19_crypto_sms.py tests/test_v19_telegram_crypto.py tests/test_v19_crypto_telegram_monitor.py
+      - run: python -m py_compile backend/v19_crypto_exit_diagnostics.py backend/v19_crypto_sms.py backend/v19_telegram_crypto.py backend/v19_crypto_telegram_monitor.py backend/main.py backend/legacy/monolith.py
