@@ -8,7 +8,7 @@ import re
 import sqlite3
 import threading
 import uuid
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 
 _REBUY_LOCK = threading.Lock()
 _SYMBOL = re.compile(r"^[A-Z0-9]{2,20}/USD$")
@@ -24,11 +24,42 @@ def parse_request(symbol, amount, confirmation):
         spend = Decimal(str(amount))
     except (InvalidOperation, TypeError, ValueError):
         raise ValueError("Invalid USD spend") from None
-    if not spend.is_finite() or not (Decimal("1") <= spend <= Decimal("250")):
-        raise ValueError("USD spend must be between $1 and $250")
+    if not spend.is_finite() or spend < Decimal("1"):
+        raise ValueError("USD spend must be at least $1")
     if spend != spend.quantize(Decimal("0.01")):
         raise ValueError("Use dollars and cents, max two decimal places")
     return sym, spend
+
+
+def available_crypto_cash(account):
+    """Conservative cash available to buy non-marginable cryptocurrency.
+
+    Never treat equity, portfolio value, stock margin or vault totals as cash.
+    If a broker field is missing/invalid, fail closed instead of guessing.
+    """
+    values = []
+    for field in ("cash", "non_marginable_buying_power"):
+        try:
+            raw = getattr(account, field, None)
+            value = Decimal(str(raw))
+            if not value.is_finite():
+                raise ValueError(field)
+            values.append(max(Decimal("0"), value))
+        except (InvalidOperation, TypeError, ValueError):
+            return Decimal("0")
+    return min(values).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
+
+
+def crypto_rebuy_preview(client):
+    """Read-only account cash preview; never attempts to submit an order."""
+    try:
+        available = available_crypto_cash(client.get_account())
+        return {"ok": True, "availableUsd": str(available),
+                "minOrderUsd": "1.00", "canBuy": available >= Decimal("1.00"),
+                "source": "minimum of Alpaca cash and non-marginable buying power"}
+    except Exception:
+        return {"ok": False, "availableUsd": None, "canBuy": False,
+                "message": "Alpaca available cash could not be verified"}
 
 
 def _request_id(value):
@@ -89,12 +120,9 @@ def rebuy_order(client, *, symbol, amount, confirmation, allowed_ids,
         if "crypto" not in str(getattr(asset, "asset_class", "")).lower() or not getattr(asset, "tradable", False):
             return {**result, "message": "Broker has not verified this coin as tradable"}
         account = client.get_account()
-        try:
-            available = Decimal(str(getattr(account, "non_marginable_buying_power", "0") or "0"))
-        except (InvalidOperation, ValueError, TypeError):
-            available = Decimal("-1")
-        if not available.is_finite() or available < spend:
-            return {**result, "message": "Insufficient verified non-marginable buying power"}
+        available = available_crypto_cash(account)
+        if available < spend:
+            return {**result, "message": f"Insufficient spendable cash: Alpaca permits up to ${available} for this rebuy"}
         # Never buy while an existing broker order for this coin remains open.
         # Read failures block the buy rather than assuming no pending orders.
         from alpaca.trading.requests import GetOrdersRequest
