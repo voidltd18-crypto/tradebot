@@ -11,7 +11,7 @@ def test_paper_smoke_never_uses_live_credentials_or_live_api():
     assert 'TRADEBOT_ALPACA' not in source
     assert 'paper=False' not in source
     assert '--submit' in source
-    assert any(isinstance(n, ast.FunctionDef) and n.name == "main" for n in tree)
+    assert any(isinstance(n, ast.FunctionDef) and n.name == "main" for n in tree.body)
 
 
 def test_missing_paper_credentials_never_submits(monkeypatch):
