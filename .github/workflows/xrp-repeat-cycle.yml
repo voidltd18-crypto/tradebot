@@ -11,6 +11,7 @@ on:
       - 'tests/test_xrp_cycle_executor.py'
       - 'tests/test_crypto_xrp_full_roundtrip_simulation.py'
       - 'tests/test_xrp_cycle_sale_provenance.py'
+      - 'tests/test_xrp_cycle_pause_guard.py'
       - '.github/workflows/xrp-repeat-cycle.yml'
 jobs:
   verify:
@@ -21,5 +22,5 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install pytest
-      - run: python -m pytest -q tests/test_xrp_repeat_cycle.py tests/test_xrp_repeat_cycle_snapshot.py tests/test_xrp_cycle_executor.py tests/test_crypto_xrp_full_roundtrip_simulation.py tests/test_xrp_cycle_sale_provenance.py
+      - run: python -m pytest -q tests/test_xrp_repeat_cycle.py tests/test_xrp_repeat_cycle_snapshot.py tests/test_xrp_cycle_executor.py tests/test_crypto_xrp_full_roundtrip_simulation.py tests/test_xrp_cycle_sale_provenance.py tests/test_xrp_cycle_pause_guard.py
       - run: python -m py_compile backend/v19_xrp_repeat_cycle.py backend/v19_xrp_repeat_cycle_snapshot.py backend/v19_xrp_cycle_executor.py backend/main.py
