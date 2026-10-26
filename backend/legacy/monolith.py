@@ -4418,6 +4418,9 @@ def pick_money_mode_stocks(
         from backend.v19_stock_account_gate_audit import account_block_summary
         account_audit = account_block_summary(account_gate_blocks)
         print(f"V19 STOCK ACCOUNT GATE AUDIT | scanned={len(scans)} blocked={account_audit['total']} categories={account_audit['summary']} trading_unchanged=true", flush=True)
+        from backend.v19_stock_account_gate_audit import locked_symbol_names
+        lock_names = locked_symbol_names(account_gate_blocks)
+        print(f"V19 STOCK DAILY LOCK SYMBOLS | count={len(lock_names)} tickers={','.join(lock_names) or 'none'} trading_unchanged=true", flush=True)
     return candidates
 
 

@@ -24,3 +24,8 @@ def account_block_summary(blocks):
     counts = Counter(account_block_category(reason) for _, reason in blocks)
     parts = [f"{name}:{counts[name]}" for name in sorted(counts)]
     return {"total": len(blocks), "reasons": dict(counts), "summary": ",".join(parts) or "none"}
+
+
+def locked_symbol_names(blocks):
+    """Read-only list of tickers rejected by the existing daily lock."""
+    return sorted({str(symbol).upper() for symbol, reason in blocks if account_block_category(reason) == 'daily_lock' and str(symbol).isascii() and str(symbol).replace('.', '').isalnum() and len(str(symbol)) <= 12})
