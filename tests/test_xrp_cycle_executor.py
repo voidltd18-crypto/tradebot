@@ -46,7 +46,7 @@ class Broker:
     def get_orders(self, filter):
         if filter.kwargs["status"] == "open":
             return self.open_orders
-        return [SimpleNamespace(id="confirmed-sell-1", symbol="XRPUSD",
+        return [SimpleNamespace(id="confirmed-sell-1", client_order_id="tbprofit-confirmed-1", symbol="XRPUSD",
                                 side="sell", status="filled",
                                 filled_at=self.last, filled_avg_price="1.32")]
     def get_account(self):
