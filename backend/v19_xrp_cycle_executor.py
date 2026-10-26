@@ -46,10 +46,12 @@ def _is_confirmed_tradebot_profit_sale(order):
 
 
 def cycle_once(client, data_client, db_path, *, configured_spend=None,
-               pullback_pct="0.5", enabled=False, now=None):
+               pullback_pct="0.5", enabled=False, now=None, trading_allowed=True):
     """At most one limit BUY attempt for each verified XRP sale fill."""
     if not enabled or configured_spend is None:
         return {"status": "disabled", "orderSubmitted": False}
+    if not trading_allowed:
+        return {"status": "paused or manual override active", "orderSubmitted": False}
     if not _LOCK.acquire(blocking=False):
         return {"status": "busy", "orderSubmitted": False}
     try:
@@ -130,12 +132,18 @@ def install_cycle_worker(app, client, api_key, api_secret, db_path):
             return
         from alpaca.data.historical import CryptoHistoricalDataClient
         data = CryptoHistoricalDataClient(api_key, api_secret)
+        from backend.legacy import monolith as legacy
         def poll():
             while True:
                 try:
+                    allowed = (
+                        bool(getattr(legacy, "bot_enabled", False))
+                        and not bool(getattr(legacy, "emergency_stop", True))
+                        and not bool(getattr(legacy, "manual_override", True))
+                    )
                     result = cycle_once(client, data, db_path, configured_spend=configured,
                                         pullback_pct=os.getenv("TRADEBOT_XRP_REPEAT_PULLBACK_PCT", "0.5"),
-                                        enabled=True)
+                                        enabled=True, trading_allowed=allowed)
                     if result["orderSubmitted"]:
                         print("XRP CYCLE | guarded limit buy submitted")
                 except Exception as exc:
