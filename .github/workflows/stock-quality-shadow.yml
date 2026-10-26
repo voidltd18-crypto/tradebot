@@ -1,0 +1,24 @@
+name: Stock Quality Shadow Diagnostics
+on:
+  pull_request:
+    paths:
+      - 'backend/legacy/monolith.py'
+      - '.github/workflows/stock-quality-shadow.yml'
+jobs:
+  static-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m py_compile backend/legacy/monolith.py
+      - name: Verify shadow-only logging and unchanged live veto
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          src = Path("backend/legacy/monolith.py").read_text()
+          assert 'if not manual and (not math.isfinite(quality) or quality < V16_AUTO_MIN_ENTRY_QUALITY):' in src
+          assert 'V16 QUALITY SHADOW |' in src
+          assert 'shadow_floors = (0.026, 0.03, 0.05, 0.07)' in src
+          PY
