@@ -24,3 +24,22 @@ def account_block_summary(blocks):
     counts = Counter(account_block_category(reason) for _, reason in blocks)
     parts = [f"{name}:{counts[name]}" for name in sorted(counts)]
     return {"total": len(blocks), "reasons": dict(counts), "summary": ",".join(parts) or "none"}
+
+
+def account_block_detail(blocks, *, max_symbols=24):
+    """Safe diagnostics: bounded tickers and category, never raw broker messages."""
+    import re
+    output = []
+    seen = set()
+    for symbol, reason in blocks:
+        sym = str(symbol or "").upper().strip()
+        if not re.fullmatch(r"[A-Z][A-Z0-9.-]{0,9}", sym):
+            continue
+        category = account_block_category(reason)
+        key = (sym, category)
+        if key not in seen:
+            seen.add(key)
+            output.append(f"{sym}:{category}")
+        if len(output) >= max_symbols:
+            break
+    return ",".join(output) or "none"
