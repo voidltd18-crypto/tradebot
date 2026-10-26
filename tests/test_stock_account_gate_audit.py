@@ -25,3 +25,25 @@ def test_summary_never_emits_raw_reasons_or_changes_inputs():
                                  "other_account_block": 1}
     assert "secret" not in result["summary"]
     assert original == copy
+
+
+from backend.v19_stock_account_gate_audit import account_block_details
+
+
+def test_details_show_symbols_and_safe_categories_only():
+    blocks = [
+        ("KO", "KO existing open order"),
+        ("MARA", "MARA locked until tomorrow (MARA daily entries 1/1)"),
+        ("WULF", "secret broker failure token=private"),
+        ("bad symbol / text", "already holding"),
+    ]
+    unchanged = list(blocks)
+    details = account_block_details(blocks)
+    assert details == [
+        {"symbol": "KO", "category": "open_order"},
+        {"symbol": "MARA", "category": "mara_daily_limit"},
+        {"symbol": "WULF", "category": "other_account_block"},
+        {"symbol": "UNKNOWN", "category": "already_holding"},
+    ]
+    assert "private" not in repr(details)
+    assert blocks == unchanged

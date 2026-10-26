@@ -29,3 +29,19 @@ def account_block_summary(blocks):
 def locked_symbol_names(blocks):
     """Read-only list of tickers rejected by the existing daily lock."""
     return sorted({str(symbol).upper() for symbol, reason in blocks if account_block_category(reason) == 'daily_lock' and str(symbol).isascii() and str(symbol).replace('.', '').isalnum() and len(str(symbol)) <= 12})
+
+
+def account_block_details(blocks):
+    """Safe, read-only per-symbol view for diagnostics (no broker message leakage).
+
+    Rows contain only ticker symbols and known reason categories. Do not use
+    this display-only data to make trading or eligibility decisions.
+    """
+    rows = []
+    for symbol, reason in blocks:
+        ticker = str(symbol or "").strip().upper()
+        if not (ticker.isascii() and 1 <= len(ticker) <= 12
+                and ticker.replace(".", "").isalnum()):
+            ticker = "UNKNOWN"
+        rows.append({"symbol": ticker, "category": account_block_category(reason)})
+    return rows
