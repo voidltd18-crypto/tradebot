@@ -32,6 +32,19 @@ def _mark(db_path, sale_id, status):
         db.execute("UPDATE v19_xrp_cycle_orders SET status=? WHERE sale_id=?", (status, sale_id))
 
 
+def _is_confirmed_tradebot_profit_sale(order):
+    """Only a filled sell from this bot's approved profit seller can arm XRP."""
+    return (
+        _sym(getattr(order, "symbol", "")) == "XRPUSD"
+        and str(getattr(order, "side", "")).lower().split(".")[-1] == "sell"
+        and str(getattr(order, "status", "")).lower().split(".")[-1] == "filled"
+        and str(getattr(order, "client_order_id", "")).startswith("tbprofit-")
+        and getattr(order, "filled_at", None) is not None
+        and getattr(order, "filled_avg_price", None) is not None
+        and getattr(order, "id", None) is not None
+    )
+
+
 def cycle_once(client, data_client, db_path, *, configured_spend=None,
                pullback_pct="0.5", enabled=False, now=None):
     """At most one limit BUY attempt for each verified XRP sale fill."""
@@ -46,17 +59,9 @@ def cycle_once(client, data_client, db_path, *, configured_spend=None,
         positions = client.get_all_positions()
         pending = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
         history = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500))
-        candidates = [
-            o for o in history
-            if _sym(getattr(o, "symbol", "")) == "XRPUSD"
-            and str(getattr(o, "side", "")).lower().split(".")[-1] == "sell"
-            and str(getattr(o, "status", "")).lower().split(".")[-1] == "filled"
-            and getattr(o, "filled_at", None) is not None
-            and getattr(o, "filled_avg_price", None) is not None
-            and getattr(o, "id", None) is not None
-        ]
+        candidates = [o for o in history if _is_confirmed_tradebot_profit_sale(o)]
         if not candidates:
-            return {"status": "no verified XRP sale", "orderSubmitted": False}
+            return {"status": "no confirmed TradeBot XRP profit-sale fill", "orderSubmitted": False}
         latest = max(candidates, key=lambda order: order.filled_at)
         account = client.get_account()
         cash = available_crypto_cash(account)
