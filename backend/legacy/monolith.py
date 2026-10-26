@@ -5265,6 +5265,10 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         passing = sum(q >= V16_AUTO_MIN_ENTRY_QUALITY for q in valid_quality)
         median = valid_quality[len(valid_quality) // 2] if valid_quality else 0.0
         print(f"V16 QUALITY CALIBRATION | gate_passed={len(picks)} valid={len(valid_quality)} below_003={lower} mid_range={middle} above_floor={passing} median={median:.4f} max={max(valid_quality, default=0.0):.4f} floor={V16_AUTO_MIN_ENTRY_QUALITY:.4f}", flush=True)
+        # Counterfactual only: never used for order decisions or entry sizing.
+        shadow_floors = (0.026, 0.03, 0.05, 0.07)
+        shadow_counts = " ".join(f"floor_{floor:.3f}={sum(q >= floor for q in valid_quality)}" for floor in shadow_floors)
+        print(f"V16 QUALITY SHADOW | candidates={len(valid_quality)} {shadow_counts} active_floor={V16_AUTO_MIN_ENTRY_QUALITY:.4f} trading_unchanged=true", flush=True)
 
     for scan_index, scan in enumerate(picks):
         symbol = str(scan.get("symbol") or "").upper().strip()
