@@ -4345,6 +4345,7 @@ def pick_money_mode_stocks(
     pipeline without creating duplicate learning rows or noisy rejection logs.
     """
     gate_counts = {}
+    account_gate_blocks = []  # diagnostics only, no effect on buy decisions
 
     def persist(scan, decision, stage, reason, profile=None):
         # Count each candidate at the actual gate that accepted/rejected it.
@@ -4359,6 +4360,7 @@ def pick_money_mode_stocks(
         symbol = scan["symbol"]
         can_buy, reason = can_buy_symbol(symbol)
         if not can_buy:
+            account_gate_blocks.append((symbol, reason))
             persist(scan, "REJECTED", "account_gate", reason)
             continue
         if PDT_AWARE_MODE_ENABLED and today_buy_count() >= MAX_NEW_BUYS_PER_DAY_PDT_AWARE:
@@ -4413,6 +4415,9 @@ def pick_money_mode_stocks(
     if log_rejections:
         breakdown = ",".join(f"{key}:{value}" for key, value in sorted(gate_counts.items())) or "none"
         print(f"V17 ENTRY GATE BREAKDOWN | scanned={len(scans)} {breakdown}", flush=True)
+        from backend.v19_stock_account_gate_audit import account_block_summary
+        account_audit = account_block_summary(account_gate_blocks)
+        print(f"V19 STOCK ACCOUNT GATE AUDIT | scanned={len(scans)} blocked={account_audit['total']} categories={account_audit['summary']} trading_unchanged=true", flush=True)
     return candidates
 
 
