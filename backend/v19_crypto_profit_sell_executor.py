@@ -131,10 +131,16 @@ def poll_profit_sells(client, data_client, db_path, *, now=None, enabled=False,
         _MUTEX.release()
 
 
+def _heartbeat_path(db_path):
+    """Separate worker observability from the heavily written trading database."""
+    return str(Path(db_path).with_name("v19_crypto_sell_health.sqlite"))
+
+
 def _record_poll(db_path, result=None, error=None):
     """Write a non-sensitive worker heartbeat. Does not change trading."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(db_path, timeout=15) as conn:
+    with sqlite3.connect(_heartbeat_path(db_path), timeout=5) as conn:
+        conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("""CREATE TABLE IF NOT EXISTS v19_crypto_profit_sell_health (
             worker TEXT PRIMARY KEY, polled_at TEXT NOT NULL, outcome TEXT NOT NULL,
             submitted_count INTEGER NOT NULL, blocked_count INTEGER NOT NULL,
@@ -163,7 +169,7 @@ def worker_health(db_path):
     output = {"enabled": configured and approved, "configuredEnabled": configured,
               "liveApproved": approved, "lastPoll": None}
     try:
-        with sqlite3.connect(db_path, timeout=5) as conn:
+        with sqlite3.connect(_heartbeat_path(db_path), timeout=5) as conn:
             row = conn.execute("""SELECT polled_at,outcome,submitted_count,blocked_count,detail
                 FROM v19_crypto_profit_sell_health WHERE worker='sell'""").fetchone()
             if row:
@@ -200,8 +206,9 @@ def install_worker(app, trading_client, api_key, api_secret, db_path):
                         cost_buffer_pct=os.getenv("TRADEBOT_CRYPTO_PROFIT_SELL_COST_BUFFER_PCT", "1.0"))
                     try:
                         _record_poll(db_path, result=outcome)
-                    except sqlite3.Error:
-                        print("CRYPTO PROFIT SELL | heartbeat storage unavailable")
+                    except sqlite3.Error as storage_error:
+                        print("CRYPTO PROFIT SELL | heartbeat storage unavailable:", type(storage_error).__name__, str(storage_error)[:100])
+                    print("CRYPTO PROFIT SELL | poll completed | submitted=%d blocked=%d" % (len(outcome["submitted"]), len(outcome["blocked"])))
                     if outcome["submitted"]:
                         print("CRYPTO PROFIT SELL | submitted limit order for", ",".join(outcome["submitted"]))
                 except Exception as e:
