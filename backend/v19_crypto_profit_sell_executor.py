@@ -66,6 +66,26 @@ def _submitted(db_path, key):
         conn.execute("UPDATE v19_crypto_auto_sell_attempts SET status='submitted' WHERE position_key=?", (key,))
 
 
+def _fresh_quote_or_retry(data_client, pair, *, requested_at=None):
+    """Retry a stale quote exactly once, never accepting it as fresh without proof."""
+    from alpaca.data.requests import CryptoLatestQuoteRequest
+    from datetime import datetime, timezone
+    request = CryptoLatestQuoteRequest(symbol_or_symbols=pair)
+    for attempt in range(2):
+        quotes = data_client.get_crypto_latest_quote(request)
+        quote = quotes.get(pair) if isinstance(quotes, dict) else None
+        timestamp = getattr(quote, "timestamp", None)
+        bid = _positive(getattr(quote, "bid_price", None))
+        now = requested_at or datetime.now(timezone.utc)
+        if (bid is not None and isinstance(timestamp, datetime)
+                and timestamp.tzinfo is not None and timestamp.utcoffset() is not None
+                and 0 <= (now - timestamp.astimezone(timezone.utc)).total_seconds() <= 30):
+            return bid, timestamp
+        if attempt == 0:
+            time.sleep(0.25)
+    return None, None
+
+
 def poll_profit_sells(client, data_client, db_path, *, now=None, enabled=False,
                       allowed_symbols=(), min_gain_pct="2", cost_buffer_pct="1"):
     """One broker pass; caller must explicitly opt into symbols and live mode."""
@@ -77,7 +97,6 @@ def poll_profit_sells(client, data_client, db_path, *, now=None, enabled=False,
     try:
         from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
         from alpaca.trading.enums import QueryOrderStatus, OrderSide, TimeInForce
-        from alpaca.data.requests import CryptoLatestQuoteRequest
 
         # A failed broker inventory lookup stops the whole polling cycle.
         positions = client.get_all_positions()
@@ -99,10 +118,7 @@ def poll_profit_sells(client, data_client, db_path, *, now=None, enabled=False,
                 result["blocked"].append((symbol, "invalid broker position"))
                 continue
             pair = symbol[:-3] + "/USD"
-            quotes = data_client.get_crypto_latest_quote(CryptoLatestQuoteRequest(symbol_or_symbols=pair))
-            quote = quotes.get(pair) if isinstance(quotes, dict) else None
-            bid = getattr(quote, "bid_price", None)
-            stamp = getattr(quote, "timestamp", None)
+            bid, stamp = _fresh_quote_or_retry(data_client, pair, requested_at=now)
             outcome = decide_limit_sell(entry=entry, qty=qty, bid=bid, quoted_at=stamp,
                                         now=now, min_gain_pct=min_gain_pct,
                                         cost_buffer_pct=cost_buffer_pct)
