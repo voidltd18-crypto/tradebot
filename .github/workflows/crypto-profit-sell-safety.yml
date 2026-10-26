@@ -8,6 +8,7 @@ on:
       - "tests/test_crypto_profit_sell_broker_sim.py"
       - "tests/test_crypto_profit_sell_health.py"
       - "tests/test_crypto_sell_heartbeat_isolated.py"
+      - "tests/test_crypto_sell_reasons_audit.py"
       - ".github/workflows/crypto-profit-sell-safety.yml"
 jobs:
   tests:
@@ -18,5 +19,5 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install pytest
-      - run: python -m pytest -q tests/test_crypto_profit_sell_executor.py tests/test_crypto_profit_sell_broker_sim.py tests/test_crypto_profit_sell_health.py tests/test_crypto_sell_heartbeat_isolated.py
+      - run: python -m pytest -q tests/test_crypto_profit_sell_executor.py tests/test_crypto_profit_sell_broker_sim.py tests/test_crypto_profit_sell_health.py tests/test_crypto_sell_heartbeat_isolated.py tests/test_crypto_sell_reasons_audit.py
       - run: python -m py_compile backend/v19_crypto_profit_sell_executor.py backend/main.py
