@@ -131,6 +131,37 @@ def poll_profit_sells(client, data_client, db_path, *, now=None, enabled=False,
         _MUTEX.release()
 
 
+def _summarize_blocked(result):
+    """Safe, finite log summary without broker/account data."""
+    allowed_symbols = {"BTCUSD", "XRPUSD"}
+    known = {
+        "open broker order", "invalid broker position",
+        "previous sell attempt exists", "broker submission failed/unknown; reserved",
+        "live bid below target", "bid stale or future-dated",
+        "trailing profit not activated", "bid freshness unverified or stale",
+    }
+    entries = []
+    for symbol, reason in (result or {}).get("blocked", []):
+        normalized = str(symbol).upper().replace("/", "")
+        if normalized not in allowed_symbols:
+            continue
+        label = str(reason)
+        entries.append(f"{normalized}={label if label in known else 'not eligible'}")
+    return "; ".join(sorted(set(entries)))[:240] or "none"
+
+
+def _audit_broker_profit_orders(client):
+    """Independent read-only broker check; do not affect sell decisions."""
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
+    orders = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=100))
+    accepted = [order for order in orders
+                if str(getattr(order, "client_order_id", "")).startswith("tbprofit-")]
+    filled = [o for o in accepted
+              if str(getattr(o, "status", "")).lower().split(".")[-1] == "filled"]
+    return {"recentTradeBotClosed": len(accepted), "filled": len(filled)}
+
+
 def _heartbeat_path(db_path):
     """Separate worker observability from the heavily written trading database."""
     return str(Path(db_path).with_name("v19_crypto_sell_health.sqlite"))
@@ -209,6 +240,12 @@ def install_worker(app, trading_client, api_key, api_secret, db_path):
                     except sqlite3.Error as storage_error:
                         print("CRYPTO PROFIT SELL | heartbeat storage unavailable:", type(storage_error).__name__, str(storage_error)[:100])
                     print("CRYPTO PROFIT SELL | poll completed | submitted=%d blocked=%d" % (len(outcome["submitted"]), len(outcome["blocked"])))
+                    print("CRYPTO PROFIT SELL | blocked reasons |", _summarize_blocked(outcome))
+                    try:
+                        audit = _audit_broker_profit_orders(trading_client)
+                        print("CRYPTO PROFIT SELL | broker closed audit | recent=%d filled=%d" % (audit["recentTradeBotClosed"], audit["filled"]))
+                    except Exception as broker_error:
+                        print("CRYPTO PROFIT SELL | broker closed audit unavailable:", type(broker_error).__name__)
                     if outcome["submitted"]:
                         print("CRYPTO PROFIT SELL | submitted limit order for", ",".join(outcome["submitted"]))
                 except Exception as e:
