@@ -32,3 +32,16 @@ def test_manual_sell_has_broker_asset_type_split():
     fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "market_sell_qty")
     code = ast.get_source_segment(source, fn)
     assert "TimeInForce.GTC if _manual_sell_is_crypto(symbol) else TimeInForce.DAY" in code
+
+
+def test_worker_is_opt_in_and_coin_scoped():
+    import ast
+    from pathlib import Path
+    source = Path("backend/v19_universal_crypto_cycle_executor.py").read_text()
+    ast.parse(source)
+    assert "TRADEBOT_UNIVERSAL_CRYPTO_CYCLE_LIVE_APPROVED" in source
+    assert "TRADEBOT_UNIVERSAL_CRYPTO_CYCLE_SYMBOLS" in source
+    assert "symbol=sym" in source
+    assert 'approved.discard("XRPUSD")' in source
+    assert 'str(getattr(order, "client_order_id", "")).startswith("tbprofit-")' in source
+    assert "TimeInForce.GTC" in source
