@@ -2102,6 +2102,15 @@ def register_pending_sell_order(order_id: str, symbol: str, qty: float, reason: 
         return False
 
 
+def _manual_sell_is_crypto(symbol: str) -> bool:
+    """Verify crypto asset class using Alpaca, without guessing from ticker."""
+    try:
+        asset = trading_client.get_asset(symbol)
+        return "crypto" in str(getattr(asset, "asset_class", "")).lower()
+    except Exception:
+        raise ValueError("Unable to verify asset type for sell order")
+
+
 def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 0.0, reason="AUTO SELL"):
     rounded_qty = floor_qty(qty, 6)
     if rounded_qty <= 0:
@@ -2110,7 +2119,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     submitted_order = None
 
     def submit(q):
-        order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=TimeInForce.DAY)
+        order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=(TimeInForce.GTC if _manual_sell_is_crypto(symbol) else TimeInForce.DAY))
         return trading_client.submit_order(order)
 
     try:
