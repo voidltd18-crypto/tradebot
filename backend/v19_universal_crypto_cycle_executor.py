@@ -61,8 +61,18 @@ def cycle_once(client, data_client, db_path, *, symbol, configured_spend=None,
         from alpaca.trading.requests import GetOrdersRequest, LimitOrderRequest
         from alpaca.trading.enums import QueryOrderStatus, OrderSide, TimeInForce
         from alpaca.data.requests import CryptoLatestQuoteRequest
+        # A shared crypto account must not pyramid into other pairs by default.
+        # This guard deliberately checks all broker crypto positions and open BUY orders.
         positions = client.get_all_positions()
+        if any("crypto" in str(getattr(p, "asset_class", "")).lower()
+               and _sym(getattr(p, "symbol", "")) != symbol
+               for p in positions):
+            return {"status": "another crypto position already held", "orderSubmitted": False}
         pending = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
+        if any(str(getattr(o, "side", "")).lower().split(".")[-1] == "buy"
+               and _sym(getattr(o, "symbol", "")) != symbol
+               and _sym(getattr(o, "symbol", "")).endswith("USD") for o in pending):
+            return {"status": "another crypto buy order pending", "orderSubmitted": False}
         history = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500))
         candidates = [o for o in history if _is_confirmed_tradebot_profit_sale(o, symbol)]
         if not candidates:
