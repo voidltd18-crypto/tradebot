@@ -99,3 +99,11 @@ from backend.v19_crypto_profit_sell_executor import worker_health as crypto_prof
 def crypto_profit_sell_health_endpoint(request: Request):
     _legacy.verify_api_key(request)
     return crypto_profit_sell_health(_legacy.SQLITE_DB_FILE)
+
+
+# Universal crypto repeat-cycle worker (disabled unless separately approved).
+# First entry remains manual; verified profitable sells can arm per-symbol dip re-buys.
+from backend.v19_universal_crypto_cycle_executor import install_universal_cycle_worker
+install_universal_cycle_worker(
+    app, _legacy.trading_client, _legacy.API_KEY, _legacy.API_SECRET, _legacy.SQLITE_DB_FILE
+)
