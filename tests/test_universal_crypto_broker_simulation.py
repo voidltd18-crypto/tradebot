@@ -36,6 +36,7 @@ def test_profit_sell_then_dip_rebuy_once(monkeypatch, tmp_path):
         def get_orders(self, filter):
             return [sale] if filter.status == "closed" else []
         def get_account(self): return SimpleNamespace(cash="200", buying_power="200")
+        def get_asset(self, symbol): return SimpleNamespace(asset_class="crypto", tradable=True)
         def submit_order(self, order):
             self.orders.append(order)
             return SimpleNamespace(id="order_1")
