@@ -21,19 +21,19 @@ _LOCK = threading.Lock()
 def _reserve(db_path, sale_id):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path, timeout=20) as db:
-        db.execute("""CREATE TABLE IF NOT EXISTS v19_xrp_cycle_orders (
+        db.execute("""CREATE TABLE IF NOT EXISTS v19_universal_crypto_cycle_orders (
             sale_id TEXT PRIMARY KEY, at TEXT NOT NULL, status TEXT NOT NULL)""")
-        return db.execute("INSERT OR IGNORE INTO v19_xrp_cycle_orders VALUES (?,?,?)",
+        return db.execute("INSERT OR IGNORE INTO v19_universal_crypto_cycle_orders VALUES (?,?,?)",
                           (sale_id, datetime.now(timezone.utc).isoformat(), "reserved")).rowcount == 1
 
 
 def _mark(db_path, sale_id, status):
     with sqlite3.connect(db_path, timeout=20) as db:
-        db.execute("UPDATE v19_xrp_cycle_orders SET status=? WHERE sale_id=?", (status, sale_id))
+        db.execute("UPDATE v19_universal_crypto_cycle_orders SET status=? WHERE sale_id=?", (status, sale_id))
 
 
 def _is_confirmed_tradebot_profit_sale(order, symbol):
-    """Only a filled sell from this bot's approved profit seller can arm XRP."""
+    """Only a filled sell from this bot's approved profit seller can arm a re-buy."""
     return (
         _sym(getattr(order, "symbol", "")) == symbol
         and str(getattr(order, "side", "")).lower().split(".")[-1] == "sell"
@@ -82,6 +82,10 @@ def cycle_once(client, data_client, db_path, *, symbol, configured_spend=None,
         cash = available_crypto_cash(account)
         spend = resolve_cycle_spend(cash, configured_spend)
         pair = symbol[:-3] + "/USD"
+        asset = client.get_asset(pair)
+        if ("crypto" not in str(getattr(asset, "asset_class", "")).lower()
+                or not bool(getattr(asset, "tradable", False))):
+            return {"status": "asset not broker-verified as tradable crypto", "orderSubmitted": False}
         quotes = data_client.get_crypto_latest_quote(
             CryptoLatestQuoteRequest(symbol_or_symbols=pair))
         quote = quotes.get(pair) if isinstance(quotes, dict) else None
