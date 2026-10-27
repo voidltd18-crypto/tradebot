@@ -1,0 +1,23 @@
+name: Universal Crypto Dip and Sell Guard
+on:
+  pull_request:
+    paths:
+      - 'backend/v19_crypto_repeat_cycle.py'
+      - 'backend/v19_universal_crypto_cycle_executor.py'
+      - 'backend/main.py'
+      - 'scripts/verify_crypto_paper_preflight.py'
+      - 'backend/legacy/monolith.py'
+      - 'tests/test_universal_crypto_dip_and_manual_sell.py'
+      - 'tests/test_universal_crypto_broker_simulation.py'
+      - '.github/workflows/universal-crypto-dip-tests.yml'
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install pytest
+      - run: python -m pytest -q tests/test_universal_crypto_dip_and_manual_sell.py tests/test_universal_crypto_broker_simulation.py
+      - run: python -m py_compile backend/legacy/monolith.py backend/v19_crypto_repeat_cycle.py backend/v19_universal_crypto_cycle_executor.py backend/main.py scripts/verify_crypto_paper_preflight.py
