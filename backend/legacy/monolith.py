@@ -12718,7 +12718,7 @@ ADAPTIVE_UNIVERSE_ENABLED = os.getenv("ADAPTIVE_UNIVERSE_ENABLED", "true").lower
 # here bypasses account/PDT/daily locks, reputation, Sniper, A+, trigger, V2,
 # portfolio score, or the final execution lock.
 FIRST_DIBS_SYMBOL = str(os.getenv("TRADEBOT_FIRST_DIBS_SYMBOL", "MARA") or "MARA").upper().strip()
-FIRST_DIBS_ENABLED = os.getenv("TRADEBOT_FIRST_DIBS_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+FIRST_DIBS_ENABLED = os.getenv("TRADEBOT_FIRST_DIBS_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 
 def _first_dibs_symbol() -> str:
     return FIRST_DIBS_SYMBOL if FIRST_DIBS_ENABLED else ""
