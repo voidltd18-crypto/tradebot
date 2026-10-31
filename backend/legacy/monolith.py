@@ -5625,6 +5625,19 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
         ),
     }
     _v16_save_portfolio_plan(plan)
+    # Read-only diagnostics: inspect already-computed decisions; no trade gate changes.
+    rejected_examples = [
+        "%s:%s" % (row.get("symbol", "?"), row.get("reasonCode", "UNKNOWN"))
+        for row in decisions if row.get("decision") == "REJECTED"
+    ][:5]
+    print(
+        "V19 STOCK NO-BUY AUDIT | status=%s gate_eligible=%d order_limit=%d reasons=%s rejected_samples=%s"
+        % (
+            plan["status"], len(picks), order_limit,
+            ",".join("%s:%s" % (k, v) for k, v in sorted(reason_counts.items())) or "none",
+            ",".join(rejected_examples) or "none",
+        )
+    )
     print(
         f"V17.0.15 SINGLE-SOURCE FULL-BUY PLAN | gate_eligible={len(picks)} threshold={effective_minimum_score:.3f} base={AI_PORTFOLIO_MIN_SCORE:.3f} mode={threshold_mode} qualified={len(qualified_ranked)} "
         f"rejected={rejected_count} waiting={waiting_count} actionable={len(actionable_ranked)} "
