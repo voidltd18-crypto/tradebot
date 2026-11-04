@@ -57,7 +57,8 @@ def test_live_broker_lookup_never_places_order():
 
 def test_market_buy_path_fail_closed_and_opt_in_mode_off():
     src = Path("backend/legacy/monolith.py").read_text()
-    assert 'TRADEBOT_TWO_STOCK_MODE", "false"' in src
+    assert 'TRADEBOT_TWO_STOCK_MODE", "true"' in src
+    assert 'TRADEBOT_STOCK_BUYS_PAUSED", "true"' in src
     assert "broker_asset = check_from_broker(trading_client, symbol)" in src
     assert 'if not broker_asset["eligible"]:' in src
     assert "MARA_DAILY_ENTRY_LIMIT = 1" in src
