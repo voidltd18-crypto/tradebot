@@ -106,3 +106,23 @@ from backend.v19_universal_crypto_cycle_executor import install_universal_cycle_
 install_universal_cycle_worker(
     app, _legacy.trading_client, _legacy.API_KEY, _legacy.API_SECRET, _legacy.SQLITE_DB_FILE
 )
+
+
+# Verify both watchlist names against the existing Alpaca account on startup.
+# Read-only asset lookup: no orders, no changes to existing mode/credentials.
+from backend.v19_two_stock_asset_preflight import check_from_broker as _two_stock_asset_probe
+
+@app.on_event("startup")
+def probe_two_stock_assets():
+    for symbol in ("TSLA", "SPCX"):
+        result = _two_stock_asset_probe(_legacy.trading_client, symbol)
+        print(
+            "V19 TWO STOCK ALPACA PREFLIGHT | symbol=%s eligible=%s issuer=%s reasons=%s"
+            % (
+                symbol,
+                result["eligible"],
+                result.get("brokerName", "unavailable"),
+                ",".join(result["reasons"]) or "none",
+            ),
+            flush=True,
+        )
