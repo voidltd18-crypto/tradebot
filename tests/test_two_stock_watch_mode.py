@@ -5,9 +5,10 @@ from pathlib import Path
 SRC = Path("backend/legacy/monolith.py").read_text(encoding="utf-8")
 TREE = ast.parse(SRC)
 
-def test_staged_mode_off_by_default():
-    assert 'TRADEBOT_TWO_STOCK_MODE", "false"' in SRC
+def test_watch_mode_on_with_buy_pause_by_default():
+    assert 'TRADEBOT_TWO_STOCK_MODE", "true"' in SRC
     assert '("TSLA", "SPCX")' in SRC
+    assert 'TRADEBOT_STOCK_BUYS_PAUSED", "true"' in SRC
 
 def test_stock_order_and_scan_restricted_when_enabled():
     assert "def two_stock_buy_allowed(symbol: str)" in SRC
