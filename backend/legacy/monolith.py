@@ -474,6 +474,8 @@ BACKFILL_CHUNK_SIZE = 500
 BACKFILL_MAX_PAGES = 50
 
 TRADE_HISTORY_FILE = "trade_history.json"
+# Nasdaq: SpaceX SPCX began trading 2026-06-12; earlier SPCX data belongs to another issuer.
+SPCX_SPACEX_IPO_UTC = "2026-06-12T00:00:00+00:00"
 STOCK_MEMORY_FILE = "stock_memory.json"
 
 
@@ -1517,6 +1519,10 @@ def update_stock_memory_from_sell(symbol: str, pnl: float, pnl_pct: float, order
 
 
 def memory_multiplier(symbol: str):
+    # Legacy stock_memory.json has no timestamps: never trust SPCX pre-IPO history.
+    # Post-IPO evidence still contributes through symbol_reputation_snapshot.
+    if str(symbol or "").upper() == "SPCX":
+        return 1.0
     if not STOCK_MEMORY_ENABLED:
         return 1.0
     m = get_memory(symbol)
@@ -3138,6 +3144,8 @@ def _v6_historical_checkpoint_price(symbol: str, due_at: Any) -> Dict[str, Any]:
     symbol = str(symbol or "").strip().upper()
     if not symbol:
         raise RuntimeError("missing_symbol")
+    if symbol == "SPCX" and due < datetime.fromisoformat(SPCX_SPACEX_IPO_UTC):
+        raise RuntimeError("spcx_pre_ipo_history_excluded")
 
     forward_windows_minutes = [
         V6_HISTORICAL_BAR_LOOKAHEAD_MINUTES,
@@ -8059,7 +8067,8 @@ def analytics_payload():
 def symbol_stats(symbol: str):
     symbol = symbol.upper()
     closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
-    trades = [t for t in closed if str(t.get("symbol", "")).upper() == symbol]
+    trades = [t for t in closed if str(t.get("symbol", "")).upper() == symbol
+              and (symbol != "SPCX" or str(t.get("timestamp") or "") >= SPCX_SPACEX_IPO_UTC)]
     pnls = [float(t.get("pnl") or 0.0) for t in trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
@@ -9896,8 +9905,9 @@ def v2_adaptive_threshold_recommendations(horizon_hours: int = 24, min_samples: 
               SELECT d.symbol,d.confidence,d.quality,o.net_return_pct,o.observed_at,
               ROW_NUMBER() OVER (PARTITION BY COALESCE(o.sample_key,CAST(o.decision_id AS TEXT)),o.horizon_hours ORDER BY o.id ASC) rn
               FROM v2_observation_outcomes o JOIN v2_setup_decisions d ON d.id=o.decision_id
-              WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL AND o.horizon_hours=?)
-              SELECT symbol,confidence,quality,net_return_pct,observed_at FROM ranked WHERE rn=1""",(int(horizon_hours),)).fetchall()
+              WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL AND o.horizon_hours=?
+              AND (d.symbol!='SPCX' OR d.timestamp>=?))
+              SELECT symbol,confidence,quality,net_return_pct,observed_at FROM ranked WHERE rn=1""",(int(horizon_hours),SPCX_SPACEX_IPO_UTC)).fetchall()
         all_obs=[dict(r) for r in rows]
         observations=[r for r in all_obs if str(r.get("symbol") or "").upper() not in blocked]
         now=datetime.now(UTC)
@@ -17639,14 +17649,16 @@ def symbol_intelligence(days: int = 180, horizon_hours: int = 24, minimum_sample
                FROM v2_setup_decisions d
                JOIN v2_observation_outcomes o ON o.decision_id=d.id
                WHERE d.timestamp>=? AND o.horizon_hours=?
-                 AND o.status='COMPLETE' AND o.net_return_pct IS NOT NULL""",
-            (cutoff, horizon_hours),
+                 AND o.status='COMPLETE' AND o.net_return_pct IS NOT NULL
+                 AND (d.symbol!='SPCX' OR d.timestamp>=?)""",
+            (cutoff, horizon_hours, SPCX_SPACEX_IPO_UTC),
         ).fetchall()
         live_rows = conn.execute(
             """SELECT symbol,pnl_gbp,pnl_pct,timestamp
                FROM closed_trades
-               WHERE timestamp>=? AND COALESCE(qty,0)>0""",
-            (cutoff,),
+               WHERE timestamp>=? AND COALESCE(qty,0)>0
+                 AND (symbol!='SPCX' OR timestamp>=?)""",
+            (cutoff, SPCX_SPACEX_IPO_UTC),
         ).fetchall()
         conn.close()
 
