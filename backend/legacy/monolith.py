@@ -1519,6 +1519,10 @@ def update_stock_memory_from_sell(symbol: str, pnl: float, pnl_pct: float, order
 
 
 def memory_multiplier(symbol: str):
+    # Legacy stock_memory.json has no timestamps: never trust SPCX pre-IPO history.
+    # Post-IPO evidence still contributes through symbol_reputation_snapshot.
+    if str(symbol or "").upper() == "SPCX":
+        return 1.0
     if not STOCK_MEMORY_ENABLED:
         return 1.0
     m = get_memory(symbol)
@@ -8063,7 +8067,8 @@ def analytics_payload():
 def symbol_stats(symbol: str):
     symbol = symbol.upper()
     closed = closed_trades_from_db(10000) if "closed_trades_from_db" in globals() else []
-    trades = [t for t in closed if str(t.get("symbol", "")).upper() == symbol]
+    trades = [t for t in closed if str(t.get("symbol", "")).upper() == symbol
+              and (symbol != "SPCX" or str(t.get("timestamp") or "") >= SPCX_SPACEX_IPO_UTC)]
     pnls = [float(t.get("pnl") or 0.0) for t in trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
