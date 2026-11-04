@@ -2054,6 +2054,14 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", scan: Optional[Dict[str, Any]] = None):
     if not two_stock_buy_allowed(symbol):
         raise ValueError("BUY BLOCKED | two-stock mode only permits TSLA and SPCX")
+    if TRADEBOT_TWO_STOCK_MODE:
+        from backend.v19_two_stock_asset_preflight import check_from_broker
+        broker_asset = check_from_broker(trading_client, symbol)
+        if not broker_asset["eligible"]:
+            raise ValueError(
+                "BUY BLOCKED | two-stock broker asset verification: " +
+                ",".join(broker_asset["reasons"])
+            )
     eligible, block_reason = low_profit_buy_allowed(symbol)
     if not eligible:
         raise ValueError(f"BUY BLOCKED | {symbol} {block_reason}")
