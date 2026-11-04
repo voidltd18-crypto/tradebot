@@ -1972,7 +1972,9 @@ def low_profit_buy_allowed(symbol: str):
 
 # Explicit opt-in stock watchlist; never affects exits or crypto workers.
 # The live broker must confirm that each ticker is tradable before activation.
-TRADEBOT_TWO_STOCK_MODE = os.getenv("TRADEBOT_TWO_STOCK_MODE", "false").strip().lower() in ("1", "true", "yes", "on")
+TRADEBOT_TWO_STOCK_MODE = os.getenv("TRADEBOT_TWO_STOCK_MODE", "true").strip().lower() in ("1", "true", "yes", "on")
+# Fail-closed stock-buy hold while two-stock eligibility and history are validated.
+TRADEBOT_STOCK_BUYS_PAUSED = os.getenv("TRADEBOT_STOCK_BUYS_PAUSED", "true").strip().lower() in ("1", "true", "yes", "on")
 TRADEBOT_TWO_STOCK_SYMBOLS = frozenset(("TSLA", "SPCX"))
 
 
@@ -1982,6 +1984,8 @@ def two_stock_buy_allowed(symbol: str) -> bool:
 
 def can_buy_symbol(symbol: str):
     sym = str(symbol or "").upper().strip()
+    if TRADEBOT_STOCK_BUYS_PAUSED:
+        return False, "stock buys paused pending two-stock validation"
     if not two_stock_buy_allowed(sym):
         return False, "two-stock watchlist: automatic stock buys limited to TSLA and SPCX"
     low_profit_ok, low_profit_reason = low_profit_buy_allowed(sym)
@@ -2052,6 +2056,8 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
 
 
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", scan: Optional[Dict[str, Any]] = None):
+    if TRADEBOT_STOCK_BUYS_PAUSED:
+        raise ValueError("BUY BLOCKED | stock buys paused pending two-stock validation")
     if not two_stock_buy_allowed(symbol):
         raise ValueError("BUY BLOCKED | two-stock mode only permits TSLA and SPCX")
     if TRADEBOT_TWO_STOCK_MODE:
