@@ -476,6 +476,14 @@ BACKFILL_MAX_PAGES = 50
 TRADE_HISTORY_FILE = "trade_history.json"
 # Nasdaq: SpaceX SPCX began trading 2026-06-12; earlier SPCX data belongs to another issuer.
 SPCX_SPACEX_IPO_UTC = "2026-06-12T00:00:00+00:00"
+
+
+def spcx_evidence_valid(symbol: str, timestamp: Any) -> bool:
+    """Fail closed on earlier/undated evidence from the reused SPCX ticker."""
+    if str(symbol or "").upper().strip() != "SPCX":
+        return True
+    stamp = str(timestamp or "").strip()
+    return len(stamp) >= 10 and stamp[:10] >= "2026-06-12"
 STOCK_MEMORY_FILE = "stock_memory.json"
 
 
@@ -9440,6 +9448,8 @@ def _v4_rank_contextual_rows(rows: List[Any], target: Dict[str, Any]) -> List[Di
     ranked: List[Dict[str, Any]] = []
     for row in rows:
         item = dict(row)
+        if not spcx_evidence_valid(item.get("symbol"), item.get("observed_at")):
+            continue
         distance = 0.0
         used = 0
         for key, scale in numeric_scales.items():
@@ -9736,11 +9746,12 @@ def v4_pattern_report(horizon_hours: int = 24, min_samples: int = 8) -> Dict[str
         return {"ok": False, "message": "SQLite disabled"}
     try:
         init_db(); conn = db_connect()
-        rows = [dict(r) for r in conn.execute(
+        rows = [item for r in conn.execute(
             """SELECT d.*,o.net_return_pct FROM v4_market_dna d
                JOIN v2_observation_outcomes o ON o.decision_id=d.decision_id
                WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL AND o.horizon_hours=?""",
-            (int(horizon_hours),)).fetchall()]
+            (int(horizon_hours),)).fetchall()
+            if spcx_evidence_valid((item := dict(r)).get("symbol"), item.get("observed_at"))]
         conn.close()
         groups: Dict[str, Dict[str, List[float]]] = {
             "marketRegime": {}, "session": {}, "stage": {}, "confidenceBand": {}, "qualityBand": {}
@@ -9779,12 +9790,13 @@ def v4_weekly_intelligence(horizon_hours: int = 24) -> Dict[str, Any]:
     cutoff = datetime.now(UTC) - timedelta(days=7)
     try:
         init_db(); conn = db_connect()
-        rows = [dict(r) for r in conn.execute(
+        rows = [item for r in conn.execute(
             """SELECT d.*,o.net_return_pct FROM v4_market_dna d
                JOIN v2_observation_outcomes o ON o.decision_id=d.decision_id
                WHERE o.status='COMPLETE' AND o.net_return_pct IS NOT NULL
                  AND o.horizon_hours=? AND d.observed_at>=?""",
-            (int(horizon_hours), cutoff.isoformat())).fetchall()]
+            (int(horizon_hours), cutoff.isoformat())).fetchall()
+            if spcx_evidence_valid((item := dict(r)).get("symbol"), item.get("observed_at"))]
         conn.close()
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -14261,12 +14273,12 @@ def v5_run_replay(date_from: Optional[str] = None, date_to: Optional[str] = None
         if date_to:
             where.append("d.observed_at<=?")
             params.append(str(date_to))
-        rows = [dict(r) for r in conn.execute(
+        rows = [item for r in conn.execute(
             f"""SELECT d.*,o.net_return_pct,o.sample_key,o.evaluated_at
                  FROM v4_market_dna d JOIN v2_observation_outcomes o ON o.decision_id=d.decision_id
                  WHERE {' AND '.join(where)} ORDER BY d.observed_at ASC LIMIT ?""",
             tuple(params + [V5_REPLAY_MAX_ROWS]),
-        ).fetchall()]
+        ).fetchall() if spcx_evidence_valid((item := dict(r)).get("symbol"), item.get("observed_at"))]
         variants = _v5_replay_variants()
         created_at = datetime.now(UTC).isoformat()
         cur = conn.execute(
@@ -15526,12 +15538,22 @@ V91_SECTOR_ETF = {
 }
 
 def _v91_bars(symbol: str, timeframe: Any, start: datetime, end: datetime) -> List[Any]:
+    # The older SPCX ETF must not enter the SpaceX technical indicators.
+    if str(symbol or "").upper() == "SPCX":
+        start = max(start, datetime.fromisoformat(SPCX_SPACEX_IPO_UTC))
+    if start >= end:
+        return []
     req=StockBarsRequest(symbol_or_symbols=[symbol], timeframe=timeframe, start=start, end=end, feed=DataFeed.IEX)
     response=data_client.get_stock_bars(req)
-    try: return list(response[symbol])
+    try: bars = list(response[symbol])
     except Exception:
         data=getattr(response,"data",{}) or {}
-        return list(data.get(symbol,[]))
+        bars = list(data.get(symbol,[]))
+    if str(symbol or "").upper() == "SPCX":
+        ipo = datetime.fromisoformat(SPCX_SPACEX_IPO_UTC)
+        return [bar for bar in bars if getattr(bar, "timestamp", None) is not None
+                and _v6_parse_utc(bar.timestamp) >= ipo]
+    return bars
 
 def _v91_ema(values: List[float], period: int) -> Optional[float]:
     if not values: return None
@@ -16039,7 +16061,8 @@ def _v10_load_observations(conn, horizon_hours: int) -> List[Dict[str, Any]]:
                WHERE l.horizon_hours=? AND l.outcome_status='COMPLETE' AND l.net_return_pct IS NOT NULL
                ORDER BY m.decision_id ASC"""
     rows = conn.execute(query, (int(horizon_hours),)).fetchall()
-    return [dict(zip(columns + ["v10_return_pct"], row)) for row in rows]
+    return [item for row in rows
+            if spcx_evidence_valid((item := dict(zip(columns + ["v10_return_pct"], row))).get("symbol"), item.get("observed_at"))]
 
 
 def v10_run_research(horizon_hours: int = V10_DEFAULT_HORIZON_HOURS,
