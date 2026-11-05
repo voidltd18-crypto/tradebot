@@ -24,7 +24,7 @@ def valid(symbol, timestamp):
 
 
 def test_issuer_filter_missing_and_earlier_dates():
-    fn = extract("spcx_evidence_valid", {})
+    fn = extract("spcx_evidence_valid", {"Any": Any})
     assert not fn("SPCX", None)
     assert not fn("SPCX", "2026-06-11T23:59:00+00:00")
     assert fn("SPCX", "2026-06-12T13:00:00+00:00")
