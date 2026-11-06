@@ -34,7 +34,13 @@ def test_read_only_guard_diagnostics_reports_live_blocklist():
     assert result["rule"]["minimumVerifiedSellOrders"] == 5
 
 
-def test_guard_uses_five_trades_in_live_execution_path():
-    text = SOURCE.read_text(encoding="utf-8")
-    assert "weak_symbols_by_realised_trades(rows, min_trades=5, profit_threshold_gbp=5.0)" in text
-    assert 'eligible, block_reason = low_profit_buy_allowed(symbol)' in text
+def test_historical_low_profit_rule_does_not_block_execution():
+    """Keep historical diagnostics available, never veto production orders."""
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    for name in ("can_buy_symbol", "market_buy_notional", "maybe_rotate_weakest_into_best"):
+        fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
+        calls = [
+            node.func.id for node in ast.walk(fn)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        assert "low_profit_buy_allowed" not in calls, name
