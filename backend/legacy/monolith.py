@@ -2002,9 +2002,6 @@ def can_buy_symbol(symbol: str):
         return False, "stock buys paused pending two-stock validation"
     if not two_stock_buy_allowed(sym):
         return False, "two-stock watchlist: automatic stock buys limited to TSLA and SPCX"
-    low_profit_ok, low_profit_reason = low_profit_buy_allowed(sym)
-    if not low_profit_ok:
-        return False, low_profit_reason
     # MARA: one successful buy per trading day, even if the position is sold
     # manually or the service restarts. This is independent of the daily lock.
     if sym == "MARA" and today_symbol_buy_count(sym) >= MARA_DAILY_ENTRY_LIMIT:
@@ -2082,9 +2079,6 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
                 "BUY BLOCKED | two-stock broker asset verification: " +
                 ",".join(broker_asset["reasons"])
             )
-    eligible, block_reason = low_profit_buy_allowed(symbol)
-    if not eligible:
-        raise ValueError(f"BUY BLOCKED | {symbol} {block_reason}")
     order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
     trading_client.submit_order(order)
     if AI_RISK_ENGINE_ENABLED and scan:
@@ -4534,9 +4528,6 @@ def maybe_rotate_weakest_into_best(scans):
     weakest = get_weakest_position_for_rotation()
     if not best or not weakest or best["symbol"] == weakest["symbol"]:
         return "ROTATION SKIP | no useful rotation"
-    eligible, block_reason = low_profit_buy_allowed(best["symbol"])
-    if not eligible:
-        return f"ROTATION SKIP | {best['symbol']} {block_reason}"
     if weakest["pnlPct"] > ROTATE_ONLY_IF_WEAKEST_PNL_BELOW:
         return f"ROTATION SKIP | weakest {weakest['symbol']} still okay"
     if pdt_aware_should_avoid_sell(weakest["symbol"], f"PROFIT MODE ROTATE OUT FOR {best['symbol']}", weakest["pnlPct"]):
