@@ -28,8 +28,10 @@ def test_confirmed_broker_fill_invalidates_report_cache_not_on_submission():
     start = text.index("        rebuild_result = None")
     end = text.index("        # Apply realised sell PnL", start)
     sync_block = text[start:end]
-    assert 'with _reports_payload_lock:' in sync_block
-    assert '_reports_payload_cache["at"] = 0.0' in sync_block
-    assert '_reports_payload_cache["value"] = None' in sync_block
+    assert 'report_lock = globals().get("_reports_payload_lock")' in sync_block
+    assert 'report_cache = globals().get("_reports_payload_cache")' in sync_block
+    assert 'if report_lock is not None and isinstance(report_cache, dict):' in sync_block
+    assert 'report_cache["at"] = 0.0' in sync_block
+    assert 'report_cache["value"] = None' in sync_block
     assert 'rebuild_closed_trades_from_orders()' in sync_block
     assert "REPORTS_CACHE_SECONDS" in text
