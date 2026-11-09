@@ -4,6 +4,22 @@ export const pct = (value: any) => `${Number(value || 0).toFixed(2)}%`;
 export const tone = (value: any) => (Number(value || 0) >= 0 ? "gain" : "loss");
 export const clamp = (value: number, min = 0, max = 100) => Math.max(min, Math.min(max, value));
 
+// Alpaca crypto positions can be tiny but real after a near-complete sell.
+// Never format nonzero crypto inventory as 0.0000, or imply the account is flat.
+export function positionQuantity(position: { symbol?: string; qty?: number | string }) {
+  const qty = Number(position?.qty || 0);
+  if (!Number.isFinite(qty)) return "—";
+  const crypto = String(position?.symbol || "").toUpperCase().replace("/", "").endsWith("USD");
+  return qty.toFixed(crypto ? 8 : 4);
+}
+
+export function isSmallCryptoResidual(position: { symbol?: string; qty?: number | string; marketValue?: number | string }) {
+  const symbol = String(position?.symbol || "").toUpperCase().replace("/", "");
+  const quantity = Number(position?.qty || 0);
+  const value = Math.abs(Number(position?.marketValue || 0));
+  return symbol.endsWith("USD") && quantity > 0 && Number.isFinite(value) && value > 0 && value < 5;
+}
+
 export const UK_TIME_ZONE = "Europe/London";
 
 function reportTradeDate(trade: Record<string, any>) {
