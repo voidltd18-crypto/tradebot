@@ -11462,9 +11462,11 @@ def run_bot_loop():
                 scans = []
                 preferred_scan_symbol = _first_dibs_symbol()
                 scan_order = sorted(
-                    september_qualified_stock_symbols() if TRADEBOT_PERFORMANCE_UNIVERSE_MODE
-                    else (list(TRADEBOT_TWO_STOCK_SYMBOLS) if TRADEBOT_TWO_STOCK_MODE
-                          else list(current_universe)),
+                    (sym for sym in (
+                        september_qualified_stock_symbols() if TRADEBOT_PERFORMANCE_UNIVERSE_MODE
+                        else (list(TRADEBOT_TWO_STOCK_SYMBOLS) if TRADEBOT_TWO_STOCK_MODE
+                              else list(current_universe))
+                    ) if "/" not in str(sym)),
                     key=lambda sym: 0 if preferred_scan_symbol and str(sym).upper() == preferred_scan_symbol else 1,
                 )
                 for symbol in scan_order:
@@ -13029,6 +13031,10 @@ def refresh_adaptive_universe(force: bool = False) -> Dict[str, Any]:
             return
         sym = str(row.get("symbol") or "").upper().strip()
         if not sym or sym in seen:
+            return
+        # Stock discovery must not feed crypto pairs into stock quote APIs.
+        # Keep HELD rows intact for position visibility and existing exits.
+        if source != "HELD" and "/" in sym:
             return
         item = dict(row)
         item["symbol"] = sym

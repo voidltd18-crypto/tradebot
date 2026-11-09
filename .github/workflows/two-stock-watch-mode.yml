@@ -5,6 +5,7 @@ on:
       - 'backend/legacy/monolith.py'
       - 'tests/test_two_stock_watch_mode.py'
       - 'tests/test_september_evidence_stock_selection.py'
+      - 'tests/test_stock_scan_excludes_crypto_pairs.py'
       - '.github/workflows/two-stock-watch-mode.yml'
 jobs:
   test:
@@ -15,5 +16,5 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install pytest
-      - run: python -m pytest -q tests/test_two_stock_watch_mode.py tests/test_september_evidence_stock_selection.py
+      - run: python -m pytest -q tests/test_two_stock_watch_mode.py tests/test_september_evidence_stock_selection.py tests/test_stock_scan_excludes_crypto_pairs.py
       - run: python -m py_compile backend/legacy/monolith.py
