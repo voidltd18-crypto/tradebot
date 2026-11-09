@@ -39,7 +39,7 @@ export function useTradeBot(activeTab: Tab = "overview") {
   const reportsInFlight = useRef(false);
   const reportsLastFetchAt = useRef(0);
   const POLL_MS = 10000;
-  const REPORTS_REFRESH_MS = 60000;
+  const REPORTS_REFRESH_MS = 15000;
   const token = authToken;
   const secureHeaders = token ? { "X-Auth-Token": token, "x-api-key": token } : {};
   const rate = Number(data?.fx?.usdToGbp || 0.7403);
@@ -193,8 +193,26 @@ export function useTradeBot(activeTab: Tab = "overview") {
 
   useEffect(() => {
     if (!authToken || activeTab !== "reports") return;
+    // Reports are broker-fill accounting, not a one-shot snapshot. Keep them
+    // current while visible, without making the heavy report endpoint run on
+    // the 10-second overview loop.
     loadReports(false);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") loadReports(false);
+    }, REPORTS_REFRESH_MS);
+    return () => window.clearInterval(timer);
   }, [authToken, activeTab, loadReports]);
+
+  useEffect(() => {
+    if (!authToken) return;
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      fetchData(true);
+      if (activeTab === "reports") loadReports(true);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [authToken, activeTab, fetchData, loadReports]);
   useEffect(() => { const cap = Number(banking?.maxTradingCapitalGbp ?? data?.banking?.maxTradingCapitalGbp ?? 0); if (cap > 0 && !tradingCapInput) setTradingCapInput(String(Math.round(cap))); if (cap > 0 && !replayCapInput) setReplayCapInput(String(Math.round(cap))); }, [banking?.maxTradingCapitalGbp, data?.banking?.maxTradingCapitalGbp]);
   useEffect(() => { const level = Number(data?.strategySettings?.level); if (Number.isFinite(level)) setStrategyStrictness(Math.max(0, Math.min(2, level))); }, [data?.strategySettings?.level]);
   useEffect(() => { const max = Number(data?.positionSettings?.maxPositions ?? data?.maxPositions ?? data?.config?.maxPositions); if (Number.isFinite(max) && max > 0) setMaxPositionsInput(Math.max(1, Math.min(10, max))); }, [data?.positionSettings?.maxPositions, data?.maxPositions, data?.config?.maxPositions]);
@@ -227,6 +245,7 @@ export function useTradeBot(activeTab: Tab = "overview") {
       setMessage(json?.message || json?.detail || "Action completed.");
     } catch (error: any) { setMessage(error?.message || "Action failed."); }
     await fetchData(true);
+    if (activeTab === "reports") await loadReports(true);
   }
 
   async function searchStocks(queryOverride?: string) {
