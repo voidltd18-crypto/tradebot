@@ -7860,6 +7860,15 @@ def sync_recent_filled_orders_to_reports(force: bool = False) -> Dict[str, Any]:
         if imported > 0:
             rebuild_result = rebuild_closed_trades_from_orders()
             restored_locks = sorted(set(restored_locks + restore_today_sell_locks_from_db()))
+            # An Alpaca-confirmed fill changed persisted trades. Invalidate the
+            # read-only Reports cache so the next browser poll cannot show the
+            # pre-fill snapshot for another 45 seconds.
+            report_lock = globals().get("_reports_payload_lock")
+            report_cache = globals().get("_reports_payload_cache")
+            if report_lock is not None and isinstance(report_cache, dict):
+                with report_lock:
+                    report_cache["at"] = 0.0
+                    report_cache["value"] = None
             print(
                 f"AUTO REPORT SYNC | imported={imported} existing={existing} "
                 f"skipped={skipped} errors={errors} "
