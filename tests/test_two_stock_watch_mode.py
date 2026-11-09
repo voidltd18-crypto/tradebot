@@ -14,7 +14,8 @@ def test_stock_order_and_scan_restricted_when_enabled():
     assert "def two_stock_buy_allowed(symbol: str)" in SRC
     assert "if not two_stock_buy_allowed(sym):" in SRC
     assert "if not two_stock_buy_allowed(symbol):" in SRC
-    assert "if TRADEBOT_TWO_STOCK_MODE else list(current_universe)" in SRC
+    assert "if TRADEBOT_TWO_STOCK_MODE" in SRC
+    assert "september_qualified_stock_symbols() if TRADEBOT_PERFORMANCE_UNIVERSE_MODE" in SRC
 
 def test_sell_management_and_daily_loss_controls_remain():
     assert "manage_money_mode_positions()" in SRC
