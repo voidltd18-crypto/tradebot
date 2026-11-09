@@ -44,6 +44,7 @@ def environment(broker, *, paused):
         "Optional": Optional, "Dict": Dict, "Any": Any,
         "TRADEBOT_STOCK_BUYS_PAUSED": paused,
         "TRADEBOT_TWO_STOCK_MODE": True,
+        "TRADEBOT_PERFORMANCE_UNIVERSE_MODE": False,
         "TRADEBOT_TWO_STOCK_SYMBOLS": ("TSLA", "SPCX"),
         "trading_client": broker,
         "two_stock_buy_allowed": lambda symbol: symbol in ("TSLA", "SPCX"),
@@ -113,7 +114,7 @@ def test_live_guard_keeps_other_tickers_out_after_unpause():
         try:
             buy(symbol, 100)
         except ValueError as error:
-            assert "two-stock" in str(error)
+            assert "approved selection universe" in str(error)
         else:
             raise AssertionError("Wrong stock accepted")
     assert broker.orders == []

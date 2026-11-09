@@ -1991,9 +1991,68 @@ TRADEBOT_TWO_STOCK_MODE = os.getenv("TRADEBOT_TWO_STOCK_MODE", "true").strip().l
 TRADEBOT_STOCK_BUYS_PAUSED = os.getenv("TRADEBOT_STOCK_BUYS_PAUSED", "true").strip().lower() in ("1", "true", "yes", "on")
 TRADEBOT_TWO_STOCK_SYMBOLS = frozenset(("TSLA", "SPCX"))
 
+# Restore a wider STOCK-only universe based exclusively on matched September
+# closed-trade evidence. This does not relax any entry, exit, or position limit.
+# Set TRADEBOT_PERFORMANCE_UNIVERSE_MODE=false to revert to two-stock mode.
+TRADEBOT_PERFORMANCE_UNIVERSE_MODE = os.getenv(
+    "TRADEBOT_PERFORMANCE_UNIVERSE_MODE", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+SEPTEMBER_STOCK_SELECTION_POOL = frozenset(SAFE_UNIVERSE) | frozenset(("MARA", "SPCX"))
+_SEPTEMBER_SELECTION_CACHE = {"at": 0.0, "symbols": (), "evidence": ()}
+
+
+def september_qualified_stock_symbols(force=False):
+    """September 2026 profitable *matched closed trades* only, fail closed."""
+    now = time.monotonic()
+    if not force and now - _SEPTEMBER_SELECTION_CACHE["at"] < 300:
+        return list(_SEPTEMBER_SELECTION_CACHE["symbols"])
+    rows = closed_trades_from_db(10000)
+    by_symbol = {}
+    for row in rows:
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if symbol not in SEPTEMBER_STOCK_SELECTION_POOL:
+            continue
+        day = str(row.get("day") or row.get("timestamp") or "")
+        if not day.startswith("2026-09"):
+            continue
+        try:
+            qty = float(row.get("qty") or 0)
+            pnl = float(row.get("pnlGbp") or 0)
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0 or not math.isfinite(pnl):
+            continue
+        record = by_symbol.setdefault(symbol, {"trades": 0, "wins": 0, "pnlGbp": 0.0})
+        record["trades"] += 1
+        record["wins"] += int(pnl > 0)
+        record["pnlGbp"] += pnl
+    qualified = sorted(
+        ((sym, data) for sym, data in by_symbol.items()
+         if data["trades"] >= 2
+         and data["pnlGbp"] > 0
+         and data["wins"] / data["trades"] >= 0.5),
+        key=lambda item: (-item[1]["pnlGbp"], -item[1]["wins"], item[0]),
+    )[:12]
+    symbols = tuple(sym for sym, _ in qualified)
+    _SEPTEMBER_SELECTION_CACHE.update({
+        "at": now, "symbols": symbols, "evidence": tuple(qualified),
+    })
+    print(
+        "SEPTEMBER STOCK SELECTION | "
+        f"closed_rows={len(rows)} qualified={len(symbols)} "
+        f"symbols={','.join(symbols) or 'none'} "
+        "minimum_trades=2 positive_realised_gbp=true winrate_min=50% "
+        "no_history_means_no_buy=true",
+        flush=True,
+    )
+    return list(symbols)
+
 
 def two_stock_buy_allowed(symbol: str) -> bool:
-    return not TRADEBOT_TWO_STOCK_MODE or str(symbol or "").upper().strip() in TRADEBOT_TWO_STOCK_SYMBOLS
+    sym = str(symbol or "").upper().strip()
+    if TRADEBOT_PERFORMANCE_UNIVERSE_MODE:
+        return sym in september_qualified_stock_symbols()
+    return not TRADEBOT_TWO_STOCK_MODE or sym in TRADEBOT_TWO_STOCK_SYMBOLS
 
 
 def can_buy_symbol(symbol: str):
@@ -2001,7 +2060,11 @@ def can_buy_symbol(symbol: str):
     if TRADEBOT_STOCK_BUYS_PAUSED:
         return False, "stock buys paused pending two-stock validation"
     if not two_stock_buy_allowed(sym):
-        return False, "two-stock watchlist: automatic stock buys limited to TSLA and SPCX"
+        return False, (
+            "September evidence-qualified stock selection: not approved"
+            if TRADEBOT_PERFORMANCE_UNIVERSE_MODE
+            else "two-stock watchlist: automatic stock buys limited to TSLA and SPCX"
+        )
     # MARA: one successful buy per trading day, even if the position is sold
     # manually or the service restarts. This is independent of the daily lock.
     if sym == "MARA" and today_symbol_buy_count(sym) >= MARA_DAILY_ENTRY_LIMIT:
@@ -2070,8 +2133,8 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
     if TRADEBOT_STOCK_BUYS_PAUSED:
         raise ValueError("BUY BLOCKED | stock buys paused pending two-stock validation")
     if not two_stock_buy_allowed(symbol):
-        raise ValueError("BUY BLOCKED | two-stock mode only permits TSLA and SPCX")
-    if TRADEBOT_TWO_STOCK_MODE:
+        raise ValueError("BUY BLOCKED | stock outside approved selection universe")
+    if TRADEBOT_TWO_STOCK_MODE and not TRADEBOT_PERFORMANCE_UNIVERSE_MODE:
         from backend.v19_two_stock_asset_preflight import check_from_broker
         broker_asset = check_from_broker(trading_client, symbol)
         if not broker_asset["eligible"]:
@@ -11399,7 +11462,9 @@ def run_bot_loop():
                 scans = []
                 preferred_scan_symbol = _first_dibs_symbol()
                 scan_order = sorted(
-                    list(TRADEBOT_TWO_STOCK_SYMBOLS) if TRADEBOT_TWO_STOCK_MODE else list(current_universe),
+                    september_qualified_stock_symbols() if TRADEBOT_PERFORMANCE_UNIVERSE_MODE
+                    else (list(TRADEBOT_TWO_STOCK_SYMBOLS) if TRADEBOT_TWO_STOCK_MODE
+                          else list(current_universe)),
                     key=lambda sym: 0 if preferred_scan_symbol and str(sym).upper() == preferred_scan_symbol else 1,
                 )
                 for symbol in scan_order:
