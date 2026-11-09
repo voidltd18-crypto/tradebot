@@ -95,7 +95,7 @@ export function useTradeBot(activeTab: Tab = "overview") {
   const loadReports = useCallback(async (force = false) => {
     if (!authToken) return;
     const now = Date.now();
-    if (!force && (reportsInFlight.current || now - reportsLastFetchAt.current < REPORTS_REFRESH_MS)) return;
+    if (reportsInFlight.current || (!force && now - reportsLastFetchAt.current < REPORTS_REFRESH_MS)) return;
 
     reportsInFlight.current = true;
     reportsLastFetchAt.current = now;
