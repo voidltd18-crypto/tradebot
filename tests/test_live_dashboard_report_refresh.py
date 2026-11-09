@@ -25,7 +25,7 @@ def test_reports_refresh_on_tab_resume_and_after_manual_action():
 
 def test_confirmed_broker_fill_invalidates_report_cache_not_on_submission():
     text = MONOLITH.read_text(encoding="utf-8")
-    start = text.index("        rebuild_result = None\\n        if imported > 0:")
+    start = text.index("        rebuild_result = None")
     end = text.index("        # Apply realised sell PnL", start)
     sync_block = text[start:end]
     assert 'with _reports_payload_lock:' in sync_block
