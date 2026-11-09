@@ -2148,7 +2148,12 @@ def _manual_sell_is_crypto(symbol: str) -> bool:
 
 
 def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 0.0, reason="AUTO SELL"):
-    rounded_qty = floor_qty(qty, 6)
+    # Broker-native close with no qty requests 100% of the *current* crypto
+    # inventory. Manual/emergency close must never round down to six decimals
+    # or silently retry with a smaller available quantity and claim Sell All.
+    manual_full_close = str(reason).upper().startswith(("MANUAL", "EMERGENCY"))
+    crypto_full_close = manual_full_close and _manual_sell_is_crypto(symbol)
+    rounded_qty = qty if crypto_full_close else floor_qty(qty, 6)
     if rounded_qty <= 0:
         return
 
@@ -2159,9 +2164,21 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
         return trading_client.submit_order(order)
 
     try:
-        submitted_order = submit(rounded_qty)
+        if crypto_full_close:
+            submitted_order = trading_client.close_position(symbol)
+            # Account for the broker's actual submitted quantity, not a rounded
+            # or estimated snapshot amount. Fill reconciliation remains final.
+            broker_qty = getattr(submitted_order, "qty", None)
+            if broker_qty is not None:
+                rounded_qty = float(broker_qty)
+        else:
+            submitted_order = submit(rounded_qty)
     except Exception as e:
         err = str(e)
+        if crypto_full_close:
+            # Fail visibly. Never turn a failed Sell All into a partial order.
+            add_alpaca_rejection_event(symbol, reason, err)
+            raise
         if is_insufficient_qty_error(err):
             available = parse_available_qty(err)
             retry_qty = floor_qty(available, 6) if available else 0
@@ -2224,7 +2241,10 @@ def close_position(position, reason="MANUAL SELL"):
     entry = position["entry"]
     price = position["price"]
 
-    if qty <= DUST_THRESHOLD:
+    # A small genuine crypto residual is still sellable by manual Sell All.
+    # Preserve the legacy threshold for auto sells and normal stock orders.
+    manual_crypto_close = str(reason).upper().startswith(("MANUAL", "EMERGENCY")) and _manual_sell_is_crypto(symbol)
+    if qty <= 0 or (qty <= DUST_THRESHOLD and not manual_crypto_close):
         return {"ok": False, "message": "No open position to sell"}
     if has_open_order(symbol):
         return {"ok": False, "message": f"{symbol} already has open order"}
