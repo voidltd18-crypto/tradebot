@@ -1,6 +1,6 @@
 import { Card } from "../components/Card";
 import { Meter } from "../components/Meter";
-import { gbp, pct, tone, usd } from "../lib/format";
+import { gbp, pct, tone, usd, positionQuantity, isSmallCryptoResidual } from "../lib/format";
 import type { ActionFn, AnyObj, PositionStyleFn } from "../lib/types";
 
 export function OverviewPage({ data, banking, message, positions, trades, rate, bestCandidate, aiConfidence, marketRegime, riskLabel, currentAction, botHealth, aiReasons, positionSettings, fetchData, action, positionGlowStyle, onExportFullBot, exportBusy }: { data: AnyObj; banking: AnyObj; message: string; positions: AnyObj[]; trades: AnyObj[]; rate: number; bestCandidate?: AnyObj; aiConfidence: number; marketRegime: string; riskLabel: string; currentAction: string; botHealth: number; aiReasons: string[]; positionSettings: AnyObj; fetchData: (force?: boolean) => Promise<void>; action: ActionFn; positionGlowStyle: PositionStyleFn; onExportFullBot: () => void; exportBusy: boolean }) {
@@ -63,7 +63,7 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
 
       <Card title="Open Positions" className="command-panel positions-panel">
         <div className="panel-count">{positions.length}</div>
-        {positions.length ? <div className="position-list compact-positions">{positions.slice(0, 3).map((p) => <article className="position" key={p.symbol} style={positionGlowStyle(p)}><div><h3>{p.symbol}</h3><p>{usd(p.price)} · Qty {Number(p.qty || 0).toFixed(4)}</p></div><div className="position-side"><b className={tone(p.pnl)}>{gbp(p.pnlGbp ?? Number(p.pnl || 0) * rate)}<br />{pct(p.pnlPct)}</b></div></article>)}</div> : <div className="empty-position"><span>▣</span><b>No Open Positions</b><small>The bot is ready to find opportunities</small></div>}
+        {positions.length ? <div className="position-list compact-positions">{positions.slice(0, 3).map((p) => <article className="position" key={p.symbol} style={positionGlowStyle(p)}><div><h3>{p.symbol}</h3><p>{usd(p.price)} · Qty {positionQuantity(p)}{isSmallCryptoResidual(p) ? " · Small residual holding" : ""}</p></div><div className="position-side"><b className={tone(p.pnl)}>{gbp(p.pnlGbp ?? Number(p.pnl || 0) * rate)}<br />{pct(p.pnlPct)}</b></div></article>)}</div> : <div className="empty-position"><span>▣</span><b>No Open Positions</b><small>The bot is ready to find opportunities</small></div>}
       </Card>
 
       <Card title="AI System Overview" className="command-panel systems-panel">
