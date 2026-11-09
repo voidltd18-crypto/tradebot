@@ -18104,6 +18104,13 @@ def _symbol_reputation_set_cooldown(symbol: str, score: float, reason: str) -> N
 
 def symbol_reputation_allows_live_buy(symbol: str) -> Tuple[bool, str, Dict[str, Any]]:
     symbol = str(symbol or "").upper().strip()
+    # In the explicit TSLA/SPCX trading mode, do not apply legacy reputation
+    # history or persisted five-day cooldowns to these two approved tickers.
+    # Keep every separate broker, PDT, entry-signal and order-size safeguard.
+    if TRADEBOT_TWO_STOCK_MODE and symbol in TRADEBOT_TWO_STOCK_SYMBOLS:
+        return True, "two-stock mode: legacy reputation veto bypassed", {
+            "symbol": symbol, "label": "TWO_STOCK_MODE", "legacyReputationVeto": False
+        }
     if not SYMBOL_REPUTATION_ENABLED or not symbol:
         return True, "reputation gate disabled", {"symbol": symbol, "label": "DISABLED"}
 
