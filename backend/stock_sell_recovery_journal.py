@@ -139,6 +139,9 @@ class SellRecoveryJournal:
             if status == "filled" and abs(fill - row[1]) > 1e-8:
                 db.rollback()
                 raise ValueError("filled order quantity mismatch")
+            if row[3] == "TERMINAL_AWAIT_POSITION" and status not in TERMINAL:
+                db.rollback()
+                raise ValueError("terminal broker order cannot return to working")
             if row[3] == "VERIFIED_FLAT":
                 db.rollback()
                 raise ValueError("already verified flat")
