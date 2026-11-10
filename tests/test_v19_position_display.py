@@ -1,5 +1,6 @@
 """Regression tests for broker-consistent displayed P/L (read-only)."""
 from types import SimpleNamespace
+import pytest
 from backend.v19_position_display import broker_display_values
 
 
@@ -34,7 +35,8 @@ def test_fallback_quote_if_broker_mark_unavailable():
         unrealized_pl=None, unrealized_plpc=None,
     )
     price, pnl, pct = broker_display_values(position, fallback_quote=9)
-    assert (price, pnl, pct) == (9, -2, -10)
+    assert (price, pnl) == (9, -2)
+    assert pct == pytest.approx(-10)
 
 
 def test_nonfinite_quote_does_not_poison_display():
