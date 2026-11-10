@@ -9,6 +9,7 @@ unknown, do not retry until an authoritative broker reconciliation occurs.
 """
 import math
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 from backend.stock_exit_state_store import _identity, _positive
@@ -35,10 +36,15 @@ class SellRecoveryJournal:
                 UNIQUE(attempt_id)
             )""")
 
+    @contextmanager
     def _db(self):
         db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
-        db.execute("PRAGMA busy_timeout=10000")
-        return db
+        try:
+            db.execute("PRAGMA busy_timeout=10000")
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def reserve_before_submit(self, symbol, position_key, attempt_id, qty):
         """True only for the very first claim; repeat attempts never submit."""
