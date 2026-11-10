@@ -123,3 +123,35 @@ positive expectancy from a single anecdotal rebound.
 The current branch contains exporter code and mocked tests, but it does
 **not** contain fetched, independently verified FMC historical bars.
 Likewise, there has been **no verified Alpaca paper execution**.
+
+
+## Offline paper-order lifecycle rehearsal
+
+The module `backend/stock_exit_paper_rehearsal.py` is an **offline**
+broker-order-state validator. It cannot initiate a paper or live sell and
+does not import an Alpaca trading client. Its tests verify:
+
+- fresh quote/market-open/account-permission prerequisites;
+- no fresh hypothetical exit while a sell order is pending or
+  partially filled;
+- fail-closed behaviour for unknown order status or future/stale quotes;
+- cumulative fill reconciliation, terminal rejections, and consistency
+  of order IDs and requested quantity.
+
+The `wouldPassPreflight` diagnostic is **not** permission to execute.
+It does not independently verify fresh position quantities, available
+shares, strategy constraints, PDT, broker restrictions, database
+idempotency or actual account state. Successful unit tests are not proof
+that any real Alpaca paper order will be filled or safely retried.
+
+### Remaining gates before real paper-trading experiments
+
+1. Import and verify authentic FMC intraday data (currently missing).
+2. Review the current stock sell path and all competing exits
+   against a fixed, committed test snapshot.
+3. Persist order IDs and position peak state across restarts.
+4. Add a **paper-only** broker adapter with a hard configuration guard
+   proving Alpaca's paper endpoint; test rejected and partial fills
+   against the actual paper account, with explicit authorization.
+5. Keep production order execution unchanged unless separately
+   approved after observing results.
