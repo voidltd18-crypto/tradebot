@@ -37,6 +37,10 @@ def audit(source_path=MONOLITH):
             "endLine": node.end_lineno,
             "matchedSourceLines": len(matches),
             "excerpts": matches[:110],
+            "submissionBlock": [
+                {"line": n, "code": lines[n - 1][:220]}
+                for n in range(node.lineno, node.end_lineno + 1)
+            ] if name == "market_sell_qty" else [],
             "runnerBlock": [
                 {"line": n, "code": lines[n - 1][:200]}
                 for n in range(node.lineno, node.end_lineno + 1)
