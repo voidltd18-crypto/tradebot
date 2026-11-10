@@ -22,6 +22,7 @@ def evaluate_sessions(sessions):
             continue
         entry = bars[0]["price"]
         result = compare_costed_exits(entry, bars)
+        configured = compare_costed_exits(entry, bars, reference_activation_pct=1.2)
         audit = full_session_comparison(entry, bars)
         candidate = result["candidate"]
         reference = result["referenceTrailingExit"]
@@ -35,10 +36,14 @@ def evaluate_sessions(sessions):
             "netPnlDifferenceUsdPerShare": result["candidateMinusReferenceNetPnlUsd"],
             "ordersSubmitted": 0,
             "assumedEndOfDay": audit,
+            "configuredReferenceStatus": configured["referenceTrailingExit"]["status"],
+            "configuredReferenceNetReturnPct": configured["referenceTrailingExit"]["netReturnPct"],
+            "candidateVersusConfiguredReferenceUsd": configured["candidateMinusReferenceNetPnlUsd"],
         })
     comparable = [r for r in records if r["netPnlDifferenceUsdPerShare"] is not None]
     all_outcomes = [r['assumedEndOfDay'] for r in records]
     complete = [o for o in all_outcomes if o['candidateMinusReferenceUsd'] is not None]
+    configured_pairs = [r for r in records if r["candidateVersusConfiguredReferenceUsd"] is not None]
     return {
         "source": "unofficial Yahoo 1m FMC chart closes",
         "entryRule": "hypothetical first minute-close entry for each session",
@@ -50,6 +55,11 @@ def evaluate_sessions(sessions):
         "assumedCloseSpikeBetter": sum(o["candidateMinusReferenceUsd"] > 0 for o in complete),
         "assumedCloseReferenceBetter": sum(o["candidateMinusReferenceUsd"] < 0 for o in complete),
         "assumedCloseTies": sum(o["candidateMinusReferenceUsd"] == 0 for o in complete),
+        "configuredReferenceActivationPct": 1.2,
+        "configuredReferenceComparable": len(configured_pairs),
+        "configuredReferenceWins": sum(r["candidateVersusConfiguredReferenceUsd"] < 0 for r in configured_pairs),
+        "configuredCandidateWins": sum(r["candidateVersusConfiguredReferenceUsd"] > 0 for r in configured_pairs),
+        "configuredTies": sum(r["candidateVersusConfiguredReferenceUsd"] == 0 for r in configured_pairs),
         "spikeBetter": sum(r["netPnlDifferenceUsdPerShare"] > 0 for r in comparable),
         "referenceBetter": sum(r["netPnlDifferenceUsdPerShare"] < 0 for r in comparable),
         "ties": sum(r["netPnlDifferenceUsdPerShare"] == 0 for r in comparable),
