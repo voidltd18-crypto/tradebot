@@ -68,8 +68,10 @@ export default function App() {
     return <Login username={bot.secureUsername} password={bot.securePassword} error={bot.authError} setUsername={bot.setSecureUsername} setPassword={bot.setSecurePassword} onLogin={bot.secureLogin} />;
   }
 
-  const totalDeposited = Number(bot.reports?.totalDeposited || 0);
-  const totalGainLoss = Number(bot.reports?.totalGainLoss || 0);
+  // /reports returns USD. Its "totalDeposited" may represent a reset
+  // baseline rather than independently verified lifetime deposits.
+  const performanceBaselineUsd = Number(bot.reports?.totalDeposited || 0);
+  const gainLossSinceBaselineUsd = Number(bot.reports?.totalGainLoss || 0);
   const profitVault = bot.banking?.profitVault || bot.data?.banking?.profitVault || {};
   const vaultFreeCashGbp = Number(profitVault?.workingCapitalGbp || 0);
   const brokerBuyingPowerUsd = Number(bot.data?.account?.buyingPower || 0);
@@ -91,7 +93,7 @@ export default function App() {
           <Stat label="Trading Capital" value={gbp(tradingCapitalGbp)} sub="Invested + free cash · vault excluded" />
           <Stat label="Free Cash" value={gbp(displayedFreeCashGbp)} sub={bot.positions.length ? "Uninvested cash · position already open" : "Available for the next trade"} />
           <Stat label="Today P&L" value={gbp(Number(bot.data?.account?.pnlDay || 0) * bot.rate)} sub="Since midnight" className={tone(bot.data?.account?.pnlDay)} />
-          <Stat label="Total Gain/Loss" value={gbp(totalGainLoss)} sub={`Deposited ${gbp(totalDeposited)}`} className={tone(totalGainLoss)} />
+          <Stat label="Gain/Loss vs Baseline" value={gbp(gainLossSinceBaselineUsd * bot.rate)} sub={`Reference baseline ${gbp(performanceBaselineUsd * bot.rate)} · Not verified lifetime deposits`} className={tone(gainLossSinceBaselineUsd)} />
           <Stat label="Profit Vault" value={gbp(bankedProfitGbp)} sub="Protected realised profit" className={bankedProfitGbp > 0 ? "gain" : ""} />
           <Stat label="Positions" value={`${bot.positions.length} / ${maxPositions || "—"}`} sub="Open / Max" />
         </section>
