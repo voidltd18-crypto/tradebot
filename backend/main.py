@@ -126,3 +126,21 @@ def probe_two_stock_assets():
             ),
             flush=True,
         )
+
+
+# Authenticated, read-only stock momentum replay. Requires caller-provided
+# timestamped observations; does not fetch quotes or submit trade orders.
+from fastapi import HTTPException
+from backend.stock_momentum_replay import replay_stock_exits
+
+
+@app.post("/v19/stock-momentum-replay")
+def stock_momentum_replay_endpoint(request: Request, payload: dict = Body(...)):
+    _legacy.verify_api_key(request)
+    try:
+        return replay_stock_exits(
+            payload.get("entryPrice"),
+            payload.get("observations"),
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
