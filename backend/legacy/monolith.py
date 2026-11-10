@@ -2047,8 +2047,18 @@ def september_qualified_stock_symbols(force=False):
     return list(symbols)
 
 
+# Hard entry-only allowlist. Never applies to SELL or crypto order handling.
+TECH_GIANT_STOCK_POOL = frozenset(("AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "AVGO", "ORCL", "AMD", "TSLA"))
+TECH_GIANT_STOCK_ALLOWED = frozenset(
+    s.strip().upper() for s in os.getenv("STOCK_UNIVERSE", ",".join(sorted(TECH_GIANT_STOCK_POOL))).split(",")
+    if s.strip().upper() in TECH_GIANT_STOCK_POOL
+)
+
+
 def two_stock_buy_allowed(symbol: str) -> bool:
     sym = str(symbol or "").upper().strip()
+    if sym not in TECH_GIANT_STOCK_ALLOWED:
+        return False
     if TRADEBOT_PERFORMANCE_UNIVERSE_MODE:
         return sym in september_qualified_stock_symbols()
     return not TRADEBOT_TWO_STOCK_MODE or sym in TRADEBOT_TWO_STOCK_SYMBOLS
@@ -2131,6 +2141,8 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", scan: Optional[Dict[str, Any]] = None):
     if TRADEBOT_STOCK_BUYS_PAUSED:
         raise ValueError("BUY BLOCKED | stock buys paused pending two-stock validation")
+    if str(symbol or "").upper().strip() not in TECH_GIANT_STOCK_ALLOWED:
+        raise ValueError("BUY BLOCKED | stock outside tech-giants-only allowlist")
     if not two_stock_buy_allowed(symbol):
         raise ValueError("BUY BLOCKED | stock outside approved selection universe")
     if TRADEBOT_TWO_STOCK_MODE and not TRADEBOT_PERFORMANCE_UNIVERSE_MODE:
