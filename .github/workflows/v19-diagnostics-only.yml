@@ -30,3 +30,7 @@ jobs:
       - name: Run static inventory
         run: |
           python tests/test_v19_research_memory_inventory.py
+      - name: Test broker-aligned position display and swing re-entry
+        run: |
+          python -m pip install -q pytest alpaca-py
+          python -m pytest -q tests/test_v19_position_display.py tests/test_v19_swing_review.py
