@@ -54,3 +54,32 @@ Audit runs:
 Retain existing production protections. This audit adds only read-only
 source inspections and isolated tests; it changes no stock trading
 logic or broker positions.
+
+
+## Subsequent sell-submission lifecycle inspection (source and mock tests)
+
+The real `market_sell_qty` function (lines 2212–2297) was inspected
+in full. It distinguishes **order submission from execution** and moves
+the order into `PENDING_FILL_RECONCILIATION`, which is correct in
+principle. Broker-rejected submissions raise and call a rejection
+handler, whereas accepted order IDs are registered for reconciliation.
+
+**Confirmed operational risk:** if
+`register_pending_sell_order(order_id, ...)` returns `False`, the
+function currently **only prints `SELL ACCOUNTING WARNING` and proceeds**.
+The accepted broker order cannot be undone by simply raising or retrying,
+so any fix must reconcile by broker order ID before permitting new orders
+or changing peak state. This is a *reliability gap*, not evidence of a
+specific lost FMC fill. The stock caller also clears its remembered high
+after a broker submission, before an independently confirmed fill.
+These operations should be reviewed together; modifying one in isolation
+risks incorrect state transitions or duplicate sells.
+
+Isolated AST regression tests in
+`tests/test_legacy_stock_sell_submission_lifecycle.py` characterize
+accepted acknowledgements, broker submission errors, failed pending
+registration and zero quantity. All network interactions are mocks.
+
+**Release decision remains NO-GO** until broker-reconciliation
+failure handling and durable state have verified recovery tests.
+No production monolith edit or real order executed.
