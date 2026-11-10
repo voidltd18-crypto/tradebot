@@ -31,3 +31,29 @@ No broker paper/live sell order was submitted.
 position entry timestamps, extended out-of-sample testing and true paper
 broker fills, plus persistence and cross-rule integration review. Do not
 merge/activate on this evidence alone.
+
+
+## 12:41 UTC follow-up — include no-signal sessions fairly
+
+Follow-up GitHub Actions evidence:
+https://github.com/voidltd18-crypto/tradebot/actions/runs/42817929908
+
+The initial comparison reported only a single comparable session because
+4 of 5 days had no profit-exit signal. A new explicit research-only
+end-of-session liquidation assumption was therefore added. It computes
+hypothetical last-bar exits (with identical estimated trading costs) for
+NO_SIGNAL cases, without turning an unfilled/stale sell signal into a fake fill.
+
+Across the same 5 completed FMC sessions:
+- All 5 now have model-comparable estimated P&L under that assumption;
+- Spike Mode is better in **0**;
+- Reference 0.7% hypothetical trail is better in **0**;
+- Strategies tie in **5**.
+
+Interpretation: This closes the earlier missing-outcome comparison gap,
+but provides **no demonstrated improvement** and is not a validated
+actual-broker backtest. Neither strategy simulates the entire production
+stock engine, including account locks and other exits. The implied
+end-of-day liquidation is an artificial evaluation rule, NOT a TradeBot
+live trading setting. Keep release decision **NO-GO**, no merger or
+live configuration changes.
