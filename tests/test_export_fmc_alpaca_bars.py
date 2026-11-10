@@ -28,7 +28,7 @@ def test_paginated_fmc_export_is_get_only(tmp_path):
         assert "data.alpaca.markets" in req.full_url
         assert "FMC/bars" in req.full_url
         assert "trading" not in req.full_url
-        assert "APCA-API-KEY-ID" in req.headers
+        assert any(k.lower() == "apca-api-key-id" for k in req.headers)
         requests.append(req)
         return FakeResponse(pages[len(requests) - 1])
     path = tmp_path / "fmc.csv"
