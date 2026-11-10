@@ -180,3 +180,34 @@ a PAPER account in a controlled environment, reconcile actual paper account
 position/order statuses; demonstrate durable state on deployment storage;
 and review existing live sell precedence and regulatory safeguards. PR stays
 draft and no live or paper orders have been placed.
+
+
+## Final single-command read-only audit (does not deploy)
+
+The complete evidence checklist and hypothetical costed comparison are now
+available from one command after obtaining an FMC CSV:
+
+```bash
+python -m scripts.audit_fmc_spike_release fmc_2026-11-09_1min.csv --source "Alpaca IEX 1Min FMC, 2026-11-09" --entry-price 5.485 --spread-bps 20 --slippage-bps 15
+```
+
+For optional **read-only** PAPER account confirmation, set only
+`ALPACA_PAPER_API_KEY_ID` and `ALPACA_PAPER_API_SECRET_KEY` in
+your local session, then append `--paper-read-only`. The paper host is
+hard-restricted; this command cannot place orders. Do not use live credentials.
+
+The report always keeps `releaseReady: false` until independent historical
+provenance, out-of-sample economic evidence, real paper fills and operational
+gate/persistence validation have been established elsewhere. The fact that a
+paper account exists is NOT a paper order execution test. As of the PR's
+construction, no real FMC data has been retrieved by this code and no paper
+order has been placed. A paper sell test must use a separately designed
+paper-only execution harness and explicit approval; this branch only reads
+account data and simulates outcomes.
+
+### Deployment decision
+**No-go for live activation.** Keep the PR draft; all new functionality is
+either an authenticated read-only diagnostic route or unconnected offline
+script/module. Production trading rules remain unmodified. Use the existing
+Alpaca/FMC holding protection rather than assuming any simulated trailing
+stop has reached the live engine.
