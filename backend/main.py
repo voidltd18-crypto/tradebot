@@ -144,3 +144,24 @@ def stock_momentum_replay_endpoint(request: Request, payload: dict = Body(...)):
         )
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# Identical caller-provided data compared with conservative, hypothetical
+# next-tick fill prices. No Alpaca calls, no account mutation or order creation.
+from backend.stock_momentum_cost_model import compare_costed_exits, CostAssumptions
+
+
+@app.post("/v19/stock-momentum-cost-preview")
+def stock_momentum_cost_preview(request: Request, payload: dict = Body(...)):
+    _legacy.verify_api_key(request)
+    try:
+        costs = payload.get("costAssumptions") or {}
+        if not isinstance(costs, dict):
+            raise ValueError("costAssumptions must be an object")
+        return compare_costed_exits(
+            payload.get("entryPrice"),
+            payload.get("observations"),
+            assumptions=CostAssumptions(**costs),
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
