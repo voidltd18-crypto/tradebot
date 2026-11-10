@@ -13061,6 +13061,11 @@ def refresh_adaptive_universe(force: bool = False) -> Dict[str, Any]:
     for sym in held:
         add_row({"symbol": sym, "score": 999.0, "reason": "currently held position"}, "HELD")
 
+    # Guarantee all ten approved tech symbols in the adaptive scan universe.
+    # Eligibility, confidence, daily locks and order execution gates still apply.
+    for sym in sorted(TECH_GIANT_STOCK_ALLOWED):
+        add_row({"symbol": sym, "score": 996.0, "reason": "approved tech stock | scan only"}, "CORE")
+
     for sym in manual:
         if sym not in seen and sym not in globals().get("BLOCKED_WEAK_TICKERS", set()):
             add_row({"symbol": sym, "score": 998.0, "reason": "manual pin | retained in adaptive universe", "manualPick": True}, "PIN")
