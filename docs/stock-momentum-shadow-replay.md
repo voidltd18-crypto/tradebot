@@ -88,3 +88,38 @@ Without it, there are no genuine FMC results to report.
    and observed signals over multiple independently verified episodes.
 5. Keep live opt-in OFF until the evidence is reviewed. There has
    been **no broker paper order or live order** as part of this PR.
+
+
+## Export FMC bars directly from Alpaca, without any order calls
+
+The branch contains `scripts/export_fmc_alpaca_bars.py`. It uses the
+official [Alpaca historical single-stock bars endpoint](https://docs.alpaca.markets/us/v1.4.2/reference/stockbarsingle-1),
+only issuing GET requests to `data.alpaca.markets`. It does **not**
+call trading endpoints, read positions, or submit orders.
+
+Set `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY` securely in your local
+terminal environment (never paste them into the chat or commit them).
+On Windows PowerShell, after setting these variables in your current
+session, run from the repository root:
+
+```powershell
+python -m scripts.export_fmc_alpaca_bars --start 2026-11-09T14:30:00Z --end 2026-11-09T21:00:00Z --feed iex --out fmc_2026-11-09_1min.csv
+python -m scripts.replay_fmc_csv fmc_2026-11-09_1min.csv --symbol FMC --source "Alpaca IEX raw 1Min 2026-11-09" --entry-price 5.485
+```
+
+The first command fetches bars into a file **only on the computer where it
+is executed**. The second runs the hypothetical strategy comparison;
+neither performs paper/live trades. The export defaults to IEX, which may
+represent a small subset of trading activity; SIP requires sufficient
+market-data entitlements. A single day of IEX bar closes does not
+establish intrabar spike execution quality or reliable trailing exits.
+
+Prices from November 9 are **not** a full replay of a position purchased
+during or after November 9; align the replay interval with verified
+purchase timestamps. Run multiple distinct historical sessions and
+estimate half-spread, delay and slippage under stress. Never claim
+positive expectancy from a single anecdotal rebound.
+
+The current branch contains exporter code and mocked tests, but it does
+**not** contain fetched, independently verified FMC historical bars.
+Likewise, there has been **no verified Alpaca paper execution**.
