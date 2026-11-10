@@ -239,3 +239,46 @@ durability pragmas without a measured regression test.
 requires broker-idempotent client order IDs wired to the real submission
 path, effective runtime DB path confirmation, startup broker
 reconciliation and paper order tests. The disk adapter is isolated.
+
+
+## 10 November: real journal + coordinator integration and paper startup audit
+
+- Fixed a verified integration defect: `SafeStockSellCoordinator.recover()`
+  previously passed `order_id` to the SQLite journal although the
+  journal API requires `broker_order_id`. The PostgreSQL prototype
+  now uses the same keyword contract.
+- Added `tests/test_stock_sell_recovery_end_to_end.py`: actual SQLite
+  journal with simulated process restart, accepted broker acknowledgement,
+  partial fill, canceled order and acknowledgement timeout. There is
+  only one mocked sell submission across the restarted coordinator.
+- Closed SQLite connections explicitly after journal operations, guarded
+  journal terminal-to-working status regressions, and required matching
+  order **symbol**, **side** and deterministic client ID in both
+  acknowledgement and recovery.
+- A broker timeout now returns `submitted=None` /
+  `submissionUncertain=True` rather than falsely asserting no order
+  was sent.
+- Added `backend/stock_sell_startup_audit.py` to read outstanding
+  journal records in SQLite read-only mode, query the independent **paper**
+  broker by client order ID and report outcomes without changing
+  journal status or issuing a new sell.
+- `backend/main.py` has an explicit
+  `TRADEBOT_STOCK_SELL_RECOVERY_PAPER_AUDIT_ENABLED=true` gate for
+  the startup diagnostic and authenticated
+  `/v19/stock-sell-recovery-paper-audit` GET. Without that flag,
+  startup performs no audit and the endpoint returns `enabled:false`.
+  Even when enabled, it requires `_legacy.PAPER is True`, a verified
+  database file under `/var/data`, and dedicated
+  `PAPER_ALPACA_API_KEY` / `PAPER_ALPACA_SECRET_KEY`.
+- Test coverage includes the opt-in guard and zero broker submission
+  from the audit helper.
+
+[Latest passing stock CI](https://github.com/voidltd18-crypto/tradebot/actions/runs/42837306144)
+
+**Scope limitation:** the production `market_sell_qty` function is
+still unchanged; its real sell submissions are **not** routed through
+the new coordinator. The paper startup audit is not a live startup
+broker-reconciliation worker. There are no dedicated paper credentials
+available for live paper tests, and effective production database path
+is not verified. This remains an unmerged research branch with
+production activation **NO-GO**.
