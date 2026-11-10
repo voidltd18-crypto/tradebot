@@ -24,11 +24,17 @@ export function SwingReviewPanel({ authToken, symbols }: { authToken: string; sy
     if (!authToken) return;
     setLoading(true);
     setError("");
+    // A broker-history reconciliation can be slower than the status feed.
+    // Never leave the UI stuck on "Checking..." after a network stall.
+    const controller = new AbortController();
+    const abortFromParent = () => controller.abort();
+    signal?.addEventListener("abort", abortFromParent, { once: true });
+    const timeout = window.setTimeout(() => controller.abort(), 35000);
     try {
       const response = await fetch(`${API_URL}/swing-review`, {
         cache: "no-store",
         headers: { "X-Auth-Token": authToken, "x-api-key": authToken },
-        signal,
+        signal: controller.signal,
       });
       const json: AnyObj = await readJson(response);
       if (!response.ok) throw new Error(String(json?.detail || `Review unavailable (${response.status})`));
@@ -38,8 +44,14 @@ export function SwingReviewPanel({ authToken, symbols }: { authToken: string; sy
       setUpdated(new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" }));
       if (json.status !== "ok") setError(String(json.reason || "Some holdings could not be verified"));
     } catch (e) {
-      if (!signal?.aborted) setError(e instanceof Error ? e.message : "Review unavailable");
+      if (!signal?.aborted) {
+        setError(controller.signal.aborted
+          ? "Broker holding-history check timed out. Refresh to try again; trading is unaffected."
+          : e instanceof Error ? e.message : "Review unavailable");
+      }
     } finally {
+      window.clearTimeout(timeout);
+      signal?.removeEventListener("abort", abortFromParent);
       if (!signal?.aborted) setLoading(false);
     }
   }, [authToken]);
@@ -57,6 +69,7 @@ export function SwingReviewPanel({ authToken, symbols }: { authToken: string; sy
       <button className="ghost" type="button" disabled={loading} onClick={() => void load()}>{loading ? "Checking…" : "↻ Refresh"}</button>
     </div>
     {error && <p className="muted" role="status">Review status: {error}</p>}
+    {loading && <p className="muted" role="status">Verifying current holding dates against Alpaca fills. This can take several seconds.</p>}
     {!loading && !visible.length && <p className="muted">{symbols.length ? "No matching review data available yet." : "No open positions to review."}</p>}
     {visible.length > 0 && <div className="swing-review-grid">
       {visible.map((row) => {
