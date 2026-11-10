@@ -84,3 +84,37 @@ def test_missing_order_fails_closed_and_no_ephemeral_memory(tmp_path):
     assert not journal.snapshot("FMC", "unknown")["blockedFromResubmit"]
     with pytest.raises(ValueError):
         journal.broker_ack("FMC", "unknown", "attempt-1", "order-1")
+
+
+
+def test_simultaneous_sell_claims_have_single_winner(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    path = tmp_path / "sell.db"
+    SellRecoveryJournal(path)
+    def attempt(i):
+        return SellRecoveryJournal(path).reserve_before_submit(
+            "FMC", "same-lot", f"attempt-{i}", 10)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        outcomes = list(pool.map(attempt, range(12)))
+    assert outcomes.count(True) == 1
+    assert outcomes.count(False) == 11
+
+
+def test_canceled_unfilled_order_not_implicitly_retried(tmp_path):
+    journal = SellRecoveryJournal(tmp_path / "sell.db")
+    assert journal.reserve_before_submit("FMC", "lot-1", "attempt-1", 10)
+    journal.broker_ack("FMC", "lot-1", "attempt-1", "order-1")
+    result = journal.reconcile(
+        "FMC", "lot-1", broker_order_id="order-1",
+        order_status="canceled", filled_qty=0, fresh_position_qty=10)
+    assert result["status"] == "TERMINAL_AWAIT_POSITION"
+    assert not journal.reserve_before_submit("FMC", "lot-1", "attempt-2", 10)
+
+
+def test_acknowledgement_order_id_cannot_change(tmp_path):
+    journal = SellRecoveryJournal(tmp_path / "sell.db")
+    journal.reserve_before_submit("FMC", "lot-1", "attempt-1", 5)
+    journal.broker_ack("FMC", "lot-1", "attempt-1", "order-1")
+    with pytest.raises(ValueError):
+        journal.broker_ack("FMC", "lot-1", "attempt-1", "order-2")
+    assert journal.snapshot("FMC", "lot-1")["brokerOrderId"] == "order-1"
