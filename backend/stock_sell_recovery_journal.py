@@ -87,13 +87,16 @@ class SellRecoveryJournal:
             if not row or row[0] != attempt_id or (row[1] and row[1] != order_id):
                 db.rollback()
                 raise ValueError("unknown or mismatched sell attempt")
-            if row[2] not in {"RESERVED", "UNKNOWN", "ACKNOWLEDGED", "WORKING"}:
+            if row[2] not in {"RESERVED", "UNKNOWN", "ACKNOWLEDGED", "WORKING", "PARTIAL"}:
                 db.rollback()
                 raise ValueError("cannot acknowledge terminal sell attempt")
+            # A repeated acknowledgement must never rewind a reconciled
+            # WORKING or PARTIAL order to its initial ACKNOWLEDGED status.
+            next_status = row[2] if row[2] in {"WORKING", "PARTIAL"} else "ACKNOWLEDGED"
             db.execute(
-                """UPDATE stock_sell_recovery SET status='ACKNOWLEDGED',
+                """UPDATE stock_sell_recovery SET status=?,
                    broker_order_id=? WHERE symbol=? AND position_key=?""",
-                (order_id, symbol, position_key))
+                (next_status, order_id, symbol, position_key))
             db.commit()
 
     def mark_unknown(self, symbol, position_key):
