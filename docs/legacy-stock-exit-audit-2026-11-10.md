@@ -282,3 +282,20 @@ broker-reconciliation worker. There are no dedicated paper credentials
 available for live paper tests, and effective production database path
 is not verified. This remains an unmerged research branch with
 production activation **NO-GO**.
+
+
+## Same-day follow-up: duplicate acknowledgement state regression
+
+Read-only inspection of the actual SQLite journal uncovered another
+defect: a second `broker_ack(...)` with the same Alpaca order ID
+could reset a previously reconciled `WORKING` or `PARTIAL` record
+back to `ACKNOWLEDGED`. The journal now treats matching repeated
+acknowledgements as idempotent and retains the reconciled status and
+cumulative fill. Tests explicitly verify both working and partially
+filled cases across journal reopen.
+
+[Passing stock CI](https://github.com/voidltd18-crypto/tradebot/actions/runs/42838116901)
+
+No changes to production legacy submit path, Render service or
+Alpaca account. PR remains draft; paper broker verification and actual
+sell-worker integration are still required.
