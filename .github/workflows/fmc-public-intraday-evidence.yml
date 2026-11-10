@@ -3,6 +3,7 @@ on:
   pull_request:
     paths:
       - 'scripts/probe_fmc_public_intraday.py'
+      - 'scripts/probe_fmc_public_multisession.py'
       - '.github/workflows/fmc-public-intraday-evidence.yml'
   workflow_dispatch:
 permissions:
@@ -19,4 +20,6 @@ jobs:
       - name: Attempt independent, no-credential FMC minute data comparison
         env:
           PYTHONDONTWRITEBYTECODE: '1'
-        run: python -m scripts.probe_fmc_public_intraday
+        run: |
+          python -m scripts.probe_fmc_public_intraday
+          python -m scripts.probe_fmc_public_multisession
