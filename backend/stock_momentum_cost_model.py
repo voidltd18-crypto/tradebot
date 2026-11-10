@@ -65,11 +65,13 @@ def _fill_for_signal(signal, points, assumptions, entry):
     }
 
 
-def compare_costed_exits(entry_price, observations, *, assumptions=None):
+def compare_costed_exits(entry_price, observations, *, assumptions=None,
+                         reference_activation_pct=None):
     """Compare both strategies under the SAME cost and tick-delay assumptions."""
     if assumptions is None:
         assumptions = CostAssumptions()
-    replay = replay_stock_exits(entry_price, observations)
+    replay = replay_stock_exits(entry_price, observations,
+                               reference_activation_pct=reference_activation_pct)
     points = _parse_observations(observations)
     baseline = _fill_for_signal(replay["baselineFirstExit"], points,
                                 assumptions, float(entry_price))
@@ -84,6 +86,7 @@ def compare_costed_exits(entry_price, observations, *, assumptions=None):
         "dataVerifiedAsFmcHistory": False,
         "executionModel": "next observed tick; sell at adverse half-spread and slip",
         "costAssumptions": assumptions.__dict__,
+        "referenceActivationPct": replay["referenceActivationPct"],
         "candidate": candidate, "referenceTrailingExit": baseline,
         "candidateMinusReferenceNetPnlUsd": delta,
         "note": "0.7% reference is a hypothetical comparator, not a verified full TradeBot strategy",
