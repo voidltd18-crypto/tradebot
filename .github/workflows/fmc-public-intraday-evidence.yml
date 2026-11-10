@@ -1,0 +1,22 @@
+name: FMC public intraday evidence (no credentials)
+on:
+  pull_request:
+    paths:
+      - 'scripts/probe_fmc_public_intraday.py'
+      - '.github/workflows/fmc-public-intraday-evidence.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  public-minute-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Attempt independent, no-credential FMC minute data comparison
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python -m scripts.probe_fmc_public_intraday
