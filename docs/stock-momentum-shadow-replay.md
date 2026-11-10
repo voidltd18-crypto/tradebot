@@ -155,3 +155,28 @@ that any real Alpaca paper order will be filled or safely retried.
    against the actual paper account, with explicit authorization.
 5. Keep production order execution unchanged unless separately
    approved after observing results.
+
+## Restart-safe position state and PAPER account read-only inspection
+
+- `backend/stock_exit_state_store.py` stores a per-position observed peak
+  and atomic one-shot hypothetical exit reservation in a SQLite file.
+  Reservation blocks a second attempt after process restart. It requires a
+  stable position key from verified entry identity. Once reserved it remains
+  blocked until explicit independently broker-verified flat reconciliation.
+- The file **must** be on persistent storage or it will not survive an
+  ephemeral-host filesystem replacement (Render deployments may replace
+  ephemeral disks). A production-quality store should use a durable shared
+  database with a uniquely indexed idempotency key before any execution
+  integration. This offline module is not wired to the live stock engine.
+- `backend/stock_paper_account_reader.py` is a GET-only client that
+  hard-restricts its base URL to Alpaca's paper hostname, and can read the
+  paper account, FMC position, and orders for manual verification. It has
+  **no buy, sell, cancel, or submit methods**. Do not pass live credentials.
+- CI uses injected HTTP responses and temporary SQLite files. Passing tests
+  do not establish that the connected Alpaca paper account was contacted.
+
+**Outstanding:** Obtain genuine FMC market-data exports; authenticate with
+a PAPER account in a controlled environment, reconcile actual paper account
+position/order statuses; demonstrate durable state on deployment storage;
+and review existing live sell precedence and regulatory safeguards. PR stays
+draft and no live or paper orders have been placed.
