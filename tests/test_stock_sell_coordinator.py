@@ -49,7 +49,7 @@ class Broker:
             self.present = {"id": "broker-1", "symbol": symbol, "side": "sell", "client_order_id": client_order_id,
                             "status": "accepted", "filled_qty": "0"}
             raise TimeoutError("ack timeout")
-        self.present = {"id": "broker-1", "client_order_id": client_order_id,
+        self.present = {"id": "broker-1", "symbol": symbol, "side": "sell", "client_order_id": client_order_id,
                         "status": "accepted", "filled_qty": "0"}
         return self.present
 
