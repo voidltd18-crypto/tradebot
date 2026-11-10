@@ -186,3 +186,26 @@ verification. The stock coordinator has no established market-open, PDT,
 quote-freshness or full current-rule permission of its own: these must
 remain authoritative external gates. Keep the PR draft, unmerged and
 live settings untouched.
+
+
+## Paper-only Alpaca SDK adapter (experimental)
+
+Added `backend/stock_sell_alpaca_paper_adapter.py` plus isolated mock
+tests. Its `make_paper_broker()` factory creates an Alpaca
+`TradingClient(..., paper=True)` using dedicated paper credentials.
+It implements the coordinator contract for fresh stock position
+quantity, bounded open orders, lookup by deterministic
+`client_order_id`, and paper stock market SELL submission. Missing
+position/order is accepted only on an explicit API 404; authentication,
+timeout and server failures propagate and block the proposed order.
+Broker acknowledgements are validated against symbol, side and client ID.
+
+The adapter is **not connected to `backend/legacy/monolith.py`** and no
+paper or real order was submitted during mock tests. Alpaca SDK
+signatures were checked against its published API documentation;
+integration with a real paper account remains unavailable.
+
+Production NO-GO until actual paper tests, provisioned shared database,
+fresh market/PDT/full-strategy gates, deployed SHA verification, and
+authoritative post-fill reconciliation are proven. Do not merge or
+activate this research branch for the approaching market open.
