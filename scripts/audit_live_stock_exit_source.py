@@ -10,7 +10,8 @@ import re
 from pathlib import Path
 
 MONOLITH = Path(__file__).resolve().parents[1] / "backend" / "legacy" / "monolith.py"
-TARGETS = ("manage_money_mode_positions", "get_all_positions")
+TARGETS = ("manage_money_mode_positions", "get_all_positions",
+           "_v17_runner_trail_decision", "market_sell_qty")
 TERMS = re.compile(r"TRAIL|GIVEBACK|PEAK|HIGHEST|PROFIT|RUNNER|GRACE|SELL|PDT|LOCK|STOP|PARTIAL|ORDER|HOLD|COOLDOWN", re.I)
 
 
