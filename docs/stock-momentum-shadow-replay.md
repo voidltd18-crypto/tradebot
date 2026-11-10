@@ -211,3 +211,32 @@ either an authenticated read-only diagnostic route or unconnected offline
 script/module. Production trading rules remain unmodified. Use the existing
 Alpaca/FMC holding protection rather than assuming any simulated trailing
 stop has reached the live engine.
+
+
+## Authenticated paper + FMC historical verification (manual workflow prepared)
+
+The experimental branch now contains
+`.github/workflows/fmc-authenticated-readonly-audit.yml`. It requests an
+Alpaca PAPER account status via GET and authenticates FMC historical 1-minute
+GET requests at Alpaca market-data, using the repository's existing dedicated
+`PAPER_ALPACA_API_KEY` and `PAPER_ALPACA_SECRET_KEY` secrets. It
+produces a research-only downloadable JSON report with hypothetical
+candidate and reference fills. It cannot submit orders.
+
+This workflow is **manual-only** (`workflow_dispatch`) and cannot
+run as a normal PR check. GitHub normally requires workflows to be present
+on the repository's default branch to be dispatchable from Actions, even
+when a different ref is selected. This entire PR remains draft because
+merging it is not a safe substitute for production validation. No
+authenticated paper/data run has yet occurred.
+
+To test without merging this draft, use a local clone of the branch and
+run `python -m scripts.verify_fmc_paper_history_readonly` with
+dedicated PAPER credentials in environment variables, plus the
+`--start`, `--end`, `--entry-price`, `--feed`, `--out` options.
+Never paste broker credentials into chats or commit credentials to GitHub.
+
+**GO/NO-GO as of 2026-11-10: NO-GO.** The five-session public FMC
+replay showed zero observed improvement, and authenticated broker data,
+verified original trade entry, paper execution, and full live-exit-rule
+integration remain unavailable. Keep production trading untouched.
