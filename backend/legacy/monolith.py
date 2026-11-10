@@ -11477,7 +11477,7 @@ def run_bot_loop():
                         september_qualified_stock_symbols() if TRADEBOT_PERFORMANCE_UNIVERSE_MODE
                         else (list(TRADEBOT_TWO_STOCK_SYMBOLS) if TRADEBOT_TWO_STOCK_MODE
                               else list(current_universe))
-                    ) if "/" not in str(sym)),
+                    ) if "/" not in str(sym) and str(sym).upper().strip() in TECH_GIANT_STOCK_ALLOWED),
                     key=lambda sym: 0 if preferred_scan_symbol and str(sym).upper() == preferred_scan_symbol else 1,
                 )
                 for symbol in scan_order:
@@ -13042,6 +13042,9 @@ def refresh_adaptive_universe(force: bool = False) -> Dict[str, Any]:
             return
         sym = str(row.get("symbol") or "").upper().strip()
         if not sym or sym in seen:
+            return
+        # Retain existing holdings for exits; restrict all other scanner slots.
+        if source != "HELD" and sym not in TECH_GIANT_STOCK_ALLOWED:
             return
         # Stock discovery must not feed crypto pairs into stock quote APIs.
         # Keep HELD rows intact for position visibility and existing exits.
