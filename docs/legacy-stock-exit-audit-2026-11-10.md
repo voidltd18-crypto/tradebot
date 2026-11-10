@@ -83,3 +83,32 @@ registration and zero quantity. All network interactions are mocks.
 **Release decision remains NO-GO** until broker-reconciliation
 failure handling and durable state have verified recovery tests.
 No production monolith edit or real order executed.
+
+
+## 10 November: isolated durable sell journal prototype
+
+Implemented `backend/stock_sell_recovery_journal.py` and
+`tests/test_stock_sell_recovery_journal.py` on the draft PR branch.
+
+- Transactional reservation before any attempted sell; only one concurrent
+  attempt wins the claim for a given symbol and stable position identity.
+- Unknown submit acknowledgment or pending-order persistence errors remain
+  blocked from duplicate resubmission, including after a local process restart.
+- Accepted broker order ID, partial fills, cancels and terminal statuses
+  are recorded against the reservation; the same lot is **never silently
+  retried**. Broker order ID and cumulative fills cannot regress.
+- A final filled order requires an independently fresh flat position to
+  obtain `VERIFIED_FLAT` journal status. The prototype does not itself
+  submit orders or compute realised P&L.
+
+**Crucial deployment limitation:** the reference implementation uses
+SQLite. It only survives restarts when its file lives on a durable disk
+visible to the same worker and does not provide safe cross-host locking.
+Do not connect it to multiple ephemeral Render instances. A true
+production migration needs the existing persistent database,
+verified worker ownership, recovery on startup, and broker-order
+reconciliation before any new order is submitted.
+
+These are offline regression checks, **not** a deployed production fix.
+The current live `market_sell_qty` and high-water mark reset are
+unchanged. No money or orders have been touched.
