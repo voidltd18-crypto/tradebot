@@ -118,3 +118,28 @@ def test_acknowledgement_order_id_cannot_change(tmp_path):
     with pytest.raises(ValueError):
         journal.broker_ack("FMC", "lot-1", "attempt-1", "order-2")
     assert journal.snapshot("FMC", "lot-1")["brokerOrderId"] == "order-1"
+
+
+def test_repeated_ack_does_not_erase_partial_fill_state(tmp_path):
+    journal = SellRecoveryJournal(tmp_path / "sell.db")
+    assert journal.reserve_before_submit("FMC", "lot-1", "attempt-1", 10)
+    journal.broker_ack("FMC", "lot-1", "attempt-1", "order-1")
+    journal.reconcile(
+        "FMC", "lot-1", broker_order_id="order-1",
+        order_status="partially_filled", filled_qty=4, fresh_position_qty=6)
+    journal.broker_ack("FMC", "lot-1", "attempt-1", "order-1")
+    state = SellRecoveryJournal(tmp_path / "sell.db").snapshot("FMC", "lot-1")
+    assert state["status"] == "PARTIAL"
+    assert state["filledQty"] == 4
+    assert state["blockedFromResubmit"]
+
+
+def test_repeated_ack_does_not_erase_working_state(tmp_path):
+    journal = SellRecoveryJournal(tmp_path / "sell.db")
+    journal.reserve_before_submit("FMC", "lot-1", "attempt-1", 10)
+    journal.broker_ack("FMC", "lot-1", "attempt-1", "order-1")
+    journal.reconcile(
+        "FMC", "lot-1", broker_order_id="order-1",
+        order_status="accepted", filled_qty=0, fresh_position_qty=10)
+    journal.broker_ack("FMC", "lot-1", "attempt-1", "order-1")
+    assert journal.snapshot("FMC", "lot-1")["status"] == "WORKING"
