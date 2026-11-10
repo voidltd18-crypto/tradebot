@@ -157,3 +157,32 @@ SQL statement semantics, not real PostgreSQL isolation verification.
 
 **Decision remains NO-GO for live activation.** Existing production
 selling code, settings, broker orders and deployments remain unchanged.
+
+
+## Pre-market safety coordinator (isolated, no live worker attachment)
+
+Added `backend/stock_sell_coordinator.py`, an injected stock-only
+coordinator with deterministic `tb-stock-sell-<digest>`
+`client_order_id`. It checks the authoritative position, working orders,
+broker client ID and durable reservation **before** asking the injected
+broker to submit. On an acknowledgement timeout, uncertain order identity,
+or journal acknowledgement persistence failure, the reservation remains
+blocked. `recover()` reads the broker's order by client ID and reconciles
+authoritative position and cumulative fills; it never submits a new order.
+
+Contract-level regression tests:
+`tests/test_stock_sell_coordinator.py`, including timeout *after*
+broker acceptance, database acknowledgement outage, duplicate attempt,
+broker-read failure, mismatched positions and read-only recovery.
+
+CI:
+https://github.com/voidltd18-crypto/tradebot/actions/runs/42829921233
+
+**This is not a deployment.** Production still lacks a validated
+broker adapter implementing exhaustive `client_order_id` lookup,
+a TradeBot-owned shared Postgres instance with migration, a disabled-by-
+default integration in the legacy sell worker, and paper-broker execution
+verification. The stock coordinator has no established market-open, PDT,
+quote-freshness or full current-rule permission of its own: these must
+remain authoritative external gates. Keep the PR draft, unmerged and
+live settings untouched.
