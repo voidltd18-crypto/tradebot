@@ -54,7 +54,7 @@ export function useTradeBot(activeTab: Tab = "overview") {
   const strategySettings = data?.strategySettings || {};
   const positionSettings = data?.positionSettings || {};
 
-  const bestCandidate = useMemo(() => [...scans, ...dynamicRows].filter((item: AnyObj) => item?.symbol).sort((a: AnyObj, b: AnyObj) => Number(b?.confidence ?? b?.score ?? b?.quality ?? 0) - Number(a?.confidence ?? a?.score ?? a?.quality ?? 0))[0], [scans, dynamicRows]);
+  const bestCandidate = useMemo(() => { const approved = new Set(["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "AVGO", "ORCL", "AMD", "TSLA"]); return [...scans, ...dynamicRows].filter((item: AnyObj) => approved.has(String(item?.symbol || "").toUpperCase())).sort((a: AnyObj, b: AnyObj) => Number(b?.confidence ?? b?.score ?? b?.quality ?? 0) - Number(a?.confidence ?? a?.score ?? a?.quality ?? 0))[0]; }, [scans, dynamicRows]);
   const candidateScore = Number(bestCandidate?.confidence ?? bestCandidate?.score ?? bestCandidate?.quality ?? 0);
   const aiConfidenceRaw = Number(data?.ai?.confidence ?? data?.aiConfidence ?? (candidateScore <= 1 ? candidateScore * 100 : candidateScore) ?? 0);
   const aiConfidence = clamp(aiConfidenceRaw <= 1 ? aiConfidenceRaw * 100 : aiConfidenceRaw);
