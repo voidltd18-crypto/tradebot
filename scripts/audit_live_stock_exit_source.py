@@ -37,6 +37,10 @@ def audit(source_path=MONOLITH):
             "endLine": node.end_lineno,
             "matchedSourceLines": len(matches),
             "excerpts": matches[:110],
+            "runnerBlock": [
+                {"line": n, "code": lines[n - 1][:200]}
+                for n in range(node.lineno, node.end_lineno + 1)
+            ] if name == "_v17_runner_trail_decision" else [],
             "trailingBlock": [
                 {"line": n, "code": lines[n - 1][:200]}
                 for n in range(max(node.lineno, 5010), min(node.end_lineno, 5057) + 1)
