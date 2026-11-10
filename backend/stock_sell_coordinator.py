@@ -78,15 +78,15 @@ class SafeStockSellCoordinator:
             # A timeout or exception may follow a broker-accepted order.
             # Preserve the reservation; no resubmit, even after restart.
             self.journal.mark_unknown(symbol, position_key)
-            return {"status": "UNKNOWN_BROKER_OUTCOME", "submitted": False,
-                    "clientOrderId": client_id}
+            return {"status": "UNKNOWN_BROKER_OUTCOME", "submitted": None,
+                    "submissionUncertain": True, "clientOrderId": client_id}
         if not isinstance(order, dict) or not order.get("id") or (
                 order.get("client_order_id") != client_id or
                 str(order.get("symbol") or "").upper() != symbol or
                 str(order.get("side") or "").lower() != "sell"):
             self.journal.mark_unknown(symbol, position_key)
-            return {"status": "UNKNOWN_BROKER_ACK", "submitted": False,
-                    "clientOrderId": client_id}
+            return {"status": "UNKNOWN_BROKER_ACK", "submitted": None,
+                    "submissionUncertain": True, "clientOrderId": client_id}
         try:
             self.journal.broker_ack(
                 symbol, position_key, client_id, str(order["id"]))
