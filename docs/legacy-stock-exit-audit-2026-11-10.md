@@ -209,3 +209,33 @@ Production NO-GO until actual paper tests, provisioned shared database,
 fresh market/PDT/full-strategy gates, deployed SHA verification, and
 authoritative post-fill reconciliation are proven. Do not merge or
 activate this research branch for the approaching market open.
+
+
+## Existing Render disk alternative / SQLite storage audit
+
+Read-only Render metadata confirms the stock backend has one instance and
+a 100 GB persistent disk at `/var/data`. The checked-in legacy source
+sets `SQLITE_DB_FILE` from the environment, falling back to
+`persistent_file("trades.db")`; its persistent-file selection uses
+`/var/data` when available. `db_connect()` enables SQLite WAL and
+a bounded busy timeout. These source facts do **not** prove the live
+environment lacks an overriding `SQLITE_DB_FILE` setting.
+
+Added `backend/stock_sell_recovery_disk.py` and
+`tests/test_stock_sell_recovery_disk.py` to rehearse recovery
+reservations in the **same existing on-disk SQLite database** alongside
+legacy tables. The tests check reboot-like reopening, duplicate attempt
+blocking, WAL persistence, rejection of non-mounted or missing database
+files and symlinks. This is a narrower, practical alternative to adding
+a new shared PostgreSQL server for the existing single-instance service.
+
+Render's logs also show `DB WRITER SLOW` warnings, including
+`_v13_upsert_knowledge` operations around 30 seconds on 10 November.
+Those are performance symptoms; no code-level root cause is yet proven,
+and we should NOT disable knowledge persistence or change SQLite
+durability pragmas without a measured regression test.
+
+**No live changes.** A durable stock sell recovery cutover still
+requires broker-idempotent client order IDs wired to the real submission
+path, effective runtime DB path confirmation, startup broker
+reconciliation and paper order tests. The disk adapter is isolated.
