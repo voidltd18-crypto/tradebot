@@ -48,6 +48,7 @@ def replay_stock_exits(
     *,
     settings: ExitSettings = ExitSettings(),
     sample_max_gap_seconds: int = 120,
+    reference_activation_pct: float | None = None,
 ) -> dict:
     """Replay hypothetical closes at first observed trigger, before fees/slippage.
 
@@ -61,6 +62,10 @@ def replay_stock_exits(
         raise ValueError("invalid entry price") from exc
     if not isfinite(entry) or entry <= 0:
         raise ValueError("invalid entry price")
+    if reference_activation_pct is None:
+        reference_activation_pct = settings.spike_min_gain_pct
+    if not isfinite(reference_activation_pct) or reference_activation_pct <= 0:
+        raise ValueError("reference activation must be finite and positive")
     if sample_max_gap_seconds <= 0 or sample_max_gap_seconds > 3600:
         raise ValueError("invalid maximum gap")
     points = _parse_observations(observations)
@@ -92,7 +97,9 @@ def replay_stock_exits(
         candidate_trigger = armed and reversal >= (
             settings.spike_trail_pct if mode == "SPIKE" else settings.trend_trail_pct
         )
-        baseline_trigger = armed and reversal >= settings.trend_trail_pct
+        baseline_armed = (peak_gain >= reference_activation_pct and profit > 0 and
+                          len(streak) >= settings.spike_window)
+        baseline_trigger = baseline_armed and reversal >= settings.trend_trail_pct
         record = {
             "timestamp": point.timestamp.isoformat(), "price": point.price,
             "mode": mode, "profitPct": round(profit, 4),
@@ -108,6 +115,7 @@ def replay_stock_exits(
     return {
         "readOnly": True, "ordersSubmitted": 0, "source": "provided_observations",
         "sampleCount": len(points), "enabledForLiveTrading": False,
+        "referenceActivationPct": reference_activation_pct,
         "assumptions": "first observed trigger fill at sample price; no spread, slippage, fees or PDT constraints",
         "candidateFirstExit": first_candidate,
         "baselineFirstExit": first_baseline,
