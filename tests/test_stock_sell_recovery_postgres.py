@@ -72,16 +72,16 @@ def test_partial_then_terminal_cannot_become_working(tmp_path):
     journal.reserve_before_submit("FMC", "lot", "attempt", 10)
     journal.broker_ack("FMC", "lot", "attempt", "broker-01")
     partial = journal.reconcile(
-        "FMC", "lot", order_id="broker-01",
+        "FMC", "lot", broker_order_id="broker-01",
         order_status="partially_filled", filled_qty=4, fresh_position_qty=6)
     assert partial["status"] == "PARTIAL"
     terminal = journal.reconcile(
-        "FMC", "lot", order_id="broker-01",
+        "FMC", "lot", broker_order_id="broker-01",
         order_status="canceled", filled_qty=4, fresh_position_qty=6)
     assert terminal["status"] == "TERMINAL_AWAIT_POSITION"
     with pytest.raises(ValueError):
         journal.reconcile(
-            "FMC", "lot", order_id="broker-01",
+            "FMC", "lot", broker_order_id="broker-01",
             order_status="accepted", filled_qty=4, fresh_position_qty=6)
     assert journal.snapshot("FMC", "lot")["status"] == "TERMINAL_AWAIT_POSITION"
 
@@ -91,11 +91,11 @@ def test_verified_flat_requires_order_terminal_and_zero_position(tmp_path):
     journal.reserve_before_submit("FMC", "lot", "attempt", 10)
     journal.broker_ack("FMC", "lot", "attempt", "broker-01")
     r = journal.reconcile(
-        "FMC", "lot", order_id="broker-01", order_status="filled",
+        "FMC", "lot", broker_order_id="broker-01", order_status="filled",
         filled_qty=10, fresh_position_qty=2)
     assert r["status"] == "TERMINAL_AWAIT_POSITION"
     r = journal.reconcile(
-        "FMC", "lot", order_id="broker-01", order_status="filled",
+        "FMC", "lot", broker_order_id="broker-01", order_status="filled",
         filled_qty=10, fresh_position_qty=0)
     assert r["status"] == "VERIFIED_FLAT"
     assert not journal.reserve_before_submit("FMC", "lot", "retry", 10)
@@ -106,13 +106,13 @@ def test_mismatch_fill_regression_and_untrusted_status_fail_closed(tmp_path):
     journal.reserve_before_submit("FMC", "lot", "attempt", 10)
     journal.broker_ack("FMC", "lot", "attempt", "broker-01")
     journal.reconcile(
-        "FMC", "lot", order_id="broker-01", order_status="partially_filled",
+        "FMC", "lot", broker_order_id="broker-01", order_status="partially_filled",
         filled_qty=4, fresh_position_qty=6)
     for values in [
-        {"order_id": "wrong", "order_status": "filled", "filled_qty": 10},
-        {"order_id": "broker-01", "order_status": "partially_filled", "filled_qty": 2},
-        {"order_id": "broker-01", "order_status": "filled", "filled_qty": 5},
-        {"order_id": "broker-01", "order_status": "new-unknown", "filled_qty": 4},
+        {"broker_order_id": "wrong", "order_status": "filled", "filled_qty": 10},
+        {"broker_order_id": "broker-01", "order_status": "partially_filled", "filled_qty": 2},
+        {"broker_order_id": "broker-01", "order_status": "filled", "filled_qty": 5},
+        {"broker_order_id": "broker-01", "order_status": "new-unknown", "filled_qty": 4},
     ]:
         with pytest.raises(ValueError):
             journal.reconcile("FMC", "lot", fresh_position_qty=6, **values)
