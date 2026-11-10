@@ -1,0 +1,62 @@
+name: FMC authenticated paper-and-history read-only audit
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: 'UTC timestamp of FMC history start (e.g. 2026-11-09T14:30:00Z)'
+        required: true
+        type: string
+      end:
+        description: 'UTC timestamp of FMC history end (e.g. 2026-11-09T21:00:00Z)'
+        required: true
+        type: string
+      assumed_entry:
+        description: 'Hypothetical FMC entry price in USD; NOT verified broker cost basis'
+        required: true
+        default: '5.485'
+        type: string
+      feed:
+        description: 'Market data feed; IEX does not cover all US equity trades'
+        required: true
+        type: choice
+        options:
+          - iex
+          - sip
+permissions:
+  contents: read
+jobs:
+  fmcreadonly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      PAPER_ALPACA_API_KEY: ${{ secrets.PAPER_ALPACA_API_KEY }}
+      PAPER_ALPACA_SECRET_KEY: ${{ secrets.PAPER_ALPACA_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Require isolated paper secrets
+        shell: bash
+        run: |
+          if [[ -z "$PAPER_ALPACA_API_KEY" || -z "$PAPER_ALPACA_SECRET_KEY" ]]; then
+            echo "Dedicated PAPER credentials unavailable; no network checks performed"
+            exit 1
+          fi
+      - name: Verify Alpaca PAPER account and fetch FMC historical bars, GET only
+        shell: bash
+        env:
+          FMC_START: ${{ inputs.start }}
+          FMC_END: ${{ inputs.end }}
+          FMC_ENTRY: ${{ inputs.assumed_entry }}
+          FMC_FEED: ${{ inputs.feed }}
+        run: |
+          python -m scripts.verify_fmc_paper_history_readonly \
+            --start "$FMC_START" --end "$FMC_END" \
+            --entry-price "$FMC_ENTRY" --feed "$FMC_FEED" \
+            --out fmc-readonly-research-report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fmc-readonly-research-report
+          path: fmc-readonly-research-report.json
+          retention-days: 7
