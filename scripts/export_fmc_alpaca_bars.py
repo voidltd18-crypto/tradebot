@@ -98,15 +98,15 @@ def fetch_fmc_bars(start, end, *, api_key, api_secret, feed="iex", opener=None,
 
 
 def export_fmc_bars(start, end, path, *, feed="iex", env=None, opener=None):
+    path = Path(path)
+    if path.exists():
+        raise FileExistsError("refusing to overwrite existing data file")
     env = os.environ if env is None else env
     rows = fetch_fmc_bars(
         start, end, api_key=env.get("APCA_API_KEY_ID") or env.get("ALPACA_API_KEY", ""),
         api_secret=env.get("APCA_API_SECRET_KEY") or env.get("ALPACA_API_SECRET", ""),
         feed=feed, opener=opener,
     )
-    path = Path(path)
-    if path.exists():
-        raise FileExistsError("refusing to overwrite existing data file")
     with path.open("x", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=("timestamp", "close"))
         writer.writeheader()
