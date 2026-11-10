@@ -1365,11 +1365,10 @@ def get_all_positions():
                 except Exception:
                     quote_price = 0.0
 
-            pnl = 0.0
-            pnl_pct = 0.0
-            if entry > 0 and quote_price > 0:
-                pnl = (quote_price - entry) * qty
-                pnl_pct = ((quote_price / entry) - 1.0) * 100.0
+            # Use Alpaca's coherent position mark for the dashboard.
+            # Keep the separate quote_price for historical peak/risk management.
+            from backend.v19_position_display import broker_display_values
+            display_price, pnl, pnl_pct = broker_display_values(pos, quote_price)
 
             highest = state[symbol].get("highest_since_entry")
             observed_peak = max(float(highest or 0.0), quote_price)
@@ -1398,7 +1397,7 @@ def get_all_positions():
                 "symbol": symbol,
                 "qty": qty,
                 "entry": entry,
-                "price": quote_price,
+                "price": display_price,
                 "marketValue": market_value,
                 "marketValueGbp": money_gbp(market_value),
                 "pnl": pnl,

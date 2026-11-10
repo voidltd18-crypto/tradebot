@@ -162,7 +162,12 @@ def current_position_entry_fill(orders, symbol: str, current_qty: float):
             balance -= qty
             if balance < 0:
                 raise ValueError("fill history incomplete or includes short selling")
-            if balance == 0:
+            # Fractional market orders can leave sub-microshare dust behind
+            # (FMC: 0.000000028 after the previous full close). Treat only
+            # that negligible remainder as flat so re-entries get a fresh
+            # holding date; final inventory still has to reconcile to Alpaca.
+            if balance <= Decimal("0.000001"):
+                balance = Decimal("0")
                 entry = None
     if abs(balance - Decimal(str(current_qty))) > Decimal("0.000001") or entry is None:
         raise ValueError("fills do not reconcile to current broker position")
