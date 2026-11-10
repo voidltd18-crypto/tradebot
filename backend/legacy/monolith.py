@@ -2650,6 +2650,13 @@ def v2_symbol_expectancy(symbol: str):
     directional = len(wins) + len(losses)
     win_rate = len(wins) / directional if directional else 0.0
     expectancy_pct = sum(pct) / len(pct) if pct else 0.0
+    # Read-only provenance for auditing legacy performance evidence.
+    dated_rows = [(_parse_trade_dt(t.get("timestamp")), t) for t in rows]
+    dated_rows = [(dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt, t) for dt, t in dated_rows if dt is not None]
+    recent_30d = sum(dt >= datetime.now(UTC) - timedelta(days=30) for dt, _ in dated_rows)
+    recent_90d = sum(dt >= datetime.now(UTC) - timedelta(days=90) for dt, _ in dated_rows)
+    oldest_sample = min((dt.isoformat() for dt, _ in dated_rows), default=None)
+    newest_sample = max((dt.isoformat() for dt, _ in dated_rows), default=None)
     enough = len(rows) >= V2_MIN_SYMBOL_SAMPLES
     approved = enough and win_rate >= V2_MIN_WIN_RATE and profit_factor >= V2_MIN_PROFIT_FACTOR and expectancy_pct >= V2_MIN_EXPECTANCY_PCT
     reasons = []
@@ -2660,6 +2667,9 @@ def v2_symbol_expectancy(symbol: str):
     return {
         "symbol": sym, "samples": len(rows), "wins": len(wins), "losses": len(losses), "breakevens": len(breakevens),
         "directionalSamples": directional, "winRate": win_rate, "profitFactor": profit_factor,
+        "lookbackDays": V2_LOOKBACK_DAYS, "recent30dSamples": recent_30d,
+        "recent90dSamples": recent_90d, "oldestSampleAt": oldest_sample,
+        "newestSampleAt": newest_sample,
         "expectancyPct": expectancy_pct, "totalPnl": sum(pnls),
         "approved": approved, "reason": "approved" if approved else "; ".join(reasons) or "not approved",
         "forwardShadow": v2_forward_shadow_profile(sym),
@@ -4541,6 +4551,7 @@ def pick_money_mode_stocks(
         if not v2_ok:
             if log_rejections and not v2_profile.get("coldStart"):
                 print(f"V2 SKIP {symbol} | {v2_profile.get('reason')}")
+                print(f"V2 EVIDENCE AUDIT | symbol={symbol} samples={v2_profile.get('samples')} recent30={v2_profile.get('recent30dSamples')} recent90={v2_profile.get('recent90dSamples')} oldest={v2_profile.get('oldestSampleAt')} newest={v2_profile.get('newestSampleAt')} lookback_days={v2_profile.get('lookbackDays')} trading_unchanged=true", flush=True)
             stage = "v17_cold_start_gate" if v2_profile.get("coldStart") else "expectancy_gate"
             reason_text = v2_profile.get("coldStartReason") or v2_profile.get("reason", "not approved")
             persist(scan, "REJECTED", stage, reason_text, v2_profile)
