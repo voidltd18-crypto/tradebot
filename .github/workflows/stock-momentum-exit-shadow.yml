@@ -1,0 +1,18 @@
+name: Stock momentum exit shadow tests
+on:
+  pull_request:
+    paths:
+      - 'backend/stock_momentum_exit_shadow.py'
+      - 'tests/test_stock_momentum_exit_shadow.py'
+      - '.github/workflows/stock-momentum-exit-shadow.yml'
+  workflow_dispatch:
+jobs:
+  shadow-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install pytest
+      - run: python -m pytest -q tests/test_stock_momentum_exit_shadow.py
