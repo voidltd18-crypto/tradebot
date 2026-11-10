@@ -81,7 +81,9 @@ class SafeStockSellCoordinator:
             return {"status": "UNKNOWN_BROKER_OUTCOME", "submitted": False,
                     "clientOrderId": client_id}
         if not isinstance(order, dict) or not order.get("id") or (
-                order.get("client_order_id") != client_id):
+                order.get("client_order_id") != client_id or
+                str(order.get("symbol") or "").upper() != symbol or
+                str(order.get("side") or "").lower() != "sell"):
             self.journal.mark_unknown(symbol, position_key)
             return {"status": "UNKNOWN_BROKER_ACK", "submitted": False,
                     "clientOrderId": client_id}
@@ -105,7 +107,9 @@ class SafeStockSellCoordinator:
         # Missing broker order means unknown, not permission to retry.
         order = self.broker.get_order_by_client_id(cid)
         if not isinstance(order, dict) or not order.get("id") or (
-                order.get("client_order_id") != cid):
+                order.get("client_order_id") != cid or
+                str(order.get("symbol") or "").upper() != symbol or
+                str(order.get("side") or "").lower() != "sell"):
             return {"status": "UNRESOLVED_BROKER_ORDER", "submitted": False}
         fresh_qty = self.broker.fresh_position_qty(symbol)
         result = self.journal.reconcile(
