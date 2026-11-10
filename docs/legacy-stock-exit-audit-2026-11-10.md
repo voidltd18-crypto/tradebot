@@ -112,3 +112,48 @@ reconciliation before any new order is submitted.
 These are offline regression checks, **not** a deployed production fix.
 The current live `market_sell_qty` and high-water mark reset are
 unchanged. No money or orders have been touched.
+
+
+## Shared PostgreSQL recovery adapter — 10 November 2026
+
+Draft branch now includes:
+- `backend/sql/stock_sell_recovery_postgres_v1.sql`: dedicated
+  `tradebot_stock_sell_recovery_v1` schema with unique stable attempt
+  and broker-order identities
+- `backend/stock_sell_recovery_postgres.py`: SQL-atomic reservation,
+  acknowledged broker order identity, unknown outcome quarantine,
+  cumulative filled-quantity protection, terminal order reconciliation
+  and verified-flat record (without permitting same-position re-entry)
+- `tests/test_stock_sell_recovery_postgres.py`: offline SQL compatibility
+  checks for process reattachment, identity mismatch, canceled/partial
+  fills, terminal-to-working rejection and fail-closed DB outage
+
+[Latest passing stock tests](https://github.com/voidltd18-crypto/tradebot/actions/runs/42829257975)
+
+**Explicit scope:** this adapter has not been installed or called by
+`backend/legacy/monolith.py`, has not been run against a real PostgreSQL
+instance, has no configured Render database, and does not automatically
+migrate any existing data. The local test harness uses SQLite for compatible
+SQL statement semantics, not real PostgreSQL isolation verification.
+
+### Required steps before any production cutover
+
+1. Provision/identify a **TradeBot-owned**, durable PostgreSQL database
+   isolated from the separate Project AI project, with encrypted connection.
+2. Apply reviewed migration to a staging branch/database only; verify
+   PostgreSQL connection, concurrent insert semantics and transaction
+   rollback under injected failures.
+3. Implement deterministic broker-side `client_order_id` for every
+   attempt. On unknown response, **query the broker by that ID**
+   before any retry; never assume a timeout means no order.
+4. Integrate under a **disabled-by-default stock-only feature flag**.
+   Reserve and persist BEFORE placing a sell, recover broker acknowledgements
+   and fills on restart, and block fresh attempts for unknown orders.
+5. Keep the existing high-water mark until confirmed flat or verified
+   position reduction, rather than resetting it immediately at submission.
+6. Check single-worker ownership, old database migration compatibility,
+   sell lock/PDT rules, and order fills/cancellations with a dedicated paper
+   account before considering a controlled production rollout.
+
+**Decision remains NO-GO for live activation.** Existing production
+selling code, settings, broker orders and deployments remain unchanged.
