@@ -9,6 +9,7 @@ from collections import defaultdict
 from datetime import datetime
 
 from backend.stock_momentum_cost_model import compare_costed_exits
+from backend.stock_momentum_endofday_audit import full_session_comparison
 from scripts.probe_fmc_public_intraday import get_intraday_fmc
 
 
@@ -21,6 +22,7 @@ def evaluate_sessions(sessions):
             continue
         entry = bars[0]["price"]
         result = compare_costed_exits(entry, bars)
+        audit = full_session_comparison(entry, bars)
         candidate = result["candidate"]
         reference = result["referenceTrailingExit"]
         records.append({
@@ -32,8 +34,11 @@ def evaluate_sessions(sessions):
             "referenceNetReturnPct": reference["netReturnPct"],
             "netPnlDifferenceUsdPerShare": result["candidateMinusReferenceNetPnlUsd"],
             "ordersSubmitted": 0,
+            "assumedEndOfDay": audit,
         })
     comparable = [r for r in records if r["netPnlDifferenceUsdPerShare"] is not None]
+    all_outcomes = [r['assumedEndOfDay'] for r in records]
+    complete = [o for o in all_outcomes if o['candidateMinusReferenceUsd'] is not None]
     return {
         "source": "unofficial Yahoo 1m FMC chart closes",
         "entryRule": "hypothetical first minute-close entry for each session",
@@ -41,6 +46,10 @@ def evaluate_sessions(sessions):
         "paperOrLiveVerified": False,
         "sessions": records,
         "comparableSessions": len(comparable),
+        "assumedCloseComparableSessions": len(complete),
+        "assumedCloseSpikeBetter": sum(o["candidateMinusReferenceUsd"] > 0 for o in complete),
+        "assumedCloseReferenceBetter": sum(o["candidateMinusReferenceUsd"] < 0 for o in complete),
+        "assumedCloseTies": sum(o["candidateMinusReferenceUsd"] == 0 for o in complete),
         "spikeBetter": sum(r["netPnlDifferenceUsdPerShare"] > 0 for r in comparable),
         "referenceBetter": sum(r["netPnlDifferenceUsdPerShare"] < 0 for r in comparable),
         "ties": sum(r["netPnlDifferenceUsdPerShare"] == 0 for r in comparable),
