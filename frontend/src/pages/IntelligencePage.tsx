@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -17,7 +17,7 @@ import { API_URL, readJson } from "../lib/api";
 import { clamp } from "../lib/format";
 import type { AnyObj } from "../lib/types";
 
-type IntelligenceSection = "ceo" | "board" | "brain" | "market" | "research" | "symbols" | "rules" | "evolution";
+type IntelligenceSection = "ceo" | "board" | "brain" | "market" | "research" | "symbols" | "rules" | "evolution" | "memory" | "scientist" | "portfolio" | "operations";
 
 type EndpointState = {
   data: AnyObj;
@@ -86,18 +86,25 @@ function DataTable({ rows, columns }: { rows: AnyObj[]; columns: { key: string; 
   return <div className="table-wrap"><table className="compact-table"><thead><tr>{columns.map((column) => <th key={column.key}>{column.label}</th>)}</tr></thead><tbody>{rows.map((row, index) => <tr key={String(row.id ?? row.key ?? row.symbol ?? index)}>{columns.map((column) => <td key={column.key}>{column.render ? column.render(row) : text(row[column.key], "—")}</td>)}</tr>)}</tbody></table></div>;
 }
 
-export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfidence, fetchData }: {
+export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfidence, fetchData, autoExport = false, onExportComplete }: {
   authToken: string;
   marketRegime: string;
   botHealth: number;
   aiConfidence: number;
   fetchData: (force?: boolean) => Promise<void>;
+  autoExport?: boolean;
+  onExportComplete?: (success: boolean) => void;
 }) {
   const [section, setSection] = useState<IntelligenceSection>("ceo");
   const [lastUpdated, setLastUpdated] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [promotionBusy, setPromotionBusy] = useState(false);
   const [promotionMessage, setPromotionMessage] = useState("");
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportProgress, setExportProgress] = useState("");
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const reportRef = useRef<HTMLDivElement | null>(null);
+  const autoExportStartedRef = useRef(false);
   const [sources, setSources] = useState<Record<string, EndpointState>>({
     advisor: EMPTY_ENDPOINT,
     shadow: EMPTY_ENDPOINT,
@@ -116,6 +123,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     operator: EMPTY_ENDPOINT,
     status: EMPTY_ENDPOINT,
     reports: EMPTY_ENDPOINT,
+    banking: EMPTY_ENDPOINT,
     reputation: EMPTY_ENDPOINT,
     ceoStatus: EMPTY_ENDPOINT,
     ceoJournal: EMPTY_ENDPOINT,
@@ -124,6 +132,29 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     boardStatus: EMPTY_ENDPOINT,
     boardHistory: EMPTY_ENDPOINT,
     boardConstitution: EMPTY_ENDPOINT,
+    memoryStatus: EMPTY_ENDPOINT,
+    memoryKnowledge: EMPTY_ENDPOINT,
+    memoryEvents: EMPTY_ENDPOINT,
+    memoryConstitution: EMPTY_ENDPOINT,
+    scientistStatus: EMPTY_ENDPOINT,
+    scientistHypotheses: EMPTY_ENDPOINT,
+    scientistExperiments: EMPTY_ENDPOINT,
+    scientistEvents: EMPTY_ENDPOINT,
+    scientistConstitution: EMPTY_ENDPOINT,
+    operationsStatus: EMPTY_ENDPOINT,
+    operationsComponents: EMPTY_ENDPOINT,
+    operationsAlerts: EMPTY_ENDPOINT,
+    operationsHistory: EMPTY_ENDPOINT,
+    operationsConstitution: EMPTY_ENDPOINT,
+    operationsDependencies: EMPTY_ENDPOINT,
+    operationsWatchdogs: EMPTY_ENDPOINT,
+    operationsQueues: EMPTY_ENDPOINT,
+    operationsDoctor: EMPTY_ENDPOINT,
+    operationsEngineHealth: EMPTY_ENDPOINT,
+    portfolio: EMPTY_ENDPOINT,
+    audit: EMPTY_ENDPOINT,
+    weeklyReview: EMPTY_ENDPOINT,
+    observatory: EMPTY_ENDPOINT,
   });
 
   const endpoints = useMemo(() => ({
@@ -144,6 +175,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     operator: "/v10/operator/status",
     status: "/status",
     reports: "/reports",
+    banking: "/banking-status",
     reputation: "/v10/symbol-reputation/summary",
     ceoStatus: "/v12/ceo/status?journal_limit=40",
     ceoJournal: "/v12/ceo/journal?limit=100",
@@ -152,29 +184,104 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     boardStatus: "/v12/board/status",
     boardHistory: "/v12/board/history?limit=30",
     boardConstitution: "/v12/board/constitution",
+    memoryStatus: "/v13/memory/status",
+    memoryKnowledge: "/v13/memory/knowledge?limit=200",
+    memoryEvents: "/v13/memory/events?limit=100",
+    memoryConstitution: "/v13/memory/constitution",
+    scientistStatus: "/v14/scientist/status",
+    scientistHypotheses: "/v14/scientist/hypotheses?limit=200",
+    scientistExperiments: "/v14/scientist/experiments?limit=200",
+    scientistEvents: "/v14/scientist/events?limit=100",
+    scientistConstitution: "/v14/scientist/constitution",
+    operationsStatus: "/v15/operations/status",
+    operationsComponents: "/v15/operations/components",
+    operationsAlerts: "/v15/operations/alerts?limit=100&status=ACTIVE",
+    operationsHistory: "/v15/operations/history?limit=100",
+    operationsConstitution: "/v15/operations/constitution",
+    operationsDependencies: "/v15/operations/dependencies",
+    operationsWatchdogs: "/v15/operations/watchdogs",
+    operationsQueues: "/v15/operations/queues",
+    operationsDoctor: "/v15/operations/doctor",
+    operationsEngineHealth: "/v15/operations/engine-health",
+    portfolio: "/v16/portfolio/status",
+    audit: "/v17/decision-audit?days=7",
+    weeklyReview: "/v18/weekly-review?days=7",
+    observatory: "/v18/performance-observatory?days=7",
   }), []);
 
-  const load = useCallback(async () => {
+  const sectionKeys = useMemo<Record<IntelligenceSection, string[]>>(() => ({
+    ceo: ["ceoStatus", "ceoJournal", "ceoReviews", "ceoConstitution", "advisor"],
+    board: ["boardStatus", "boardHistory", "boardConstitution"],
+    brain: ["advisor", "decision", "strategy", "shadow", "operator", "status"],
+    market: ["marketDna", "patterns", "weekly", "status"],
+    research: ["research", "v7Status", "v8Status", "shadow"],
+    symbols: ["symbols", "reputation", "weakness"],
+    rules: ["rules", "strategy"],
+    evolution: ["promotion", "operator", "v7Status", "v8Status"],
+    memory: ["memoryStatus", "memoryKnowledge", "memoryEvents", "memoryConstitution"],
+    scientist: ["scientistStatus", "scientistHypotheses", "scientistExperiments", "scientistEvents", "scientistConstitution"],
+    portfolio: ["portfolio"],
+    operations: ["operationsStatus", "operationsEngineHealth", "operationsComponents", "operationsDependencies", "operationsWatchdogs", "operationsQueues", "operationsDoctor", "operationsAlerts", "operationsHistory", "operationsConstitution"],
+  }), []);
+
+  const load = useCallback(async (force = false) => {
     if (!authToken) return;
     setRefreshing(true);
     const headers = { "X-Auth-Token": authToken, "x-api-key": authToken };
-    const entries = Object.entries(endpoints);
-    const results = await Promise.all(entries.map(async ([key, endpoint]) => {
-      try {
-        const response = await fetch(`${API_URL}${endpoint}`, { cache: "no-store", headers });
-        const json = await readJson(response);
-        if (!response.ok || json?.ok === false) throw new Error(json?.detail || json?.message || `${response.status}`);
-        return [key, { data: json || {}, error: "", loading: false }] as const;
-      } catch (error: any) {
-        return [key, { data: {}, error: error?.message || "Endpoint unavailable", loading: false }] as const;
-      }
-    }));
-    setSources(Object.fromEntries(results));
-    setLastUpdated(new Date().toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
-    setRefreshing(false);
-  }, [authToken, endpoints]);
+    const keys = sectionKeys[section].filter((key) => key in endpoints);
 
-  useEffect(() => { load(); }, [load]);
+    setSources((previous) => {
+      const next = { ...previous };
+      keys.forEach((key) => {
+        const current = previous[key] || EMPTY_ENDPOINT;
+        if (force || !current.data || Object.keys(current.data).length === 0) {
+          next[key] = { ...current, loading: true, error: "" };
+        }
+      });
+      return next;
+    });
+
+    const fetchEndpoint = async (key: string, endpoint: string): Promise<void> => {
+      const controller = new AbortController();
+      const slowEndpoint = ["reports", "operator", "operationsDoctor", "operationsEngineHealth"].includes(key);
+      const timeoutSeconds = slowEndpoint ? 20 : 12;
+      const timeout = window.setTimeout(() => controller.abort(), timeoutSeconds * 1000);
+      try {
+        const response = await fetch(`${API_URL}${endpoint}`, { cache: "no-store", headers, signal: controller.signal });
+        const json = await readJson(response);
+        if (!response.ok) throw new Error(json?.detail || json?.message || `HTTP ${response.status}`);
+        setSources((previous) => ({ ...previous, [key]: { data: json || {}, error: "", loading: false } }));
+      } catch (error: any) {
+        const message = error?.name === "AbortError" ? `Request timed out after ${timeoutSeconds} seconds` : error?.message || "Endpoint unavailable";
+        setSources((previous) => ({ ...previous, [key]: { data: previous[key]?.data || {}, error: message, loading: false } }));
+      } finally {
+        window.clearTimeout(timeout);
+      }
+    };
+
+    try {
+      // Three workers are enough for the selected subsection and avoid a request storm.
+      const queue = keys.map((key) => [key, endpoints[key as keyof typeof endpoints]] as [string, string]);
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < queue.length) {
+          const item = queue[cursor++];
+          if (!item) return;
+          await fetchEndpoint(item[0], item[1]);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(3, Math.max(1, queue.length)) }, () => worker()));
+      setLastUpdated(new Date().toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour: "2-digit", minute: "2-digit", second: "2-digit" }));
+    } finally {
+      setRefreshing(false);
+    }
+  }, [authToken, endpoints, section, sectionKeys]);
+
+  // V18.2.9: hidden auto-export instances must not start the normal tab loader in parallel
+  // with the full report collector. That request storm was the main source of partial PDFs.
+  useEffect(() => {
+    if (!autoExport) void load(false);
+  }, [autoExport, load]);
 
   const advisor = sources.advisor.data;
   const shadow = sources.shadow.data;
@@ -193,6 +300,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const operator = sources.operator.data;
   const liveStatus = sources.status.data;
   const reportsData = sources.reports.data;
+  const bankingData = sources.banking.data;
   const reputationData = sources.reputation.data;
   const ceoBackend = sources.ceoStatus.data;
   const ceoJournalData = sources.ceoJournal.data;
@@ -201,6 +309,83 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const boardStatus = sources.boardStatus.data;
   const boardHistoryData = sources.boardHistory.data;
   const boardConstitution = sources.boardConstitution.data;
+  const memoryStatus = sources.memoryStatus.data;
+  const memoryKnowledgeData = sources.memoryKnowledge.data;
+  const memoryEventsData = sources.memoryEvents.data;
+  const memoryConstitution = sources.memoryConstitution.data;
+  const memorySummary = firstObject(memoryStatus.summary);
+  const memoryKnowledge = firstArray(memoryKnowledgeData.items, memoryStatus.latestKnowledge);
+  const memoryEvents = firstArray(memoryEventsData.items);
+  const scientistStatus = sources.scientistStatus.data;
+  const scientistHypothesesData = sources.scientistHypotheses.data;
+  const scientistExperimentsData = sources.scientistExperiments.data;
+  const scientistEventsData = sources.scientistEvents.data;
+  const scientistConstitution = sources.scientistConstitution.data;
+  const scientistSummary = firstObject(scientistStatus.summary);
+  const scientistHypotheses = firstArray(scientistHypothesesData.items, scientistStatus.topHypotheses);
+  const scientistExperiments = firstArray(scientistExperimentsData.items, scientistStatus.topExperiments);
+  const scientistEvents = firstArray(scientistEventsData.items);
+  const operationsStatus = sources.operationsStatus.data;
+  const operationsComponentsData = sources.operationsComponents.data;
+  const operationsAlertsData = sources.operationsAlerts.data;
+  const operationsHistoryData = sources.operationsHistory.data;
+  const operationsConstitution = sources.operationsConstitution.data;
+  const operationsDependencies = Array.isArray(sources.operationsDependencies.data?.items) ? sources.operationsDependencies.data.items : [];
+  const operationsWatchdogs = Array.isArray(sources.operationsWatchdogs.data?.items) ? sources.operationsWatchdogs.data.items : [];
+  const operationsQueues = sources.operationsQueues.data?.queues || {};
+  const operationsDoctor = sources.operationsDoctor.data || {};
+  const operationsEngineHealth = sources.operationsEngineHealth.data || {};
+  const portfolioData = sources.portfolio.data || {};
+  const auditData = sources.audit.data || {};
+  const weeklyReviewData = sources.weeklyReview.data || {};
+  const observatoryData = sources.observatory.data || {};
+  const portfolioAllocations = firstArray(portfolioData.allocations, portfolioData.plan?.allocations);
+  const portfolioCapacity = firstObject(portfolioData.capacity);
+  const operationsComponents = firstArray(
+    operationsComponentsData.items,
+    operationsComponentsData.components,
+    operationsStatus.components,
+    operationsStatus.items,
+    operationsEngineHealth.components,
+  );
+  const derivedPassed = operationsComponents.filter((row) => text(row.status, "").toUpperCase() === "PASS").length;
+  const derivedWarnings = operationsComponents.filter((row) => text(row.status, "").toUpperCase() === "WARN").length;
+  const derivedFailed = operationsComponents.filter((row) => ["FAIL", "CRITICAL"].includes(text(row.status, "").toUpperCase())).length;
+  const derivedHealthScore = operationsComponents.length
+    ? Math.round(((derivedPassed + (derivedWarnings * 0.5)) / operationsComponents.length) * 100)
+    : 0;
+  const operationsSummary = firstObject(
+    operationsStatus.summary,
+    operationsStatus.operationsSummary,
+    operationsStatus.latestAudit?.summary,
+    operationsStatus.latestAudit,
+    operationsEngineHealth.operationsSummary,
+    operationsDoctor.operationsSummary,
+    {
+      overallStatus: derivedFailed ? "CRITICAL" : derivedWarnings ? "WARNING" : operationsComponents.length ? "HEALTHY" : "STARTING",
+      healthScore: derivedHealthScore,
+      passed: derivedPassed,
+      warnings: derivedWarnings,
+      failed: derivedFailed,
+      componentCount: operationsComponents.length,
+      nextAuditInSeconds: 900,
+    },
+  );
+  const holidayMode = firstObject(
+    operationsDoctor.holidayMode,
+    operationsStatus.holidayMode,
+    operationsEngineHealth.holidayMode,
+    {
+      headline: derivedFailed ? "ATTENTION REQUIRED" : derivedWarnings ? "MONITORING WARNINGS" : operationsComponents.length ? "SYSTEM HEALTHY" : "WAITING FOR FIRST AUDIT",
+      healthScore: num(operationsSummary.healthScore, derivedHealthScore),
+      safeToLeaveRunning: derivedFailed === 0,
+      criticalFailures: derivedFailed,
+      warnings: derivedWarnings,
+      automaticRecovery: "MONITORING",
+    },
+  );
+  const operationsAlerts = firstArray(operationsAlertsData.items);
+  const operationsHistory = firstArray(operationsHistoryData.items);
   const operatorCurrent = firstObject(operator.current);
   const operatorProposal = firstObject(operator.lastProposal);
   const operatorChanged = firstObject(operatorProposal.changed);
@@ -217,7 +402,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       : operatorStableRuns >= operatorRequiredRuns
         ? "READY FOR CLOSED-MARKET APPLY"
         : "COLLECTING STABLE EVIDENCE";
-  const operatorLastRun = operator.lastRunAt ? new Date(String(operator.lastRunAt)).toLocaleString("en-GB") : "Not run yet";
+  const operatorLastRun = operator.lastRunAt ? new Date(String(operator.lastRunAt)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "Not run yet";
   const operatorHistory = firstArray(operator.history);
   const evolutionActions = [...operatorHistory].reverse().map((row, index) => {
     const before = firstObject(row.before);
@@ -296,13 +481,74 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     samples: num(row.samples ?? row.trades ?? row.count),
   }));
 
-  const endpointHealth = Object.values(sources).filter((source) => !source.error && !source.loading).length;
-  const endpointTotal = Object.keys(sources).length;
-  const intelligenceHealth = Math.round(((botHealth / 100) * 0.45 + (endpointHealth / endpointTotal) * 0.55) * 100);
+  const monitoredSourceEntries = Object.entries(sources).filter(([key]) => key !== "operationsEngineHealth");
+  const endpointHealth = monitoredSourceEntries.filter(([, source]) => !source.error && !source.loading).length;
+  const endpointTotal = monitoredSourceEntries.length;
+  const frontendOfflineEngines = monitoredSourceEntries
+    .filter(([, source]) => Boolean(source.error) || source.loading)
+    .map(([key, source]) => ({
+      name: keyLabel(key),
+      category: "Dashboard endpoint",
+      status: source.loading ? "STARTING" : "FAIL",
+      reason: source.loading ? "Waiting for endpoint response." : source.error,
+      source: "FRONTEND",
+    }));
+  const intelligenceHealth = Math.round(((botHealth / 100) * 0.45 + (endpointHealth / Math.max(1, endpointTotal)) * 0.55) * 100);
+  const backendEngineRows = firstArray(
+    operationsEngineHealth.offline,
+    operationsEngineHealth.failed,
+    operationsEngineHealth.engines,
+    operationsEngineHealth.items,
+  );
+  const backendOfflineEngines = backendEngineRows
+    .filter((row) => {
+      const status = text(row.status, row.online === false ? "FAIL" : "PASS").toUpperCase();
+      return row.online === false || !["PASS", "ONLINE", "HEALTHY", "OK"].includes(status);
+    })
+    .map((row) => ({
+      ...row,
+      name: text(row.name ?? row.endpoint ?? row.key, "Unnamed backend engine"),
+      category: text(row.category ?? row.area, "Backend component"),
+      status: text(row.status, row.online === false ? "FAIL" : "WARN").toUpperCase(),
+      critical: row.critical === true,
+      source: "BACKEND",
+      reason: text(row.reason ?? row.message ?? row.error, "No diagnostic reason returned."),
+    }));
+  const exactOfflineEngines = [...frontendOfflineEngines, ...backendOfflineEngines].filter((row, index, rows) =>
+    rows.findIndex((candidate) => `${candidate.source}:${candidate.name}` === `${row.source}:${row.name}`) === index
+  );
 
 
   const account = firstObject(liveStatus.account, liveStatus.data?.account);
   const reportSummary = firstObject(reportsData.summary, reportsData);
+  const fullBotPositions = firstArray(liveStatus.positions, liveStatus.data?.positions);
+  const fullBotScans = firstArray(liveStatus.scans, liveStatus.data?.scans);
+  const fullBotClosedTrades = firstArray(reportsData.closedTrades, reportsData.trades, reportsData.items);
+  const fullBotAdaptive = firstObject(liveStatus.adaptiveUniverse, liveStatus.data?.adaptiveUniverse);
+  const fullBotAdaptiveRows = Array.isArray(fullBotAdaptive.rows)
+    ? fullBotAdaptive.rows.filter((item: unknown) => item && typeof item === "object") as AnyObj[]
+    : Array.isArray(fullBotAdaptive.activeSymbols)
+      ? fullBotAdaptive.activeSymbols.map((symbol: unknown) => typeof symbol === "string" ? { symbol } : symbol).filter((item: unknown) => item && typeof item === "object") as AnyObj[]
+      : [];
+  const fullBotVault = firstObject(bankingData.profitVault, liveStatus.banking?.profitVault, liveStatus.data?.banking?.profitVault);
+  // V18.2.4 Capital Clarity — keep the PDF on the same definitions as Home.
+  // Legacy workingCapitalGbp is FREE CASH, not the whole trading pot.
+  const fullBotFreeCashGbp = num(fullBotVault.freeCashGbp ?? fullBotVault.workingCapitalGbp);
+  const fullBotTradingCapitalGbp = num(fullBotVault.tradingCapitalGbp, Math.max(0, num(fullBotVault.accountEquityGbp) - num(fullBotVault.bankedProfitGbp)));
+  const fullBotInvestedCapitalGbp = Math.max(0, fullBotTradingCapitalGbp - fullBotFreeCashGbp);
+  const observatoryProtection = observatoryData.profitProtection || {};
+  const observatoryFreeCashGbp = num(observatoryProtection.freeCashGbp ?? observatoryProtection.workingCapitalGbp);
+  const observatoryTradingCapitalGbp = num(observatoryProtection.tradingCapitalGbp, fullBotTradingCapitalGbp);
+  const observatoryInvestedCapitalGbp = Math.max(0, observatoryTradingCapitalGbp - observatoryFreeCashGbp);
+  const fullBotMarket = firstObject(liveStatus.market, liveStatus.data?.market);
+  const fullBotStrategy = firstObject(liveStatus.strategySettings, liveStatus.data?.strategySettings);
+  const fullBotPositionSettings = firstObject(liveStatus.positionSettings, liveStatus.data?.positionSettings);
+  const fullBotConfig = firstObject(liveStatus.config, liveStatus.data?.config);
+  const fullBotLogs = firstArray(liveStatus.logs, liveStatus.data?.logs).slice(-30).reverse();
+  const fullBotTrades = firstArray(liveStatus.trades, liveStatus.data?.trades).slice(-30).reverse();
+  const reportFxRate = num(liveStatus.fx?.usdToGbp ?? liveStatus.data?.fx?.usdToGbp, 0.78);
+  const reportGbp = (usdValue: unknown) => `£${(num(usdValue) * reportFxRate).toFixed(2)}`;
+  const directGbp = (gbpValue: unknown) => `£${num(gbpValue).toFixed(2)}`;
   const backendAccount = firstObject(ceoBackend.account);
   const backendPerformance = firstObject(ceoBackend.performance);
   const backendHealth = firstObject(ceoBackend.health);
@@ -332,7 +578,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     ];
   const rawCeoJournal = firstArray(ceoJournalData.items, ceoBackend.journal);
   const ceoJournal = rawCeoJournal.length ? rawCeoJournal.map((entry) => ({
-    time: entry.created_at ? new Date(String(entry.created_at)).toLocaleString("en-GB", { dateStyle: "short", timeStyle: "medium" }) : text(entry.day, "Recorded"),
+    time: entry.created_at ? new Date(String(entry.created_at)).toLocaleString("en-GB", { timeZone: "Europe/London", dateStyle: "short", timeStyle: "medium" }) : text(entry.day, "Recorded"),
     title: text(entry.title, keyLabel(text(entry.category, "CEO event"))),
     detail: text(entry.detail, "No detail recorded."),
     severity: text(entry.severity, "INFO"),
@@ -343,11 +589,215 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
   const ceoReviewRows = firstArray(ceoReviewsData.items);
   const ceoManualActionRequired = ceoBackend.manualActionRequired === true;
   const ceoGradeLetter = text(ceoBackend.gradeLetter, "—");
-  const ceoCreatedAt = ceoBackend.createdAt ? new Date(String(ceoBackend.createdAt)).toLocaleString("en-GB") : "Not generated yet";
+  const ceoCreatedAt = ceoBackend.createdAt ? new Date(String(ceoBackend.createdAt)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "Not generated yet";
 
   const refreshAll = async () => {
-    await Promise.all([load(), fetchData(true)]);
+    await Promise.all([load(true), fetchData(true)]);
   };
+
+  const exportFullBotReport = async () => {
+    if (!authToken || exportBusy) return;
+    let exportSucceeded = false;
+    setExportBusy(true);
+    setExportProgress("Preparing report snapshot…");
+    const headers = { "X-Auth-Token": authToken, "x-api-key": authToken };
+
+    // V18.2.9 Report Snapshot Coordinator
+    // Build a deliberate, low-concurrency snapshot before React is allowed to render the PDF.
+    // A complete report is never generated from endpoint timeouts / placeholder state.
+    const criticalKeys = new Set([
+      "status", "banking", "reports", "advisor", "operator", "promotion",
+      "ceoStatus", "ceoReviews", "boardStatus", "boardHistory",
+      "memoryStatus", "memoryKnowledge", "scientistStatus", "scientistHypotheses", "scientistExperiments",
+      "operationsStatus", "operationsComponents", "operationsEngineHealth",
+      "portfolio", "audit", "weeklyReview", "observatory", "research", "v8Status",
+    ]);
+
+    const timeoutFor = (key: string) => {
+      if (key === "reports") return 90000;
+      if (["operationsDoctor", "operationsEngineHealth", "operator", "ceoStatus", "boardStatus"].includes(key)) return 45000;
+      if (["memoryKnowledge", "scientistHypotheses", "scientistExperiments", "operationsHistory"].includes(key)) return 30000;
+      return 22000;
+    };
+
+    const fetchReportEndpoint = async (key: string, endpoint: string): Promise<EndpointState> => {
+      const maxAttempts = criticalKeys.has(key) ? 3 : 2;
+      let lastMessage = "Failed to load";
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), timeoutFor(key));
+        try {
+          const response = await fetch(`${API_URL}${endpoint}`, {
+            cache: "no-store",
+            headers,
+            signal: controller.signal,
+          });
+          const json = await readJson(response);
+          if (!response.ok) throw new Error(text(json?.detail ?? json?.message, `HTTP ${response.status}`));
+          return { data: firstObject(json), error: "", loading: false };
+        } catch (error: any) {
+          lastMessage = error?.name === "AbortError"
+            ? `Timed out after ${Math.round(timeoutFor(key) / 1000)} seconds`
+            : (error?.message || "Failed to load");
+          if (attempt < maxAttempts) {
+            setExportProgress(`Retrying ${keyLabel(key)} (${attempt + 1}/${maxAttempts})…`);
+            await new Promise((resolve) => window.setTimeout(resolve, 700 * attempt));
+          }
+        } finally {
+          window.clearTimeout(timeout);
+        }
+      }
+      return { data: {}, error: lastMessage, loading: false };
+    };
+
+    try {
+      // Put the account/governance truth first, then the heavier evidence/history endpoints.
+      const priority = [
+        "status", "banking", "reports", "advisor", "operator", "promotion",
+        "ceoStatus", "boardStatus", "memoryStatus", "scientistStatus", "operationsStatus",
+        "portfolio", "audit", "weeklyReview", "observatory",
+      ];
+      const allEntries = Object.entries(endpoints);
+      const priorityRank = new Map(priority.map((key, index) => [key, index]));
+      const entries = [...allEntries].sort(([a], [b]) =>
+        (priorityRank.get(a) ?? 999) - (priorityRank.get(b) ?? 999)
+      );
+      const results: Record<string, EndpointState> = {};
+      let cursor = 0;
+      let completed = 0;
+
+      // Only two concurrent report requests. This avoids starving Render/SQLite while still
+      // collecting the complete report reasonably quickly.
+      const worker = async () => {
+        while (cursor < entries.length) {
+          const index = cursor++;
+          const item = entries[index];
+          if (!item) return;
+          const [key, endpoint] = item;
+          setExportProgress(`Collecting ${keyLabel(key)} · ${completed}/${entries.length}`);
+          results[key] = await fetchReportEndpoint(key, endpoint);
+          completed += 1;
+          setExportProgress(`Collecting report evidence · ${completed}/${entries.length}`);
+        }
+      };
+
+      await Promise.all(Array.from({ length: 2 }, () => worker()));
+
+      const failedCritical = [...criticalKeys]
+        .filter((key) => results[key]?.error)
+        .map((key) => `${keyLabel(key)}: ${results[key]?.error}`);
+
+      if (failedCritical.length) {
+        throw new Error(`Report snapshot incomplete. Nothing was exported. Missing: ${failedCritical.join("; ")}`);
+      }
+
+      // One atomic state publication means the PDF render cannot mix old and new endpoint data.
+      setSources((previous) => ({ ...previous, ...results }));
+      setLastUpdated(new Date().toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false }));
+      setExportProgress("Rendering complete snapshot…");
+      setExportingPdf(true);
+
+      // Wait until React has mounted every whole-bot + Intelligence section and completed two paint cycles.
+      const waitForReport = async () => {
+        const started = Date.now();
+        let stableFrames = 0;
+        let previousHeight = 0;
+        while (Date.now() - started < 10000) {
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+          const root = reportRef.current;
+          const count = root?.querySelectorAll(".pdf-section").length ?? 0;
+          const height = root?.scrollHeight ?? 0;
+          if (root && count >= 21 && height > 1000) {
+            stableFrames = Math.abs(height - previousHeight) < 4 ? stableFrames + 1 : 0;
+            previousHeight = height;
+            if (stableFrames >= 2) return root;
+          }
+        }
+        throw new Error("The complete report snapshot did not finish rendering in time.");
+      };
+
+      const element = await waitForReport();
+      if (document.fonts?.ready) await document.fonts.ready;
+      await new Promise((resolve) => window.setTimeout(resolve, 850));
+      setExportProgress("Capturing PDF pages…");
+
+      const [{ default: html2canvas }, jsPdfModule] = await Promise.all([
+        import("html2canvas"),
+        import("jspdf"),
+      ]);
+      const JsPDF = (jsPdfModule as any).jsPDF || (jsPdfModule as any).default;
+      const pdf = new JsPDF({ orientation: "landscape", unit: "mm", format: "a4", compress: true });
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const margin = 7;
+      const usableWidth = pageWidth - margin * 2;
+      const usableHeight = pageHeight - margin * 2;
+
+      const sections = Array.from(element.querySelectorAll<HTMLElement>(".pdf-section"));
+      if (!sections.length) throw new Error("No TradeBot report sections were available for export.");
+
+      let firstPage = true;
+      for (let sectionIndex = 0; sectionIndex < sections.length; sectionIndex += 1) {
+        const sectionElement = sections[sectionIndex];
+        setExportProgress(`Capturing section ${sectionIndex + 1}/${sections.length}…`);
+        const canvas = await html2canvas(sectionElement, {
+          scale: 1.25,
+          useCORS: true,
+          backgroundColor: "#07111f",
+          logging: false,
+          scrollX: 0,
+          scrollY: -window.scrollY,
+          windowWidth: 1500,
+        });
+
+        if (!canvas.width || !canvas.height) continue;
+        const pxPerMm = canvas.width / usableWidth;
+        const sliceHeightPx = Math.max(1, Math.floor(usableHeight * pxPerMm));
+
+        for (let y = 0; y < canvas.height; y += sliceHeightPx) {
+          const currentSliceHeight = Math.min(sliceHeightPx, canvas.height - y);
+          const slice = document.createElement("canvas");
+          slice.width = canvas.width;
+          slice.height = currentSliceHeight;
+          const context = slice.getContext("2d");
+          if (!context) continue;
+          context.drawImage(canvas, 0, y, canvas.width, currentSliceHeight, 0, 0, canvas.width, currentSliceHeight);
+
+          const imageData = slice.toDataURL("image/jpeg", 0.92);
+          const imageHeightMm = currentSliceHeight / pxPerMm;
+          if (!firstPage) pdf.addPage("a4", "landscape");
+          firstPage = false;
+          pdf.addImage(imageData, "JPEG", margin, margin, usableWidth, imageHeightMm, undefined, "FAST");
+        }
+      }
+
+      if (firstPage) throw new Error("Full bot report capture returned no printable content.");
+
+      const now = new Date();
+      const stamp = [
+        String(now.getDate()).padStart(2, "0"),
+        String(now.getMonth() + 1).padStart(2, "0"),
+        now.getFullYear(),
+      ].join("-") + "_" + [String(now.getHours()).padStart(2, "0"), String(now.getMinutes()).padStart(2, "0")].join("-");
+
+      pdf.save(`TradeBot_FULL_BOT_REPORT_${stamp}.pdf`);
+      exportSucceeded = true;
+    } catch (error: any) {
+      window.alert(`Full bot PDF export failed: ${error?.message || "Unknown error"}`);
+    } finally {
+      setExportingPdf(false);
+      setExportBusy(false);
+      setExportProgress("");
+      onExportComplete?.(exportSucceeded);
+    }
+  };
+
+  useEffect(() => {
+    if (!autoExport || autoExportStartedRef.current) return;
+    autoExportStartedRef.current = true;
+    const timer = window.setTimeout(() => { void exportFullBotReport(); }, 120);
+    return () => window.clearTimeout(timer);
+  }, [autoExport]);
 
   const promotionPost = async (endpoint: string, body: AnyObj) => {
     if (!authToken) return;
@@ -393,7 +843,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     if (confirmation !== null) promotionPost("/v10/operator/rollback", { confirmation });
   };
 
-  return <div className="intelligence-page">
+  return <div ref={reportRef} className={`intelligence-page ${exportingPdf ? "pdf-export-mode" : ""}`}>
     <Card wide className="intelligence-hero">
       <div className="intelligence-hero-head">
         <div>
@@ -403,23 +853,270 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         </div>
         <div className="actions">
           <span className={`pill ${endpointHealth === endpointTotal ? "ok" : endpointHealth ? "warn" : "bad"}`}>{endpointHealth}/{endpointTotal} engines online</span>
-          <button className="ghost" disabled={refreshing} onClick={refreshAll}>{refreshing ? "REFRESHING..." : "REFRESH INTELLIGENCE"}</button>
+          <button className="ghost pdf-export-button" disabled={exportBusy} onClick={exportFullBotReport}>{exportBusy ? (exportProgress || "BUILDING PDF...") : "EXPORT FULL BOT REPORT PDF"}</button>
+          <button className="ghost" disabled={refreshing || exportBusy} onClick={refreshAll}>{refreshing ? "REFRESHING..." : "REFRESH INTELLIGENCE"}</button>
         </div>
       </div>
       <div className="intelligence-stat-grid">
         <StatTile label="Intelligence Health" value={`${intelligenceHealth}%`} sub={lastUpdated ? `Updated ${lastUpdated}` : "Connecting"} />
         <StatTile label="Market Regime" value={text(advisor.marketRegime ?? marketDna.currentRegime ?? weekly.currentRegime ?? marketRegime)} />
-        <StatTile label="Evidence Collected" value={evidenceCount.toLocaleString("en-GB")} sub={`${discoveryCount.toLocaleString("en-GB")} discoveries`} />
+        <StatTile label="Evidence Collected" value={evidenceCount.toLocaleString("en-GB", { timeZone: "Europe/London" })} sub={`${discoveryCount.toLocaleString("en-GB", { timeZone: "Europe/London" })} discoveries`} />
         <StatTile label="Decision Confidence" value={`${Math.round(aiConfidence)}%`} />
       </div>
     </Card>
 
     <nav className="intelligence-tabs">
-      {(["ceo", "board", "brain", "market", "research", "symbols", "rules", "evolution"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "ceo" ? "AI CEO" : item === "board" ? "AI BOARD" : item === "brain" ? "AI BRAIN" : item.toUpperCase()}</button>)}
+      {(["ceo", "board", "brain", "market", "research", "symbols", "rules", "evolution", "memory", "scientist", "portfolio", "operations"] as IntelligenceSection[]).map((item) => <button key={item} className={section === item ? "active" : ""} onClick={() => setSection(item)}>{item === "ceo" ? "AI CEO" : item === "board" ? "AI BOARD" : item === "brain" ? "AI BRAIN" : item === "memory" ? "AI MEMORY" : item === "scientist" ? "AI SCIENTIST" : item === "portfolio" ? "AI PORTFOLIO" : item === "operations" ? "AI OPERATIONS" : item.toUpperCase()}</button>)}
     </nav>
 
+    {exportingPdf && <div className="pdf-section grid two full-bot-report-section" data-pdf-title="TRADEBOT OVERVIEW">
+      <Card title="Account & Runtime">
+        <div className="intelligence-stat-grid full-bot-stat-grid">
+          <StatTile label="Equity" value={reportGbp(account.equity)} sub={`$${num(account.equity).toFixed(2)}`} />
+          <StatTile label="Trading Capital" value={directGbp(fullBotTradingCapitalGbp)} sub="Invested + free cash · vault excluded" />
+          <StatTile label="Today" value={reportGbp(account.pnlDay ?? account.dayPnl)} sub={`$${num(account.pnlDay ?? account.dayPnl).toFixed(2)}`} tone={num(account.pnlDay ?? account.dayPnl) >= 0 ? "positive" : "negative"} />
+          <StatTile label="Total Gain/Loss" value={reportGbp(reportSummary.totalGainLoss ?? reportSummary.totalPnl ?? reportSummary.netPnl)} tone={num(reportSummary.totalGainLoss ?? reportSummary.totalPnl ?? reportSummary.netPnl) >= 0 ? "positive" : "negative"} />
+        </div>
+        <div className="summary full-bot-summary">
+          <div><span>Bot</span><b>{liveStatus.botEnabled === false ? "OFF" : "ON"}</b></div>
+          <div><span>Market</span><b>{text(fullBotMarket.label, fullBotMarket.isOpen ? "OPEN" : "CLOSED")}</b></div>
+          <div><span>Market source</span><b>{text(fullBotMarket.source, "—")}</b></div>
+          <div><span>Open positions</span><b>{fullBotPositions.length}</b></div>
+          <div><span>Current universe</span><b>{(Array.isArray(liveStatus.universe) ? liveStatus.universe.length : Array.isArray(liveStatus.currentUniverse) ? liveStatus.currentUniverse.length : fullBotAdaptiveRows.length)}</b></div>
+          <div><span>Report generated</span><b>{new Date().toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>
+        </div>
+      </Card>
+      <Card title="Profit Vault">
+        <div className="summary">
+          <div><span>Status</span><b>{fullBotVault.enabled === false ? "OFF" : "ACTIVE"}</b></div>
+          <div><span>Protected baseline</span><b>{directGbp(fullBotVault.baselineGbp)}</b></div>
+          <div><span>Trading capital</span><b>{directGbp(fullBotTradingCapitalGbp)}</b></div>
+          <div><span>Invested capital</span><b>{directGbp(fullBotInvestedCapitalGbp)}</b></div>
+          <div><span>Free cash</span><b>{directGbp(fullBotFreeCashGbp)}</b></div>
+          <div><span>Banked profit</span><b>{directGbp(fullBotVault.bankedProfitGbp)}</b></div>
+          <div><span>Lifetime banked</span><b>{directGbp(fullBotVault.lifetimeBankedGbp)}</b></div>
+          <div><span>Last banked symbol</span><b>{text(fullBotVault.lastBankedSymbol, "—")}</b></div>
+        </div>
+      </Card>
+      <Card title="Current Best Opportunity" wide>
+        {fullBotScans.length ? <DataTable rows={[...fullBotScans].sort((a,b) => num(b.confidence)-num(a.confidence)).slice(0,8)} columns={[
+          { key: "symbol", label: "Symbol" },
+          { key: "price", label: "Price", render: (row) => `$${num(row.price).toFixed(2)}` },
+          { key: "confidence", label: "Confidence", render: (row) => `${(num(row.confidence) * (num(row.confidence) <= 1 ? 100 : 1)).toFixed(0)}%` },
+          { key: "quality_score", label: "Quality", render: (row) => num(row.quality_score ?? row.qualityScore).toFixed(4) },
+          { key: "sniper_pass", label: "Sniper", render: (row) => row.sniper_pass ?? row.sniper ? "PASS" : "NO" },
+          { key: "a_plus_pass", label: "A+", render: (row) => row.a_plus_pass ? "PASS" : "NO" },
+        ]} /> : <EmptyState endpoint="live scanner" />}
+      </Card>
+    </div>}
 
-    {section === "ceo" && <div className="grid two ceo-view">
+    {exportingPdf && <div className="pdf-section full-bot-report-section" data-pdf-title="POSITIONS">
+      <Card title="Open Positions — Full Snapshot" wide>
+        {fullBotPositions.length ? <DataTable rows={fullBotPositions} columns={[
+          { key: "symbol", label: "Symbol" },
+          { key: "qty", label: "Qty", render: (row) => num(row.qty).toFixed(4) },
+          { key: "entry", label: "Entry", render: (row) => `$${num(row.entry).toFixed(2)}` },
+          { key: "price", label: "Current", render: (row) => `$${num(row.price).toFixed(2)}` },
+          { key: "pnlGbp", label: "PnL", render: (row) => directGbp(row.pnlGbp ?? num(row.pnl) * reportFxRate) },
+          { key: "pnlPct", label: "%", render: (row) => `${num(row.pnlPct).toFixed(2)}%` },
+          { key: "highest", label: "Peak", render: (row) => `$${num(row.highest ?? row.peakExhaustionPeak).toFixed(2)}` },
+          { key: "trailStartPrice", label: "Trail starts", render: (row) => `$${num(row.trailStartPrice).toFixed(2)}` },
+          { key: "trailFloor", label: "Trail floor", render: (row) => num(row.trailFloor) > 0 ? `$${num(row.trailFloor).toFixed(2)}` : "—" },
+          { key: "stopPrice", label: "Stop", render: (row) => `$${num(row.stopPrice).toFixed(2)}` },
+          { key: "peakExhaustionTouches", label: "Peak tests", render: (row) => `${num(row.peakExhaustionTouches)}/${num(row.peakExhaustionRequired,4)}` },
+        ]} /> : <EmptyState endpoint="open positions" />}
+      </Card>
+    </div>}
+
+    {exportingPdf && <div className="pdf-section grid two full-bot-report-section" data-pdf-title="REPORTS & TRADE HISTORY">
+      <Card title="Performance Summary">
+        <div className="summary">
+          <div><span>Total deposited</span><b>{reportGbp(reportSummary.totalDeposited)}</b></div>
+          <div><span>Total gain/loss</span><b>{reportGbp(reportSummary.totalGainLoss ?? reportSummary.totalPnl)}</b></div>
+          <div><span>Closed trades</span><b>{num(reportSummary.closedTrades ?? reportsData.closedCount, fullBotClosedTrades.length)}</b></div>
+          <div><span>Win rate</span><b>{pct(reportSummary.winRate).toFixed(1)}%</b></div>
+          <div><span>Today realised</span><b>{reportGbp(reportSummary.todayPnl ?? reportSummary.dailyPnl)}</b></div>
+        </div>
+      </Card>
+      <Card title="Recent Bot Activity">
+        {fullBotTrades.length ? <DataTable rows={fullBotTrades.slice(0,12)} columns={[
+          { key: "time", label: "Time" }, { key: "side", label: "Side" }, { key: "symbol", label: "Symbol" },
+          { key: "reason", label: "Reason" }, { key: "pnl", label: "PnL", render: (row) => reportGbp(row.pnl) },
+        ]} /> : <EmptyState endpoint="recent trading activity" />}
+      </Card>
+      <Card title="Closed Trade History" wide>
+        {fullBotClosedTrades.length ? <DataTable rows={fullBotClosedTrades.slice(0,40)} columns={[
+          { key: "date", label: "Date", render: (row) => text(row.date ?? row.day ?? String(row.timestamp ?? "").slice(0,10), "—") },
+          { key: "time", label: "Time", render: (row) => text(row.time ?? String(row.timestamp ?? "").slice(11,19), "—") },
+          { key: "symbol", label: "Symbol" },
+          { key: "entry", label: "Entry", render: (row) => `$${num(row.entry ?? row.entryPrice).toFixed(2)}` },
+          { key: "exit", label: "Exit", render: (row) => `$${num(row.exit ?? row.exitPrice).toFixed(2)}` },
+          { key: "pnl", label: "PnL", render: (row) => reportGbp(row.pnl) },
+          { key: "pnlPct", label: "%", render: (row) => `${num(row.pnlPct).toFixed(2)}%` },
+          { key: "reason", label: "Exit reason" },
+        ]} /> : <EmptyState endpoint="closed trade history" />}
+      </Card>
+    </div>}
+
+    {exportingPdf && <div className="pdf-section grid two full-bot-report-section" data-pdf-title="MARKET EXPLORER & ADAPTIVE UNIVERSE">
+      <Card title="Adaptive Open-Market Universe" wide>
+        <div className="intelligence-stat-grid full-bot-stat-grid">
+          <StatTile label="Active scan slots" value={String(fullBotAdaptiveRows.length || num(fullBotAdaptive.activeSymbols?.length))} />
+          <StatTile label="Fresh discoveries" value={String(num(fullBotAdaptive.discoveryCount))} />
+          <StatTile label="Core anchors" value={String(num(fullBotAdaptive.coreCount))} />
+          <StatTile label="Rotation interval" value={`${Math.round(num(fullBotAdaptive.refreshSeconds,1800)/60)}m`} />
+        </div>
+        {fullBotAdaptiveRows.length ? <DataTable rows={fullBotAdaptiveRows.slice(0,30).map((row:any) => typeof row === "string" ? {symbol: row} : row)} columns={[
+          { key: "symbol", label: "Symbol" }, { key: "adaptiveSource", label: "Source", render: (row) => text(row.adaptiveSource, "ACTIVE") },
+          { key: "reason", label: "Reason" }, { key: "trust", label: "Trust", render: (row) => text(row.trust ?? row.trustLevel, "—") },
+        ]} /> : <EmptyState endpoint="adaptive universe" />}
+      </Card>
+      <Card title="Top Scanner Candidates" wide>
+        {fullBotScans.length ? <DataTable rows={[...fullBotScans].sort((a,b) => num(b.confidence)-num(a.confidence)).slice(0,20)} columns={[
+          { key: "symbol", label: "Symbol" }, { key: "price", label: "Price", render: (row) => `$${num(row.price).toFixed(2)}` },
+          { key: "confidence", label: "Confidence", render: (row) => `${(num(row.confidence)*(num(row.confidence)<=1?100:1)).toFixed(0)}%` },
+          { key: "quality_score", label: "Quality", render: (row) => num(row.quality_score ?? row.qualityScore).toFixed(4) },
+          { key: "short_momentum", label: "Momentum", render: (row) => num(row.short_momentum ?? row.shortMomentum).toFixed(4) },
+          { key: "spread", label: "Spread", render: (row) => num(row.spread).toFixed(4) },
+          { key: "sniper_reason", label: "Gate / reason", render: (row) => text(row.a_plus_reason ?? row.sniper_reason ?? row.reason, "—") },
+        ]} /> : <EmptyState endpoint="market scanner" />}
+      </Card>
+    </div>}
+
+    {exportingPdf && <div className="pdf-section grid two full-bot-report-section" data-pdf-title="ADMIN & LIVE CONFIGURATION">
+      <Card title="Live Trading Configuration">
+        <div className="summary">
+          <div><span>Max positions</span><b>{text(fullBotPositionSettings.maxPositions ?? fullBotConfig.maxPositions, "—")}</b></div>
+          <div><span>Buy size mode</span><b>{text(fullBotPositionSettings.buySizeMode, "—")}</b></div>
+          <div><span>Strategy level</span><b>{text(fullBotStrategy.level, "—")}</b></div>
+          <div><span>Strategy name</span><b>{text(fullBotStrategy.name ?? fullBotStrategy.label, "—")}</b></div>
+          <div><span>New position notional</span><b>{reportGbp(liveStatus.newPositionNotional)}</b></div>
+          <div><span>Paper mode</span><b>{liveStatus.paper === true ? "YES" : liveStatus.paper === false ? "NO" : "—"}</b></div>
+        </div>
+      </Card>
+      <Card title="Connectivity & Broker State">
+        <div className="summary">
+          <div><span>Account status</span><b>{text(account.status, "CONNECTED")}</b></div>
+          <div><span>Buying power</span><b>{reportGbp(account.buyingPower)}</b></div>
+          <div><span>Cash</span><b>{reportGbp(account.cash)}</b></div>
+          <div><span>Market clock</span><b>{text(fullBotMarket.source, "—")}</b></div>
+          <div><span>Fallback active</span><b>{fullBotMarket.fallbackActive ? "YES" : "NO"}</b></div>
+          <div><span>Bot enabled</span><b>{liveStatus.botEnabled === false ? "NO" : "YES"}</b></div>
+        </div>
+      </Card>
+      <Card title="Recent Runtime Logs" wide>
+        {fullBotLogs.length ? <div className="log-list full-bot-log-list">{fullBotLogs.map((row:any,index:number) => <div key={index}>{typeof row === "string" ? row : text(row.message ?? row.text ?? row.detail, JSON.stringify(row))}</div>)}</div> : <EmptyState endpoint="runtime logs" />}
+      </Card>
+    </div>}
+
+    {exportingPdf && <div className="pdf-section grid two full-bot-report-section" data-pdf-title="DECISION AUDIT · V17.9">
+      <Card title="Decision Audit Summary">
+        <div className="summary">
+          <div><span>Window</span><b>7 days</b></div>
+          <div><span>Pending checkpoints</span><b>{num(auditData.pendingCheckpoints)}</b></div>
+          <div><span>Missed-winner threshold</span><b>+{num(auditData.thresholds?.missedWinnerPct,1).toFixed(2)}%</b></div>
+          <div><span>Good-block threshold</span><b>{num(auditData.thresholds?.goodBlockPct,-0.5).toFixed(2)}%</b></div>
+        </div>
+      </Card>
+      <Card title="Gate Effectiveness">
+        {firstArray(auditData.gates).length ? <DataTable rows={firstArray(auditData.gates)} columns={[
+          { key: "stage", label: "Gate" }, { key: "blocked", label: "Blocked" }, { key: "good_blocks", label: "Good blocks" },
+          { key: "missed_winners", label: "Missed winners" }, { key: "neutral", label: "Neutral" },
+          { key: "effectivenessPct", label: "Effectiveness", render: (row) => `${num(row.effectivenessPct).toFixed(1)}%` },
+        ]} /> : <EmptyState endpoint="V17.9 decision audit" />}
+      </Card>
+      <Card title="Recent Rejected Opportunities" wide>
+        {firstArray(auditData.recent).length ? <DataTable rows={firstArray(auditData.recent).slice(0,30)} columns={[
+          { key: "decision_at", label: "Time", render: (row) => text(row.decision_at ? new Date(String(row.decision_at)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "—") },
+          { key: "symbol", label: "Symbol" }, { key: "stage", label: "Gate" },
+          { key: "return_15m", label: "15m", render: (row) => row.return_15m == null ? "—" : `${num(row.return_15m).toFixed(2)}%` },
+          { key: "return_30m", label: "30m", render: (row) => row.return_30m == null ? "—" : `${num(row.return_30m).toFixed(2)}%` },
+          { key: "return_1h", label: "1h", render: (row) => row.return_1h == null ? "—" : `${num(row.return_1h).toFixed(2)}%` },
+          { key: "return_2h", label: "2h", render: (row) => row.return_2h == null ? "—" : `${num(row.return_2h).toFixed(2)}%` },
+          { key: "classification", label: "Verdict" }, { key: "reason", label: "Reason" },
+        ]} /> : <EmptyState endpoint="audited rejection history" />}
+      </Card>
+    </div>}
+
+    {exportingPdf && <div className="pdf-section grid two full-bot-report-section" data-pdf-title="AUTONOMOUS WEEKLY REVIEW · V18">
+      <Card title="V18 Weekly Governance">
+        <div className="summary">
+          <div><span>Verdict</span><b>{text(weeklyReviewData.verdict,"—")}</b></div>
+          <div><span>Evidence strength</span><b>{text(weeklyReviewData.evidenceStrength,"—")}</b></div>
+          <div><span>Audited decisions</span><b>{num(weeklyReviewData.evidence?.auditedDecisions)} / {num(weeklyReviewData.evidence?.minimumAuditedDecisions,20)}</b></div>
+          <div><span>Pending checkpoints</span><b>{num(weeklyReviewData.evidence?.pendingCheckpoints)}</b></div>
+          <div><span>Proposal</span><b>{text(weeklyReviewData.proposal?.action,"OBSERVE")}</b></div>
+          <div><span>Stability</span><b>{num(weeklyReviewData.proposal?.stabilityCount)} / {num(weeklyReviewData.proposal?.stabilityRequired,5)}</b></div>
+          <div><span>Board eligible</span><b>{weeklyReviewData.proposal?.promotionEligible ? "YES" : "NO"}</b></div>
+        </div>
+        <p className="notice">{text(weeklyReviewData.proposal?.text,"Collecting evidence.")}</p>
+      </Card>
+      <Card title="Constitutional Locks">
+        <div className="tags">{(Array.isArray(weeklyReviewData.constitutionalLocks) ? weeklyReviewData.constitutionalLocks : []).map((lock:string) => <span className="tag" key={lock}>{lock.replaceAll("_"," ")}</span>)}</div>
+      </Card>
+      <Card title="Weekly Gate Review" wide>
+        {firstArray(weeklyReviewData.gates).length ? <DataTable rows={firstArray(weeklyReviewData.gates)} columns={[
+          { key: "stage", label: "Gate" }, { key: "classified", label: "Evidence" }, { key: "good_blocks", label: "Good blocks" },
+          { key: "missed_winners", label: "Missed winners" }, { key: "neutral", label: "Neutral" },
+          { key: "effectivenessPct", label: "Effectiveness", render: (row) => `${num(row.effectivenessPct).toFixed(1)}%` }, { key: "action", label: "Action" },
+        ]} /> : <EmptyState endpoint="V18 weekly review" />}
+      </Card>
+    </div>}
+
+    {exportingPdf && <div className="pdf-section grid two full-bot-report-section" data-pdf-title="PERFORMANCE OBSERVATORY · V18.1">
+      <Card title="Trading Performance">
+        <div className="summary">
+          <div><span>Realised P&L · 7d</span><b>{directGbp(observatoryData.trading?.realisedPnlGbp)}</b></div>
+          <div><span>Closed trades</span><b>{num(observatoryData.trading?.closedTrades)}</b></div>
+          <div><span>Win rate</span><b>{num(observatoryData.trading?.winRatePct).toFixed(1)}%</b></div>
+          <div><span>Max realised drawdown</span><b>{directGbp(observatoryData.trading?.maxRealisedDrawdownGbp)}</b></div>
+          <div><span>Avg winner</span><b>{directGbp(observatoryData.trading?.avgWinnerGbp)}</b></div>
+          <div><span>Avg loser</span><b>{directGbp(observatoryData.trading?.avgLoserGbp)}</b></div>
+        </div>
+      </Card>
+      <Card title="Profit Protection & Capture">
+        <div className="summary">
+          <div><span>Banked profit</span><b>{directGbp(observatoryData.profitProtection?.bankedProfitGbp)}</b></div>
+          <div><span>Lifetime banked</span><b>{directGbp(observatoryData.profitProtection?.lifetimeBankedGbp)}</b></div>
+          <div><span>Trading capital</span><b>{directGbp(observatoryTradingCapitalGbp)}</b></div>
+          <div><span>Invested capital</span><b>{directGbp(observatoryInvestedCapitalGbp)}</b></div>
+          <div><span>Free cash</span><b>{directGbp(observatoryFreeCashGbp)}</b></div>
+          <div><span>Protected baseline</span><b>{directGbp(observatoryData.profitProtection?.protectedBaselineGbp)}</b></div>
+          <div><span>Replay trades measured</span><b>{num(observatoryData.profitCapture?.replayTradesMeasured)}</b></div>
+          <div><span>Average peak capture</span><b>{observatoryData.profitCapture?.averagePeakCapturePct == null ? "COLLECTING" : `${num(observatoryData.profitCapture?.averagePeakCapturePct).toFixed(1)}%`}</b></div>
+        </div>
+      </Card>
+      <Card title="Exit Performance" wide>
+        {firstArray(observatoryData.exits).length ? <DataTable rows={firstArray(observatoryData.exits)} columns={[
+          { key: "reason", label: "Exit reason" }, { key: "trades", label: "Trades" },
+          { key: "winRatePct", label: "Win rate", render: (row) => `${num(row.winRatePct).toFixed(1)}%` },
+          { key: "pnlGbp", label: "Realised P&L", render: (row) => directGbp(row.pnlGbp) },
+        ]} /> : <EmptyState endpoint="V18.1 exit performance" />}
+      </Card>
+    </div>}
+
+    {exportingPdf && <div className="pdf-section grid two full-bot-report-section" data-pdf-title="AI PORTFOLIO & FINAL GATE">
+      <Card title="Portfolio Manager">
+        <div className="summary">
+          <div><span>Status</span><b>{text(portfolioData.status ?? portfolioData.plan?.status, "—")}</b></div>
+          <div><span>Qualified</span><b>{num(portfolioData.qualifiedCount ?? portfolioData.plan?.qualifiedCount)}</b></div>
+          <div><span>Actionable</span><b>{num(portfolioData.actionableCount ?? portfolioData.plan?.actionableCount)}</b></div>
+          <div><span>Minimum score</span><b>{num(portfolioData.minimumPortfolioScore ?? portfolioData.plan?.minimumPortfolioScore).toFixed(3)}</b></div>
+          <div><span>Available slots</span><b>{num(portfolioCapacity.availableSlots ?? portfolioCapacity.structuralAvailableSlots)}</b></div>
+          <div><span>Deployable capital</span><b>{reportGbp(portfolioData.deployableCapitalUsd ?? portfolioData.plan?.deployableCapitalUsd)}</b></div>
+        </div>
+      </Card>
+      <Card title="Planned Allocations">
+        {portfolioAllocations.length ? <DataTable rows={portfolioAllocations} columns={[
+          { key: "symbol", label: "Symbol" }, { key: "portfolioScore", label: "Score", render: (row) => num(row.portfolioScore ?? row.score).toFixed(3) },
+          { key: "notionalUsd", label: "Allocation", render: (row) => `$${num(row.notionalUsd ?? row.notional).toFixed(2)}` },
+          { key: "notionalGbp", label: "GBP", render: (row) => directGbp(row.notionalGbp ?? num(row.notionalUsd) * reportFxRate) },
+        ]} /> : <EmptyState endpoint="portfolio allocations" />}
+      </Card>
+    </div>}
+
+
+    {(section === "ceo" || exportingPdf) && <div className="pdf-section grid two ceo-view" data-pdf-title="AI CEO">
       <Card title="AI Chief Executive" wide className="ceo-command-card">
         <div className="ceo-command-head">
           <div>
@@ -450,8 +1147,8 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         <div className="summary">
           <div><span>Autonomy</span><b>{text(backendEvolution.mode, operator.mode)}</b></div>
           <div><span>Calibration</span><b>{Math.round(pct(backendLearning.confidenceCalibration ?? calibration))}%</b></div>
-          <div><span>Completed outcomes</span><b>{num(backendLearning.completedOutcomes, evidenceCount).toLocaleString("en-GB")}</b></div>
-          <div><span>Ready outcomes</span><b>{num(backendLearning.readyOutcomes).toLocaleString("en-GB")}</b></div>
+          <div><span>Completed outcomes</span><b>{num(backendLearning.completedOutcomes, evidenceCount).toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>
+          <div><span>Ready outcomes</span><b>{num(backendLearning.readyOutcomes).toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>
         </div>
       </Card>
 
@@ -480,7 +1177,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
 
       <Card title="CEO Review History">
         <DataTable rows={ceoReviewRows.slice(0, 10)} columns={[
-          { key: "created_at", label: "Date", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB") : "—" },
+          { key: "created_at", label: "Date", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "—" },
           { key: "review_type", label: "Type" },
           { key: "grade_letter", label: "Grade", render: (row) => `${text(row.grade_letter, "—")} (${num(row.grade).toFixed(1)})` },
           { key: "risk_level", label: "Risk" },
@@ -498,7 +1195,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
     </div>}
 
 
-    {section === "board" && <div className="grid two ceo-view">
+    {(section === "board" || exportingPdf) && <div className="pdf-section grid two ceo-view" data-pdf-title="AI BOARD">
       <Card title="AI Board of Directors" wide className="ceo-command-card">
         <div className="ceo-command-head">
           <div>
@@ -525,7 +1222,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="Board Next Action" className="ceo-decision-card">
         <span className={`pill ${boardStatus.finalDecision === "VETO" ? "bad" : boardStatus.finalDecision === "DELAY" ? "warn" : "ok"}`}>{text(boardStatus.finalDecision, "PENDING")}</span>
         <h3>{text(boardStatus.nextAction, "Waiting for the first automatic board review.")}</h3>
-        <p className="muted">Meeting type: {text(boardStatus.meetingType, "—")} · {boardStatus.createdAt ? new Date(String(boardStatus.createdAt)).toLocaleString("en-GB") : "—"}</p>
+        <p className="muted">Meeting type: {text(boardStatus.meetingType, "—")} · {boardStatus.createdAt ? new Date(String(boardStatus.createdAt)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "—"}</p>
       </Card>
 
       <Card title="Director Votes" wide>
@@ -539,7 +1236,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
 
       <Card title="Board Meeting History" wide>
         <DataTable rows={firstArray(boardHistoryData.items).slice(0, 15)} columns={[
-          { key: "created_at", label: "Date", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB") : "—" },
+          { key: "created_at", label: "Date", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "—" },
           { key: "meeting_type", label: "Meeting" },
           { key: "final_decision", label: "Decision" },
           { key: "ceo_grade", label: "CEO Grade", render: (row) => num(row.ceo_grade).toFixed(1) },
@@ -553,7 +1250,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
     </div>}
 
-    {section === "brain" && <div className="grid two">
+    {(section === "brain" || exportingPdf) && <div className="pdf-section grid two" data-pdf-title="AI BRAIN">
       <Card title="AI Readiness">
         <Meter label="Learning progress" value={learningProgress} />
         <Meter label="Shadow accuracy" value={shadowAccuracy} />
@@ -604,7 +1301,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         </div> : <div className="operator-no-change">No parameter change is currently proposed.</div>}
 
         <div className="operator-evidence-grid">
-          <div><span>Evidence samples</span><b>{num(operatorProposal.evidenceSamples).toLocaleString("en-GB")}</b></div>
+          <div><span>Evidence samples</span><b>{num(operatorProposal.evidenceSamples).toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>
           <div><span>Eligible</span><b>{operatorEligible ? "YES" : "NO"}</b></div>
           <div><span>Automatic changes</span><b>{text(operator.mode, "SHADOW") === "AUTO" ? "ENABLED" : "DISABLED"}</b></div>
           <div><span>Rollback protection</span><b>ACTIVE</b></div>
@@ -647,7 +1344,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <div><span>Proposed confidence gate</span><b>{Object.keys(promotionCandidate).length ? num(promotionCandidate.confidence).toFixed(2) : "—"}</b></div>
           <div><span>Current quality gate</span><b>{num(promotion.current?.quality).toFixed(3)}</b></div>
           <div><span>Proposed quality gate</span><b>{Object.keys(promotionCandidate).length ? num(promotionCandidate.quality).toFixed(3) : "—"}</b></div>
-          <div><span>Samples</span><b>{num(promotionCandidate.samples).toLocaleString("en-GB")}</b></div>
+          <div><span>Samples</span><b>{num(promotionCandidate.samples).toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>
           <div><span>Candidate expectancy</span><b>{num(promotionCandidate.expectancyPct).toFixed(2)}%</b></div>
           <div><span>Profit factor</span><b>{num(promotionCandidate.profitFactor).toFixed(2)}</b></div>
           <div><span>Stability</span><b>{num(promotionLatest.matching_runs ?? promotionOptimizer.stability?.matchingRuns)} / {num(promotionLatest.required_runs ?? promotionOptimizer.stability?.requiredRuns)}</b></div>
@@ -679,7 +1376,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="Strategy Intelligence" wide>
         <DataTable rows={strategyRows.slice(0, 12)} columns={[
           { key: "name", label: "Strategy", render: (row) => <b>{text(row.name ?? row.strategy ?? row.key)}</b> },
-          { key: "trades", label: "Samples", render: (row) => num(row.trades ?? row.samples ?? row.observations).toLocaleString("en-GB") },
+          { key: "trades", label: "Samples", render: (row) => num(row.trades ?? row.samples ?? row.observations).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
           { key: "winRate", label: "Win Rate", render: (row) => `${Math.round(pct(row.winRate ?? row.accuracy))}%` },
           { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.averageReturnPct ?? row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
           { key: "status", label: "Status", render: (row) => <span className="pill">{text(row.status ?? row.verdict ?? row.readiness, "Learning")}</span> },
@@ -687,7 +1384,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
     </div>}
 
-    {section === "market" && <div className="grid two">
+    {(section === "market" || exportingPdf) && <div className="pdf-section grid two" data-pdf-title="MARKET">
       <Card title="Current Market DNA">
         <div className="summary">
           {Object.entries(firstObject(marketDna.current, marketDna.snapshot, marketDna.market, marketDna.dna)).slice(0, 10).map(([key, value]) => <div key={key}><span>{keyLabel(key)}</span><b>{typeof value === "number" ? value.toFixed(2) : text(value)}</b></div>)}
@@ -713,7 +1410,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
     </div>}
 
-    {section === "research" && <div className="grid two">
+    {(section === "research" || exportingPdf) && <div className="pdf-section grid two" data-pdf-title="RESEARCH">
       <Card title="Research Lab Status">
         <div className="summary">
           <div><span>Version</span><b>{text(v8Status.version ?? v7Status.version ?? research.version)}</b></div>
@@ -729,7 +1426,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         <DataTable rows={researchRows.slice(0, 25)} columns={[
           { key: "name", label: "Brain", render: (row) => <b>{text(row.name ?? row.key ?? row.brainName)}</b> },
           { key: "generation", label: "Generation", render: (row) => text(row.generation ?? row.origin, "—") },
-          { key: "trades", label: "Samples", render: (row) => num(row.trades ?? row.samples).toLocaleString("en-GB") },
+          { key: "trades", label: "Samples", render: (row) => num(row.trades ?? row.samples).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
           { key: "winRate", label: "Win Rate", render: (row) => `${Math.round(pct(row.winRate ?? row.accuracy))}%` },
           { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.expectancyPct ?? row.expectancy).toFixed(2)}%` },
           { key: "score", label: "Score", render: (row) => num(row.researchScore ?? row.score).toFixed(2) },
@@ -738,14 +1435,14 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
     </div>}
 
-    {section === "symbols" && <div className="grid two">
+    {(section === "symbols" || exportingPdf) && <div className="pdf-section grid two" data-pdf-title="SYMBOLS">
       <Card title="Symbol Expectancy" wide>
         {chartSymbolRows.length ? <div className="chart"><ResponsiveContainer width="100%" height="100%"><BarChart data={chartSymbolRows}><CartesianGrid strokeDasharray="3 3" stroke="rgba(148,163,184,.16)" /><XAxis dataKey="name" stroke="#94a3b8" /><YAxis stroke="#94a3b8" /><Tooltip contentStyle={{ background: "#020617", border: "1px solid #263450", borderRadius: 12 }} /><Bar dataKey="expectancy" name="Expectancy %">{chartSymbolRows.map((row, index) => <Cell key={index} fill={row.expectancy >= 0 ? "#22c55e" : "#fb7185"} />)}</Bar></BarChart></ResponsiveContainer></div> : <EmptyState endpoint="symbol intelligence" error={sources.symbols.error} />}
       </Card>
       <Card title="Symbol DNA Rankings" wide>
         <DataTable rows={symbolRows.slice(0, 30)} columns={[
           { key: "symbol", label: "Symbol", render: (row) => <b className="symbol-badge">{text(row.symbol ?? row.name ?? row.key)}</b> },
-          { key: "samples", label: "Samples", render: (row) => num(row.trades ?? row.samples ?? row.observations).toLocaleString("en-GB") },
+          { key: "samples", label: "Samples", render: (row) => num(row.trades ?? row.samples ?? row.observations).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
           { key: "winRate", label: "Win Rate", render: (row) => `${Math.round(pct(row.winRate ?? row.accuracy))}%` },
           { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.averageReturnPct ?? row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
           { key: "bestRegime", label: "Best Regime", render: (row) => text(row.status, "Learning") },
@@ -754,7 +1451,180 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       </Card>
     </div>}
 
-    {section === "evolution" && <div className="grid two evolution-view">
+
+    {(section === "memory" || exportingPdf) && <div className="pdf-section memory-view" data-pdf-title="AI MEMORY">
+      <Card title="V13 Long-Term AI Memory">
+        <div className="intelligence-hero-head"><div><span className="eyebrow">AUTONOMOUS KNOWLEDGE LAYER</span><h2>{memoryStatus.enabled === false ? "MEMORY DISABLED" : "MEMORY LEARNING ACTIVE"}</h2><p>Evidence-backed knowledge shared with the CEO, Board, Research and Evolution engines.</p></div><div className="score-ring"><strong>{num(memorySummary.highConfidence)}</strong><span>high-confidence claims</span></div></div>
+        <div className="intelligence-stats four"><StatTile label="Active knowledge" value={num(memorySummary.activeKnowledge).toLocaleString("en-GB", { timeZone: "Europe/London" })} /><StatTile label="High confidence" value={num(memorySummary.highConfidence).toLocaleString("en-GB", { timeZone: "Europe/London" })} /><StatTile label="Positive claims" value={num(memorySummary.positiveClaims).toLocaleString("en-GB", { timeZone: "Europe/London" })} tone="positive" /><StatTile label="Negative claims" value={num(memorySummary.negativeClaims).toLocaleString("en-GB", { timeZone: "Europe/London" })} tone="negative" /></div>
+        <div className="status-strip"><span>AUTOMATIC LEARNING ACTIVE</span><span>ADVISORY ONLY</span><span>STALE KNOWLEDGE AUTO-RETIRES</span></div>
+      </Card>
+      <Card title="What the AI currently knows">
+        <DataTable rows={memoryKnowledge} columns={[
+          { key: "knowledgeType", label: "Type", render: (row) => <span className="pill">{text(row.knowledgeType, "UNKNOWN")}</span> },
+          { key: "subject", label: "Subject" },
+          { key: "claim", label: "Evidence-backed knowledge" },
+          { key: "confidence", label: "Confidence", render: (row) => `${num(row.confidence).toFixed(0)}%` },
+          { key: "evidenceCount", label: "Evidence", render: (row) => num(row.evidenceCount).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
+          { key: "status", label: "Status" },
+        ]} />
+      </Card>
+      <div className="grid two">
+        <Card title="Memory activity">{memoryEvents.length ? <div className="journal-list">{memoryEvents.slice(0, 20).map((row, index) => <article key={String(row.id ?? index)}><time>{row.created_at ? new Date(row.created_at).toLocaleString("en-GB", { timeZone: "Europe/London" }) : ""}</time><div><b>{text(row.title, "Memory event")}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <EmptyState endpoint="V13 memory events" error={sources.memoryEvents.error} />}</Card>
+        <Card title="Memory Constitution"><div className="constitution-list">{Array.isArray(memoryConstitution.rules) && memoryConstitution.rules.length ? memoryConstitution.rules.map((rule: unknown, index: number) => <div key={index}><span>{index + 1}</span><p>{text(rule)}</p></div>) : <EmptyState endpoint="V13 memory constitution" error={sources.memoryConstitution.error} />}</div></Card>
+      </div>
+    </div>}
+
+
+    {(section === "scientist" || exportingPdf) && <div className="pdf-section memory-view scientist-view" data-pdf-title="AI SCIENTIST">
+      <Card title="V14 Autonomous AI Scientist">
+        <div className="intelligence-hero-head"><div><span className="eyebrow">AUTOMATIC RESEARCH ORGANISATION</span><h2>{scientistStatus.enabled === false ? "SCIENTIST DISABLED" : "SCIENTIST ACTIVE"}</h2><p>Generates evidence-backed hypotheses from AI Memory and designs controlled shadow experiments. It cannot alter live trading.</p></div><div className="score-ring"><strong>{num(scientistSummary.hypotheses)}</strong><span>active hypotheses</span></div></div>
+        <div className="intelligence-stats four"><StatTile label="Hypotheses" value={num(scientistSummary.hypotheses).toLocaleString("en-GB", { timeZone: "Europe/London" })} /><StatTile label="Experiments" value={num(scientistSummary.experiments).toLocaleString("en-GB", { timeZone: "Europe/London" })} /><StatTile label="Shadow ready" value={num(scientistSummary.shadowReady).toLocaleString("en-GB", { timeZone: "Europe/London" })} /><StatTile label="Board eligible" value={num(scientistSummary.boardEligible).toLocaleString("en-GB", { timeZone: "Europe/London" })} tone={num(scientistSummary.boardEligible) ? "positive" : ""} /></div>
+        <div className="status-strip"><span>AUTOMATIC HYPOTHESIS GENERATION</span><span>RESEARCH ONLY</span><span>NO MANUAL REVIEW REQUIRED</span></div>
+        <p className="muted">{text(scientistStatus.nextAction, "Collecting evidence for the next research cycle.")}</p>
+      </Card>
+      <Card title="Current Scientific Hypotheses">
+        <DataTable rows={scientistHypotheses} columns={[
+          { key: "title", label: "Hypothesis", render: (row) => <b>{text(row.title)}</b> },
+          { key: "hypothesisType", label: "Type", render: (row) => <span className="pill">{text(row.hypothesisType)}</span> },
+          { key: "subject", label: "Subject" },
+          { key: "statement", label: "Testable statement" },
+          { key: "confidence", label: "Prior confidence", render: (row) => `${num(row.confidence).toFixed(0)}%` },
+          { key: "evidenceCount", label: "Source evidence", render: (row) => num(row.evidenceCount).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
+          { key: "status", label: "Status" },
+        ]} />
+      </Card>
+      <Card title="Experiment Pipeline">
+        <DataTable rows={scientistExperiments} columns={[
+          { key: "name", label: "Experiment", render: (row) => <b>{text(row.name)}</b> },
+          { key: "experimentType", label: "Design", render: (row) => <span className="pill">{text(row.experimentType)}</span> },
+          { key: "status", label: "Status" },
+          { key: "sampleSize", label: "Tagged samples", render: (row) => num(row.sampleSize).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
+          { key: "winRate", label: "Win rate", render: (row) => row.winRate === null || row.winRate === undefined ? "—" : `${num(row.winRate).toFixed(0)}%` },
+          { key: "expectancyPct", label: "Expectancy", render: (row) => row.expectancyPct === null || row.expectancyPct === undefined ? "—" : `${num(row.expectancyPct).toFixed(2)}%` },
+          { key: "evaluationScore", label: "Research score", render: (row) => num(row.evaluationScore).toFixed(2) },
+          { key: "boardEligible", label: "Board", render: (row) => <span className={`pill ${row.boardEligible ? "ok" : "warn"}`}>{row.boardEligible ? "ELIGIBLE" : "NOT YET"}</span> },
+        ]} />
+      </Card>
+      <div className="grid two">
+        <Card title="Scientist activity">{scientistEvents.length ? <div className="journal-list">{scientistEvents.slice(0, 20).map((row, index) => <article key={String(row.id ?? index)}><time>{row.created_at ? new Date(row.created_at).toLocaleString("en-GB", { timeZone: "Europe/London" }) : ""}</time><div><b>{text(row.title, "Scientist event")}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <EmptyState endpoint="V14 scientist events" error={sources.scientistEvents.error} />}</Card>
+        <Card title="Scientist Constitution"><div className="constitution-list">{Array.isArray(scientistConstitution.rules) && scientistConstitution.rules.length ? scientistConstitution.rules.map((rule: unknown, index: number) => <div key={index}><span>{index + 1}</span><p>{text(rule)}</p></div>) : <EmptyState endpoint="V14 scientist constitution" error={sources.scientistConstitution.error} />}</div></Card>
+      </div>
+    </div>}
+
+
+
+    {(section === "portfolio" || exportingPdf) && <div className="pdf-section grid two portfolio-view" data-pdf-title="AI PORTFOLIO">
+      <Card title="AI Portfolio Manager" wide>
+        <div className="intelligence-hero-head">
+          <div>
+            <p className="eyebrow">V16 SCORE-WEIGHTED CAPITAL ALLOCATION</p>
+            <h2>{text(portfolioData.status, "WAITING FOR PLAN")}</h2>
+            <p className="muted">Ranks every qualified candidate, gives stronger opportunities more capital, and keeps cash only when the evidence or safety rules justify it.</p>
+          </div>
+          <span className={`pill ${portfolioData.enabled === false ? "bad" : "ok"}`}>{portfolioData.enabled === false ? "DISABLED" : "ACTIVE"}</span>
+        </div>
+        <div className="intelligence-stats four">
+          <StatTile label="Qualified" value={num(portfolioData.qualifiedCandidates ?? portfolioAllocations.length).toLocaleString("en-GB", { timeZone: "Europe/London" })} />
+          <StatTile label="Deploy" value={`$${num(portfolioData.deployCapitalUsd ?? portfolioData.plan?.deployCapitalUsd).toFixed(2)}`} tone="positive" />
+          <StatTile label="Cash Reserve" value={`$${num(portfolioData.cashReserveUsd ?? portfolioData.plan?.cashReserveUsd ?? portfolioCapacity.buyingPowerUsd).toFixed(2)}`} />
+          <StatTile label="Available Slots" value={num(portfolioCapacity.availableSlots).toLocaleString("en-GB", { timeZone: "Europe/London" })} />
+        </div>
+        <p className="notice">{text(portfolioData.reason ?? portfolioData.plan?.reason, portfolioData.status === "WAITING_FOR_PLAN" ? "Waiting for the next scan cycle to produce qualified candidates." : "Portfolio plan ready.")}</p>
+      </Card>
+
+      <Card title="Ranked Allocations" wide>
+        {portfolioAllocations.length ? <DataTable rows={portfolioAllocations} columns={[
+          { key: "rank", label: "Rank", render: (row) => `#${num(row.rank, 0) || "—"}` },
+          { key: "symbol", label: "Symbol" },
+          { key: "portfolioScore", label: "Score", render: (row) => num(row.portfolioScore ?? row.score).toFixed(2) },
+          { key: "confidence", label: "Confidence", render: (row) => `${pct(row.confidence).toFixed(0)}%` },
+          { key: "quality", label: "Quality", render: (row) => num(row.quality).toFixed(4) },
+          { key: "allocationUsd", label: "Allocation", render: (row) => `$${num(row.allocationUsd ?? row.notionalUsd).toFixed(2)}` },
+          { key: "weightPct", label: "Weight", render: (row) => `${num(row.weightPct ?? row.weight).toFixed(1)}%` },
+          { key: "reason", label: "Why" },
+        ]} /> : <EmptyState endpoint="V16 portfolio plan" error={sources.portfolio.error || "No qualified portfolio plan has been produced yet."} />}
+      </Card>
+
+      <Card title="Capacity & Cash Decision">
+        <div className="summary">
+          <div><span>Open positions</span><b>{num(portfolioData.openPositions ?? portfolioCapacity.openPositions)}</b></div>
+          <div><span>Effective capacity</span><b>{num(portfolioCapacity.effectiveMaxPositions)}</b></div>
+          <div><span>Affordable new positions</span><b>{num(portfolioCapacity.affordableNewPositions)}</b></div>
+          <div><span>Buying power</span><b>${num(portfolioCapacity.buyingPowerUsd).toFixed(2)}</b></div>
+        </div>
+      </Card>
+
+      <Card title="How allocation works">
+        <div className="constitution-list">
+          <div><span>1</span><p>Every candidate must first pass the existing confidence, quality, spread, risk and lockout gates.</p></div>
+          <div><span>2</span><p>Qualified candidates compete against one another using a unified portfolio score.</p></div>
+          <div><span>3</span><p>Higher-scoring candidates receive larger allocations; lower-scoring approved candidates receive smaller allocations.</p></div>
+          <div><span>4</span><p>Cash remains only when candidate breadth, market quality, correlation or safety limits make deployment unattractive.</p></div>
+        </div>
+      </Card>
+    </div>}
+
+    {(section === "operations" || exportingPdf) && <div className="pdf-section memory-view operations-view" data-pdf-title="AI OPERATIONS">
+      <Card title="V15.1 AI Operations Centre Pro">
+        <div className="intelligence-hero-head"><div><span className="eyebrow">AUTOMATIC FULL-SYSTEM MONITORING</span><h2>{text(operationsSummary.overallStatus, "STARTING")}</h2><p>Continuously checks the full dependency tree, registered APIs, database integrity, queues, workers, intelligence, governance and host resources.</p></div><div className="score-ring"><strong>{num(operationsSummary.healthScore).toFixed(0)}%</strong><span>system health</span></div></div>
+        <div className="intelligence-stats four"><StatTile label="Passed" value={num(operationsSummary.passed).toLocaleString("en-GB", { timeZone: "Europe/London" })} tone="positive" /><StatTile label="Warnings" value={num(operationsSummary.warnings).toLocaleString("en-GB", { timeZone: "Europe/London" })} /><StatTile label="Failed" value={num(operationsSummary.failed).toLocaleString("en-GB", { timeZone: "Europe/London" })} tone={num(operationsSummary.failed) ? "negative" : ""} /><StatTile label="Active alerts" value={operationsAlerts.length.toLocaleString("en-GB", { timeZone: "Europe/London" })} tone={operationsAlerts.length ? "negative" : "positive"} /></div>
+        <div className="status-strip"><span>AUTOMATIC AUDITS ACTIVE</span><span>EVERY {Math.max(1, Math.round(num(operationsSummary.nextAuditInSeconds, 900) / 60))} MINUTES</span><span>ENDPOINT DISCOVERY</span><span>WORKER WATCHDOG</span><span>NO MANUAL REVIEW</span></div>
+        <p className="muted">Last audit: {operationsSummary.checkedAt ? new Date(String(operationsSummary.checkedAt)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "Waiting for first automatic audit"}. {text(operationsStatus.nextAction, "No intervention required.")}</p>
+      </Card>
+      <Card title="Holiday Mode">
+        <div className="intelligence-hero-head"><div><span className="eyebrow">AUTOMATIC HOLIDAY SUPERVISION</span><h2>{text(holidayMode.headline, "WAITING FOR FIRST AUDIT")}</h2><p>{holidayMode.safeToLeaveRunning === false ? "A critical condition needs human attention." : "The system is monitoring itself and will keep warnings visible until they clear."}</p></div><div className="score-ring"><strong>{num(holidayMode.healthScore).toFixed(0)}%</strong><span>holiday health</span></div></div>
+        <div className="status-strip"><span>{holidayMode.safeToLeaveRunning === false ? "ATTENTION REQUIRED" : "SAFE TO LEAVE RUNNING"}</span><span>RECOVERY: {text(holidayMode.automaticRecovery, "MONITORING")}</span><span>CRITICAL: {num(holidayMode.criticalFailures)}</span><span>WARNINGS: {num(holidayMode.warnings)}</span></div>
+      </Card>
+      <Card title="Exact Engine Health">
+        <div className="intelligence-hero-head"><div><span className="eyebrow">FAULT-ISOLATED DIAGNOSTICS</span><h2>{exactOfflineEngines.length ? `${exactOfflineEngines.length} ITEMS NEED ATTENTION` : "ALL MONITORED ENGINES HEALTHY"}</h2><p>The dashboard now identifies each unavailable endpoint or failed internal component instead of showing only a total.</p></div><div className="score-ring"><strong>{endpointHealth}/{endpointTotal}</strong><span>dashboard endpoints online</span></div></div>
+        {exactOfflineEngines.length ? <DataTable rows={exactOfflineEngines} columns={[
+          { key: "status", label: "Health", render: (row) => <span className={`pill ${row.status === "WARN" || row.status === "STARTING" ? "warn" : "bad"}`}>{text(row.status)}</span> },
+          { key: "source", label: "Detected by", render: (row) => <span className="pill">{text(row.source)}</span> },
+          { key: "category", label: "Area" },
+          { key: "name", label: "Engine / endpoint", render: (row) => <b>{text(row.name)}</b> },
+          { key: "reason", label: "Exact reason" },
+          { key: "critical", label: "Critical", render: (row) => row.critical ? "YES" : "NO" },
+        ]} /> : <div className="intelligence-empty"><strong>All clear</strong><span>Every monitored dashboard endpoint and backend Operations component is currently healthy.</span></div>}
+      </Card>
+      <Card title="Dependency Health">
+        <DataTable rows={operationsDependencies} columns={[
+          { key: "status", label: "Health", render: (row) => <span className={`pill ${row.status === "PASS" ? "ok" : "warn"}`}>{text(row.status)}</span> },
+          { key: "name", label: "Department", render: (row) => <b>{text(row.name)}</b> },
+          { key: "healthy", label: "Healthy", render: (row) => `${num(row.healthy)} / ${num(row.total)}` },
+          { key: "components", label: "Dependencies", render: (row) => Array.isArray(row.components) ? row.components.map((x: any) => `${text(x.name)}: ${text(x.status)}`).join(" · ") : "—" },
+        ]} />
+      </Card>
+      <div className="grid two">
+        <Card title="Worker Watchdogs"><DataTable rows={operationsWatchdogs} columns={[
+          { key: "status", label: "Health", render: (row) => <span className={`pill ${row.status === "PASS" ? "ok" : "warn"}`}>{text(row.status)}</span> },
+          { key: "name", label: "Watchdog" }, { key: "message", label: "Latest result" },
+          { key: "durationMs", label: "Check", render: (row) => `${num(row.durationMs).toFixed(0)} ms` },
+        ]} /></Card>
+        <Card title="Queue & Audit Stores"><div className="summary">{Object.entries(operationsQueues).length ? Object.entries(operationsQueues).map(([key,value]: any) => <div key={key}><span>{keyLabel(key)}</span><b>{typeof value === "object" ? text(value.total ?? value.status ?? value.table, "AVAILABLE") : num(value).toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></div>) : <div><span>Status</span><b>Waiting for audit</b></div>}</div></Card>
+      </div>
+      <Card title="Subsystem Health">
+        <DataTable rows={operationsComponents} columns={[
+          { key: "status", label: "Health", render: (row) => <span className={`pill ${row.status === "PASS" ? "ok" : "warn"}`}>{text(row.status)}</span> },
+          { key: "category", label: "Area" },
+          { key: "name", label: "Subsystem", render: (row) => <b>{text(row.name)}</b> },
+          { key: "message", label: "Latest check" },
+          { key: "durationMs", label: "Response", render: (row) => `${num(row.durationMs).toFixed(0)} ms` },
+          { key: "critical", label: "Critical", render: (row) => row.critical ? "YES" : "NO" },
+        ]} />
+      </Card>
+      <div className="grid two">
+        <Card title="Active Operations Alerts">{operationsAlerts.length ? <div className="journal-list">{operationsAlerts.slice(0, 30).map((row, index) => <article key={String(row.id ?? index)}><time>{row.last_seen ? new Date(String(row.last_seen)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : ""}</time><div><b>{text(row.severity)} · {text(row.title)}</b><p>{text(row.detail, "")}</p></div></article>)}</div> : <div className="intelligence-empty"><strong>All clear</strong><span>No active system alerts.</span></div>}</Card>
+        <Card title="Health History"><DataTable rows={operationsHistory.slice(0, 30)} columns={[
+          { key: "created_at", label: "Audit", render: (row) => row.created_at ? new Date(String(row.created_at)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "—" },
+          { key: "overallStatus", label: "Status" },
+          { key: "healthScore", label: "Health", render: (row) => `${num(row.healthScore).toFixed(0)}%` },
+          { key: "passed", label: "Pass" }, { key: "warnings", label: "Warn" }, { key: "failed", label: "Fail" },
+        ]} /></Card>
+      </div>
+      <Card title="Operations Constitution"><div className="constitution-list">{Array.isArray(operationsConstitution.rules) && operationsConstitution.rules.length ? operationsConstitution.rules.map((rule: unknown, index: number) => <div key={index}><span>{index + 1}</span><p>{text(rule)}</p></div>) : <EmptyState endpoint="V15 operations constitution" error={sources.operationsConstitution.error} />}</div></Card>
+    </div>}
+
+    {(section === "evolution" || exportingPdf) && <div className="pdf-section grid two evolution-view" data-pdf-title="EVOLUTION">
       <Card title="Current Evolution State">
         <div className="evolution-current">
           <span className="pill ok">GENERATION {currentGeneration}</span>
@@ -765,7 +1635,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <div><span>Promotions recorded</span><b>{promotionActions.length}</b></div>
           <div><span>Rollbacks recorded</span><b>{evolutionActions.filter((row) => row.actionType.includes("ROLLBACK")).length}</b></div>
           <div><span>Current stability</span><b>{operatorStableRuns} / {operatorRequiredRuns}</b></div>
-          <div><span>Last applied</span><b>{operator.lastApplyAt ? new Date(String(operator.lastApplyAt)).toLocaleString("en-GB") : "No promotion yet"}</b></div>
+          <div><span>Last applied</span><b>{operator.lastApplyAt ? new Date(String(operator.lastApplyAt)).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "No promotion yet"}</b></div>
           <div><span>Rollback protection</span><b>{operator.history?.length ? "ACTIVE" : "ARMED"}</b></div>
         </div>
       </Card>
@@ -777,7 +1647,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
           <small>{operatorChangeCount ? `${Math.max(0, operatorRequiredRuns - operatorStableRuns)} matching reviews remain.` : "No evidence-backed change is currently required."}</small>
         </div>
         {operatorChangeCount ? <div className="evolution-candidate-list">{Object.entries(operatorChanged).map(([key, change]) => { const item = firstObject(change); return <div key={key}><span>{keyLabel(key)}</span><b>{formatOperatorValue(key, item.before)} → {formatOperatorValue(key, item.after)}</b></div>; })}</div> : <EmptyState endpoint="autonomous candidate" />}
-        <p className="muted">Evidence: {num(operatorProposal.evidenceSamples).toLocaleString("en-GB")} completed observations. Apply window: market closed only.</p>
+        <p className="muted">Evidence: {num(operatorProposal.evidenceSamples).toLocaleString("en-GB", { timeZone: "Europe/London" })} completed observations. Apply window: market closed only.</p>
       </Card>
 
       <Card title="Evolution Equity Checkpoints" wide>
@@ -792,19 +1662,19 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
       <Card title="Evolution Timeline" wide>
         {evolutionActions.length ? <div className="evolution-timeline">{[...evolutionActions].reverse().map((row) => <article key={String(row.id ?? `${row.createdAt}-${row.generation}`)} className={`evolution-entry ${row.actionType.includes("ROLLBACK") ? "rollback" : "promotion"}`}>
           <div className="evolution-node" />
-          <div className="evolution-entry-head"><div><span className="pill">G{row.generation}</span><b>{keyLabel(row.actionType)}</b></div><time>{row.createdAt ? new Date(row.createdAt).toLocaleString("en-GB") : "Unknown time"}</time></div>
+          <div className="evolution-entry-head"><div><span className="pill">G{row.generation}</span><b>{keyLabel(row.actionType)}</b></div><time>{row.createdAt ? new Date(row.createdAt).toLocaleString("en-GB", { timeZone: "Europe/London" }) : "Unknown time"}</time></div>
           <p>{row.reason}</p>
-          <div className="evolution-meta"><span>Evidence <b>{row.samples.toLocaleString("en-GB")}</b></span><span>Status <b>{row.status}</b></span>{row.equity > 0 && <span>Equity <b>${row.equity.toFixed(2)}</b></span>}</div>
+          <div className="evolution-meta"><span>Evidence <b>{row.samples.toLocaleString("en-GB", { timeZone: "Europe/London" })}</b></span><span>Status <b>{row.status}</b></span>{row.equity > 0 && <span>Equity <b>${row.equity.toFixed(2)}</b></span>}</div>
           {Object.keys(row.changed).length > 0 && <div className="evolution-change-list">{Object.entries(row.changed).map(([key, value]) => { const change = firstObject(value); return <div key={key}><span>{keyLabel(key)}</span><b>{formatOperatorValue(key, change.before)} → {formatOperatorValue(key, change.after)}</b></div>; })}</div>}
         </article>)}</div> : <EmptyState endpoint="autonomous promotion history" />}
       </Card>
     </div>}
 
-    {section === "rules" && <div className="grid two">
+    {(section === "rules" || exportingPdf) && <div className="pdf-section grid two" data-pdf-title="RULES">
       <Card title="Rule Intelligence" wide>
         <DataTable rows={ruleRows.slice(0, 30)} columns={[
           { key: "rule", label: "Rule", render: (row) => <b>{text(row.rule ?? row.name ?? row.key)}</b> },
-          { key: "triggered", label: "Triggered", render: (row) => num(row.triggered ?? row.samples ?? row.count).toLocaleString("en-GB") },
+          { key: "triggered", label: "Triggered", render: (row) => num(row.triggered ?? row.samples ?? row.count).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
           { key: "helped", label: "Helped", render: (row) => `${Math.round(pct(row.helpedRate ?? row.helpRate ?? row.successRate ?? row.winRate))}%` },
           { key: "expectancy", label: "Expectancy", render: (row) => `${num(row.rejectedTradeAverageReturnPct ?? row.expectancyPct ?? row.expectancy ?? row.edgePct).toFixed(2)}%` },
           { key: "verdict", label: "Verdict", render: (row) => <span className="pill">{text(row.rating ?? row.verdict ?? row.status ?? row.recommendation, "Learning")}</span> },
@@ -814,7 +1684,7 @@ export function IntelligencePage({ authToken, marketRegime, botHealth, aiConfide
         <DataTable rows={weaknessRows.slice(0, 30)} columns={[
           { key: "weakness", label: "Weakness", render: (row) => <b>{text(row.finding ?? row.weakness ?? row.name ?? row.title ?? row.rule)}</b> },
           { key: "severity", label: "Severity", render: (row) => text(row.severity ?? row.risk ?? row.level, "Unknown") },
-          { key: "samples", label: "Evidence", render: (row) => num(row.samples ?? row.trades ?? row.count).toLocaleString("en-GB") },
+          { key: "samples", label: "Evidence", render: (row) => num(row.samples ?? row.trades ?? row.count).toLocaleString("en-GB", { timeZone: "Europe/London" }) },
           { key: "impact", label: "Impact", render: (row) => text(row.severity ?? row.impactPct ?? row.expectancyPct ?? row.impact, "—") },
           { key: "recommendation", label: "Recommendation", render: (row) => text(row.recommendation ?? row.action ?? row.note, "Observe") },
         ]} />

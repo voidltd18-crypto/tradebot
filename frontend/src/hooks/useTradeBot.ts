@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { API_URL, readJson } from "../lib/api";
 import { clamp } from "../lib/format";
-import type { AnyObj, BuySizeMode, Currency } from "../lib/types";
+import type { AnyObj, BuySizeMode, Currency, Tab } from "../lib/types";
 
-export function useTradeBot() {
+export function useTradeBot(activeTab: Tab = "overview") {
   const [data, setData] = useState<AnyObj>({});
   const [reports, setReports] = useState<AnyObj>({});
+  const [reportsLoading, setReportsLoading] = useState(false);
+  const [reportsError, setReportsError] = useState("");
+  const [reportsUpdatedAt, setReportsUpdatedAt] = useState("");
   const [banking, setBanking] = useState<AnyObj>({});
   const [status, setStatus] = useState("Connecting...");
   const [message, setMessage] = useState("Ready.");
@@ -33,7 +36,10 @@ export function useTradeBot() {
   const fetchSeq = useRef(0);
   const fetchInFlight = useRef(false);
   const lastFetchAt = useRef(0);
+  const reportsInFlight = useRef(false);
+  const reportsLastFetchAt = useRef(0);
   const POLL_MS = 10000;
+  const REPORTS_REFRESH_MS = 15000;
   const token = authToken;
   const secureHeaders = token ? { "X-Auth-Token": token, "x-api-key": token } : {};
   const rate = Number(data?.fx?.usdToGbp || 0.7403);
@@ -69,37 +75,144 @@ export function useTradeBot() {
     return result;
   }, [bestCandidate]);
 
+  const fetchJsonWithTimeout = useCallback(async (path: string, timeoutMs = 30000) => {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(`${API_URL}${path}`, {
+        cache: "no-store",
+        headers: secureHeaders,
+        signal: controller.signal,
+      });
+      const json = await readJson(response);
+      if (!response.ok) throw new Error(json?.detail || json?.message || `${path} failed (${response.status})`);
+      return json || {};
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }, [authToken]);
+
+  const loadReports = useCallback(async (force = false) => {
+    if (!authToken) return;
+    const now = Date.now();
+    if (reportsInFlight.current || (!force && now - reportsLastFetchAt.current < REPORTS_REFRESH_MS)) return;
+
+    reportsInFlight.current = true;
+    reportsLastFetchAt.current = now;
+    setReportsLoading(true);
+    setReportsError("");
+
+    try {
+      const json = await fetchJsonWithTimeout("/reports", 90000);
+      setReports((previous) => ({ ...previous, ...json }));
+      setReportsUpdatedAt(new Date().toISOString());
+    } catch (error: any) {
+      if (error?.name === "AbortError") {
+        setReportsError("Reports are taking longer than expected. Live trading, balances, positions and AI remain connected.");
+      } else {
+        setReportsError(error?.message || "Reports unavailable.");
+        console.error("Reports load failed", error);
+      }
+    } finally {
+      reportsInFlight.current = false;
+      setReportsLoading(false);
+    }
+  }, [authToken, fetchJsonWithTimeout]);
+
   const fetchData = useCallback(async (force = false) => {
     if (!authToken) return;
     const now = Date.now();
     if (!force && (fetchInFlight.current || now - lastFetchAt.current < POLL_MS)) return;
+
     fetchInFlight.current = true;
     lastFetchAt.current = now;
     const seq = ++fetchSeq.current;
+    let liveConnected = false;
+
+    // V18.2.8: hydrate independently. Previously Promise.allSettled meant a fast
+    // /banking-status response was held hostage by a slow /status request for up
+    // to 30 seconds. Each panel now paints as soon as its own endpoint returns.
+    const bankingPromise = fetchJsonWithTimeout("/banking-status", 10000)
+      .then((value) => {
+        if (seq !== fetchSeq.current || value?.ok === false) return;
+        setBanking(value || {});
+        liveConnected = true;
+        setStatus("Connected");
+
+        // Give the header a useful equity value immediately while the richer
+        // status snapshot is still arriving. /status will replace this with the
+        // authoritative live account/positions payload a moment later.
+        const eq = Number(value?.accountEquity || 0);
+        if (eq > 0) {
+          setData((previous) => ({
+            ...previous,
+            account: {
+              ...(previous?.account || {}),
+              equity: previous?.account?.equity || eq,
+              equityGbp: previous?.account?.equityGbp || eq * Number(previous?.fx?.usdToGbp || 0.7403),
+            },
+            banking: { ...(previous?.banking || {}), ...(value || {}) },
+          }));
+        }
+      })
+      .catch((error: any) => {
+        if (error?.name !== "AbortError") console.error("Banking status load failed", error);
+      });
+
+    const statusPromise = fetchJsonWithTimeout("/status", 12000)
+      .then((value) => {
+        if (seq !== fetchSeq.current) return;
+        if (value && Object.keys(value).length > 0) {
+          setData((previous) => ({ ...previous, ...value }));
+          const mode = value?.positionSettings?.buySizeMode;
+          if (mode) setBuySizeMode(mode === "partial" ? "partial" : "full");
+          liveConnected = true;
+          setStatus("Connected");
+        }
+      })
+      .catch((error: any) => {
+        if (error?.name !== "AbortError") console.error("Live status load failed", error);
+      });
+
     try {
-      const [statusResult, reportResult, bankingResult] = await Promise.allSettled([
-        fetch(`${API_URL}/status`, { cache: "no-store", headers: secureHeaders }).then(readJson),
-        fetch(`${API_URL}/reports`, { cache: "no-store", headers: secureHeaders }).then(readJson),
-        fetch(`${API_URL}/banking-status`, { cache: "no-store", headers: secureHeaders }).then(readJson),
-      ]);
+      await Promise.allSettled([bankingPromise, statusPromise]);
       if (seq !== fetchSeq.current) return;
-      if (statusResult.status === "fulfilled") {
-        setData((previous) => ({ ...previous, ...statusResult.value }));
-        const mode = statusResult.value?.positionSettings?.buySizeMode;
-        if (mode) setBuySizeMode(mode === "partial" ? "partial" : "full");
-      }
-      if (reportResult.status === "fulfilled") setReports((previous) => ({ ...previous, ...reportResult.value }));
-      if (bankingResult.status === "fulfilled") setBanking(bankingResult.value || {});
-      setStatus("Connected");
-    } catch (error) {
-      console.error(error);
-      setStatus("Connection failed");
+      if (!liveConnected) setStatus("Connection failed");
     } finally {
       fetchInFlight.current = false;
     }
-  }, [authToken]);
+  }, [authToken, fetchJsonWithTimeout]);
 
-  useEffect(() => { if (!authToken) return; fetchData(true); const timer = window.setInterval(() => fetchData(false), POLL_MS); return () => window.clearInterval(timer); }, [authToken, fetchData]);
+
+  useEffect(() => {
+    if (!authToken) return;
+    fetchData(true);
+    const timer = window.setInterval(() => fetchData(false), POLL_MS);
+    return () => window.clearInterval(timer);
+  }, [authToken, fetchData]);
+
+  useEffect(() => {
+    if (!authToken || activeTab !== "reports") return;
+    // Reports are broker-fill accounting, not a one-shot snapshot. Keep them
+    // current while visible, without making the heavy report endpoint run on
+    // the 10-second overview loop.
+    loadReports(false);
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === "visible") loadReports(false);
+    }, REPORTS_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [authToken, activeTab, loadReports]);
+
+  useEffect(() => {
+    if (!authToken) return;
+    const onVisible = () => {
+      if (document.visibilityState !== "visible") return;
+      fetchData(true);
+      if (activeTab === "reports") loadReports(true);
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [authToken, activeTab, fetchData, loadReports]);
   useEffect(() => { const cap = Number(banking?.maxTradingCapitalGbp ?? data?.banking?.maxTradingCapitalGbp ?? 0); if (cap > 0 && !tradingCapInput) setTradingCapInput(String(Math.round(cap))); if (cap > 0 && !replayCapInput) setReplayCapInput(String(Math.round(cap))); }, [banking?.maxTradingCapitalGbp, data?.banking?.maxTradingCapitalGbp]);
   useEffect(() => { const level = Number(data?.strategySettings?.level); if (Number.isFinite(level)) setStrategyStrictness(Math.max(0, Math.min(2, level))); }, [data?.strategySettings?.level]);
   useEffect(() => { const max = Number(data?.positionSettings?.maxPositions ?? data?.maxPositions ?? data?.config?.maxPositions); if (Number.isFinite(max) && max > 0) setMaxPositionsInput(Math.max(1, Math.min(10, max))); }, [data?.positionSettings?.maxPositions, data?.maxPositions, data?.config?.maxPositions]);
@@ -119,7 +232,7 @@ export function useTradeBot() {
 
   function secureLogout() {
     localStorage.removeItem("tradebot_auth_token"); localStorage.removeItem("dashboard_api_key");
-    fetchSeq.current += 1; setAuthToken(""); setData({}); setReports({}); setBanking({}); setStatus("Logged out"); setMessage("Logged out.");
+    fetchSeq.current += 1; fetchInFlight.current = false; reportsInFlight.current = false; setAuthToken(""); setData({}); setReports({}); setReportsLoading(false); setReportsError(""); setReportsUpdatedAt(""); setBanking({}); setStatus("Logged out"); setMessage("Logged out.");
   }
 
   async function action(endpoint: string) {
@@ -132,6 +245,7 @@ export function useTradeBot() {
       setMessage(json?.message || json?.detail || "Action completed.");
     } catch (error: any) { setMessage(error?.message || "Action failed."); }
     await fetchData(true);
+    if (activeTab === "reports") await loadReports(true);
   }
 
   async function searchStocks(queryOverride?: string) {
@@ -161,5 +275,5 @@ export function useTradeBot() {
   async function setManualBaseline() { const gbpValue = Number(manualBaselineInput); if (!(gbpValue > 0)) return setMessage("Enter a valid GBP baseline."); setBaselineSaving(true); try { await postSetting("/set-baseline", { baseline: rate > 0 ? gbpValue / rate : gbpValue }, "Baseline saved."); } catch (e: any) { setMessage(e.message); } finally { setBaselineSaving(false); } }
   async function runBacktestReplay() { const capGbp = Number(replayCapInput || tradingCapInput); if (!(capGbp > 0)) return setMessage("Enter a valid replay cap."); setReplayLoading(true); try { const result = await postSetting("/backtest-replay", { capGbp }, "Replay complete."); setReplayResult(result); } catch (e: any) { setMessage(e.message); } finally { setReplayLoading(false); } }
 
-  return { data, reports, banking, status, message, authToken, secureUsername, securePassword, authError, setSecureUsername, setSecurePassword, secureLogin, secureLogout, rate, positions, trades, logs, closedTrades, dynamicScanner, dynamicRows, strategySettings, positionSettings, bestCandidate, aiConfidence, marketLabel, marketRegime, riskLabel, currentAction, botHealth, aiReasons, fetchData, action, chartCurrency, setChartCurrency, stockQuery, setStockQuery, stockResults, setStockResults, stockSearchLoading, searchStocks, tradingCapInput, setTradingCapInput, tradingCapSaving, saveTradingCap, manualBaselineInput, setManualBaselineInput, baselineSaving, setManualBaseline, strategyStrictness, setStrategyStrictness, strategySaving, saveStrategy, maxPositionsInput, setMaxPositionsInput, positionsSaving, saveMaxPositions, buySizeMode, saveBuySizeMode, replayCapInput, setReplayCapInput, replayLoading, replayResult, runBacktestReplay };
+  return { data, reports, reportsLoading, reportsError, reportsUpdatedAt, loadReports, banking, status, message, authToken, secureUsername, securePassword, authError, setSecureUsername, setSecurePassword, secureLogin, secureLogout, rate, positions, trades, logs, closedTrades, dynamicScanner, dynamicRows, strategySettings, positionSettings, bestCandidate, aiConfidence, marketLabel, marketRegime, riskLabel, currentAction, botHealth, aiReasons, fetchData, action, chartCurrency, setChartCurrency, stockQuery, setStockQuery, stockResults, setStockResults, stockSearchLoading, searchStocks, tradingCapInput, setTradingCapInput, tradingCapSaving, saveTradingCap, manualBaselineInput, setManualBaselineInput, baselineSaving, setManualBaseline, strategyStrictness, setStrategyStrictness, strategySaving, saveStrategy, maxPositionsInput, setMaxPositionsInput, positionsSaving, saveMaxPositions, buySizeMode, saveBuySizeMode, replayCapInput, setReplayCapInput, replayLoading, replayResult, runBacktestReplay };
 }

@@ -1,22 +1,59 @@
-import { useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { DashboardStyles } from "./components/DashboardStyles";
 import { Header } from "./components/Header";
 import { Login } from "./components/Login";
 import { Nav } from "./components/Nav";
 import { Stat } from "./components/Stat";
+import { SwingReviewPanel } from "./components/SwingReviewPanel";
 import { useTradeBot } from "./hooks/useTradeBot";
 import { gbp, tone, usd } from "./lib/format";
 import type { AnyObj, Tab } from "./lib/types";
-import { AdminPage } from "./pages/AdminPage";
-import { IntelligencePage } from "./pages/IntelligencePage";
-import { ExplorerPage } from "./pages/ExplorerPage";
 import { OverviewPage } from "./pages/OverviewPage";
 import { PositionsPage } from "./pages/PositionsPage";
-import { ReportsPage } from "./pages/ReportsPage";
+
+const AdminPage = lazy(() => import("./pages/AdminPage").then((module) => ({ default: module.AdminPage })));
+const IntelligencePage = lazy(() => import("./pages/IntelligencePage").then((module) => ({ default: module.IntelligencePage })));
+const ExplorerPage = lazy(() => import("./pages/ExplorerPage").then((module) => ({ default: module.ExplorerPage })));
+const PortfolioPage = lazy(() => import("./pages/PortfolioPage").then((module) => ({ default: module.PortfolioPage })));
+const ObservatoryPage = lazy(() => import("./pages/ObservatoryPage").then((module) => ({ default: module.ObservatoryPage })));
+const WeeklyReviewPage = lazy(() => import("./pages/WeeklyReviewPage").then((module) => ({ default: module.WeeklyReviewPage })));
+const AuditPage = lazy(() => import("./pages/AuditPage").then((module) => ({ default: module.AuditPage })));
+const ReportsPage = lazy(() => import("./pages/ReportsPage").then((module) => ({ default: module.ReportsPage })));
+
+
+function usePhoneLayout() {
+  const detect = () => {
+    if (typeof window === "undefined") return false;
+    const vv = window.visualViewport?.width ?? Number.POSITIVE_INFINITY;
+    const screenWidth = Math.min(window.screen?.width || Number.POSITIVE_INFINITY, window.screen?.height || Number.POSITIVE_INFINITY);
+    const coarse = window.matchMedia?.("(pointer: coarse)")?.matches ?? false;
+    return window.innerWidth <= 760 || vv <= 760 || screenWidth <= 760 || (coarse && window.innerWidth <= 1100);
+  };
+  const [isPhone, setIsPhone] = useState(detect);
+  useEffect(() => {
+    const refresh = () => setIsPhone(detect());
+    refresh();
+    window.addEventListener("resize", refresh);
+    window.addEventListener("orientationchange", refresh);
+    window.visualViewport?.addEventListener("resize", refresh);
+    return () => {
+      window.removeEventListener("resize", refresh);
+      window.removeEventListener("orientationchange", refresh);
+      window.visualViewport?.removeEventListener("resize", refresh);
+    };
+  }, []);
+  return isPhone;
+}
+
+function PageLoading() {
+  return <div className="card"><strong>Loading this page…</strong><div className="muted">Live balances and trading remain connected.</div></div>;
+}
 
 export default function App() {
   const [tab, setTab] = useState<Tab>("overview");
-  const bot = useTradeBot();
+  const [exportRequested, setExportRequested] = useState(false);
+  const isPhone = usePhoneLayout();
+  const bot = useTradeBot(tab);
 
   function positionGlowStyle(position: AnyObj): React.CSSProperties {
     const pnlPct = Number(position?.pnlPct || 0);
@@ -31,25 +68,51 @@ export default function App() {
     return <Login username={bot.secureUsername} password={bot.securePassword} error={bot.authError} setUsername={bot.setSecureUsername} setPassword={bot.setSecurePassword} onLogin={bot.secureLogin} />;
   }
 
-  const totalDeposited = Number(bot.reports?.totalDeposited || 0);
-  const totalGainLoss = Number(bot.reports?.totalGainLoss || 0);
+  // /reports returns USD. Its "totalDeposited" may represent a reset
+  // baseline rather than independently verified lifetime deposits.
+  const performanceBaselineUsd = Number(bot.reports?.totalDeposited || 0);
+  const gainLossSinceBaselineUsd = Number(bot.reports?.totalGainLoss || 0);
+  const profitVault = bot.banking?.profitVault || bot.data?.banking?.profitVault || {};
+  const vaultFreeCashGbp = Number(profitVault?.workingCapitalGbp || 0);
+  const brokerBuyingPowerUsd = Number(bot.data?.account?.buyingPower || 0);
+  const displayedFreeCashGbp = vaultFreeCashGbp > 0 ? vaultFreeCashGbp : brokerBuyingPowerUsd * bot.rate;
+  const bankedProfitGbp = Number(profitVault?.bankedProfitGbp || 0);
+  const accountEquityGbp = Number(bot.data?.account?.equity || 0) * bot.rate;
+  const tradingCapitalGbp = Math.max(0, Number(profitVault?.accountEquityGbp || accountEquityGbp) - bankedProfitGbp);
+  const maxPositions = Number(bot.data?.maxPositions || bot.positionSettings?.maxPositions || 0);
 
-  return <div className="app ai-dashboard">
+  return <div className={`app ai-dashboard command-dashboard${isPhone ? " phone-layout" : ""}`}>
     <DashboardStyles />
-    <Header status={bot.status} data={bot.data} marketLabel={bot.marketLabel} onLogout={bot.secureLogout} />
-    <section className="stats">
-      <Stat label="Equity" value={gbp(Number(bot.data?.account?.equity || 0) * bot.rate)} sub={usd(bot.data?.account?.equity)} />
-      <Stat label="Buying Power" value={gbp(Number(bot.data?.account?.buyingPower || 0) * bot.rate)} sub={usd(bot.data?.account?.buyingPower)} />
-      <Stat label="Today" value={gbp(Number(bot.data?.account?.pnlDay || 0) * bot.rate)} sub={usd(bot.data?.account?.pnlDay)} className={tone(bot.data?.account?.pnlDay)} />
-      <Stat label="Total Gain/Loss" value={gbp(totalGainLoss * bot.rate)} sub={`Deposited ${gbp(totalDeposited * bot.rate)}`} className={tone(totalGainLoss)} />
-    </section>
-    <Nav tab={tab} setTab={setTab} />
+    <div className="dashboard-shell">
+      <Nav tab={tab} setTab={setTab} isPhone={isPhone} />
+      <div className="dashboard-content">
+        <Header status={bot.status} data={bot.data} marketLabel={bot.marketLabel} onLogout={bot.secureLogout} />
 
-    {tab === "overview" && <OverviewPage {...bot} positionGlowStyle={positionGlowStyle} />}
-    {tab === "positions" && <PositionsPage positions={bot.positions} rate={bot.rate} action={bot.action} positionGlowStyle={positionGlowStyle} />}
-    {tab === "reports" && <ReportsPage reports={bot.reports} data={bot.data} rate={bot.rate} closedTrades={bot.closedTrades} chartCurrency={bot.chartCurrency} setChartCurrency={bot.setChartCurrency} />}
-    {tab === "intelligence" && <IntelligencePage authToken={bot.authToken} marketRegime={bot.marketRegime} botHealth={bot.botHealth} aiConfidence={bot.aiConfidence} fetchData={bot.fetchData} />}
-    {tab === "explorer" && <ExplorerPage stockQuery={bot.stockQuery} setStockQuery={bot.setStockQuery} stockResults={bot.stockResults} setStockResults={bot.setStockResults} stockSearchLoading={bot.stockSearchLoading} searchStocks={bot.searchStocks} action={bot.action} />}
-    {tab === "admin" && <AdminPage {...bot} />}
+        <section className="stats command-stats">
+          <Stat label="Equity" value={gbp(accountEquityGbp)} sub={usd(bot.data?.account?.equity)} />
+          <Stat label="Trading Capital" value={gbp(tradingCapitalGbp)} sub="Invested + free cash · vault excluded" />
+          <Stat label="Free Cash" value={gbp(displayedFreeCashGbp)} sub={bot.positions.length ? "Uninvested cash · position already open" : "Available for the next trade"} />
+          <Stat label="Today P&L" value={gbp(Number(bot.data?.account?.pnlDay || 0) * bot.rate)} sub="Since midnight" className={tone(bot.data?.account?.pnlDay)} />
+          <Stat label="Gain/Loss vs Baseline" value={gbp(gainLossSinceBaselineUsd * bot.rate)} sub={`Reference baseline ${gbp(performanceBaselineUsd * bot.rate)} · Not verified lifetime deposits`} className={tone(gainLossSinceBaselineUsd)} />
+          <Stat label="Profit Vault" value={gbp(bankedProfitGbp)} sub="Protected realised profit" className={bankedProfitGbp > 0 ? "gain" : ""} />
+          <Stat label="Positions" value={`${bot.positions.length} / ${maxPositions || "—"}`} sub="Open / Max" />
+        </section>
+
+        {(tab === "overview" || tab === "positions") && <SwingReviewPanel authToken={bot.authToken} symbols={bot.positions.map((p: AnyObj) => String(p.symbol))} />}
+        {tab === "overview" && <OverviewPage {...bot} positionGlowStyle={positionGlowStyle} onExportFullBot={() => setExportRequested(true)} exportBusy={exportRequested} />}
+        {tab === "positions" && <PositionsPage positions={bot.positions} rate={bot.rate} action={bot.action} positionGlowStyle={positionGlowStyle} authToken={bot.authToken} />}
+        <Suspense fallback={<PageLoading />}>
+          {tab === "portfolio" && <PortfolioPage authToken={bot.authToken} />}
+          {tab === "reports" && <ReportsPage reports={bot.reports} data={bot.data} rate={bot.rate} closedTrades={bot.closedTrades} chartCurrency={bot.chartCurrency} setChartCurrency={bot.setChartCurrency} reportsLoading={bot.reportsLoading} reportsError={bot.reportsError} reportsUpdatedAt={bot.reportsUpdatedAt} loadReports={bot.loadReports} authToken={bot.authToken} />}
+          {tab === "intelligence" && <IntelligencePage authToken={bot.authToken} marketRegime={bot.marketRegime} botHealth={bot.botHealth} aiConfidence={bot.aiConfidence} fetchData={bot.fetchData} />}
+          {tab === "explorer" && <ExplorerPage data={bot.data} stockQuery={bot.stockQuery} setStockQuery={bot.setStockQuery} stockResults={bot.stockResults} setStockResults={bot.setStockResults} stockSearchLoading={bot.stockSearchLoading} searchStocks={bot.searchStocks} action={bot.action} />}
+          {tab === "audit" && <AuditPage authToken={bot.authToken} />}
+          {tab === "weekly" && <WeeklyReviewPage authToken={bot.authToken} />}
+          {tab === "observatory" && <ObservatoryPage authToken={bot.authToken} />}
+          {tab === "admin" && <AdminPage {...bot} />}
+          {exportRequested && tab !== "intelligence" && <div className="home-export-host" aria-hidden="true"><IntelligencePage authToken={bot.authToken} marketRegime={bot.marketRegime} botHealth={bot.botHealth} aiConfidence={bot.aiConfidence} fetchData={bot.fetchData} autoExport onExportComplete={() => setExportRequested(false)} /></div>}
+        </Suspense>
+      </div>
+    </div>
   </div>;
 }
