@@ -10,12 +10,13 @@ from backend.stock_sell_recovery_journal import SellRecoveryJournal
 
 
 def open_recovery_on_tradebot_disk(sqlite_database_file, *, mount_path="/var/data"):
-    database = Path(sqlite_database_file).resolve(strict=True)
+    raw_database = Path(sqlite_database_file)
+    if raw_database.is_symlink():
+        raise ValueError("symlink database not permitted")
+    database = raw_database.resolve(strict=True)
     mount = Path(mount_path).resolve(strict=True)
     if not mount.is_dir() or not database.is_file():
         raise ValueError("persistent Render mount and existing database required")
     if database == mount or mount not in database.parents:
         raise ValueError("live database is outside the verified persistent disk")
-    if database.is_symlink():
-        raise ValueError("symlink database not permitted")
     return SellRecoveryJournal(database)
