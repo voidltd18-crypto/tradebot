@@ -2059,9 +2059,9 @@ def two_stock_buy_allowed(symbol: str) -> bool:
     sym = str(symbol or "").upper().strip()
     if sym not in TECH_GIANT_STOCK_ALLOWED:
         return False
-    if TRADEBOT_PERFORMANCE_UNIVERSE_MODE:
-        return sym in september_qualified_stock_symbols()
-    return not TRADEBOT_TWO_STOCK_MODE or sym in TRADEBOT_TWO_STOCK_SYMBOLS
+    # Tech-only selection replaces the legacy September/two-stock symbol pool.
+    # All downstream confidence, risk, daily-lock and position gates remain active.
+    return True
 
 
 def can_buy_symbol(symbol: str):
@@ -11472,13 +11472,11 @@ def run_bot_loop():
 
                 scans = []
                 preferred_scan_symbol = _first_dibs_symbol()
+                # Always evaluate the complete approved tech pool; legacy September
+                # and two-stock modes must not silently narrow the live scan to one.
                 scan_order = sorted(
-                    (sym for sym in (
-                        september_qualified_stock_symbols() if TRADEBOT_PERFORMANCE_UNIVERSE_MODE
-                        else (list(TRADEBOT_TWO_STOCK_SYMBOLS) if TRADEBOT_TWO_STOCK_MODE
-                              else list(current_universe))
-                    ) if "/" not in str(sym) and str(sym).upper().strip() in TECH_GIANT_STOCK_ALLOWED),
-                    key=lambda sym: 0 if preferred_scan_symbol and str(sym).upper() == preferred_scan_symbol else 1,
+                    TECH_GIANT_STOCK_ALLOWED,
+                    key=lambda sym: (0 if preferred_scan_symbol and sym == preferred_scan_symbol else 1, sym),
                 )
                 for symbol in scan_order:
                     try:
