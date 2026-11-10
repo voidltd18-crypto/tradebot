@@ -4526,7 +4526,9 @@ def pick_money_mode_stocks(
             persist(scan, "REJECTED", "sniper_gate", sniper_reason)
             continue
 
-        aplus_ok, aplus_reason = a_plus_gate(scan)
+        # Simplified live entry: the sniper gate already checks confidence,
+        # spread, momentum and quality. Avoid a second overlapping A+ veto.
+        aplus_ok, aplus_reason = (True, "covered by sniper") if os.getenv("TRADEBOT_SIMPLE_TECH_ENTRY", "false").lower() in ("1", "true", "yes", "on") else a_plus_gate(scan)
         if not aplus_ok:
             if log_rejections:
                 print(f"A+ SKIP {symbol} | {aplus_reason}")
@@ -5505,7 +5507,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
 
         # A high confidence/portfolio score cannot override weak raw quality.
         # Manual planning remains unchanged; this gate is for automatic entries.
-        if not manual and (not math.isfinite(quality) or quality < V16_AUTO_MIN_ENTRY_QUALITY):
+        if not manual and (not math.isfinite(quality) or (quality < V16_AUTO_MIN_ENTRY_QUALITY and os.getenv("TRADEBOT_SIMPLE_TECH_ENTRY", "false").lower() not in ("1", "true", "yes", "on"))):
             decisions.append({
                 "scanIndex": scan_index + 1,
                 "symbol": symbol,
