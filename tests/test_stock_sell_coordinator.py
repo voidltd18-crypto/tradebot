@@ -46,7 +46,7 @@ class Broker:
         self.orders.append((symbol, qty, client_order_id))
         if self.fail:
             # Mimics timeout AFTER an accepted order.
-            self.present = {"id": "broker-1", "client_order_id": client_order_id,
+            self.present = {"id": "broker-1", "symbol": symbol, "side": "sell", "client_order_id": client_order_id,
                             "status": "accepted", "filled_qty": "0"}
             raise TimeoutError("ack timeout")
         self.present = {"id": "broker-1", "client_order_id": client_order_id,
@@ -124,7 +124,7 @@ def test_preflight_checks_prevent_sells():
 
 def test_known_broker_id_before_reservation_blocks_trade():
     c, j, b = make()
-    b.present = {"id": "old", "client_order_id": stable_client_order_id("FMC", "lot")}
+    b.present = {"id": "old", "symbol": "FMC", "side": "sell", "client_order_id": stable_client_order_id("FMC", "lot")}
     assert c.propose(symbol="FMC", position_key="lot", quantity=10,
                      eligible=True)["status"] == "BROKER_ORDER_EXISTS"
     assert not j.rows and not b.orders
