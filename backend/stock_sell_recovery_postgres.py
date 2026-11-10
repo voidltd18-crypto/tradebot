@@ -103,11 +103,13 @@ class PostgresSellRecoveryJournal:
                    WHERE symbol=%s AND position_key=%s
                      AND (broker_order_id IS NULL OR broker_order_id=%s)
                      AND status != 'VERIFIED_FLAT'
+                     AND (status != 'TERMINAL_AWAIT_POSITION' OR
+                          %s IN ('filled','canceled','expired','rejected','replaced'))
                      AND filled_qty <= %s AND intended_qty >= %s
                      AND (%s != 'filled' OR intended_qty = %s)
                    RETURNING attempt_id""",
                 (order_id, fill, target, symbol, position_key, order_id,
-                 fill, fill, status, fill)).fetchone()
+                 status, fill, fill, status, fill)).fetchone()
             if not row:
                 raise ValueError("unverified, inconsistent or already terminal sell")
         return {"status": target, "blockedFromResubmit": True,
