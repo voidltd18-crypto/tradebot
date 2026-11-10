@@ -218,3 +218,46 @@ def test_execution_activities_reject_duplicates_and_missing_inventory():
     result = safe_position_swing_review(fills, "MARA", 1, d("2026-10-23"), sessions)
     assert result["status"] == "unverified"
     assert result["action"] == "NO_ACTION"
+
+
+def test_fmc_full_close_microshare_dust_then_reentry_is_new_day():
+    """Actual Alpaca-shaped FMC execution inventory on Nov 2 and Nov 9."""
+    from types import SimpleNamespace
+    from backend.v19_swing_review import safe_position_swing_review
+
+    def fill(ts, side, qty):
+        return SimpleNamespace(symbol="FMC", status="filled", side=side,
+                               filled_qty=qty, filled_at=ts)
+
+    orders = [
+        fill("2026-11-02T17:05:47Z", "buy", "161.661198028"),
+        fill("2026-11-02T17:35:48Z", "sell", "161.661198"),
+        fill("2026-11-09T20:13:04Z", "buy", "162.416590701"),
+    ]
+    sessions = list(map(d, [
+        "2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05",
+        "2026-11-06", "2026-11-09", "2026-11-10",
+    ]))
+    review = safe_position_swing_review(orders, "FMC", 162.416590729,
+                                         d("2026-11-10"), sessions)
+    assert review["status"] == "verified"
+    assert review["entrySession"] == "2026-11-09"
+    assert review["holdingTradingDay"] == 2
+    assert review["reviewDue"] is False
+
+
+def test_material_residual_still_counts_as_same_holding():
+    from types import SimpleNamespace
+    from backend.v19_swing_review import current_position_entry_fill, entry_session_from_fill
+
+    def fill(ts, side, qty):
+        return SimpleNamespace(symbol="FMC", status="filled", side=side,
+                               filled_qty=qty, filled_at=ts)
+
+    orders = [
+        fill("2026-11-02T17:00:00Z", "buy", "10"),
+        fill("2026-11-02T18:00:00Z", "sell", "9.9"),
+        fill("2026-11-09T20:13:04Z", "buy", "1"),
+    ]
+    entry = current_position_entry_fill(orders, "FMC", 1.1)
+    assert entry_session_from_fill(entry) == d("2026-11-02")
