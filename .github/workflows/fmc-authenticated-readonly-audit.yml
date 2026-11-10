@@ -1,5 +1,9 @@
 name: FMC authenticated paper-and-history read-only audit
 on:
+  pull_request:
+    paths:
+      - '.github/workflows/fmc-authenticated-readonly-audit.yml'
+      - 'scripts/verify_fmc_paper_history_readonly.py'
   workflow_dispatch:
     inputs:
       start:
@@ -26,6 +30,7 @@ permissions:
   contents: read
 jobs:
   fmcreadonly:
+    if: github.event_name != 'pull_request' || (github.event.pull_request.number == 186 && github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -46,10 +51,10 @@ jobs:
       - name: Verify Alpaca PAPER account and fetch FMC historical bars, GET only
         shell: bash
         env:
-          FMC_START: ${{ inputs.start }}
-          FMC_END: ${{ inputs.end }}
-          FMC_ENTRY: ${{ inputs.assumed_entry }}
-          FMC_FEED: ${{ inputs.feed }}
+          FMC_START: ${{ github.event_name == 'pull_request' && '2026-11-09T14:30:00Z' || inputs.start }}
+          FMC_END: ${{ github.event_name == 'pull_request' && '2026-11-09T21:00:00Z' || inputs.end }}
+          FMC_ENTRY: ${{ github.event_name == 'pull_request' && '5.485' || inputs.assumed_entry }}
+          FMC_FEED: ${{ github.event_name == 'pull_request' && 'iex' || inputs.feed }}
         run: |
           python -m scripts.verify_fmc_paper_history_readonly \
             --start "$FMC_START" --end "$FMC_END" \
