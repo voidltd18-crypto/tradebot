@@ -37,3 +37,54 @@ position-specific state persistence, reconciliation of existing sell rules,
 market-hours tests, paper-trading evidence, and explicit review.
 
 Related: draft PR #186; this remains separate from the original selling rules.
+
+
+## Execution cost simulation (separate preview)
+
+POST `/v19/stock-momentum-cost-preview` using the same payload as the
+replay endpoint. Optional `costAssumptions` supports
+`spread_bps`, `exit_slippage_bps`, `entry_slippage_bps`,
+`fee_per_side_usd`, `shares`, and `max_fill_delay_seconds`.
+Defaults are 20 bps spread, 15 bps exit slippage, 1 share, and
+no commissions. These are examples, not measured FMC fills.
+
+The model waits for the next chronological sample after a signal,
+refuses fills if that quote is more than 120 seconds later, and reports
+`NO_SIGNAL`, `NO_NEXT_QUOTE`, `STALE_NEXT_QUOTE`, or
+`SIMULATED_FILL`. It compares the same observations with a hypothetical
+0.7% trailing reference. Neither model is the entire live TradeBot
+strategy, which includes other exits and regulatory/account gates.
+
+## Replay FMC from a real, verified provider CSV
+
+Obtain **chronological intraday historical bar data for FMC** from an
+authorised market data source, e.g. an Alpaca historical export made
+with your own entitled API credentials. Do not commit keys or private
+account data. Prepare a CSV with `timestamp` (offset-aware ISO
+8601) and `close` (USD bar close); max 5,000 rows per run.
+
+```bash
+python -m scripts.replay_fmc_csv fmc_1min.csv \
+  --symbol FMC --source "Alpaca 1-minute export, YYYY-MM-DD, feed and adjustment noted" \
+  --entry-price 5.485
+```
+
+The CSV runner will *always* identify the source as operator-supplied and
+unverified. Minute close prices omit intrabar extremes and bid/ask spreads;
+use multiple trading days and varied cost assumptions. **This repository
+does not currently contain an independently verified FMC historical CSV.**
+Without it, there are no genuine FMC results to report.
+
+## Paper-verification gate (not yet executed)
+
+1. Confirm actual live exit precedence, duplicate-order prevention,
+   market-hours/PDT rules, and no accidental sell after a stale or
+   missing quote.
+2. Reconcile quotes against Alpaca timestamps and persist per-position
+   peaks across worker restarts and overnight gaps.
+3. Dry-run with broker **paper** credentials only; verify order status,
+   partial fills, and broker rejection responses.
+4. Compare realised paper execution to simulated spreads, slippage,
+   and observed signals over multiple independently verified episodes.
+5. Keep live opt-in OFF until the evidence is reviewed. There has
+   been **no broker paper order or live order** as part of this PR.
