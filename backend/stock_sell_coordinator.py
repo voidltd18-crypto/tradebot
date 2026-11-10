@@ -109,7 +109,7 @@ class SafeStockSellCoordinator:
             return {"status": "UNRESOLVED_BROKER_ORDER", "submitted": False}
         fresh_qty = self.broker.fresh_position_qty(symbol)
         result = self.journal.reconcile(
-            symbol, position_key, order_id=str(order["id"]),
+            symbol, position_key, broker_order_id=str(order["id"]),
             order_status=str(order.get("status") or ""),
             filled_qty=order.get("filled_qty"),
             fresh_position_qty=fresh_qty,
