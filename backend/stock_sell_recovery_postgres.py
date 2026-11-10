@@ -82,10 +82,10 @@ class PostgresSellRecoveryJournal:
                 (symbol, position_key)).fetchone()
             return bool(row)
 
-    def reconcile(self, symbol, position_key, *, order_id, order_status,
+    def reconcile(self, symbol, position_key, *, broker_order_id, order_status,
                   filled_qty, fresh_position_qty):
         symbol, position_key = _identity(symbol, position_key)
-        order_id = _token(order_id, "order ID")
+        order_id = _token(broker_order_id, "order ID")
         status = str(order_status or "").strip().lower()
         if status not in KNOWN:
             raise ValueError("unrecognized broker order status")
