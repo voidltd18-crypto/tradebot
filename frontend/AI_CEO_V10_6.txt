@@ -1,0 +1,10 @@
+TradeBot V10.6 AI CEO
+- New AI CEO tab inside AI Intelligence
+- Executive status, CEO grade and risk state
+- Live P&L/equity summary
+- Evidence-backed CEO recommendation
+- Executive priorities
+- Company health meters
+- Research and symbol highlights
+- CEO journal assembled from real operator/research/risk evidence
+No trading logic is changed by this frontend release.
