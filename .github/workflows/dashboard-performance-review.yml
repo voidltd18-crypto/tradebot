@@ -1,0 +1,21 @@
+name: Dashboard Performance and Holding Review
+on:
+  pull_request:
+    paths:
+      - 'frontend/src/App.tsx'
+      - 'frontend/src/components/SwingReviewPanel.tsx'
+      - '.github/workflows/dashboard-performance-review.yml'
+  workflow_dispatch:
+jobs:
+  frontend-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
