@@ -57,3 +57,36 @@ stock engine, including account locks and other exits. The implied
 end-of-day liquidation is an artificial evaluation rule, NOT a TradeBot
 live trading setting. Keep release decision **NO-GO**, no merger or
 live configuration changes.
+
+
+## Pre-market review: reference activation discrepancy
+
+The first research baseline required a 2.0% peak gain before the 0.7%
+trailing reversal could fire. The repository's `backend/config.py`
+instead declares the default `TRAIL_START_PCT=1.2` and
+`TRAIL_GIVEBACK_PCT=0.7`. These defaults are **not proof** of the
+actual running Render values or the full legacy monolith selling logic.
+
+The replay and cost comparator now offer an explicit optional
+`reference_activation_pct=1.2`. Their existing default remains
+unchanged to preserve the original research result. Regression tests
+confirm a 1.2%-armed reference can trigger where the experimental
+2%-armed candidate has no profit-exit signal.
+
+Using the same five public FMC sessions and first-minute hypothetical
+entries, the configured-reference *triggered-exit* comparison produced:
+one comparable session, zero candidate wins, zero configured-reference
+wins and one tie. Four other sessions did not yield two executable
+hypothetical profit exits, so that narrow win count is **not a claim of
+equivalent profitability**.
+
+Evidence: GitHub Actions
+https://github.com/voidltd18-crypto/tradebot/actions/runs/42822344356
+and regression tests
+https://github.com/voidltd18-crypto/tradebot/actions/runs/42822344364
+
+**Pre-market conclusion: NO-GO for Spike Mode live rollout.**
+Do not infer live configuration or full stock engine behavior from the
+published strategy defaults. Authenticated paper check previously
+failed due missing dedicated PAPER secrets, not market hours. Continue
+using existing live strategy without an unverified settings change.
