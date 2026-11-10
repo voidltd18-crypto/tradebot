@@ -1,8 +1,0 @@
-alpaca-py
-fastapi
-uvicorn
-pydantic
-requests
-pytz
-ib_insync==0.9.86
-nest_asyncio==1.6.0
