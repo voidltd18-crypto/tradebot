@@ -300,7 +300,8 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })}</p>}
     </Card>
 
-    <Card title="Smart Rebuy — Crypto Signals" wide>\n      <div style={{padding:18,border:"1px solid #334155",borderRadius:14,background:"#1e293b"}}>
+    <Card title="Smart Rebuy — Crypto Signals" wide>
+      <div style={{padding:18,border:"1px solid #334155",borderRadius:14,background:"#1e293b"}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}>
           <div><strong style={{fontSize:18}}>Smart Rebuy</strong><p style={{margin:"5px 0",color:"#cbd5e1"}}>Live Alpaca · Read-only · No automatic buys · Relevant = recent trading activity, not a buy recommendation</p></div>
           <div style={{display:"flex",alignItems:"center",gap:8}}>
@@ -312,6 +313,17 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
             <button className="table-action" disabled={signalLoading} onClick={()=>void checkManualRebuySignal()}>{signalLoading?"Checking…":"Refresh Signal"}</button>
           </div>
         </div>
+        {showAllRebuyCoins && <div style={{marginTop:14,padding:12,borderRadius:10,background:"#0f172a"}}>
+          <p style={{margin:"0 0 10px",color:"#cbd5e1"}}>All 29 coins — select one to check its broker signal:</p>
+          <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+            {SMART_REBUY_PAIRS.map(pair => <button key={pair} type="button"
+              aria-pressed={signalSymbol===pair}
+              onClick={()=>{setSignalSymbol(pair);setSignal(null);}}
+              style={{padding:"7px 11px",borderRadius:8,cursor:"pointer",border:signalSymbol===pair?"1px solid #38bdf8":"1px solid #475569",background:signalSymbol===pair?"#164e63":"#1e293b",color:"#f8fafc"}}>
+              {pair.replace(/USD$/, "/USD")}
+            </button>)}
+          </div>
+        </div>}
         {signal && (() => {
           const reason=String(signal.reason||"No verified signal");
           const blocked=signal.positionOpen===true||signal.orderPending===true||/position|order pending|broker data unavailable|unverified|verified sale|credentials|invalid|could not verify/i.test(reason);
