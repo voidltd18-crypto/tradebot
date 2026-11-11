@@ -3016,8 +3016,8 @@ def record_v2_setup_decision(scan: Dict[str, Any], decision: str, stage: str, re
         "confidenceMemoryAudit": {
             "rawConfidence": round(min(1.0, max(0.0,
                 min(0.35, float(scan.get("quality_score") or 0.0) * 8.0)
-                + (0.20 if float(scan.get("spread") or 1.0) <= PREFER_SPREAD_UNDER
-                   else 0.10 if float(scan.get("spread") or 1.0) <= MAX_SPREAD else 0.0)
+                + (0.20 if float(scan.get("spread", 1.0)) <= PREFER_SPREAD_UNDER
+                   else 0.10 if float(scan.get("spread", 1.0)) <= MAX_SPREAD else 0.0)
                 + (0.20 if float(scan.get("short_momentum") or 0.0) >= 0
                    else 0.10 if float(scan.get("short_momentum") or 0.0) >= SNIPER_MIN_MOMENTUM else 0.0)
                 + (0.15 if SNIPER_MIN_PULLBACK <= float(scan.get("pullback") or 0.0) <= SNIPER_MAX_PULLBACK else 0.0)
