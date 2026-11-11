@@ -1,9 +1,69 @@
 import { Card } from "../components/Card";
+import { useEffect, useState } from "react";
+import { API_URL } from "../lib/api";
+
+const APPROVED_TECH = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "AVGO", "ORCL", "AMD", "TSLA"];
+
+function EntryGateDiagnostics({ authToken }: { authToken: string }) {
+  const [rows, setRows] = useState<any[]>([]);
+  const [error, setError] = useState("");
+  const [updated, setUpdated] = useState("");
+  useEffect(() => {
+    if (!authToken) return;
+    let active = true;
+    const refresh = async () => {
+      try {
+        const response = await fetch(`${API_URL}/v2/recent-decisions?limit=300`, {
+          cache: "no-store", headers: { "X-Auth-Token": authToken, "x-api-key": authToken }
+        });
+        if (!response.ok) throw new Error(`Decision history unavailable (HTTP ${response.status})`);
+        const result = await response.json();
+        if (!active) return;
+        const latest = new Map<string, any>();
+        for (const item of (Array.isArray(result?.decisions) ? result.decisions : [])) {
+          const symbol = String(item?.symbol || "").toUpperCase();
+          if (APPROVED_TECH.includes(symbol) && !latest.has(symbol)) latest.set(symbol, item);
+        }
+        setRows(APPROVED_TECH.map(symbol => latest.get(symbol) || { symbol }));
+        setUpdated(new Date().toISOString());
+        setError("");
+      } catch (e: any) { if (active) setError(e?.message || "Decision history unavailable"); }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 30000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [authToken]);
+  const numeric = (value: unknown, digits: number) => value == null || value === "" ? "—" : Number(value).toFixed(digits);
+  return <Card title="Why No Buy? · Entry Gate Diagnostics" wide className="decision-card">
+    <p className="muted">Latest recorded decision per approved stock. Read-only historical evidence, not a live order recommendation. Older decisions may no longer reflect current market conditions.</p>
+    {error && <p className="muted">{error}</p>}
+    {updated && <p className="muted">Checked: {new Date(updated).toLocaleTimeString("en-GB")} · Decisions recorded by the trading engine</p>}
+    <div style={{ overflowX: "auto" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left", fontSize: "0.85rem" }}>
+        <thead><tr>{["Stock", "Decision", "Gate", "Confidence", "Quality", "Samples", "Win rate", "Profit factor", "Reason", "Recorded"].map(label => <th key={label} style={{ padding: "8px", borderBottom: "1px solid #64748b" }}>{label}</th>)}</tr></thead>
+        <tbody>{rows.map(row => <tr key={row.symbol}>
+          <td style={{ padding: "8px" }}><b>{row.symbol}</b></td>
+          <td style={{ padding: "8px" }}>{row.decision || "No record"}</td>
+          <td style={{ padding: "8px" }}>{row.stage || "—"}</td>
+          <td style={{ padding: "8px" }}>{numeric(row.confidence, 2)}</td>
+          <td style={{ padding: "8px" }}>{numeric(row.quality, 4)}</td>
+          <td style={{ padding: "8px" }}>{row.historical_samples ?? "—"}</td>
+          <td style={{ padding: "8px" }}>{row.historical_win_rate == null ? "—" : `${(Number(row.historical_win_rate) * 100).toFixed(0)}%`}</td>
+          <td style={{ padding: "8px" }}>{numeric(row.historical_profit_factor, 2)}</td>
+          <td style={{ padding: "8px", minWidth: "220px" }}>{row.reason || "No decision recorded"}</td>
+          <td style={{ padding: "8px", whiteSpace: "nowrap" }}>{row.timestamp ? new Date(row.timestamp).toLocaleString("en-GB", { timeZone: "Europe/London", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"}</td>
+        </tr>)}</tbody>
+      </table>
+    </div>
+  </Card>;
+}
+
+
 import { Meter } from "../components/Meter";
 import { gbp, pct, tone, usd, positionQuantity, isSmallCryptoResidual } from "../lib/format";
 import type { ActionFn, AnyObj, PositionStyleFn } from "../lib/types";
 
-export function OverviewPage({ data, banking, message, positions, trades, rate, bestCandidate, aiConfidence, marketRegime, riskLabel, currentAction, botHealth, aiReasons, positionSettings, fetchData, action, positionGlowStyle, onExportFullBot, exportBusy }: { data: AnyObj; banking: AnyObj; message: string; positions: AnyObj[]; trades: AnyObj[]; rate: number; bestCandidate?: AnyObj; aiConfidence: number; marketRegime: string; riskLabel: string; currentAction: string; botHealth: number; aiReasons: string[]; positionSettings: AnyObj; fetchData: (force?: boolean) => Promise<void>; action: ActionFn; positionGlowStyle: PositionStyleFn; onExportFullBot: () => void; exportBusy: boolean }) {
+export function OverviewPage({ data, banking, message, positions, trades, rate, bestCandidate, aiConfidence, marketRegime, riskLabel, currentAction, botHealth, aiReasons, positionSettings, fetchData, action, positionGlowStyle, onExportFullBot, exportBusy, authToken }: { data: AnyObj; banking: AnyObj; message: string; positions: AnyObj[]; trades: AnyObj[]; rate: number; bestCandidate?: AnyObj; aiConfidence: number; marketRegime: string; riskLabel: string; currentAction: string; botHealth: number; aiReasons: string[]; positionSettings: AnyObj; fetchData: (force?: boolean) => Promise<void>; action: ActionFn; positionGlowStyle: PositionStyleFn; onExportFullBot: () => void; exportBusy: boolean; authToken: string }) {
   const maxPositions = Number(data?.maxPositions || positionSettings?.maxPositions || 0);
   const vault = banking?.profitVault || data?.banking?.profitVault || {};
   const market = data?.market || {};
@@ -90,6 +150,7 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
       </Card>
     </section>
 
+    <EntryGateDiagnostics authToken={authToken} />
     <section className="grid two dashboard-detail-grid">
       <Card title="AI Brain" className="decision-card"><div className="ai-grid"><div><div className="ai-status-line"><span>Market view</span><b>{marketRegime}</b></div><div className="ai-status-line"><span>Risk</span><b>{riskLabel}</b></div><div className="ai-status-line"><span>Current action</span><b>{currentAction}</b></div><div className="ai-status-line"><span>Open positions</span><b>{positions.length}/{maxPositions}</b></div></div><div><Meter value={aiConfidence} label="AI confidence"/><Meter value={botHealth} label="System health"/></div></div></Card>
       <Card title="Best Current Opportunity" className="decision-card">{bestCandidate?.symbol ? <><p className="eyebrow">Top-ranked candidate</p><h3 className="decision-symbol">{bestCandidate.symbol}</h3><div className="summary"><div><span>Confidence</span><b>{aiConfidence.toFixed(0)}%</b></div><div><span>Price</span><b>{bestCandidate?.price ? usd(bestCandidate.price) : "—"}</b></div><div><span>Movement</span><b className={tone(bestCandidate?.changePct || bestCandidate?.gap_pct)}>{pct(bestCandidate?.changePct ?? bestCandidate?.gap_pct ?? 0)}</b></div></div><ul className="reason-list">{aiReasons.length ? aiReasons.map((reason) => <li key={reason}>{reason}</li>) : <li>Waiting for the live scanner to provide detailed evidence.</li>}</ul></> : <p className="muted">No ranked opportunity is available yet. The card will populate when the scanner produces candidates.</p>}</Card>
