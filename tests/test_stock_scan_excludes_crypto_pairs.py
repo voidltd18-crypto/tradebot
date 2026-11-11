@@ -20,8 +20,10 @@ def test_adaptive_stock_rows_exclude_crypto_pairs_preserving_held_rows():
 def test_live_stock_scan_filters_slash_symbols_but_retains_broad_universe():
     loop = next(n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.name == "run_bot_loop")
     body = ast.get_source_segment(SOURCE, loop)
-    assert 'if "/" not in str(sym)' in body
-    assert "else list(current_universe)" in body
+    assert "TECH_GIANT_STOCK_ALLOWED" in body
+    assert "scan_order = sorted(" in body
+    assert "for symbol in scan_order:" in body
+    assert "if source != \"HELD\" and sym not in TECH_GIANT_STOCK_ALLOWED:" in SOURCE
     assert "scan = compute_scan(symbol)" in body
 
 
