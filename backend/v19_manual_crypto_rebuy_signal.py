@@ -17,7 +17,10 @@ def assess_manual_rebuy(*, last_filled_sell_price, current_ask, sell_verified,
     if not sell_verified or not quote_fresh or sold is None or ask is None:
         return {**base, "reason": "Verified sale and fresh broker ask required"}
     if position_open or order_pending:
-        return {**base, "reason": "Position or order already exists"}
+        reason = ("Existing position and open order" if position_open and order_pending else
+                  "Existing position" if position_open else "Open order pending")
+        return {**base, "reason": reason, "positionOpen": bool(position_open),
+                "orderPending": bool(order_pending)}
     dip = (sold - ask) / sold * Decimal("100")
     info = {**base, "dipPct": str(dip.quantize(Decimal("0.01"))),
             "referenceSalePrice": str(sold), "currentAsk": str(ask)}
