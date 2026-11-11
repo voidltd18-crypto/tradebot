@@ -18,9 +18,23 @@ def scan_all(client, data_client):
         if _CACHE["rows"] is not None and monotonic() - _CACHE["at"] < TTL_SECONDS:
             return {"rows": _CACHE["rows"], "scannedAt": _CACHE["scannedAt"], "cached": True,
                     "total": len(PAIRS), "readOnly": True}
+        # One verified account snapshot for all pairs; fail closed on broker errors.
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            broker_snapshot = {
+                "closed_orders": client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500)),
+                "positions": client.get_all_positions(),
+                "open_orders": client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)),
+            }
+        except Exception:
+            rows = [{"symbol": sym[:-3] + "/USD", "status": "WAIT", "readOnly": True,
+                     "orderSubmitted": False, "reason": "Broker snapshot unavailable or unverified"} for sym in PAIRS]
+            return {"rows": rows, "scannedAt": datetime.now(timezone.utc).isoformat(),
+                    "cached": False, "total": len(PAIRS), "readOnly": True}
         def one(symbol):
             try:
-                result = preview(client, data_client, symbol)
+                result = preview(client, data_client, symbol, broker_snapshot=broker_snapshot)
                 return {"symbol": symbol[:-3] + "/USD", **result}
             except Exception:
                 return {"symbol": symbol[:-3] + "/USD", "status": "WAIT", "readOnly": True,
