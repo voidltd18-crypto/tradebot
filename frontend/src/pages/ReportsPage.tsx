@@ -8,6 +8,16 @@ import { gbp, pct, tone, tradeDate, tradeTime, usd } from "../lib/format";
 import type { AnyObj, Currency } from "../lib/types";
 
 type RangeKey = "today" | "week" | "month" | "year";
+type AssetFilter = "ALL" | "CRYPTO" | "STOCKS";
+
+function isCryptoTrade(trade: AnyObj): boolean {
+  const assetClass = String(trade?.asset_class ?? trade?.assetClass ?? trade?.asset_type ?? trade?.assetType ?? "").toLowerCase();
+  if (assetClass.includes("crypto")) return true;
+  if (assetClass.includes("equity") || assetClass.includes("stock")) return false;
+  const symbol = String(trade?.symbol || "").toUpperCase().replace(/\s/g, "");
+  return /^[A-Z0-9]{2,20}\/USD$/.test(symbol) || /^(BTC|ETH|SOL|DOGE|LTC|BCH|AVAX|LINK|UNI|AAVE|DOT|SHIB|PEPE|XRP|ADA|MATIC|USDT|USDC)USD$/.test(symbol);
+}
+
 
 function parseReportTimestamp(entry: AnyObj): number {
   const raw = entry?.timestamp || entry?.time || entry?.t || entry?.date || entry?.closedAt || entry?.exitTime || "";
@@ -95,6 +105,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   }
   const [range, setRange] = useState<RangeKey>("month");
   const [symbolFilter, setSymbolFilter] = useState("ALL");
+  const [assetFilter, setAssetFilter] = useState<AssetFilter>("ALL");
   const [symbolSearch, setSymbolSearch] = useState("");
   const [fromDate, setFromDate] = useState("");
   const [toDate, setToDate] = useState("");
@@ -126,18 +137,19 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
     const qty = Number(trade?.qty);
     return Number.isFinite(qty) && qty > 0;
   }), [closedTrades]);
-  const symbols = useMemo(() => Array.from(new Set(displayedTrades.map(t => String(t?.symbol || "").toUpperCase()).filter(Boolean))).sort(), [displayedTrades]);
+  const assetTrades = useMemo(() => displayedTrades.filter(t => assetFilter === "ALL" || (isCryptoTrade(t) ? "CRYPTO" : "STOCKS") === assetFilter), [displayedTrades, assetFilter]);
+  const symbols = useMemo(() => Array.from(new Set(assetTrades.map(t => String(t?.symbol || "").toUpperCase()).filter(Boolean))).sort(), [assetTrades]);
   const filteredClosedTrades = useMemo(() => {
     const from = fromDate ? new Date(`${fromDate}T00:00:00`).getTime() : 0;
     const to = toDate ? new Date(`${toDate}T23:59:59.999`).getTime() : Number.MAX_SAFE_INTEGER;
-    return [...displayedTrades].filter((trade) => {
+    return [...assetTrades].filter((trade) => {
       const symbol = String(trade?.symbol || "").toUpperCase();
       const ts = tradeTimestamp(trade);
       const dateMatch = (!from || ts >= from) && (!toDate || ts <= to);
       const momentMatch = !momentFilter || (ts >= momentFilter.from && ts <= momentFilter.to);
       return (symbolFilter === "ALL" || symbol === symbolFilter) && symbol.includes(symbolSearch.trim().toUpperCase()) && dateMatch && momentMatch;
     }).sort((a,b) => tradeTimestamp(b)-tradeTimestamp(a));
-  }, [displayedTrades, symbolFilter, symbolSearch, fromDate, toDate, momentFilter]);
+  }, [assetTrades, symbolFilter, symbolSearch, fromDate, toDate, momentFilter]);
 
   const filteredPnl = filteredClosedTrades.reduce((sum, t) => sum + Number(t?.pnl || 0), 0);
   const filteredWins = filteredClosedTrades.filter(t => Number(t?.pnl || 0) > 0).length;
@@ -221,11 +233,11 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       from = start.getTime();
       to = end.getTime();
     }
-    return displayedTrades.filter((trade) => {
+    return assetTrades.filter((trade) => {
       const ts = tradeTimestamp(trade);
       return ts >= from && ts <= to;
     }).sort((a,b) => tradeTimestamp(a)-tradeTimestamp(b));
-  }, [chartSelection, displayedTrades, range]);
+  }, [chartSelection, assetTrades, range]);
 
   const viewTradesAtSelection = () => {
     if (!chartSelection) return;
@@ -258,7 +270,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })}</p>}
     </Card>
 
-    <Card title="Performance Summary" wide><section className="stats"><Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={usd(totalDeposited)}/><Stat label="Earned" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)}/><Stat label="Lost" value={gbp(lost * rate)} sub={usd(lost)} className="loss"/><Stat label="Current Equity" value={gbp(Number(reports?.currentEquity ?? data?.account?.equity ?? 0) * rate)} sub={usd(reports?.currentEquity ?? data?.account?.equity ?? 0)}/></section><p className={tone(totalGainLoss)}>Total gain/loss: {gbp(totalGainLoss * rate)}</p></Card>
+    <Card title="Performance Summary" wide><p className="muted">Account-wide balances (stocks and crypto combined). Use the asset selector in Closed Trade History for filtered realised P&amp;L.</p><section className="stats"><Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={usd(totalDeposited)}/><Stat label="Earned" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)}/><Stat label="Lost" value={gbp(lost * rate)} sub={usd(lost)} className="loss"/><Stat label="Current Equity" value={gbp(Number(reports?.currentEquity ?? data?.account?.equity ?? 0) * rate)} sub={usd(reports?.currentEquity ?? data?.account?.equity ?? 0)}/></section><p className={tone(totalGainLoss)}>Total gain/loss: {gbp(totalGainLoss * rate)}</p></Card>
 
     <Card title="Recent Trade Reward vs Risk" wide>
       <p className="muted">Read-only · Latest {Number(expectancy?.sampleTrades || 0)} closed trades · Not lifetime performance</p>
@@ -289,14 +301,15 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
 
     <div id="closed-trade-history" className="report-anchor"><Card title="Closed Trade History" wide>
       <div className="trade-filter-panel">
-        <label><span>Search ticker</span><input type="search" aria-label="Search stock symbols" placeholder="e.g. USD, SOL, MARA" value={symbolSearch} onChange={e=>setSymbolSearch(e.target.value)}/></label>
-        <label><span>Stock</span><select value={symbolFilter} onChange={e=>setSymbolFilter(e.target.value)}><option value="ALL">All stocks</option>{symbols.map(s=><option key={s} value={s}>{s}</option>)}</select></label>
+        <label><span>Asset type</span><select aria-label="Filter reports by asset type" value={assetFilter} onChange={e => { setAssetFilter(e.target.value as AssetFilter); setSymbolFilter("ALL"); setChartSelection(null); setMomentFilter(null); }}><option value="ALL">All trades</option><option value="CRYPTO">Crypto only</option><option value="STOCKS">Stocks only</option></select></label>
+        <label><span>Search ticker</span><input type="search" aria-label="Search trade symbols" placeholder="e.g. USD, SOL, MARA" value={symbolSearch} onChange={e=>setSymbolSearch(e.target.value)}/></label>
+        <label><span>Symbol</span><select value={symbolFilter} onChange={e=>setSymbolFilter(e.target.value)}><option value="ALL">All symbols</option>{symbols.map(s=><option key={s} value={s}>{s}</option>)}</select></label>
         <label><span>From</span><input type="date" value={fromDate} onChange={e=>setFromDate(e.target.value)}/></label>
         <label><span>To</span><input type="date" value={toDate} onChange={e=>setToDate(e.target.value)}/></label>
-        <button className="ghost" onClick={()=>{setSymbolFilter("ALL");setSymbolSearch("");setFromDate("");setToDate("");setMomentFilter(null);setChartSelection(null);}}>Clear filters</button>
+        <button className="ghost" onClick={()=>{setAssetFilter("ALL");setSymbolFilter("ALL");setSymbolSearch("");setFromDate("");setToDate("");setMomentFilter(null);setChartSelection(null);}}>Clear filters</button>
       </div>
       {momentFilter && <div className="moment-filter-banner"><b>Chart selection:</b> {momentFilter.label}<button className="ghost" onClick={()=>setMomentFilter(null)}>Show all dates</button></div>}
-      <div className="filter-summary"><b>{filteredClosedTrades.length}</b> matching rows <span>•</span> PnL <strong className={tone(filteredPnl)}>{gbp(filteredPnl * rate)}</strong> <span>•</span> Winning rows {filteredWins}</div>
+      <div className="filter-summary"><b>{filteredClosedTrades.length}</b> {assetFilter === "CRYPTO" ? "crypto" : assetFilter === "STOCKS" ? "stock" : ""} matching rows <span>•</span> PnL <strong className={tone(filteredPnl)}>{gbp(filteredPnl * rate)}</strong> <span>•</span> Winning rows {filteredWins}</div>
       <div className="table-wrap"><table className="compact-table"><thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th><th>Replay</th><th>Rebuy</th></tr></thead><tbody>{filteredClosedTrades.map((trade,index)=><tr key={`${trade.id||index}-${index}`}><td>{tradeDate(trade)}</td><td>{tradeTime(trade)}</td><td><b>{trade.symbol}</b></td><td>{usd(trade.entryPrice)}</td><td>{usd(trade.exitPrice)}</td><td>{Number(trade.qty||0).toFixed(4)}</td><td className={tone(trade.pnl)}>{gbp(trade.pnlGbp ?? Number(trade.pnl||0)*rate)} / {usd(trade.pnl)}</td><td className={tone(trade.pnl)}>{pct(trade.pnlPct)}</td><td><button className="table-action" disabled={!trade.id} onClick={()=>trade.id&&setReplay({mode:"closed",symbol:String(trade.symbol),tradeId:Number(trade.id)})}>View Chart</button></td><td>{cryptoPair(String(trade.symbol || "")) ? <button className="table-action" onClick={()=>{setRebuySymbol(String(trade.symbol).toUpperCase());setRebuyRequestId(crypto.randomUUID());setRebuyAvailable(null);setRebuyAmount("");void fetchRebuyCash();setRebuyConfirmation("");setRebuyMessage("");}}>Buy Again</button> : "—"}</td></tr>)}{!filteredClosedTrades.length&&<tr><td colSpan={10}>No trades match these filters.</td></tr>}</tbody></table></div>
     </Card></div>
     {rebuySymbol && <div role="dialog" aria-modal="true" aria-label="Buy crypto again" className="report-rebuy-dialog" style={{position:"fixed",inset:0,zIndex:9000,background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
