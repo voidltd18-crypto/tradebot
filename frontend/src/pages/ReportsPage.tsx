@@ -287,7 +287,32 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       {!reportsLoading && !reportsError && reportsUpdatedAt && <p className="muted">Updated {new Date(reportsUpdatedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false })}</p>}
     </Card>
 
-    <Card title="Performance Summary" wide><p className="muted">Account-wide balances (stocks and crypto combined). Use the asset selector in Closed Trade History for filtered realised P&amp;L.</p><section className="stats"><Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={usd(totalDeposited)}/><Stat label="Earned" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)}/><Stat label="Lost" value={gbp(lost * rate)} sub={usd(lost)} className="loss"/><Stat label="Current Equity" value={gbp(Number(reports?.currentEquity ?? data?.account?.equity ?? 0) * rate)} sub={usd(reports?.currentEquity ?? data?.account?.equity ?? 0)}/></section><p className={tone(totalGainLoss)}>Total gain/loss: {gbp(totalGainLoss * rate)}</p></Card>
+    <Card title="Smart Rebuy — Crypto Signals" wide>\n      <div style={{padding:18,border:"1px solid #334155",borderRadius:14,background:"#1e293b"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}>
+          <div><strong style={{fontSize:18}}>Smart Rebuy</strong><p style={{margin:"5px 0",color:"#cbd5e1"}}>Live Alpaca · Read-only · No automatic buys</p></div>
+          <div style={{display:"flex",alignItems:"center",gap:8}}>
+            <select aria-label="Smart Rebuy pair" value={signalSymbol} onChange={e=>{setSignalSymbol(e.target.value);setSignal(null);}}><option value="UNIUSD">UNI/USD</option><option value="ARBUSD">ARB/USD</option></select>
+            <button className="table-action" disabled={signalLoading} onClick={()=>void checkManualRebuySignal()}>{signalLoading?"Checking…":"Refresh Signal"}</button>
+          </div>
+        </div>
+        {signal && (() => {
+          const reason=String(signal.reason||"No verified signal");
+          const blocked=signal.positionOpen===true||signal.orderPending===true||/position|order pending|broker data unavailable|unverified|verified sale|credentials|invalid|could not verify/i.test(reason);
+          const green=signal.status==="BUY_CANDIDATE"&&signal.readOnly===true&&signal.orderSubmitted===false;
+          const colour=green?"#22c55e":blocked?"#ef4444":"#f59e0b";
+          const label=green?"YES — Buy candidate":blocked?"NO — Blocked":"WAIT — Not ready";
+          return <div role="status" style={{marginTop:16,padding:14,borderRadius:10,background:"#0f172a"}}>
+            <div style={{display:"flex",alignItems:"center",gap:12}}>
+              <span aria-hidden="true" style={{display:"inline-block",width:24,height:24,borderRadius:"50%",background:colour,boxShadow:`0 0 0 5px ${colour}22`,flexShrink:0}}/>
+              <strong style={{fontSize:20}}>{label}</strong>
+            </div>
+            <p style={{margin:"12px 0 4px",color:"#cbd5e1"}}>{reason}</p>
+            {signal.dipPct!=null&&<small>Dip from last sale: {String(signal.dipPct)}%</small>}
+            {signal.quoteFresh===false&&<p style={{color:"#fbbf24"}}>Quote not fresh — no buy signal</p>}
+          </div>;
+        })()}
+      </div>
+    </Card>\n\n    <Card title="Performance Summary" wide><p className="muted">Account-wide balances (stocks and crypto combined). Use the asset selector in Closed Trade History for filtered realised P&amp;L.</p><section className="stats"><Stat label="Deposited" value={gbp(totalDeposited * rate)} sub={usd(totalDeposited)}/><Stat label="Earned" value={gbp(earned * rate)} sub={usd(earned)} className={tone(earned)}/><Stat label="Lost" value={gbp(lost * rate)} sub={usd(lost)} className="loss"/><Stat label="Current Equity" value={gbp(Number(reports?.currentEquity ?? data?.account?.equity ?? 0) * rate)} sub={usd(reports?.currentEquity ?? data?.account?.equity ?? 0)}/></section><p className={tone(totalGainLoss)}>Total gain/loss: {gbp(totalGainLoss * rate)}</p></Card>
 
     <Card title="Recent Trade Reward vs Risk" wide>
       <p className="muted">Read-only · Latest {Number(expectancy?.sampleTrades || 0)} closed trades · Not lifetime performance</p>
@@ -327,31 +352,6 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       </div>
       {momentFilter && <div className="moment-filter-banner"><b>Chart selection:</b> {momentFilter.label}<button className="ghost" onClick={()=>setMomentFilter(null)}>Show all dates</button></div>}
       <div className="filter-summary"><b>{filteredClosedTrades.length}</b> {assetFilter === "CRYPTO" ? "crypto" : assetFilter === "STOCKS" ? "stock" : ""} matching rows <span>•</span> PnL <strong className={tone(filteredPnl)}>{gbp(filteredPnl * rate)}</strong> <span>•</span> Winning rows {filteredWins}</div>
-      <div style={{padding:18,marginBottom:16,border:"1px solid #334155",borderRadius:14,background:"#1e293b"}}>
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}>
-          <div><strong style={{fontSize:18}}>Smart Rebuy</strong><p style={{margin:"5px 0",color:"#cbd5e1"}}>Live Alpaca · Read-only · No automatic buys</p></div>
-          <div style={{display:"flex",alignItems:"center",gap:8}}>
-            <select aria-label="Smart Rebuy pair" value={signalSymbol} onChange={e=>{setSignalSymbol(e.target.value);setSignal(null);}}><option value="UNIUSD">UNI/USD</option><option value="ARBUSD">ARB/USD</option></select>
-            <button className="table-action" disabled={signalLoading} onClick={()=>void checkManualRebuySignal()}>{signalLoading?"Checking…":"Refresh Signal"}</button>
-          </div>
-        </div>
-        {signal && (() => {
-          const reason=String(signal.reason||"No verified signal");
-          const blocked=signal.positionOpen===true||signal.orderPending===true||/position|order pending|broker data unavailable|unverified|verified sale|credentials|invalid|could not verify/i.test(reason);
-          const green=signal.status==="BUY_CANDIDATE"&&signal.readOnly===true&&signal.orderSubmitted===false;
-          const colour=green?"#22c55e":blocked?"#ef4444":"#f59e0b";
-          const label=green?"YES — Buy candidate":blocked?"NO — Blocked":"WAIT — Not ready";
-          return <div role="status" style={{marginTop:16,padding:14,borderRadius:10,background:"#0f172a"}}>
-            <div style={{display:"flex",alignItems:"center",gap:12}}>
-              <span aria-hidden="true" style={{display:"inline-block",width:24,height:24,borderRadius:"50%",background:colour,boxShadow:`0 0 0 5px ${colour}22`,flexShrink:0}}/>
-              <strong style={{fontSize:20}}>{label}</strong>
-            </div>
-            <p style={{margin:"12px 0 4px",color:"#cbd5e1"}}>{reason}</p>
-            {signal.dipPct!=null&&<small>Dip from last sale: {String(signal.dipPct)}%</small>}
-            {signal.quoteFresh===false&&<p style={{color:"#fbbf24"}}>Quote not fresh — no buy signal</p>}
-          </div>;
-        })()}
-      </div>
       <div className="table-wrap"><table className="compact-table"><thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th><th>Replay</th><th>Rebuy</th></tr></thead><tbody>{filteredClosedTrades.map((trade,index)=><tr key={`${trade.id||index}-${index}`}><td>{tradeDate(trade)}</td><td>{tradeTime(trade)}</td><td><b>{trade.symbol}</b></td><td>{usd(trade.entryPrice)}</td><td>{usd(trade.exitPrice)}</td><td>{Number(trade.qty||0).toFixed(4)}</td><td className={tone(trade.pnl)}>{gbp(trade.pnlGbp ?? Number(trade.pnl||0)*rate)} / {usd(trade.pnl)}</td><td className={tone(trade.pnl)}>{pct(trade.pnlPct)}</td><td><button className="table-action" disabled={!trade.id} onClick={()=>trade.id&&setReplay({mode:"closed",symbol:String(trade.symbol),tradeId:Number(trade.id)})}>View Chart</button></td><td>{cryptoPair(String(trade.symbol || "")) ? <button className="table-action" onClick={()=>{setRebuySymbol(String(trade.symbol).toUpperCase());setRebuyRequestId(crypto.randomUUID());setRebuyAvailable(null);setRebuyAmount("");void fetchRebuyCash();setRebuyConfirmation("");setRebuyMessage("");}}>Buy Again</button> : "—"}</td></tr>)}{!filteredClosedTrades.length&&<tr><td colSpan={10}>No trades match these filters.</td></tr>}</tbody></table></div>
     </Card></div>
     {rebuySymbol && <div role="dialog" aria-modal="true" aria-label="Buy crypto again" className="report-rebuy-dialog" style={{position:"fixed",inset:0,zIndex:9000,background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
