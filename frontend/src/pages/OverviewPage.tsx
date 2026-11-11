@@ -1,3 +1,4 @@
+import { SmartRebuyPanel } from "../components/SmartRebuyPanel";
 import { Card } from "../components/Card";
 import { useEffect, useState } from "react";
 import { API_URL } from "../lib/api";
@@ -147,6 +148,7 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
   };
 
   return <main className="home-command-center">
+    <SmartRebuyPanel authToken={authToken} />
     <section className="home-hero-row">
       <div className="system-banner"><span className={`status-dot ${botHealth >= 75 ? "healthy" : "warning"}`} /><b>{botHealth >= 75 ? "SYSTEM OPERATIONAL" : "SYSTEM CHECK"}</b><span>{message || currentAction}</span></div>
       <button className="full-report-button" onClick={onExportFullBot} disabled={exportBusy}>
