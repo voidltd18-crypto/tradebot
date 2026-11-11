@@ -9,6 +9,8 @@ import type { AnyObj, Currency } from "../lib/types";
 
 type RangeKey = "today" | "week" | "month" | "year";
 type AssetFilter = "ALL" | "CRYPTO" | "STOCKS";
+const SMART_REBUY_PAIRS = ["UNIUSD","BTCUSD","XRPUSD","SOLUSD","HYPEUSD","LDOUSD","AVAXUSD","FILUSD","LTCUSD","ARBUSD","ADAUSD","ONDOUSD","SKYUSD","SHIBUSD","LINKUSD","SUSHIUSD","BATUSD","ETHUSD","XTZUSD","AAVEUSD","DOTUSD","CRVUSD","BCHUSD","GRTUSD","PAXGUSD","DOGEUSD","BONKUSD","YFIUSD","POLUSD"] as const;
+const normaliseCryptoPair = (value: unknown) => String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 
 function isCryptoTrade(trade: AnyObj): boolean {
   const assetClass = String(trade?.asset_class ?? trade?.assetClass ?? trade?.asset_type ?? trade?.assetType ?? "").toLowerCase();
@@ -57,6 +59,7 @@ function rangeStart(range: RangeKey): number {
 export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, setChartCurrency, reportsLoading, reportsError, reportsUpdatedAt, loadReports, authToken }: { reports: AnyObj; data: AnyObj; rate: number; closedTrades: AnyObj[]; chartCurrency: Currency; setChartCurrency: (currency: Currency) => void; reportsLoading: boolean; reportsError: string; reportsUpdatedAt: string; loadReports: (force?: boolean) => Promise<void>; authToken: string }) {
   const [replay, setReplay] = useState<ReplayTarget | null>(null);
   const [signalSymbol, setSignalSymbol] = useState("UNIUSD");
+  const [showAllRebuyCoins, setShowAllRebuyCoins] = useState(false);
   const [signal, setSignal] = useState<AnyObj | null>(null);
   const [signalLoading, setSignalLoading] = useState(false);
   async function checkManualRebuySignal() {
@@ -154,6 +157,16 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
     const qty = Number(trade?.qty);
     return Number.isFinite(qty) && qty > 0;
   }), [closedTrades]);
+  // A recent executed trade makes a coin relevant to review; it is NOT a buy signal.
+  // The broker preview remains the sole authority for any green indication.
+  const relevantRebuyCoins = useMemo(() => {
+    const cutoff = Date.now() - 30 * 86400000;
+    const recent = new Set(displayedTrades.filter(t => isCryptoTrade(t) && tradeTimestamp(t) >= cutoff)
+      .map(t => normaliseCryptoPair(t?.symbol)));
+    if (signal?.status === "WATCH" || signal?.status === "BUY_CANDIDATE") recent.add(signalSymbol);
+    return SMART_REBUY_PAIRS.filter(pair => recent.has(pair));
+  }, [displayedTrades, signal, signalSymbol]);
+  const visibleRebuyCoins = showAllRebuyCoins ? SMART_REBUY_PAIRS : relevantRebuyCoins;
   const assetTrades = useMemo(() => displayedTrades.filter(t => assetFilter === "ALL" || (isCryptoTrade(t) ? "CRYPTO" : "STOCKS") === assetFilter), [displayedTrades, assetFilter]);
   const symbols = useMemo(() => Array.from(new Set(assetTrades.map(t => String(t?.symbol || "").toUpperCase()).filter(Boolean))).sort(), [assetTrades]);
   const filteredClosedTrades = useMemo(() => {
@@ -289,9 +302,13 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
 
     <Card title="Smart Rebuy — Crypto Signals" wide>\n      <div style={{padding:18,border:"1px solid #334155",borderRadius:14,background:"#1e293b"}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}>
-          <div><strong style={{fontSize:18}}>Smart Rebuy</strong><p style={{margin:"5px 0",color:"#cbd5e1"}}>Live Alpaca · Read-only · No automatic buys</p></div>
+          <div><strong style={{fontSize:18}}>Smart Rebuy</strong><p style={{margin:"5px 0",color:"#cbd5e1"}}>Live Alpaca · Read-only · No automatic buys · Relevant = recent trading activity, not a buy recommendation</p></div>
           <div style={{display:"flex",alignItems:"center",gap:8}}>
-            <select aria-label="Smart Rebuy pair" value={signalSymbol} onChange={e=>{setSignalSymbol(e.target.value);setSignal(null);}}><option value="UNIUSD">UNI/USD</option><option value="ARBUSD">ARB/USD</option></select>
+            <select aria-label="Smart Rebuy pair" value={signalSymbol} onChange={e=>{setSignalSymbol(e.target.value);setSignal(null);}}>
+              {!visibleRebuyCoins.includes(signalSymbol as typeof SMART_REBUY_PAIRS[number]) && <option value={signalSymbol}>{signalSymbol.replace(/USD$/, "/USD")} · Selected</option>}
+              {visibleRebuyCoins.map(pair => <option key={pair} value={pair}>{pair.replace(/USD$/, "/USD")}</option>)}
+            </select>
+            <button className="ghost" onClick={()=>setShowAllRebuyCoins(v=>!v)}>{showAllRebuyCoins ? "Show relevant only" : `Show all 29 coins`}</button>
             <button className="table-action" disabled={signalLoading} onClick={()=>void checkManualRebuySignal()}>{signalLoading?"Checking…":"Refresh Signal"}</button>
           </div>
         </div>
