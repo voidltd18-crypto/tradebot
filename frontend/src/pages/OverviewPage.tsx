@@ -33,9 +33,15 @@ function EntryGateDiagnostics({ authToken }: { authToken: string }) {
     const timer = window.setInterval(() => void refresh(), 30000);
     return () => { active = false; window.clearInterval(timer); };
   }, [authToken]);
+  // A pre-expectancy rejection records zero-valued placeholders for historical
+  // metrics. Do not present those as evidence of zero wins or zero samples.
+  const hasExpectancyEvidence = (row: any) =>
+    ["expectancy_gate", "v17_cold_start_gate", "final_gate"].includes(String(row.stage || "")) ||
+    Number(row.historical_samples || 0) > 0;
+  const stale = (row: any) => !row.timestamp || Date.now() - new Date(row.timestamp).getTime() > 30 * 60 * 1000;
   const numeric = (value: unknown, digits: number) => value == null || value === "" ? "—" : Number(value).toFixed(digits);
   return <Card title="Why No Buy? · Entry Gate Diagnostics" wide className="decision-card">
-    <p className="muted">Latest recorded decision per approved stock. Read-only historical evidence, not a live order recommendation. Older decisions may no longer reflect current market conditions.</p>
+    <p className="muted">Latest recorded decision per approved stock. STALE means older than 30 minutes. Historical metrics marked Not evaluated / — were not assessed at the rejection gate; they are not zero-performance evidence. Read-only; not a live order recommendation.</p>
     {error && <p className="muted">{error}</p>}
     {updated && <p className="muted">Checked: {new Date(updated).toLocaleTimeString("en-GB")} · Decisions recorded by the trading engine</p>}
     <div style={{ overflowX: "auto" }}>
@@ -43,13 +49,13 @@ function EntryGateDiagnostics({ authToken }: { authToken: string }) {
         <thead><tr>{["Stock", "Decision", "Gate", "Confidence", "Quality", "Samples", "Win rate", "Profit factor", "Reason", "Recorded"].map(label => <th key={label} style={{ padding: "8px", borderBottom: "1px solid #64748b" }}>{label}</th>)}</tr></thead>
         <tbody>{rows.map(row => <tr key={row.symbol}>
           <td style={{ padding: "8px" }}><b>{row.symbol}</b></td>
-          <td style={{ padding: "8px" }}>{row.decision || "No record"}</td>
+          <td style={{ padding: "8px" }}>{row.decision ? `${row.decision}${stale(row) ? " · STALE" : ""}` : "No record"}</td>
           <td style={{ padding: "8px" }}>{row.stage || "—"}</td>
           <td style={{ padding: "8px" }}>{numeric(row.confidence, 2)}</td>
           <td style={{ padding: "8px" }}>{numeric(row.quality, 4)}</td>
-          <td style={{ padding: "8px" }}>{row.historical_samples ?? "—"}</td>
-          <td style={{ padding: "8px" }}>{row.historical_win_rate == null ? "—" : `${(Number(row.historical_win_rate) * 100).toFixed(0)}%`}</td>
-          <td style={{ padding: "8px" }}>{numeric(row.historical_profit_factor, 2)}</td>
+          <td style={{ padding: "8px" }}>{hasExpectancyEvidence(row) ? (row.historical_samples ?? "—") : "Not evaluated"}</td>
+          <td style={{ padding: "8px" }}>{!hasExpectancyEvidence(row) || row.historical_win_rate == null ? "—" : `${(Number(row.historical_win_rate) * 100).toFixed(0)}%`}</td>
+          <td style={{ padding: "8px" }}>{hasExpectancyEvidence(row) ? numeric(row.historical_profit_factor, 2) : "—"}</td>
           <td style={{ padding: "8px", minWidth: "220px" }}>{row.reason || "No decision recorded"}</td>
           <td style={{ padding: "8px", whiteSpace: "nowrap" }}>{row.timestamp ? new Date(row.timestamp).toLocaleString("en-GB", { timeZone: "Europe/London", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"}</td>
         </tr>)}</tbody>
