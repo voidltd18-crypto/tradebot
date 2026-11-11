@@ -56,6 +56,23 @@ function rangeStart(range: RangeKey): number {
 
 export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, setChartCurrency, reportsLoading, reportsError, reportsUpdatedAt, loadReports, authToken }: { reports: AnyObj; data: AnyObj; rate: number; closedTrades: AnyObj[]; chartCurrency: Currency; setChartCurrency: (currency: Currency) => void; reportsLoading: boolean; reportsError: string; reportsUpdatedAt: string; loadReports: (force?: boolean) => Promise<void>; authToken: string }) {
   const [replay, setReplay] = useState<ReplayTarget | null>(null);
+  const [signalSymbol, setSignalSymbol] = useState("UNIUSD");
+  const [signal, setSignal] = useState<AnyObj | null>(null);
+  const [signalLoading, setSignalLoading] = useState(false);
+  async function checkManualRebuySignal() {
+    setSignalLoading(true);
+    setSignal(null);
+    try {
+      const response = await fetch(`${API_URL}/v19/manual-crypto-rebuy-preview/${encodeURIComponent(signalSymbol)}`, {
+        cache: "no-store", headers: {"X-Auth-Token": authToken, "x-api-key": authToken},
+      });
+      const result = await readJson(response);
+      if (!response.ok) throw new Error("Broker preview unavailable");
+      setSignal(result);
+    } catch {
+      setSignal({status:"WAIT",reason:"Could not verify broker data; do not buy"});
+    } finally { setSignalLoading(false); }
+  }
   const [rebuySymbol, setRebuySymbol] = useState("");
   const [rebuyRequestId, setRebuyRequestId] = useState("");
   const [rebuyAmount, setRebuyAmount] = useState("25");
@@ -310,6 +327,18 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       </div>
       {momentFilter && <div className="moment-filter-banner"><b>Chart selection:</b> {momentFilter.label}<button className="ghost" onClick={()=>setMomentFilter(null)}>Show all dates</button></div>}
       <div className="filter-summary"><b>{filteredClosedTrades.length}</b> {assetFilter === "CRYPTO" ? "crypto" : assetFilter === "STOCKS" ? "stock" : ""} matching rows <span>•</span> PnL <strong className={tone(filteredPnl)}>{gbp(filteredPnl * rate)}</strong> <span>•</span> Winning rows {filteredWins}</div>
+      <div style={{padding:12,marginBottom:12,border:"1px solid #334155",borderRadius:10}}>
+        <strong>Manual Crypto Rebuy Signal (read-only)</strong>
+        <p style={{margin:"6px 0"}}>Uses Alpaca's last filled sale and fresh ask. No automatic buys. A dip alone is not a confirmed reversal.</p>
+        <label>Pair <select value={signalSymbol} onChange={e=>{setSignalSymbol(e.target.value);setSignal(null);}}>
+          <option value="UNIUSD">UNI/USD</option><option value="ARBUSD">ARB/USD</option>
+        </select></label>
+        <button className="table-action" disabled={signalLoading} onClick={()=>void checkManualRebuySignal()}>{signalLoading?"Checking…":"Check rebuy signal"}</button>
+        {signal && <p role="status"><b>{String(signal.status || "WAIT")}</b> — {String(signal.reason || "Not verified")}
+          {signal.dipPct != null ? ` · Dip from last sell: ${signal.dipPct}%` : ""}
+          {signal.currentAsk ? ` · Alpaca ask: ${signal.currentAsk}` : ""}
+        </p>}
+      </div>
       <div className="table-wrap"><table className="compact-table"><thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th><th>Replay</th><th>Rebuy</th></tr></thead><tbody>{filteredClosedTrades.map((trade,index)=><tr key={`${trade.id||index}-${index}`}><td>{tradeDate(trade)}</td><td>{tradeTime(trade)}</td><td><b>{trade.symbol}</b></td><td>{usd(trade.entryPrice)}</td><td>{usd(trade.exitPrice)}</td><td>{Number(trade.qty||0).toFixed(4)}</td><td className={tone(trade.pnl)}>{gbp(trade.pnlGbp ?? Number(trade.pnl||0)*rate)} / {usd(trade.pnl)}</td><td className={tone(trade.pnl)}>{pct(trade.pnlPct)}</td><td><button className="table-action" disabled={!trade.id} onClick={()=>trade.id&&setReplay({mode:"closed",symbol:String(trade.symbol),tradeId:Number(trade.id)})}>View Chart</button></td><td>{cryptoPair(String(trade.symbol || "")) ? <button className="table-action" onClick={()=>{setRebuySymbol(String(trade.symbol).toUpperCase());setRebuyRequestId(crypto.randomUUID());setRebuyAvailable(null);setRebuyAmount("");void fetchRebuyCash();setRebuyConfirmation("");setRebuyMessage("");}}>Buy Again</button> : "—"}</td></tr>)}{!filteredClosedTrades.length&&<tr><td colSpan={10}>No trades match these filters.</td></tr>}</tbody></table></div>
     </Card></div>
     {rebuySymbol && <div role="dialog" aria-modal="true" aria-label="Buy crypto again" className="report-rebuy-dialog" style={{position:"fixed",inset:0,zIndex:9000,background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
