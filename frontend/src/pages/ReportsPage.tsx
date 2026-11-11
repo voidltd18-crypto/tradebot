@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { Card } from "../components/Card";
 import { API_URL, readJson } from "../lib/api";
@@ -60,6 +60,37 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const [replay, setReplay] = useState<ReplayTarget | null>(null);
   const [signalSymbol, setSignalSymbol] = useState("UNIUSD");
   const [showAllRebuyCoins, setShowAllRebuyCoins] = useState(false);
+  const [bulkSignals, setBulkSignals] = useState<AnyObj[]>([]);
+  const [bulkLoading, setBulkLoading] = useState(false);
+  const [bulkError, setBulkError] = useState("");
+  const [bulkScannedAt, setBulkScannedAt] = useState("");
+  const bulkBusyRef = useRef(false);
+  useEffect(() => {
+    if (!authToken) return;
+    let active = true;
+    async function scan() {
+      if (bulkBusyRef.current) return;
+      bulkBusyRef.current = true;
+      if (active) setBulkLoading(true);
+      try {
+        const response = await fetch(`${API_URL}/v19/manual-crypto-rebuy-scan`, {
+          cache:"no-store", headers: {"X-Auth-Token":authToken,"x-api-key":authToken},
+        });
+        if (!response.ok) throw new Error("Automatic broker scan unavailable");
+        const payload = await readJson(response);
+        if (!Array.isArray(payload?.rows) || payload.rows.length !== SMART_REBUY_PAIRS.length) throw new Error("Incomplete scan");
+        if (active) {setBulkSignals(payload.rows);setBulkScannedAt(String(payload.scannedAt||""));setBulkError("");}
+      } catch {
+        if (active) setBulkError("Automatic scan unavailable — no unverified buy signals shown");
+      } finally {
+        bulkBusyRef.current = false;
+        if (active) setBulkLoading(false);
+      }
+    }
+    void scan();
+    const interval = window.setInterval(()=>void scan(), 120000);
+    return ()=>{active=false;window.clearInterval(interval);};
+  }, [authToken]);
   const [signal, setSignal] = useState<AnyObj | null>(null);
   const [signalLoading, setSignalLoading] = useState(false);
   async function checkManualRebuySignal() {
@@ -157,16 +188,12 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
     const qty = Number(trade?.qty);
     return Number.isFinite(qty) && qty > 0;
   }), [closedTrades]);
-  // A recent executed trade makes a coin relevant to review; it is NOT a buy signal.
-  // The broker preview remains the sole authority for any green indication.
-  const relevantRebuyCoins = useMemo(() => {
-    const cutoff = Date.now() - 30 * 86400000;
-    const recent = new Set(displayedTrades.filter(t => isCryptoTrade(t) && tradeTimestamp(t) >= cutoff)
-      .map(t => normaliseCryptoPair(t?.symbol)));
-    if (signal?.status === "WATCH" || signal?.status === "BUY_CANDIDATE") recent.add(signalSymbol);
-    return SMART_REBUY_PAIRS.filter(pair => recent.has(pair));
-  }, [displayedTrades, signal, signalSymbol]);
-  const visibleRebuyCoins = showAllRebuyCoins ? SMART_REBUY_PAIRS : relevantRebuyCoins;
+  const highlightedRebuyCoins = useMemo(() => bulkSignals.filter(row =>
+    row?.status === "BUY_CANDIDATE" && row?.readOnly === true && row?.orderSubmitted === false ||
+    row?.status === "WATCH" && row?.readOnly === true && row?.orderSubmitted === false
+  ).sort((a,b) => (a.status === "BUY_CANDIDATE" ? 0 : 1) - (b.status === "BUY_CANDIDATE" ? 0 : 1)), [bulkSignals]);
+  const relevantRebuyCoins = highlightedRebuyCoins.map(row => normaliseCryptoPair(row.symbol));
+  const visibleRebuyCoins = showAllRebuyCoins ? SMART_REBUY_PAIRS : SMART_REBUY_PAIRS.filter(pair => relevantRebuyCoins.includes(pair));
   const assetTrades = useMemo(() => displayedTrades.filter(t => assetFilter === "ALL" || (isCryptoTrade(t) ? "CRYPTO" : "STOCKS") === assetFilter), [displayedTrades, assetFilter]);
   const symbols = useMemo(() => Array.from(new Set(assetTrades.map(t => String(t?.symbol || "").toUpperCase()).filter(Boolean))).sort(), [assetTrades]);
   const filteredClosedTrades = useMemo(() => {
@@ -303,7 +330,7 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
     <Card title="Smart Rebuy — Crypto Signals" wide>
       <div style={{padding:18,border:"1px solid #334155",borderRadius:14,background:"#1e293b"}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}>
-          <div><strong style={{fontSize:18}}>Smart Rebuy</strong><p style={{margin:"5px 0",color:"#cbd5e1"}}>Live Alpaca · Read-only · No automatic buys · Relevant = recent trading activity, not a buy recommendation</p></div>
+          <div><strong style={{fontSize:18}}>Smart Rebuy</strong><p style={{margin:"5px 0",color:"#cbd5e1"}}>Live Alpaca · Read-only · No automatic buys · Automatically scans 29 coins every 2 minutes · Manual decisions only</p></div>
           <div style={{display:"flex",alignItems:"center",gap:8}}>
             <select aria-label="Smart Rebuy pair" value={signalSymbol} onChange={e=>{setSignalSymbol(e.target.value);setSignal(null);}}>
               {!visibleRebuyCoins.includes(signalSymbol as typeof SMART_REBUY_PAIRS[number]) && <option value={signalSymbol}>{signalSymbol.replace(/USD$/, "/USD")} · Selected</option>}
@@ -311,6 +338,17 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
             </select>
             <button className="ghost" onClick={()=>setShowAllRebuyCoins(v=>!v)}>{showAllRebuyCoins ? "Show relevant only" : `Show all 29 coins`}</button>
             <button className="table-action" disabled={signalLoading} onClick={()=>void checkManualRebuySignal()}>{signalLoading?"Checking…":"Refresh Signal"}</button>
+          </div>
+        </div>
+        <div style={{marginTop:12}}>
+          <p style={{color:"#cbd5e1",margin:"0 0 8px"}}>{bulkLoading ? "Scanning 29 coins…" : bulkScannedAt ? `Auto-scanned 29 coins · ${new Date(bulkScannedAt).toLocaleTimeString("en-GB")}` : "Awaiting first automatic scan"}</p>
+          {bulkError && <p role="status" style={{color:"#fbbf24"}}>{bulkError}</p>}
+          {!bulkLoading && !bulkError && highlightedRebuyCoins.length===0 && <p style={{color:"#94a3b8"}}>No verified WATCH or BUY candidates right now. All other coins are hidden.</p>}
+          <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
+            {highlightedRebuyCoins.map(row => <button key={row.symbol} type="button" onClick={()=>{setSignalSymbol(normaliseCryptoPair(row.symbol));setSignal(row);}}
+              style={{padding:"10px 14px",borderRadius:9,border:"1px solid #475569",background:"#0f172a",color:"#f8fafc",cursor:"pointer"}}>
+              <span style={{color:row.status==="BUY_CANDIDATE"?"#22c55e":"#f59e0b"}}>●</span> {row.symbol} · {row.status==="BUY_CANDIDATE"?"BUY candidate":"WATCH"}{row.dipPct!=null?` · ${row.dipPct}% dip`:""}
+            </button>)}
           </div>
         </div>
         {showAllRebuyCoins && <div style={{marginTop:14,padding:12,borderRadius:10,background:"#0f172a"}}>
