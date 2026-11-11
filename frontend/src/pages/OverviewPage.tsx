@@ -38,14 +38,31 @@ function EntryGateDiagnostics({ authToken }: { authToken: string }) {
   const hasExpectancyEvidence = (row: any) =>
     ["expectancy_gate", "v17_cold_start_gate", "final_gate"].includes(String(row.stage || "")) ||
     Number(row.historical_samples || 0) > 0;
-  const stale = (row: any) => !row.timestamp || Date.now() - new Date(row.timestamp).getTime() > 30 * 60 * 1000;
+  // Session-aware freshness: the previous close is expected outside regular
+  // US equity hours. This schedule is indicative; exchange holidays and halts
+  // are not inferred from the clock.
+  const nyParts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York", weekday: "short", hour: "2-digit",
+    minute: "2-digit", hourCycle: "h23"
+  }).formatToParts(new Date());
+  const nyValue = (type: string) => nyParts.find(part => part.type === type)?.value || "";
+  const nyMinute = Number(nyValue("hour")) * 60 + Number(nyValue("minute"));
+  const regularHours = !["Sat", "Sun"].includes(nyValue("weekday")) && nyMinute >= 570 && nyMinute < 960;
+  const sessionStartedLongEnough = nyMinute >= 600;
+  const decisionStatus = (row: any) => {
+    if (!row.timestamp) return "NO RECORD";
+    const age = Date.now() - new Date(row.timestamp).getTime();
+    if (!regularHours) return "LAST SESSION";
+    if (age <= 30 * 60 * 1000) return "RECENT";
+    return sessionStartedLongEnough ? "SCAN OVERDUE" : "AWAITING OPEN SCAN";
+  };
   const memoryAudit = (row: any) => {
     try { const payload = JSON.parse(String(row.payload_json || "{}")); return payload?.confidenceMemoryAudit || null; }
     catch { return null; }
   };
   const numeric = (value: unknown, digits: number) => value == null || value === "" ? "—" : Number(value).toFixed(digits);
   return <Card title="Why No Buy? · Entry Gate Diagnostics" wide className="decision-card">
-    <p className="muted">Latest recorded decision per approved stock. STALE means older than 30 minutes. Historical metrics marked Not evaluated / — were not assessed at the rejection gate; they are not zero-performance evidence. Raw conf. is confidence before stock-memory adjustment; Memory × is the applied multiplier. — means this evidence was not captured for an older decision. Read-only; not a live order recommendation.</p>
+    <p className="muted">Latest recorded decision per approved stock. LAST SESSION is expected outside regular US equity hours; SCAN OVERDUE means the latest decision is over 30 minutes old during regular hours (after 10:00 New York time). This is a clock-based schedule, not an exchange holiday or halt feed. Historical metrics marked Not evaluated / — were not assessed at the rejection gate; they are not zero-performance evidence. Raw conf. is confidence before stock-memory adjustment; Memory × is the applied multiplier. — means this evidence was not captured for an older decision. Read-only; not a live order recommendation.</p>
     {error && <p className="muted">{error}</p>}
     {updated && <p className="muted">Checked: {new Date(updated).toLocaleTimeString("en-GB")} · Decisions recorded by the trading engine</p>}
     <div style={{ overflowX: "auto" }}>
@@ -53,7 +70,7 @@ function EntryGateDiagnostics({ authToken }: { authToken: string }) {
         <thead><tr>{["Stock", "Decision", "Gate", "Confidence", "Raw conf.", "Memory ×", "Quality", "Samples", "Win rate", "Profit factor", "Reason", "Recorded"].map(label => <th key={label} style={{ padding: "8px", borderBottom: "1px solid #64748b" }}>{label}</th>)}</tr></thead>
         <tbody>{rows.map(row => <tr key={row.symbol}>
           <td style={{ padding: "8px" }}><b>{row.symbol}</b></td>
-          <td style={{ padding: "8px" }}>{row.decision ? `${row.decision}${stale(row) ? " · STALE" : ""}` : "No record"}</td>
+          <td style={{ padding: "8px" }}>{row.decision ? `${row.decision} · ${decisionStatus(row)}` : "No record"}</td>
           <td style={{ padding: "8px" }}>{row.stage || "—"}</td>
           <td style={{ padding: "8px" }}>{numeric(row.confidence, 2)}</td>
           <td style={{ padding: "8px" }}>{numeric(memoryAudit(row)?.rawConfidence, 2)}</td>
