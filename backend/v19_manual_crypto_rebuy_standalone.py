@@ -25,7 +25,7 @@ p{color:#b7c4d9}label{display:block;margin:22px 0 8px}
 input{box-sizing:border-box;width:100%;padding:13px;background:#202d40;color:white;border:1px solid #65748b;border-radius:8px}
 button{background:#4b8cff;color:white;border:0;border-radius:8px;padding:12px 18px;margin-top:14px;cursor:pointer}
 button:disabled{opacity:.5;cursor:wait}
-section{background:#1c293c;border-radius:10px;padding:18px;margin-top:18px;white-space:pre-wrap;overflow-wrap:anywhere}
+section{background:#1c293c;border:1px solid #334155;border-radius:14px;padding:22px;margin-top:18px} .signal{display:flex;align-items:center;gap:14px;margin:14px 0} .light{width:28px;height:28px;border-radius:50%;flex-shrink:0} .red{background:#ef4444;box-shadow:0 0 0 5px #ef444422} .amber{background:#f59e0b;box-shadow:0 0 0 5px #f59e0b22} .green{background:#22c55e;box-shadow:0 0 0 5px #22c55e22} .status{font-size:24px;font-weight:750} .detail{color:#b7c4d9;margin:8px 0} .metrics{font-size:14px;color:#cbd5e1}
 small{color:#a9b7c9}
 </style></head><body><main><h1>Smart Rebuy</h1>
 <p>Live Alpaca data · Read-only · No orders submitted</p>
@@ -54,11 +54,32 @@ btn.addEventListener('click',async()=>{
     const section=document.createElement('section');
     const title=document.createElement('strong');
     title.textContent=item.symbol==='UNIUSD'?'UNI/USD':'ARB/USD';
-    const details=document.createElement('pre');
-    details.style.whiteSpace='pre-wrap';
-    details.style.overflowWrap='anywhere';
-    details.textContent=item.error||JSON.stringify(item.data,null,2);
-    section.append(title,details);output.append(section);
+    const data=item.data||{};
+    const reason=String(data.reason||'No verified signal');
+    const blocked=Boolean(item.error)||data.positionOpen===true||data.orderPending===true||
+      /position|order pending|broker data unavailable|unverified|verified sale|credentials|invalid/i.test(reason);
+    const green=!item.error&&data.status==='BUY_CANDIDATE'&&data.readOnly===true&&data.orderSubmitted===false;
+    const colour=green?'green':blocked?'red':'amber';
+    const label=green?'YES — Buy candidate':blocked?'NO — Blocked':'WAIT — Not ready';
+    const signal=document.createElement('div');signal.className='signal';
+    const light=document.createElement('span');light.className='light '+colour;
+    light.setAttribute('aria-hidden','true');
+    const status=document.createElement('span');status.className='status';status.textContent=label;
+    signal.append(light,status);
+    const message=document.createElement('p');message.className='detail';
+    message.textContent=item.error||reason;
+    section.append(title,signal,message);
+    if(data.dipPct!=null){
+      const metric=document.createElement('div');metric.className='metrics';
+      metric.textContent='Dip from last sale: '+data.dipPct+'%';
+      section.append(metric);
+    }
+    if(data.quoteFresh===false){
+      const warning=document.createElement('p');warning.className='metrics';
+      warning.textContent='Quote not fresh — no buy signal';
+      section.append(warning);
+    }
+    output.append(section);
   }
   btn.disabled=false;
 });
