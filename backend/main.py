@@ -136,3 +136,12 @@ def manual_crypto_rebuy_preview_endpoint(symbol: str, request: Request):
     from alpaca.data.historical import CryptoHistoricalDataClient
     data_client = CryptoHistoricalDataClient(_legacy.API_KEY, _legacy.API_SECRET)
     return manual_crypto_rebuy_preview(_legacy.trading_client, data_client, symbol)
+
+
+@app.get("/v19/manual-crypto-rebuy-scan")
+def manual_crypto_rebuy_scan_endpoint(request: Request):
+    _legacy.verify_api_key(request)
+    from alpaca.data.historical import CryptoHistoricalDataClient
+    from backend.v19_manual_crypto_rebuy_bulk import scan_all
+    data_client = CryptoHistoricalDataClient(_legacy.API_KEY, _legacy.API_SECRET)
+    return scan_all(_legacy.trading_client, data_client)
