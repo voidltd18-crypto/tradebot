@@ -61,29 +61,55 @@ function EntryGateDiagnostics({ authToken }: { authToken: string }) {
     catch { return null; }
   };
   const numeric = (value: unknown, digits: number) => value == null || value === "" ? "—" : Number(value).toFixed(digits);
+  const friendlyReason = (row: any) => {
+    const reason = String(row.reason || "");
+    if (!row.decision) return "No recorded decision";
+    if (row.stage === "sniper_gate" && reason.includes("confidence too low")) return "Confidence below sniper minimum";
+    if (row.stage === "account_gate" && reason.includes("locked until tomorrow")) return "Daily trading lock";
+    if (row.stage === "symbol_reputation_gate" && reason.includes("cooldown")) return "Historical reputation cooldown";
+    if (row.stage === "expectancy_gate") return "Historical expectancy check";
+    if (row.stage === "account_gate") return "Account or order restriction";
+    return reason || String(row.stage || "Not approved").replace(/_/g, " ");
+  };
+  const recordedAt = (row: any) => row.timestamp
+    ? new Date(row.timestamp).toLocaleString("en-GB", {
+        timeZone: "Europe/London", day: "2-digit", month: "short",
+        hour: "2-digit", minute: "2-digit"
+      }) : "—";
   return <Card title="Why No Buy? · Entry Gate Diagnostics" wide className="decision-card">
-    <p className="muted">Latest recorded decision per approved stock. LAST SESSION is expected outside regular US equity hours; SCAN OVERDUE means the latest decision is over 30 minutes old during regular hours (after 10:00 New York time). This is a clock-based schedule, not an exchange holiday or halt feed. Historical metrics marked Not evaluated / — were not assessed at the rejection gate; they are not zero-performance evidence. Raw conf. is confidence before stock-memory adjustment; Memory × is the applied multiplier. — means this evidence was not captured for an older decision. Read-only; not a live order recommendation.</p>
+    <p className="muted">Latest recorded decision for each approved stock. Confidence shows the score used for trading; raw confidence and memory show how historical performance affected it. Read-only.</p>
     {error && <p className="muted">{error}</p>}
-    {updated && <p className="muted">Checked: {new Date(updated).toLocaleTimeString("en-GB")} · Decisions recorded by the trading engine</p>}
+    {updated && <p className="muted">Checked {new Date(updated).toLocaleTimeString("en-GB")} · US session labels are clock-based (holidays and halts not detected)</p>}
     <div style={{ overflowX: "auto" }}>
       <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left", fontSize: "0.85rem" }}>
-        <thead><tr>{["Stock", "Decision", "Gate", "Confidence", "Raw conf.", "Memory ×", "Quality", "Samples", "Win rate", "Profit factor", "Reason", "Recorded"].map(label => <th key={label} style={{ padding: "8px", borderBottom: "1px solid #64748b" }}>{label}</th>)}</tr></thead>
+        <thead><tr>{["Stock", "Result", "Session", "Final conf.", "Raw conf.", "Memory ×", "Why?", "Recorded"].map(label =>
+          <th key={label} style={{ padding: "9px 7px", borderBottom: "1px solid #64748b", whiteSpace: "nowrap" }}>{label}</th>
+        )}</tr></thead>
         <tbody>{rows.map(row => <tr key={row.symbol}>
-          <td style={{ padding: "8px" }}><b>{row.symbol}</b></td>
-          <td style={{ padding: "8px" }}>{row.decision ? `${row.decision} · ${decisionStatus(row)}` : "No record"}</td>
-          <td style={{ padding: "8px" }}>{row.stage || "—"}</td>
-          <td style={{ padding: "8px" }}>{numeric(row.confidence, 2)}</td>
-          <td style={{ padding: "8px" }}>{numeric(memoryAudit(row)?.rawConfidence, 2)}</td>
-          <td style={{ padding: "8px" }}>{memoryAudit(row)?.multiplier == null ? "—" : `${Number(memoryAudit(row).multiplier).toFixed(2)}×`}</td>
-          <td style={{ padding: "8px" }}>{numeric(row.quality, 4)}</td>
-          <td style={{ padding: "8px" }}>{hasExpectancyEvidence(row) ? (row.historical_samples ?? "—") : "Not evaluated"}</td>
-          <td style={{ padding: "8px" }}>{!hasExpectancyEvidence(row) || row.historical_win_rate == null ? "—" : `${(Number(row.historical_win_rate) * 100).toFixed(0)}%`}</td>
-          <td style={{ padding: "8px" }}>{hasExpectancyEvidence(row) ? numeric(row.historical_profit_factor, 2) : "—"}</td>
-          <td style={{ padding: "8px", minWidth: "220px" }}>{row.reason || "No decision recorded"}</td>
-          <td style={{ padding: "8px", whiteSpace: "nowrap" }}>{row.timestamp ? new Date(row.timestamp).toLocaleString("en-GB", { timeZone: "Europe/London", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) : "—"}</td>
+          <td style={{ padding: "9px 7px" }}><b>{row.symbol}</b></td>
+          <td style={{ padding: "9px 7px" }}>{row.decision || "No record"}</td>
+          <td style={{ padding: "9px 7px", whiteSpace: "nowrap" }}>{decisionStatus(row)}</td>
+          <td style={{ padding: "9px 7px" }}><b>{numeric(row.confidence, 2)}</b></td>
+          <td style={{ padding: "9px 7px" }}>{numeric(memoryAudit(row)?.rawConfidence, 2)}</td>
+          <td style={{ padding: "9px 7px" }}>{memoryAudit(row)?.multiplier == null ? "—" : `${Number(memoryAudit(row).multiplier).toFixed(2)}×`}</td>
+          <td style={{ padding: "9px 7px", minWidth: "190px" }}>
+            <details>
+              <summary style={{ cursor: "pointer" }}>{friendlyReason(row)}</summary>
+              <div className="muted" style={{ paddingTop: "6px", fontSize: "0.8rem" }}>
+                <div>Gate: {row.stage || "—"}</div>
+                <div>Exact reason: {row.reason || "—"}</div>
+                <div>Quality: {numeric(row.quality, 4)}</div>
+                <div>Historical samples: {hasExpectancyEvidence(row) ? row.historical_samples ?? "—" : "Not evaluated"}</div>
+                <div>Win rate: {hasExpectancyEvidence(row) && row.historical_win_rate != null ? `${(Number(row.historical_win_rate) * 100).toFixed(0)}%` : "Not evaluated"}</div>
+                <div>Profit factor: {hasExpectancyEvidence(row) ? numeric(row.historical_profit_factor, 2) : "Not evaluated"}</div>
+              </div>
+            </details>
+          </td>
+          <td style={{ padding: "9px 7px", whiteSpace: "nowrap" }}>{recordedAt(row)}</td>
         </tr>)}</tbody>
       </table>
     </div>
+    <p className="muted" style={{ fontSize: "0.78rem" }}>LAST SESSION = previous regular session; RECENT = within 30 minutes; SCAN OVERDUE = no recent decision after 10:00 New York time. Dashes mean older decisions lack the new memory audit. Click a reason for the full evidence.</p>
   </Card>;
 }
 
