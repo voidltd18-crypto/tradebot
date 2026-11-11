@@ -39,19 +39,25 @@ function EntryGateDiagnostics({ authToken }: { authToken: string }) {
     ["expectancy_gate", "v17_cold_start_gate", "final_gate"].includes(String(row.stage || "")) ||
     Number(row.historical_samples || 0) > 0;
   const stale = (row: any) => !row.timestamp || Date.now() - new Date(row.timestamp).getTime() > 30 * 60 * 1000;
+  const memoryAudit = (row: any) => {
+    try { const payload = JSON.parse(String(row.payload_json || "{}")); return payload?.confidenceMemoryAudit || null; }
+    catch { return null; }
+  };
   const numeric = (value: unknown, digits: number) => value == null || value === "" ? "—" : Number(value).toFixed(digits);
   return <Card title="Why No Buy? · Entry Gate Diagnostics" wide className="decision-card">
-    <p className="muted">Latest recorded decision per approved stock. STALE means older than 30 minutes. Historical metrics marked Not evaluated / — were not assessed at the rejection gate; they are not zero-performance evidence. Read-only; not a live order recommendation.</p>
+    <p className="muted">Latest recorded decision per approved stock. STALE means older than 30 minutes. Historical metrics marked Not evaluated / — were not assessed at the rejection gate; they are not zero-performance evidence. Raw conf. is confidence before stock-memory adjustment; Memory × is the applied multiplier. — means this evidence was not captured for an older decision. Read-only; not a live order recommendation.</p>
     {error && <p className="muted">{error}</p>}
     {updated && <p className="muted">Checked: {new Date(updated).toLocaleTimeString("en-GB")} · Decisions recorded by the trading engine</p>}
     <div style={{ overflowX: "auto" }}>
       <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left", fontSize: "0.85rem" }}>
-        <thead><tr>{["Stock", "Decision", "Gate", "Confidence", "Quality", "Samples", "Win rate", "Profit factor", "Reason", "Recorded"].map(label => <th key={label} style={{ padding: "8px", borderBottom: "1px solid #64748b" }}>{label}</th>)}</tr></thead>
+        <thead><tr>{["Stock", "Decision", "Gate", "Confidence", "Raw conf.", "Memory ×", "Quality", "Samples", "Win rate", "Profit factor", "Reason", "Recorded"].map(label => <th key={label} style={{ padding: "8px", borderBottom: "1px solid #64748b" }}>{label}</th>)}</tr></thead>
         <tbody>{rows.map(row => <tr key={row.symbol}>
           <td style={{ padding: "8px" }}><b>{row.symbol}</b></td>
           <td style={{ padding: "8px" }}>{row.decision ? `${row.decision}${stale(row) ? " · STALE" : ""}` : "No record"}</td>
           <td style={{ padding: "8px" }}>{row.stage || "—"}</td>
           <td style={{ padding: "8px" }}>{numeric(row.confidence, 2)}</td>
+          <td style={{ padding: "8px" }}>{numeric(memoryAudit(row)?.rawConfidence, 2)}</td>
+          <td style={{ padding: "8px" }}>{memoryAudit(row)?.multiplier == null ? "—" : `${Number(memoryAudit(row).multiplier).toFixed(2)}×`}</td>
           <td style={{ padding: "8px" }}>{numeric(row.quality, 4)}</td>
           <td style={{ padding: "8px" }}>{hasExpectancyEvidence(row) ? (row.historical_samples ?? "—") : "Not evaluated"}</td>
           <td style={{ padding: "8px" }}>{!hasExpectancyEvidence(row) || row.historical_win_rate == null ? "—" : `${(Number(row.historical_win_rate) * 100).toFixed(0)}%`}</td>
