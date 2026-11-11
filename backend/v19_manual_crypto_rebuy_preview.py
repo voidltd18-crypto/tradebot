@@ -28,7 +28,8 @@ def preview(client, data_client, symbol):
         pending = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
         pair = sym[:-3] + "/USD"
         quotes = data_client.get_crypto_latest_quote(CryptoLatestQuoteRequest(symbol_or_symbols=pair))
-        quote = quotes.get(pair) if isinstance(quotes, dict) else None
+        quote_data = quotes if isinstance(quotes, dict) else getattr(quotes, "data", {})
+        quote = quote_data.get(pair) if isinstance(quote_data, dict) else None
         stamp = getattr(quote, "timestamp", None)
         now = datetime.now(timezone.utc)
         fresh = (isinstance(stamp, datetime) and stamp.tzinfo is not None
@@ -52,7 +53,7 @@ def preview(client, data_client, symbol):
             grouped = []
             for start, group in sorted(buckets.items()):
                 group.sort(key=lambda x: x.timestamp)
-                if len(group) == 5 and all(group[i].timestamp.astimezone(timezone.utc) == start + __import__("datetime").timedelta(minutes=i) for i in range(5)):
+                if len(group) == 5 and all(group[i].timestamp.astimezone(timezone.utc) == start + timedelta(minutes=i) for i in range(5)):
                     grouped.append(SimpleNamespace(timestamp=start, close=group[-1].close,
                         low=min(x.low for x in group), high=max(x.high for x in group)))
             recovery = confirmed_recovery(grouped, now=now)
