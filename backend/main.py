@@ -126,3 +126,103 @@ def probe_two_stock_assets():
             ),
             flush=True,
         )
+
+
+# Authenticated, read-only stock momentum replay. Requires caller-provided
+# timestamped observations; does not fetch quotes or submit trade orders.
+from fastapi import HTTPException
+from backend.stock_momentum_replay import replay_stock_exits
+
+
+@app.post("/v19/stock-momentum-replay")
+def stock_momentum_replay_endpoint(request: Request, payload: dict = Body(...)):
+    _legacy.verify_api_key(request)
+    try:
+        return replay_stock_exits(
+            payload.get("entryPrice"),
+            payload.get("observations"),
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# Identical caller-provided data compared with conservative, hypothetical
+# next-tick fill prices. No Alpaca calls, no account mutation or order creation.
+from backend.stock_momentum_cost_model import compare_costed_exits, CostAssumptions
+
+
+@app.post("/v19/stock-momentum-cost-preview")
+def stock_momentum_cost_preview(request: Request, payload: dict = Body(...)):
+    _legacy.verify_api_key(request)
+    try:
+        costs = payload.get("costAssumptions") or {}
+        if not isinstance(costs, dict):
+            raise ValueError("costAssumptions must be an object")
+        return compare_costed_exits(
+            payload.get("entryPrice"),
+            payload.get("observations"),
+            assumptions=CostAssumptions(**costs),
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+# PAPER-ONLY, READ-ONLY stock sell recovery inspection. Disabled by default.
+# This never alters the live stock order path and cannot submit a sell.
+def _stock_sell_recovery_paper_audit_enabled():
+    import os
+    return os.getenv("TRADEBOT_STOCK_SELL_RECOVERY_PAPER_AUDIT_ENABLED", "").strip().lower() == "true"
+
+
+def _stock_sell_recovery_paper_audit():
+    import os
+    from pathlib import Path
+    from backend.stock_sell_alpaca_paper_adapter import make_paper_broker
+    from backend.stock_sell_startup_audit import audit_stock_sell_recovery
+
+    if _legacy.PAPER is not True:
+        raise RuntimeError("stock sell recovery audit requires TradeBot PAPER mode")
+    path = Path(_legacy.SQLITE_DB_FILE).resolve(strict=True)
+    mount = Path("/var/data").resolve(strict=True)
+    if not path.is_file() or mount not in path.parents:
+        raise RuntimeError("stock sell recovery audit requires verified mounted SQLite file")
+    broker = make_paper_broker(
+        os.getenv("PAPER_ALPACA_API_KEY", ""),
+        os.getenv("PAPER_ALPACA_SECRET_KEY", ""),
+    )
+    return audit_stock_sell_recovery(path, broker=broker)
+
+
+@app.on_event("startup")
+def audit_pending_stock_sells_on_paper_startup():
+    if not _stock_sell_recovery_paper_audit_enabled():
+        return
+    try:
+        result = _stock_sell_recovery_paper_audit()
+        print(
+            "STOCK SELL RECOVERY PAPER AUDIT | "
+            f"unresolved={len(result['rows'])} readOnly=True ordersSubmitted=0",
+            flush=True,
+        )
+    except Exception as exc:
+        # Report the safety blocker without impacting the legacy live worker.
+        print(
+            "STOCK SELL RECOVERY PAPER AUDIT BLOCKED | "
+            f"reason={type(exc).__name__} readOnly=True ordersSubmitted=0",
+            flush=True,
+        )
+
+
+@app.get("/v19/stock-sell-recovery-paper-audit")
+def stock_sell_recovery_paper_audit_endpoint(request: Request):
+    _legacy.verify_api_key(request)
+    if not _stock_sell_recovery_paper_audit_enabled():
+        return {"readOnly": True, "ordersSubmitted": 0,
+                "enabled": False, "rows": []}
+    try:
+        return _stock_sell_recovery_paper_audit()
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Paper-only recovery audit unavailable or preflight not verified",
+        )

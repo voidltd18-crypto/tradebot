@@ -1,0 +1,19 @@
+name: DB storage and writer read-only audit
+on:
+  pull_request:
+    paths:
+      - 'scripts/audit_db_storage_source.py'
+      - '.github/workflows/db-storage-source-audit.yml'
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Inspect legacy SQLite paths without starting worker
+        run: python scripts/audit_db_storage_source.py

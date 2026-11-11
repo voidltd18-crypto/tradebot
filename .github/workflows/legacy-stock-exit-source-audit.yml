@@ -1,0 +1,19 @@
+name: Legacy stock exit source audit
+on:
+  pull_request:
+    paths:
+      - 'scripts/audit_live_stock_exit_source.py'
+      - '.github/workflows/legacy-stock-exit-source-audit.yml'
+permissions:
+  contents: read
+jobs:
+  source-inspection:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Read stock exit functions from legacy monolith (no broker)
+        run: python -m scripts.audit_live_stock_exit_source
