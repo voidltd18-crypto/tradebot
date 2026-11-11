@@ -13,6 +13,8 @@ __all__ = ["app"]
 
 # Read-only Telegram crypto alerts run only with explicit environment opt-in.
 from backend.legacy import monolith as _legacy
+from backend.v19_stock_crypto_capacity import install_stock_crypto_capacity
+install_stock_crypto_capacity(_legacy)
 from backend.v19_crypto_telegram_monitor import install_crypto_telegram_worker
 install_crypto_telegram_worker(app, _legacy.trading_client, _legacy.state, _legacy.SQLITE_DB_FILE)
 
