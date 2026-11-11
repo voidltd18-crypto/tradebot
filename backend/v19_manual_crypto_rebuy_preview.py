@@ -3,7 +3,7 @@ from datetime import datetime, timezone, timedelta
 from backend.v19_manual_crypto_rebuy_signal import assess_manual_rebuy
 from backend.v19_manual_crypto_recovery import confirmed_recovery
 
-def preview(client, data_client, symbol):
+def preview(client, data_client, symbol, *, broker_snapshot=None):
     sym = str(symbol or "").upper().replace("/", "")
     blocked = {"status": "WAIT", "readOnly": True, "orderSubmitted": False}
     if not (sym.endswith("USD") and sym[:-3].isalpha() and 2 <= len(sym[:-3]) <= 10):
@@ -13,7 +13,8 @@ def preview(client, data_client, symbol):
         from alpaca.trading.enums import QueryOrderStatus
         from alpaca.data.requests import CryptoLatestQuoteRequest, CryptoBarsRequest
         from alpaca.data.timeframe import TimeFrame
-        orders = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500))
+        orders = (broker_snapshot["closed_orders"] if broker_snapshot is not None else
+                  client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500)))
         def matching(o):
             return (str(getattr(o, "symbol", "")).upper().replace("/", "") == sym
                     and str(getattr(o, "side", "")).lower().split(".")[-1] == "sell"
@@ -24,8 +25,9 @@ def preview(client, data_client, symbol):
         if not sales:
             return {**blocked, "reason": "No broker-confirmed filled sell found"}
         latest = max(sales, key=lambda o: o.filled_at)
-        positions = client.get_all_positions()
-        pending = client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500))
+        positions = (broker_snapshot["positions"] if broker_snapshot is not None else client.get_all_positions())
+        pending = (broker_snapshot["open_orders"] if broker_snapshot is not None else
+                   client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=500)))
         pair = sym[:-3] + "/USD"
         quotes = data_client.get_crypto_latest_quote(CryptoLatestQuoteRequest(symbol_or_symbols=pair))
         quote_data = quotes if isinstance(quotes, dict) else getattr(quotes, "data", {})
