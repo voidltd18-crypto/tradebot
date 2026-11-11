@@ -16,3 +16,5 @@ jobs:
         with:
           python-version: '3.11'
       - run: python scripts/audit_current_stock_sell_lifecycle.py
+      - run: python -m pip install pytest
+      - run: python -m pytest -q tests/test_current_stock_sell_untracked_alert.py
