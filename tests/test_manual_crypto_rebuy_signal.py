@@ -25,3 +25,16 @@ def test_missing_broker_verification_blocks():
 
 def test_existing_position_blocks():
     assert check(current_ask="6.00", recovery_confirmed=True, position_open=True)["status"] == "WAIT"
+
+
+def test_position_and_order_reasons_are_distinct():
+    position = check(current_ask="6.00", position_open=True)
+    pending = check(current_ask="6.00", order_pending=True)
+    both = check(current_ask="6.00", position_open=True, order_pending=True)
+    assert position["reason"] == "Existing position"
+    assert position["positionOpen"] and not position["orderPending"]
+    assert pending["reason"] == "Open order pending"
+    assert pending["orderPending"] and not pending["positionOpen"]
+    assert both["reason"] == "Existing position and open order"
+    assert both["positionOpen"] and both["orderPending"]
+    assert all(r["status"] == "WAIT" and r["readOnly"] and not r["orderSubmitted"] for r in (position, pending, both))
