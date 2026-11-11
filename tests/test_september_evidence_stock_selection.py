@@ -32,13 +32,14 @@ def setup(rows, enabled=True):
         "closed_trades_from_db": lambda count: rows,
         "time": type("Clock", (), {"monotonic": staticmethod(lambda: 1000.0)}),
         "math": math,
+        "TECH_GIANT_STOCK_ALLOWED": frozenset(("AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "AVGO", "ORCL", "AMD", "TSLA")),
     }
     qualify = isolate("september_qualified_stock_symbols", ns)
     allowed = isolate("two_stock_buy_allowed", ns)
     return qualify, allowed, cache
 
 
-def test_only_net_positive_september_stock_winners_qualify():
+def test_archived_september_qualifier_is_independent_of_current_tech_allowlist():
     rows = [
         closed("MARA", "2026-09-03", 5),
         closed("MARA", "2026-09-04", -1),
@@ -51,25 +52,25 @@ def test_only_net_positive_september_stock_winners_qualify():
     ]
     qualify, allowed, cache = setup(rows)
     assert qualify() == ["MARA"]
-    assert allowed("MARA")
-    assert not allowed("NVDA")
-    assert not allowed("TSLA")
+    assert not allowed("MARA")
+    assert allowed("NVDA")
+    assert allowed("TSLA")
     assert not allowed("SPCX")
     assert not allowed("BTCUSD")
     assert cache["evidence"][0][1]["pnlGbp"] == 4
 
 
-def test_no_verified_september_history_means_no_stock_buys():
+def test_no_september_history_does_not_disable_current_tech_allowlist():
     qualify, allowed, _ = setup([])
     assert qualify() == []
-    assert not allowed("TSLA")
+    assert allowed("TSLA")
     assert not allowed("MARA")
 
 
-def test_reverting_flag_restores_exact_tsla_spcx_only_mode():
+def test_legacy_flag_does_not_override_current_tech_allowlist():
     _, allowed, _ = setup([], enabled=False)
-    assert allowed("TSLA") and allowed("SPCX")
-    assert not allowed("MARA") and not allowed("NVDA")
+    assert allowed("TSLA") and allowed("NVDA")
+    assert not allowed("MARA") and not allowed("SPCX")
 
 
 def test_pause_daily_lock_cap_and_execution_gates_remain_in_source():
