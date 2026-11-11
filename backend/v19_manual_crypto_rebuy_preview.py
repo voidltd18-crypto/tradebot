@@ -1,5 +1,5 @@
 """Broker-backed read-only manual rebuy preview; no order submission."""
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from backend.v19_manual_crypto_rebuy_signal import assess_manual_rebuy
 from backend.v19_manual_crypto_recovery import confirmed_recovery
 
@@ -33,8 +33,30 @@ def preview(client, data_client, symbol):
         now = datetime.now(timezone.utc)
         fresh = (isinstance(stamp, datetime) and stamp.tzinfo is not None
                  and 0 <= (now - stamp).total_seconds() <= 30)
-        bars_result = data_client.get_crypto_bars(CryptoBarsRequest(\n            symbol_or_symbols=pair, timeframe=TimeFrame.Minute,\n            start=now.replace(second=0, microsecond=0) - __import__("datetime").timedelta(minutes=45),\n            end=now,\n        ))\n        # Aggregate only complete, consecutive 5-minute buckets.\n        recovery = False\n        bar_data = bars_result if isinstance(bars_result, dict) else getattr(bars_result, 'data', {})
-        raw_bars = bar_data.get(pair, []) if isinstance(bar_data, dict) else []\n        if raw_bars:\n            from types import SimpleNamespace\n            buckets = {}\n            for bar in raw_bars:\n                t = bar.timestamp.astimezone(timezone.utc)\n                start = t.replace(minute=t.minute - t.minute % 5, second=0, microsecond=0)\n                buckets.setdefault(start, []).append(bar)\n            grouped = []\n            for start, group in sorted(buckets.items()):\n                group.sort(key=lambda x: x.timestamp)\n                if len(group) == 5 and all(group[i].timestamp.astimezone(timezone.utc) == start + __import__("datetime").timedelta(minutes=i) for i in range(5)):\n                    grouped.append(SimpleNamespace(timestamp=start, close=group[-1].close,\n                        low=min(x.low for x in group), high=max(x.high for x in group)))\n            recovery = confirmed_recovery(grouped, now=now)\n        return {**assess_manual_rebuy(
+        bars_result = data_client.get_crypto_bars(CryptoBarsRequest(
+            symbol_or_symbols=pair, timeframe=TimeFrame.Minute,
+            start=now.replace(second=0, microsecond=0) - timedelta(minutes=45),
+            end=now,
+        ))
+        # Aggregate only complete, consecutive 5-minute buckets.
+        recovery = False
+        bar_data = bars_result if isinstance(bars_result, dict) else getattr(bars_result, 'data', {})
+        raw_bars = bar_data.get(pair, []) if isinstance(bar_data, dict) else []
+        if raw_bars:
+            from types import SimpleNamespace
+            buckets = {}
+            for bar in raw_bars:
+                t = bar.timestamp.astimezone(timezone.utc)
+                start = t.replace(minute=t.minute - t.minute % 5, second=0, microsecond=0)
+                buckets.setdefault(start, []).append(bar)
+            grouped = []
+            for start, group in sorted(buckets.items()):
+                group.sort(key=lambda x: x.timestamp)
+                if len(group) == 5 and all(group[i].timestamp.astimezone(timezone.utc) == start + __import__("datetime").timedelta(minutes=i) for i in range(5)):
+                    grouped.append(SimpleNamespace(timestamp=start, close=group[-1].close,
+                        low=min(x.low for x in group), high=max(x.high for x in group)))
+            recovery = confirmed_recovery(grouped, now=now)
+        return {**assess_manual_rebuy(
             last_filled_sell_price=latest.filled_avg_price,
             current_ask=getattr(quote, "ask_price", None),
             sell_verified=True, quote_fresh=fresh,
