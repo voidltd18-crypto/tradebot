@@ -2279,6 +2279,20 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     )
     if not register_pending_sell_order(order_id, symbol, rounded_qty, reason, order_status):
         print(f"SELL ACCOUNTING WARNING | symbol={symbol} order_id={order_id} pending_order_not_persisted")
+        # A broker ACK may already represent a live order. Do not retry here,
+        # and do not report a fill; urgently surface the missing accounting
+        # record so broker order status can be checked independently.
+        try:
+            notify(
+                f"⚠️ SELL ACCOUNTING UNTRACKED: {symbol} | broker order={order_id or 'UNKNOWN'} "
+                "accepted/submitted but pending record could not be saved. "
+                "Check Alpaca order status; do NOT retry automatically."
+            )
+        except Exception as alert_exc:
+            print(
+                f"SELL ACCOUNTING ALERT FAILED | symbol={symbol} "
+                f"order_id={order_id} error={type(alert_exc).__name__}"
+            )
     pnl = (price - entry) * rounded_qty if entry > 0 and price > 0 else 0.0
     pnl_pct = ((price / entry) - 1.0) * 100.0 if entry > 0 and price > 0 else 0.0
     event = {
