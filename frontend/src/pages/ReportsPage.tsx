@@ -110,6 +110,8 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
   const [rebuySymbol, setRebuySymbol] = useState("");
   const [rebuyRequestId, setRebuyRequestId] = useState("");
   const [rebuyAmount, setRebuyAmount] = useState("25");
+  const [rebuyPotChoice, setRebuyPotChoice] = useState<"FULL" | "HALF" | null>(null);
+  const [rebuySignalWarning, setRebuySignalWarning] = useState("");
   const [rebuyAvailable, setRebuyAvailable] = useState<number | null>(null);
   const [rebuyCashLoading, setRebuyCashLoading] = useState(false);
   const [rebuyCashError, setRebuyCashError] = useState("");
@@ -128,10 +130,25 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
         throw new Error(String(payload?.message || "Available cash could not be verified"));
       }
       setRebuyAvailable(amount);
-      setRebuyAmount(amount.toFixed(2));
+      setRebuyAmount(rebuyPotChoice === "HALF" ? (Math.floor(amount * 50) / 100).toFixed(2) : (Math.floor(amount * 100) / 100).toFixed(2));
     } catch (error: any) {
       setRebuyCashError(String(error?.message || "Available cash could not be verified"));
     } finally { setRebuyCashLoading(false); }
+  }
+  function openSmartRebuyBuy(row: AnyObj) {
+    const symbol = String(row?.symbol || "").toUpperCase();
+    if (!cryptoPair(symbol) || rebuyPending) return;
+    setRebuySymbol(symbol);
+    setRebuyRequestId(crypto.randomUUID());
+    setRebuyPotChoice(null);
+    setRebuyAvailable(null);
+    setRebuyAmount("");
+    setRebuyConfirmation("");
+    setRebuyMessage("");
+    setRebuySignalWarning(row.status === "BUY_CANDIDATE"
+      ? "Green signal is informational, not a guarantee. Broker conditions may have changed."
+      : "AMBER WATCH: Recovery is NOT verified. Buying now is outside the green rebuy signal.");
+    void fetchRebuyCash();
   }
   const [rebuyConfirmation, setRebuyConfirmation] = useState("");
   const [rebuyPending, setRebuyPending] = useState(false);
@@ -345,10 +362,12 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
           {bulkError && <p role="status" style={{color:"#fbbf24"}}>{bulkError}</p>}
           {!bulkLoading && !bulkError && highlightedRebuyCoins.length===0 && <p style={{color:"#94a3b8"}}>No verified WATCH or BUY candidates right now. All other coins are hidden.</p>}
           <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
-            {highlightedRebuyCoins.map(row => <button key={row.symbol} type="button" onClick={()=>{setSignalSymbol(normaliseCryptoPair(row.symbol));setSignal(row);}}
-              style={{padding:"10px 14px",borderRadius:9,border:"1px solid #475569",background:"#0f172a",color:"#f8fafc",cursor:"pointer"}}>
-              <span style={{color:row.status==="BUY_CANDIDATE"?"#22c55e":"#f59e0b"}}>●</span> {row.symbol} · {row.status==="BUY_CANDIDATE"?"BUY candidate":"WATCH"}{row.dipPct!=null?` · ${row.dipPct}% dip`:""}
-            </button>)}
+            {highlightedRebuyCoins.map(row => <div key={row.symbol} style={{display:"flex",alignItems:"center",gap:6,padding:"4px 5px 4px 10px",borderRadius:9,border:"1px solid #475569",background:"#0f172a"}}>
+              <button type="button" onClick={()=>{setSignalSymbol(normaliseCryptoPair(row.symbol));setSignal(row);}} style={{padding:"6px 2px",border:0,background:"transparent",color:"#f8fafc",cursor:"pointer"}}>
+                <span style={{color:row.status==="BUY_CANDIDATE"?"#22c55e":"#f59e0b"}}>●</span> {row.symbol} · {row.status==="BUY_CANDIDATE"?"BUY candidate":"WATCH"}{row.dipPct!=null?` · ${row.dipPct}% dip`:""}
+              </button>
+              <button type="button" className="table-action" onClick={()=>openSmartRebuyBuy(row)}>Buy</button>
+            </div>)}
           </div>
         </div>
         {showAllRebuyCoins && <div style={{marginTop:14,padding:12,borderRadius:10,background:"#0f172a"}}>
@@ -419,14 +438,20 @@ export function ReportsPage({ reports, data, rate, closedTrades, chartCurrency, 
       </div>
       {momentFilter && <div className="moment-filter-banner"><b>Chart selection:</b> {momentFilter.label}<button className="ghost" onClick={()=>setMomentFilter(null)}>Show all dates</button></div>}
       <div className="filter-summary"><b>{filteredClosedTrades.length}</b> {assetFilter === "CRYPTO" ? "crypto" : assetFilter === "STOCKS" ? "stock" : ""} matching rows <span>•</span> PnL <strong className={tone(filteredPnl)}>{gbp(filteredPnl * rate)}</strong> <span>•</span> Winning rows {filteredWins}</div>
-      <div className="table-wrap"><table className="compact-table"><thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th><th>Replay</th><th>Rebuy</th></tr></thead><tbody>{filteredClosedTrades.map((trade,index)=><tr key={`${trade.id||index}-${index}`}><td>{tradeDate(trade)}</td><td>{tradeTime(trade)}</td><td><b>{trade.symbol}</b></td><td>{usd(trade.entryPrice)}</td><td>{usd(trade.exitPrice)}</td><td>{Number(trade.qty||0).toFixed(4)}</td><td className={tone(trade.pnl)}>{gbp(trade.pnlGbp ?? Number(trade.pnl||0)*rate)} / {usd(trade.pnl)}</td><td className={tone(trade.pnl)}>{pct(trade.pnlPct)}</td><td><button className="table-action" disabled={!trade.id} onClick={()=>trade.id&&setReplay({mode:"closed",symbol:String(trade.symbol),tradeId:Number(trade.id)})}>View Chart</button></td><td>{cryptoPair(String(trade.symbol || "")) ? <button className="table-action" onClick={()=>{setRebuySymbol(String(trade.symbol).toUpperCase());setRebuyRequestId(crypto.randomUUID());setRebuyAvailable(null);setRebuyAmount("");void fetchRebuyCash();setRebuyConfirmation("");setRebuyMessage("");}}>Buy Again</button> : "—"}</td></tr>)}{!filteredClosedTrades.length&&<tr><td colSpan={10}>No trades match these filters.</td></tr>}</tbody></table></div>
+      <div className="table-wrap"><table className="compact-table"><thead><tr><th>Date</th><th>Time</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>Qty</th><th>PnL</th><th>%</th><th>Replay</th><th>Rebuy</th></tr></thead><tbody>{filteredClosedTrades.map((trade,index)=><tr key={`${trade.id||index}-${index}`}><td>{tradeDate(trade)}</td><td>{tradeTime(trade)}</td><td><b>{trade.symbol}</b></td><td>{usd(trade.entryPrice)}</td><td>{usd(trade.exitPrice)}</td><td>{Number(trade.qty||0).toFixed(4)}</td><td className={tone(trade.pnl)}>{gbp(trade.pnlGbp ?? Number(trade.pnl||0)*rate)} / {usd(trade.pnl)}</td><td className={tone(trade.pnl)}>{pct(trade.pnlPct)}</td><td><button className="table-action" disabled={!trade.id} onClick={()=>trade.id&&setReplay({mode:"closed",symbol:String(trade.symbol),tradeId:Number(trade.id)})}>View Chart</button></td><td>{cryptoPair(String(trade.symbol || "")) ? <button className="table-action" onClick={()=>{setRebuySymbol(String(trade.symbol).toUpperCase());setRebuyRequestId(crypto.randomUUID());setRebuyAvailable(null);setRebuyAmount("");void fetchRebuyCash();setRebuyConfirmation("");setRebuyMessage("");setRebuySignalWarning("");setRebuyPotChoice(null);}}>Buy Again</button> : "—"}</td></tr>)}{!filteredClosedTrades.length&&<tr><td colSpan={10}>No trades match these filters.</td></tr>}</tbody></table></div>
     </Card></div>
     {rebuySymbol && <div role="dialog" aria-modal="true" aria-label="Buy crypto again" className="report-rebuy-dialog" style={{position:"fixed",inset:0,zIndex:9000,background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
       <div style={{width:"min(450px,100%)",background:"#161b27",border:"1px solid #475569",borderRadius:12,padding:20,color:"#f8fafc"}}>
-        <h3>Buy Again — {rebuySymbol}</h3>
+        <h3>Buy Crypto — {rebuySymbol}</h3>
+        {rebuySignalWarning && <p role="alert" style={{color:"#fbbf24"}}>{rebuySignalWarning}</p>}
         <p>This requests a <strong>new Alpaca market buy</strong> at the current market price, not the historical sale price. It may use real money if the broker account is live and the feature is enabled.</p>
+        <div style={{display:"flex",gap:8,marginBottom:12}}>
+          <button type="button" disabled={rebuyAvailable===null || rebuyPending} onClick={()=>{setRebuyPotChoice("FULL");setRebuyAmount((Math.floor((rebuyAvailable||0)*100)/100).toFixed(2));}}>Full pot (100%)</button>
+          <button type="button" disabled={rebuyAvailable===null || rebuyPending} onClick={()=>{setRebuyPotChoice("HALF");setRebuyAmount((Math.floor((rebuyAvailable||0)*50)/100).toFixed(2));}}>Half pot (50%)</button>
+        </div>
+        <p style={{color:"#cbd5e1"}}>Pot = verified available Alpaca cash, not total portfolio value. Choose a pot size, then confirm the live market order.</p>
         <label style={{display:"block",marginBottom:12}}>Amount to spend (USD)
-          <input type="number" min="1" max={rebuyAvailable ?? undefined} step="0.01" value={rebuyAmount} disabled={rebuyCashLoading || rebuyAvailable === null} onChange={e=>setRebuyAmount(e.target.value)} style={{display:"block",width:"100%",marginTop:5}}/>
+          <input type="number" min="1" max={rebuyAvailable ?? undefined} step="0.01" value={rebuyAmount} disabled={rebuyCashLoading || rebuyAvailable === null} onChange={e=>{setRebuyPotChoice(null);setRebuyAmount(e.target.value);}} style={{display:"block",width:"100%",marginTop:5}}/>
         </label>
         <p role="status" style={{marginTop:-4}}>{rebuyCashLoading ? "Checking Alpaca cash…" : rebuyAvailable !== null ? `Available to buy: ${rebuyAvailable.toFixed(2)} USD` : (rebuyCashError || "No verified buying power available")}</p>
         <button className="ghost" disabled={rebuyCashLoading || rebuyPending} onClick={()=>{void fetchRebuyCash();}}>Refresh buying power</button>
