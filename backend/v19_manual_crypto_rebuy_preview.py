@@ -57,14 +57,18 @@ def preview(client, data_client, symbol):
                     grouped.append(SimpleNamespace(timestamp=start, close=group[-1].close,
                         low=min(x.low for x in group), high=max(x.high for x in group)))
             recovery = confirmed_recovery(grouped, now=now)
-        return {**assess_manual_rebuy(
+        result = assess_manual_rebuy(
             last_filled_sell_price=latest.filled_avg_price,
             current_ask=getattr(quote, "ask_price", None),
             sell_verified=True, quote_fresh=fresh,
             recovery_confirmed=recovery,
             position_open=any(str(getattr(p, "symbol", "")).upper().replace("/", "") == sym for p in positions),
             order_pending=any(str(getattr(o, "symbol", "")).upper().replace("/", "") == sym for o in pending),
-        ), "symbol": pair, "referenceSaleAt": latest.filled_at.isoformat(),
-            "recoveryVerified": recovery}
+        )
+        return {**result, "symbol": pair, "referenceSaleAt": latest.filled_at.isoformat(),
+                "recoveryVerified": recovery, "quoteFresh": fresh,
+                "quoteAgeSeconds": round((now - stamp).total_seconds(), 1) if isinstance(stamp, datetime) and stamp.tzinfo is not None else None,
+                "quoteTimestamp": stamp.isoformat() if isinstance(stamp, datetime) else None,
+                "quoteAvailable": quote is not None}
     except Exception:
         return {**blocked, "reason": "Broker data unavailable or unverified"}
