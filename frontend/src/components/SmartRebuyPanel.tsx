@@ -181,25 +181,25 @@ return <>
       </div>
     </Card>
 
-    {rebuySymbol && <div role="dialog" aria-modal="true" aria-label="Buy crypto again" className="report-rebuy-dialog" style={{position:"fixed",inset:0,zIndex:9000,background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
-      <div style={{width:"min(450px,100%)",background:"#161b27",border:"1px solid #475569",borderRadius:12,padding:20,color:"#f8fafc"}}>
+    {rebuySymbol && <div role="dialog" aria-modal="true" aria-label="Buy crypto again" className="report-rebuy-dialog" style={{position:"fixed",inset:0,zIndex:9000,background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center",padding:"max(8px, env(safe-area-inset-top)) 8px max(8px, env(safe-area-inset-bottom))",overflowY:"auto",boxSizing:"border-box"}}>
+      <div style={{width:"100%",maxWidth:450,maxHeight:"calc(100dvh - 24px)",minWidth:0,overflowY:"auto",overscrollBehavior:"contain",boxSizing:"border-box",background:"#161b27",border:"1px solid #475569",borderRadius:12,padding:"clamp(12px, 4vw, 20px)",color:"#f8fafc",fontSize:"clamp(14px, 3.8vw, 16px)",lineHeight:1.45}}>
         <h3>Buy Crypto — {rebuySymbol}</h3>
         {rebuySignalWarning && <p role="alert" style={{color:"#fbbf24"}}>{rebuySignalWarning}</p>}
         <p>This requests a <strong>new Alpaca market buy</strong> at the current market price, not the historical sale price. It may use real money if the broker account is live and the feature is enabled.</p>
-        <div style={{display:"flex",gap:8,marginBottom:12}}>
+        <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
           <button type="button" disabled={rebuyAvailable===null || rebuyPending} onClick={()=>{setRebuyPotChoice("FULL");setRebuyAmount((Math.floor((rebuyAvailable||0)*100)/100).toFixed(2));}}>Full pot (100%)</button>
           <button type="button" disabled={rebuyAvailable===null || rebuyPending} onClick={()=>{setRebuyPotChoice("HALF");setRebuyAmount((Math.floor((rebuyAvailable||0)*50)/100).toFixed(2));}}>Half pot (50%)</button>
         </div>
         <p style={{color:"#cbd5e1"}}>Pot = verified available Alpaca cash, not total portfolio value. Choose a pot size, then confirm the live market order.</p>
         <label style={{display:"block",marginBottom:12}}>Amount to spend (USD) — choose Full or Half pot
-          <input type="number" min="1" max={rebuyAvailable ?? undefined} step="0.01" value={rebuyAmount} disabled={rebuyCashLoading || rebuyAvailable === null} onChange={e=>{setRebuyPotChoice(null);setRebuyAmount(e.target.value);}} style={{display:"block",width:"100%",marginTop:5}}/>
+          <input type="number" min="1" max={rebuyAvailable ?? undefined} step="0.01" value={rebuyAmount} disabled={rebuyCashLoading || rebuyAvailable === null} onChange={e=>{setRebuyPotChoice(null);setRebuyAmount(e.target.value);}} style={{display:"block",width:"100%",maxWidth:"100%",boxSizing:"border-box",marginTop:5,fontSize:16}}/>
         </label>
         <p role="status" style={{marginTop:-4}}>{rebuyCashLoading ? "Checking Alpaca cash…" : rebuyAvailable !== null ? `Available to buy: ${rebuyAvailable.toFixed(2)} USD` : (rebuyCashError || "No verified buying power available")}</p>
         <button className="ghost" disabled={rebuyCashLoading || rebuyPending} onClick={()=>{void fetchRebuyCash();}}>Refresh buying power</button>
         <p style={{color:"#fbbf24"}}>Review your coin and amount before pressing Confirm Buy. This button places a real-money market order when live trading is enabled.</p>
         <p>The available amount comes from Alpaca cash and non-marginable buying power, not your invested positions or vault. Alpaca rechecks cash when you confirm.</p>
         {rebuyMessage && <p role="status">{rebuyMessage}</p>}
-        <div style={{display:"flex",gap:8,justifyContent:"flex-end"}}>
+        <div style={{display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap",position:"sticky",bottom:0,background:"#161b27",padding:"10px 0"}}>
           <button className="ghost" disabled={rebuyPending} onClick={()=>{setRebuySymbol("");setRebuyRequestId("");setRebuyMessage("");}}>Close</button>
           <button disabled={rebuyPending || rebuyCashLoading || rebuyAvailable === null || !rebuyPotChoice || !(Number(rebuyAmount)>=1 && Number(rebuyAmount)<=rebuyAvailable)} onClick={submitRebuy}>{rebuyPending?"Submitting…":"Confirm Buy"}</button>
         </div>
