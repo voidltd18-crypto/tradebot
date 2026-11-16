@@ -38,7 +38,9 @@ export function useTradeBot(activeTab: Tab = "overview") {
   const lastFetchAt = useRef(0);
   const reportsInFlight = useRef(false);
   const reportsLastFetchAt = useRef(0);
-  const POLL_MS = 10000;
+  const POLL_MS = 3000;
+  const BANKING_REFRESH_MS = 15000;
+  const lastBankingFetchAt = useRef(0);
   const REPORTS_REFRESH_MS = 15000;
   const token = authToken;
   const secureHeaders = token ? { "X-Auth-Token": token, "x-api-key": token } : {};
@@ -132,9 +134,11 @@ export function useTradeBot(activeTab: Tab = "overview") {
     // V18.2.8: hydrate independently. Previously Promise.allSettled meant a fast
     // /banking-status response was held hostage by a slow /status request for up
     // to 30 seconds. Each panel now paints as soon as its own endpoint returns.
-    const bankingPromise = fetchJsonWithTimeout("/banking-status", 10000)
+    const shouldRefreshBanking = force || now - lastBankingFetchAt.current >= BANKING_REFRESH_MS;
+    if (shouldRefreshBanking) lastBankingFetchAt.current = now;
+    const bankingPromise = (shouldRefreshBanking ? fetchJsonWithTimeout("/banking-status", 10000) : Promise.resolve(null))
       .then((value) => {
-        if (seq !== fetchSeq.current || value?.ok === false) return;
+        if (!value || seq !== fetchSeq.current || value?.ok === false) return;
         setBanking(value || {});
         liveConnected = true;
         setStatus("Connected");
