@@ -13,6 +13,43 @@ export function SmartRebuyPanel({authToken}:{authToken:string}) {
   const [bulkError, setBulkError] = useState("");
   const [bulkScannedAt, setBulkScannedAt] = useState("");
   const bulkBusyRef = useRef(false);
+  // Sound is opt-in: mobile browsers require a user gesture to enable audio.
+  const [soundEnabled, setSoundEnabled] = useState(false);
+  const audioRef = useRef<AudioContext | null>(null);
+  const lastGreenRef = useRef<Set<string> | null>(null);
+  const soundEnabledRef = useRef(false);
+  const playGreenAlert = () => {
+    const ctx = audioRef.current;
+    if (!ctx || ctx.state !== "running") return;
+    const start = ctx.currentTime;
+    [0, 0.17].forEach((offset, i) => {
+      const oscillator = ctx.createOscillator();
+      const gain = ctx.createGain();
+      oscillator.type = "sine";
+      oscillator.frequency.value = i ? 880 : 660;
+      gain.gain.setValueAtTime(0.0001, start + offset);
+      gain.gain.exponentialRampToValueAtTime(0.13, start + offset + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + offset + 0.15);
+      oscillator.connect(gain); gain.connect(ctx.destination);
+      oscillator.start(start + offset); oscillator.stop(start + offset + 0.16);
+    });
+  };
+  const enableSound = async () => {
+    if (soundEnabledRef.current) {
+      soundEnabledRef.current = false; setSoundEnabled(false);
+      return;
+    }
+    try {
+      const ctx = audioRef.current || new AudioContext();
+      audioRef.current = ctx;
+      await ctx.resume();
+      if (ctx.state !== "running") return;
+      soundEnabledRef.current = true; setSoundEnabled(true);
+      playGreenAlert(); // confirmation that sound was enabled
+    } catch { soundEnabledRef.current = false; setSoundEnabled(false); }
+  };
+  useEffect(() => () => { soundEnabledRef.current = false; void audioRef.current?.close(); }, []);
+
   useEffect(() => {
     if (!authToken) return;
     let active = true;
@@ -27,7 +64,13 @@ export function SmartRebuyPanel({authToken}:{authToken:string}) {
         if (!response.ok) throw new Error("Automatic broker scan unavailable");
         const payload = await readJson(response);
         if (!Array.isArray(payload?.rows) || payload.rows.length !== SMART_REBUY_PAIRS.length) throw new Error("Incomplete scan");
-        if (active) {setBulkSignals(payload.rows);setBulkScannedAt(String(payload.scannedAt||""));setBulkError("");}
+        if (active) {
+          const greenNow = new Set<string>(payload.rows.filter((row: AnyObj) => row?.status === "BUY_CANDIDATE" && row?.readOnly === true && row?.orderSubmitted === false).map((row: AnyObj) => normaliseCryptoPair(row.symbol)));
+          const previous = lastGreenRef.current;
+          if (previous !== null && soundEnabledRef.current && [...greenNow].some(symbol => !previous.has(symbol))) playGreenAlert();
+          lastGreenRef.current = greenNow;
+          setBulkSignals(payload.rows);setBulkScannedAt(String(payload.scannedAt||""));setBulkError("");
+        }
       } catch {
         if (active) setBulkError("Automatic scan unavailable — no unverified buy signals shown");
       } finally {
@@ -128,7 +171,7 @@ return <>
     <Card title="Smart Rebuy — Crypto Signals" wide>
       <div style={{padding:18,border:"1px solid #334155",borderRadius:14,background:"#1e293b"}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}>
-          <div><strong style={{fontSize:18}}>Smart Rebuy</strong><p style={{margin:"5px 0",color:"#cbd5e1"}}>Live Alpaca · Read-only · No automatic buys · Automatically scans 29 coins every 2 minutes · Manual decisions only</p></div>
+          <div><strong style={{fontSize:18}}>Smart Rebuy</strong><p style={{margin:"5px 0",color:"#cbd5e1"}}>Live Alpaca · Read-only · No automatic buys · Automatically scans 29 coins every 2 minutes · Manual decisions only</p><button type="button" className="ghost" aria-pressed={soundEnabled} onClick={()=>void enableSound()}>{soundEnabled ? "🔔 Green alerts ON" : "🔕 Enable green alert sound"}</button><small style={{display:"block",marginTop:5,color:"#cbd5e1"}}>Chimes when a coin turns green after the first scan. Keep this page open; iPhone may silence background tabs.</small></div>
           <div style={{display:"flex",alignItems:"center",gap:8}}>
             <select aria-label="Smart Rebuy pair" value={signalSymbol} onChange={e=>{setSignalSymbol(e.target.value);setSignal(null);}}>
               {!visibleRebuyCoins.includes(signalSymbol as typeof SMART_REBUY_PAIRS[number]) && <option value={signalSymbol}>{signalSymbol.replace(/USD$/, "/USD")} · Selected</option>}
