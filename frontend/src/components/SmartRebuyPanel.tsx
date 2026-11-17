@@ -165,7 +165,12 @@ export function SmartRebuyPanel({authToken}:{authToken:string}) {
   const highlightedRebuyCoins = useMemo(() => bulkSignals.filter(row =>
     row?.status === "BUY_CANDIDATE" && row?.readOnly === true && row?.orderSubmitted === false ||
     row?.status === "WATCH" && row?.readOnly === true && row?.orderSubmitted === false
-  ).sort((a,b) => (a.status === "BUY_CANDIDATE" ? 0 : 1) - (b.status === "BUY_CANDIDATE" ? 0 : 1)), [bulkSignals]);
+  ).sort((a,b) => {
+    const statusOrder = (row: AnyObj) => row.status === "BUY_CANDIDATE" ? 0 : 1;
+    if (statusOrder(a) !== statusOrder(b)) return statusOrder(a) - statusOrder(b);
+    const strength = (row: AnyObj) => row.status === "BUY_CANDIDATE" && typeof row.recoveryStrengthPct === "number" && Number.isFinite(row.recoveryStrengthPct) ? row.recoveryStrengthPct : -Infinity;
+    return strength(b) - strength(a);
+  }), [bulkSignals]);
   const relevantRebuyCoins = highlightedRebuyCoins.map(row => normaliseCryptoPair(row.symbol));
   const visibleRebuyCoins = showAllRebuyCoins ? SMART_REBUY_PAIRS : SMART_REBUY_PAIRS.filter(pair => relevantRebuyCoins.includes(pair));
 
@@ -187,10 +192,11 @@ return <>
           <p style={{color:"#cbd5e1",margin:"0 0 8px"}}>{bulkLoading ? "Scanning 29 coins…" : bulkScannedAt ? `Auto-scanned 29 coins · ${new Date(bulkScannedAt).toLocaleTimeString("en-GB")}` : "Awaiting first automatic scan"}</p>
           {bulkError && <p role="status" style={{color:"#fbbf24"}}>{bulkError}</p>}
           {!bulkLoading && !bulkError && highlightedRebuyCoins.length===0 && <p style={{color:"#94a3b8"}}>No verified WATCH or BUY candidates right now. All other coins are hidden.</p>}
+          <p style={{color:"#cbd5e1",fontSize:12,margin:"0 0 8px"}}>Green coins ranked by verified 15-minute recovery strength (highest first), not biggest dip. Missing strength stays unranked; momentum is not a guarantee.</p>
           <div style={{display:"flex",flexWrap:"wrap",gap:8}}>
-            {highlightedRebuyCoins.map(row => <div key={row.symbol} style={{display:"flex",alignItems:"center",gap:6,padding:"4px 5px 4px 10px",borderRadius:9,border:"1px solid #475569",background:"#0f172a"}}>
+            {highlightedRebuyCoins.map((row,index) => <div key={row.symbol} style={{display:"flex",alignItems:"center",gap:6,padding:"4px 5px 4px 10px",borderRadius:9,border:"1px solid #475569",background:"#0f172a"}}>
               <button type="button" onClick={()=>{setSignalSymbol(normaliseCryptoPair(row.symbol));setSignal(row);}} style={{padding:"6px 2px",border:0,background:"transparent",color:"#f8fafc",cursor:"pointer"}}>
-                <span style={{color:row.status==="BUY_CANDIDATE"?"#22c55e":"#f59e0b"}}>●</span> {row.symbol} · {row.status==="BUY_CANDIDATE"?"BUY candidate":"WATCH"}{row.dipPct!=null?` · ${row.dipPct}% dip`:""}
+                <span style={{color:row.status==="BUY_CANDIDATE"?"#22c55e":"#f59e0b"}}>●</span> {row.symbol} · {row.status==="BUY_CANDIDATE"?"BUY candidate":"WATCH"}{row.dipPct!=null?` · ${row.dipPct}% dip`:""}{row.status==="BUY_CANDIDATE" && typeof row.recoveryStrengthPct==="number" ? ` · #${highlightedRebuyCoins.slice(0,index+1).filter(r=>r.status==="BUY_CANDIDATE" && typeof r.recoveryStrengthPct==="number").length} recovery +${row.recoveryStrengthPct.toFixed(2)}%` : ""}
               </button>
               <button type="button" className="table-action" onClick={()=>openSmartRebuyBuy(row)}>Buy</button>
             </div>)}

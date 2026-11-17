@@ -43,6 +43,7 @@ def preview(client, data_client, symbol, *, broker_snapshot=None):
         ))
         # Aggregate only complete, consecutive 5-minute buckets.
         recovery = False
+        recovery_strength_pct = None
         bar_data = bars_result if isinstance(bars_result, dict) else getattr(bars_result, 'data', {})
         raw_bars = bar_data.get(pair, []) if isinstance(bar_data, dict) else []
         if raw_bars:
@@ -59,6 +60,15 @@ def preview(client, data_client, symbol, *, broker_snapshot=None):
                     grouped.append(SimpleNamespace(timestamp=start, close=group[-1].close,
                         low=min(x.low for x in group), high=max(x.high for x in group)))
             recovery = confirmed_recovery(grouped, now=now)
+            # Rank only verified green recoveries by actual rise across the
+            # latest three completed consecutive five-minute closes.
+            # This is momentum, NOT a predicted return or a buy recommendation.
+            if recovery:
+                completed = [b for b in grouped if 300 <= (now - b.timestamp).total_seconds() <= 1800]
+                last_three = completed[-3:]
+                if len(last_three) == 3 and float(last_three[0].close) > 0:
+                    recovery_strength_pct = round(
+                        (float(last_three[-1].close) / float(last_three[0].close) - 1) * 100, 3)
         result = assess_manual_rebuy(
             last_filled_sell_price=latest.filled_avg_price,
             current_ask=getattr(quote, "ask_price", None),
@@ -68,7 +78,7 @@ def preview(client, data_client, symbol, *, broker_snapshot=None):
             order_pending=any(str(getattr(o, "symbol", "")).upper().replace("/", "") == sym for o in pending),
         )
         return {**result, "symbol": pair, "referenceSaleAt": latest.filled_at.isoformat(),
-                "recoveryVerified": recovery, "quoteFresh": fresh,
+                "recoveryVerified": recovery, "recoveryStrengthPct": recovery_strength_pct if result.get("status") == "BUY_CANDIDATE" else None, "quoteFresh": fresh,
                 "quoteAgeSeconds": round((now - stamp).total_seconds(), 1) if isinstance(stamp, datetime) and stamp.tzinfo is not None else None,
                 "quoteTimestamp": stamp.isoformat() if isinstance(stamp, datetime) else None,
                 "quoteAvailable": quote is not None}
