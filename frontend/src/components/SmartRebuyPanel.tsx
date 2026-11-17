@@ -22,16 +22,18 @@ export function SmartRebuyPanel({authToken}:{authToken:string}) {
     const ctx = audioRef.current;
     if (!ctx || ctx.state !== "running") return;
     const start = ctx.currentTime;
-    [0, 0.17].forEach((offset, i) => {
+    // A louder, longer three-note chime with a soft attack to avoid clicks.
+    // Peak gain remains below unity; device volume is still controlled by iOS.
+    [0, 0.24, 0.48].forEach((offset, i) => {
       const oscillator = ctx.createOscillator();
       const gain = ctx.createGain();
-      oscillator.type = "sine";
-      oscillator.frequency.value = i ? 880 : 660;
+      oscillator.type = "triangle";
+      oscillator.frequency.value = [660, 880, 1046][i];
       gain.gain.setValueAtTime(0.0001, start + offset);
-      gain.gain.exponentialRampToValueAtTime(0.13, start + offset + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, start + offset + 0.15);
+      gain.gain.exponentialRampToValueAtTime(0.42, start + offset + 0.025);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + offset + 0.22);
       oscillator.connect(gain); gain.connect(ctx.destination);
-      oscillator.start(start + offset); oscillator.stop(start + offset + 0.16);
+      oscillator.start(start + offset); oscillator.stop(start + offset + 0.23);
     });
   };
   const enableSound = async () => {
