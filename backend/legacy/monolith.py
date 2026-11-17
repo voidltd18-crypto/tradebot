@@ -2222,6 +2222,14 @@ def _manual_sell_is_crypto(symbol: str) -> bool:
 
 
 def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 0.0, reason="AUTO SELL"):
+    # Defense in depth: no legacy automated crypto sells, even from a path
+    # outside manage_money_mode_positions. Explicit manual sells remain usable.
+    # A broker asset-class lookup failure must never permit an auto sell.
+    if not str(reason).upper().startswith("MANUAL"):
+        asset_class = str(getattr(trading_client.get_asset(symbol), "asset_class", "")).lower()
+        if "equity" not in asset_class or "crypto" in asset_class:
+            print(f"LEGACY AUTO SELL BLOCKED | symbol={symbol} reason={reason} asset_class={asset_class}")
+            return {"ok": False, "message": "Legacy automatic exits are stock-only"}
     # Broker-native close with no qty requests 100% of the *current* crypto
     # inventory. Manual/emergency close must never round down to six decimals
     # or silently retry with a smaller available quantity and claim Sell All.
@@ -4913,6 +4921,18 @@ def _v17_peak_exhaustion_decision(p: Dict[str, Any]) -> Dict[str, Any]:
 def manage_money_mode_positions():
     for p in get_all_positions():
         symbol = p["symbol"]
+
+        # Stock-only legacy exit manager. Crypto is managed by the separate
+        # profit-only crypto worker, regardless of US stock market hours.
+        # Fail closed if Alpaca cannot verify the asset class.
+        try:
+            asset_class = str(getattr(trading_client.get_asset(symbol), "asset_class", "")).lower()
+        except Exception as exc:
+            print(f"LEGACY EXIT SKIPPED | symbol={symbol} asset class unavailable: {exc}")
+            continue
+        if "crypto" in asset_class or "equity" not in asset_class:
+            print(f"LEGACY EXIT SKIPPED | symbol={symbol} asset_class={asset_class}")
+            continue
 
         if not MANAGE_OUTSIDE_UNIVERSE_POSITIONS and symbol not in current_universe:
             continue
