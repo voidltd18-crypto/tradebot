@@ -28,6 +28,12 @@ def evaluate():
         result = backtest(symbol, sample)
         baseline = (sample[-1].close / sample[200].open - 1) * 100
         result["buyHoldComparablePct"] = round(baseline, 2)
+        result["buyHold25PctAllocationPct"] = round(baseline * 0.25, 2)
+        closed = result["trades"]
+        result["winningTrades"] = sum(1 for trade in closed if trade["pnl"] > 0)
+        result["winRatePct"] = round(100 * result["winningTrades"] / len(closed), 2) if closed else None
+        result["worstClosedTradeUsd"] = min((trade["pnl"] for trade in closed), default=None)
+        result["outperformsMatchedAllocationBaseline"] = result["totalReturnPct"] > result["buyHold25PctAllocationPct"]
         result["dataStart"] = sample[0].day.isoformat()
         result["dataEnd"] = sample[-1].day.isoformat()
         results.append(result)
