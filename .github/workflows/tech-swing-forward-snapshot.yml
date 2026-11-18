@@ -1,0 +1,35 @@
+name: Tech swing forward research snapshot
+on:
+  pull_request:
+    paths:
+      - 'backend/v20_tech_swing_forward_snapshot.py'
+      - 'backend/v20_tech_swing_candidate_preview.py'
+      - 'tests/test_v20_tech_swing_forward_snapshot.py'
+      - '.github/workflows/tech-swing-forward-snapshot.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install yfinance pandas pytest
+      - run: python -m pytest -q tests/test_v20_tech_swing_forward_snapshot.py
+      - name: Restore previous research archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python -m backend.v20_tech_swing_restore_artifacts
+      - run: python -m backend.v20_tech_swing_forward_snapshot --output-dir swing-forward-snapshots
+      - run: python -m backend.v20_tech_swing_forward_report --snapshot-dir swing-forward-snapshots --output swing-forward-report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: swing-forward-candidate-snapshot
+          path: |
+            swing-forward-snapshots/
+            swing-forward-report.json
+          retention-days: 90
