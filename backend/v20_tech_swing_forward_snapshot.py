@@ -69,7 +69,13 @@ def main():
     # Artifacts can be retained and compared in future, but do not pretend
     # GitHub Actions artifacts alone constitute a persistent 60-session ledger.
     filename = folder / ("candidate-" + snapshot["lastCompletedCommonBar"] + ".json")
-    filename.write_text(json.dumps(snapshot, indent=2) + "\n", encoding="utf-8")
+    payload = json.dumps(snapshot, indent=2) + "\n"
+    if filename.exists():
+        existing = json.loads(filename.read_text(encoding="utf-8"))
+        if existing.get("preview") != snapshot["preview"]:
+            raise ValueError("Conflicting archived candidate snapshot for this trading day")
+    else:
+        filename.write_text(payload, encoding="utf-8")
     print(json.dumps({"snapshotPath": str(filename),
                       "lastCompletedCommonBar": snapshot["lastCompletedCommonBar"],
                       "topCandidate": snapshot["preview"]["topCandidate"],
