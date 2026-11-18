@@ -15,12 +15,18 @@ def broker_readiness(client, *, symbol, notional, signal_at, now=None,
         asset = client.get_asset(symbol)
         clock = client.get_clock()
         positions = list(client.get_all_positions())
-        # Alpaca's get_orders without a request may be unsupported in some SDKs;
-        # require a caller-supplied read-only fetch method for OPEN orders.
-        if not hasattr(client, "get_open_orders_for_preflight"):
-            raise ValueError("verified open-order query adapter missing")
-        open_orders = list(client.get_open_orders_for_preflight())
-        if any(str(getattr(order, "status", "")).lower() in {"filled", "canceled", "expired", "rejected"} for order in open_orders):
+        # Use Alpaca's explicit OPEN-order filter. Never interpret a default
+        # get_orders() response as proof there are no pending orders.
+        if hasattr(client, "get_open_orders_for_preflight"):
+            open_orders = list(client.get_open_orders_for_preflight())
+        else:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            open_orders = list(client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)))
+        closed = {"filled", "canceled", "cancelled", "expired", "rejected",
+                  "orderstatus.filled", "orderstatus.canceled",
+                  "orderstatus.expired", "orderstatus.rejected"}
+        if any(str(getattr(order, "status", "")).lower() in closed for order in open_orders):
             raise ValueError("open-order query returned non-open orders")
         result = inspect_candidate(symbol=symbol, account=account, asset=asset,
                                    clock=clock, positions=positions, open_orders=open_orders,
