@@ -23,7 +23,9 @@ def test_restore_previous_snapshot(monkeypatch, tmp_path):
         def read(self): return self.body
     def fake_urlopen(req,timeout):
         return Response(json.dumps(listing).encode() if "artifacts?" in req.full_url else archive.getvalue())
-    monkeypatch.setattr("backend.v20_tech_swing_restore_artifacts.urlopen",fake_urlopen)
+    class FakeOpener:
+        def open(self, req, timeout): return fake_urlopen(req, timeout)
+    monkeypatch.setattr("backend.v20_tech_swing_restore_artifacts.build_opener", lambda *args: FakeOpener())
     r=restore_latest("owner/repo","token",tmp_path,current_run_id=222)
     assert r["restored"]==1
     assert (tmp_path/"candidate-2026-11-17.json").exists()
