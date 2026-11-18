@@ -8,7 +8,8 @@ import io
 import json
 import os
 from pathlib import Path
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, build_opener, HTTPRedirectHandler
+from urllib.parse import urlsplit
 from zipfile import ZipFile
 
 ARTIFACT_NAME = "swing-forward-candidate-snapshot"
@@ -20,8 +21,16 @@ def restore_latest(repo, token, destination, *, current_run_id=None):
     base = f"https://api.github.com/repos/{repo}"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": "2022-11-28"}
+    class SafeRedirect(HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+            redirected = super().redirect_request(req, fp, code, msg, hdrs, newurl)
+            if redirected is not None and urlsplit(newurl).hostname != urlsplit(req.full_url).hostname:
+                redirected.remove_header("Authorization")
+            return redirected
+
+    opener = build_opener(SafeRedirect)
     def get(url):
-        with urlopen(Request(url, headers=headers), timeout=30) as response:
+        with opener.open(Request(url, headers=headers), timeout=30) as response:
             return response.read()
     artifacts = json.loads(get(f"{base}/actions/artifacts?per_page=100"))["artifacts"]
     candidates = [a for a in artifacts if a["name"] == ARTIFACT_NAME and not a["expired"]
