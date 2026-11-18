@@ -20,6 +20,7 @@ def portfolio_backtest(history, capital=10000., allocation=0.25, friction_bps=15
     cash, held, qty, entry_price, entry_i = float(capital), None, 0., 0., -1
     cooldown = {}
     trades, curve = [], []
+    selections = []
     friction = friction_bps / 10000
     for i, day in enumerate(dates):
         if i >= 201:
@@ -60,6 +61,7 @@ def portfolio_backtest(history, capital=10000., allocation=0.25, friction_bps=15
                     qty = spend / entry_price
                     cash -= spend
                     entry_i = i
+                    selections.append({'day': day.isoformat(), 'symbol': held, 'momentum60': round(max(eligible)[0], 6)})
         curve.append(cash + (qty * rows[held][i].close if held else 0))
     peak, drawdown = curve[0], 0.
     for value in curve:
@@ -69,6 +71,7 @@ def portfolio_backtest(history, capital=10000., allocation=0.25, friction_bps=15
             "totalReturnPct": round(100 * (curve[-1] / capital - 1), 2),
             "maxDrawdownPct": round(drawdown * 100, 2), "trades": trades,
             "closedTrades": len(trades), "openSymbolAtEnd": held,
+            "entrySelections": selections,
             "start": dates[0].isoformat(), "end": dates[-1].isoformat(),
             "assumptions": {"maxAllocationPct": allocation*100, "maxHoldSessions": 120,
                             "frictionBpsPerSide": friction_bps,
