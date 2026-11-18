@@ -8,11 +8,13 @@ import json
 from datetime import date
 from backend.v20_tech_swing_research import Bar, UNIVERSE, backtest
 from backend.v20_tech_swing_trend_hold import trend_hold
+from backend.v20_tech_swing_portfolio import portfolio_backtest
 
 
 def evaluate():
     import yfinance as yf
     results = []
+    portfolio_history = {}
     for symbol in sorted(UNIVERSE - {"GOOG"}):
         frame = yf.download(symbol, start="2019-01-01", end="2026-11-18",
                             auto_adjust=True, progress=False, threads=False)
@@ -26,6 +28,7 @@ def evaluate():
         # Out-of-sample window: first 200 bars of 2023 as warm-up;
         # all trades and equity changes reported only from 2024 onward.
         sample = [b for b in bars if date(2023, 1, 1) <= b.day <= date(2026, 11, 17)]
+        portfolio_history[symbol] = sample
         result = backtest(symbol, sample)
         alternative = trend_hold(symbol, sample)
         result['trendHoldAlternative'] = {key: alternative[key] for key in ('totalReturnPct', 'maxDrawdownPct', 'closedTrades', 'openPositionAtEnd', 'assumptions')}
@@ -41,7 +44,8 @@ def evaluate():
         result["dataStart"] = sample[0].day.isoformat()
         result["dataEnd"] = sample[-1].day.isoformat()
         results.append(result)
-    print(json.dumps({"researchOnly": True, "liveOrders": 0,
+    combined = portfolio_backtest(portfolio_history)
+    print(json.dumps({"researchOnly": True, "liveOrders": 0, "portfolio": combined,
                       "warning": "One-symbol simulations; not a combined portfolio, no parameter optimisation; includes synthetic friction, excludes taxes and dividends",
                       "results": results}, indent=2))
 
