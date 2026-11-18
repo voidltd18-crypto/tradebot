@@ -27,8 +27,8 @@ def evaluate():
         bars = [Bar(day.date(), float(row["Open"]), float(row["High"]),
                     float(row["Low"]), float(row["Close"]), float(row["Volume"]))
                 for day, row in frame.iterrows()]
-        # Out-of-sample window: first 200 bars of 2023 as warm-up;
-        # all trades and equity changes reported only from 2024 onward.
+        # Historical research sample, NOT independent out-of-sample validation.
+        # First 201 aligned sessions warm up indicators; trading may start in 2023.
         sample = [b for b in bars if date(2023, 1, 1) <= b.day <= date(2026, 11, 17)]
         portfolio_history[symbol] = sample
         result = backtest(symbol, sample)
