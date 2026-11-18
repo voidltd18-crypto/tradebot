@@ -44,6 +44,7 @@ def preview(client, data_client, symbol, *, broker_snapshot=None):
         # Aggregate only complete, consecutive 5-minute buckets.
         recovery = False
         recovery_strength_pct = None
+        recovery_confidence = None
         bar_data = bars_result if isinstance(bars_result, dict) else getattr(bars_result, 'data', {})
         raw_bars = bar_data.get(pair, []) if isinstance(bar_data, dict) else []
         if raw_bars:
@@ -67,8 +68,21 @@ def preview(client, data_client, symbol, *, broker_snapshot=None):
                 completed = [b for b in grouped if 300 <= (now - b.timestamp).total_seconds() <= 1800]
                 last_three = completed[-3:]
                 if len(last_three) == 3 and float(last_three[0].close) > 0:
+                    first, middle, final = last_three
                     recovery_strength_pct = round(
-                        (float(last_three[-1].close) / float(last_three[0].close) - 1) * 100, 3)
+                        (float(final.close) / float(first.close) - 1) * 100, 3)
+                    # Descriptive signal-quality heuristic, not a probability.
+                    # Reward sustained upward steps and limit over-reliance on a
+                    # single last-candle spike. No volume claim without data.
+                    first_step = (float(middle.close) / float(first.close) - 1) * 100
+                    second_step = (float(final.close) / float(middle.close) - 1) * 100
+                    balance = min(first_step, second_step) / max(first_step, second_step) if max(first_step, second_step) > 0 else 0
+                    score = round(min(100, 35 + min(35, max(0, recovery_strength_pct) * 15) + 30 * max(0, balance)))
+                    recovery_confidence = {
+                        "score": score,
+                        "label": "STRONG" if score >= 75 else "MODERATE" if score >= 55 else "EARLY",
+                        "basis": "Three rising completed 5-minute closes; score weighs rise and consistency, not future probability",
+                    }
         result = assess_manual_rebuy(
             last_filled_sell_price=latest.filled_avg_price,
             current_ask=getattr(quote, "ask_price", None),
@@ -78,7 +92,8 @@ def preview(client, data_client, symbol, *, broker_snapshot=None):
             order_pending=any(str(getattr(o, "symbol", "")).upper().replace("/", "") == sym for o in pending),
         )
         return {**result, "symbol": pair, "referenceSaleAt": latest.filled_at.isoformat(),
-                "recoveryVerified": recovery, "recoveryStrengthPct": recovery_strength_pct if result.get("status") == "BUY_CANDIDATE" else None, "quoteFresh": fresh,
+                "recoveryVerified": recovery, "recoveryStrengthPct": recovery_strength_pct if result.get("status") == "BUY_CANDIDATE" else None,
+                "recoveryConfidence": recovery_confidence if result.get("status") == "BUY_CANDIDATE" and fresh else None, "quoteFresh": fresh,
                 "quoteAgeSeconds": round((now - stamp).total_seconds(), 1) if isinstance(stamp, datetime) and stamp.tzinfo is not None else None,
                 "quoteTimestamp": stamp.isoformat() if isinstance(stamp, datetime) else None,
                 "quoteAvailable": quote is not None}
