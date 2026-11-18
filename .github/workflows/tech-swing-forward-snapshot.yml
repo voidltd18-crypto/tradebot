@@ -1,5 +1,11 @@
 name: Tech swing forward research snapshot
 on:
+  pull_request:
+    paths:
+      - 'backend/v20_tech_swing_forward_snapshot.py'
+      - 'backend/v20_tech_swing_candidate_preview.py'
+      - 'tests/test_v20_tech_swing_forward_snapshot.py'
+      - '.github/workflows/tech-swing-forward-snapshot.yml'
   workflow_dispatch:
 permissions:
   contents: read
