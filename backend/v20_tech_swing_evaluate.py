@@ -10,6 +10,7 @@ from backend.v20_tech_swing_research import Bar, UNIVERSE, backtest
 from backend.v20_tech_swing_trend_hold import trend_hold
 from backend.v20_tech_swing_portfolio import portfolio_backtest
 from backend.v20_tech_swing_passive import passive_basket
+from backend.v20_tech_swing_release_gate import assess_release
 
 
 def evaluate():
@@ -64,7 +65,8 @@ def evaluate():
                                          "closedTrades": holdout["closedTrades"],
                                          "passiveReturnPct": holdout_passive["returnPct"],
                                          "passiveMaxDrawdownPct": holdout_passive["maxDrawdownPct"]}
-    print(json.dumps({"researchOnly": True, "liveOrders": 0, "portfolio": combined,
+    gate = assess_release(combined)
+    print(json.dumps({"researchOnly": True, "liveOrders": 0, "releaseGate": gate, "portfolio": combined,
                       "warning": "Research simulations, not forward validation. Synthetic friction; excludes taxes and dividends; no live orders",
                       "results": results}, indent=2))
 
