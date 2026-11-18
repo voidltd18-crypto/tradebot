@@ -125,6 +125,10 @@ def poll_profit_sells(client, data_client, db_path, *, now=None, enabled=False,
             if not outcome["eligible"]:
                 result["blocked"].append((symbol, outcome["reason"]))
                 continue
+            from backend.v20_master_pause import is_paused
+            if is_paused():
+                result["blocked"].append((symbol, "master pause active"))
+                continue
             identity = f"{symbol}:{entry}:{qty}"
             oid = _reserve(db_path, identity)
             if not oid:
