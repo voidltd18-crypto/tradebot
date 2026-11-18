@@ -13,6 +13,8 @@ on:
       - 'tests/test_v20_tech_swing_passive.py'
       - 'backend/v20_tech_swing_release_gate.py'
       - 'tests/test_v20_tech_swing_release_gate.py'
+      - 'backend/v20_tech_swing_candidate_preview.py'
+      - 'tests/test_v20_tech_swing_candidate_preview.py'
       - '.github/workflows/tech-swing-research.yml'
   workflow_dispatch:
 jobs:
@@ -26,7 +28,7 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install pytest
-      - run: python -m pytest -q tests/test_v20_tech_swing_research.py tests/test_v20_tech_swing_trend_hold.py tests/test_v20_tech_swing_portfolio.py tests/test_v20_tech_swing_passive.py tests/test_v20_tech_swing_release_gate.py
+      - run: python -m pytest -q tests/test_v20_tech_swing_research.py tests/test_v20_tech_swing_trend_hold.py tests/test_v20_tech_swing_portfolio.py tests/test_v20_tech_swing_passive.py tests/test_v20_tech_swing_release_gate.py tests/test_v20_tech_swing_candidate_preview.py
   historical-data-backtest:
     runs-on: ubuntu-latest
     permissions:
