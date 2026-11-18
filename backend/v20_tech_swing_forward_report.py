@@ -31,7 +31,7 @@ def main():
     if not paths:
         raise SystemExit("No archived snapshots found; cannot fabricate forward results")
     report = build_report(paths, fetch_daily_history())
-    Path(args.output).write_text(json.dumps(report, indent=2)+"\\n", encoding="utf-8")
+    Path(args.output).write_text(json.dumps(report, indent=2)+chr(10), encoding="utf-8")
     print(json.dumps({"snapshots": report["uniqueDatedSnapshots"],
                       "observedSignals": report["observedSignals"],
                       "benchmarkComparableSignals": report["benchmarkComparableSignals"],
