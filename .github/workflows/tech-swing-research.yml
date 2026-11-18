@@ -4,6 +4,7 @@ on:
     paths:
       - 'backend/v20_tech_swing_research.py'
       - 'tests/test_v20_tech_swing_research.py'
+      - 'backend/v20_tech_swing_evaluate.py'
       - '.github/workflows/tech-swing-research.yml'
   workflow_dispatch:
 jobs:
@@ -18,3 +19,19 @@ jobs:
           python-version: '3.11'
       - run: python -m pip install pytest
       - run: python -m pytest -q tests/test_v20_tech_swing_research.py
+  historical-data-backtest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install yfinance pandas
+      - run: python -m backend.v20_tech_swing_evaluate > swing-backtest-results.json
+      - run: cat swing-backtest-results.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: swing-backtest-results
+          path: swing-backtest-results.json
