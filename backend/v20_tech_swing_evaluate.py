@@ -45,6 +45,24 @@ def evaluate():
         result["dataEnd"] = sample[-1].day.isoformat()
         results.append(result)
     combined = portfolio_backtest(portfolio_history)
+    # Passive benchmark: same 25% capital, equal-weight six-stock basket, 75% cash.
+    # 15bps synthetic friction on entry and exit, with no rebalancing.
+    friction = 15 / 10000
+    gross = sum((bars[-1].close * (1-friction)) / (bars[201].open * (1+friction))
+                for bars in portfolio_history.values()) / len(portfolio_history)
+    combined["matchedPassiveBasketReturnPct"] = round(25 * (gross - 1), 2)
+    combined["beatsMatchedPassiveBasket"] = combined["totalReturnPct"] > combined["matchedPassiveBasketReturnPct"]
+    combined["passiveBenchmarkMethod"] = "25% equal-weight tech basket, 75% cash; 15bps entry and exit"
+    # Separate fresh-capital 2026 test with earlier bars for indicator warm-up.
+    shared = sorted(set.intersection(*(set(b.day for b in bars) for bars in portfolio_history.values())))
+    first2026 = next(i for i, day in enumerate(shared) if day.year == 2026)
+    if first2026 >= 201:
+        start = shared[first2026-201]
+        subset = {sym: [b for b in bars if b.day >= start] for sym, bars in portfolio_history.items()}
+        holdout = portfolio_backtest(subset)
+        combined["freshCapital2026"] = {"returnPct": holdout["totalReturnPct"],
+                                         "maxDrawdownPct": holdout["maxDrawdownPct"],
+                                         "closedTrades": holdout["closedTrades"]}
     print(json.dumps({"researchOnly": True, "liveOrders": 0, "portfolio": combined,
                       "warning": "One-symbol simulations; not a combined portfolio, no parameter optimisation; includes synthetic friction, excludes taxes and dividends",
                       "results": results}, indent=2))
