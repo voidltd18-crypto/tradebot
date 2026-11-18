@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from datetime import date
 from backend.v20_tech_swing_research import Bar, UNIVERSE, backtest
+from backend.v20_tech_swing_trend_hold import trend_hold
 
 
 def evaluate():
@@ -26,6 +27,9 @@ def evaluate():
         # all trades and equity changes reported only from 2024 onward.
         sample = [b for b in bars if date(2023, 1, 1) <= b.day <= date(2026, 11, 17)]
         result = backtest(symbol, sample)
+        alternative = trend_hold(symbol, sample)
+        result['trendHoldAlternative'] = {key: alternative[key] for key in ('totalReturnPct', 'maxDrawdownPct', 'closedTrades', 'openPositionAtEnd', 'assumptions')}
+        result['trendHoldBeatsOriginal'] = alternative['totalReturnPct'] > result['totalReturnPct']
         baseline = (sample[-1].close / sample[200].open - 1) * 100
         result["buyHoldComparablePct"] = round(baseline, 2)
         result["buyHold25PctAllocationPct"] = round(baseline * 0.25, 2)
