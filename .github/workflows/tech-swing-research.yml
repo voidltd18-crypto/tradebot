@@ -31,6 +31,8 @@ on:
       - 'tests/test_v20_tech_swing_broker_preflight.py'
       - 'backend/v20_tech_swing_broker_readiness.py'
       - 'tests/test_v20_tech_swing_broker_readiness.py'
+      - 'backend/v20_master_pause.py'
+      - 'tests/test_v20_master_pause.py'
       - '.github/workflows/tech-swing-research.yml'
   workflow_dispatch:
 jobs:
@@ -44,7 +46,7 @@ jobs:
         with:
           python-version: '3.11'
       - run: python -m pip install pytest
-      - run: python -m pytest -q tests/test_v20_tech_swing_research.py tests/test_v20_tech_swing_trend_hold.py tests/test_v20_tech_swing_portfolio.py tests/test_v20_tech_swing_passive.py tests/test_v20_tech_swing_release_gate.py tests/test_v20_tech_swing_candidate_preview.py tests/test_v20_tech_swing_forward_snapshot.py tests/test_v20_tech_swing_forward_ledger.py tests/test_v20_tech_swing_forward_outcomes.py tests/test_v20_tech_swing_forward_benchmark.py tests/test_v20_tech_swing_forward_report.py tests/test_v20_tech_swing_restore_artifacts.py tests/test_v20_tech_swing_broker_preflight.py tests/test_v20_tech_swing_broker_readiness.py
+      - run: python -m pytest -q tests/test_v20_tech_swing_research.py tests/test_v20_tech_swing_trend_hold.py tests/test_v20_tech_swing_portfolio.py tests/test_v20_tech_swing_passive.py tests/test_v20_tech_swing_release_gate.py tests/test_v20_tech_swing_candidate_preview.py tests/test_v20_tech_swing_forward_snapshot.py tests/test_v20_tech_swing_forward_ledger.py tests/test_v20_tech_swing_forward_outcomes.py tests/test_v20_tech_swing_forward_benchmark.py tests/test_v20_tech_swing_forward_report.py tests/test_v20_tech_swing_restore_artifacts.py tests/test_v20_tech_swing_broker_preflight.py tests/test_v20_tech_swing_broker_readiness.py tests/test_v20_master_pause.py
   historical-data-backtest:
     runs-on: ubuntu-latest
     permissions:
