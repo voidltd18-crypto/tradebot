@@ -95,7 +95,14 @@ def scan(x_preview_token: str = Header(default="")):
                 final = type(gate)(symbol, "GREEN", "Research-only pullback candidate; no orders enabled")
             else:
                 final = technical
-        signals.append({"symbol": symbol, "status": final.status, "reason": final.reason})
+        # Separate hypothetical research signal from real-account entry eligibility.
+        # Existing broker holdings always block real orders; no managed ledger is inferred.
+        research = evaluate_pullback(symbol, [float(bar.close) for bar in bars.data.get(symbol, [])])
+        signals.append({
+            "symbol": symbol, "status": final.status, "reason": final.reason,
+            "researchStatus": research.status, "researchReason": research.reason,
+            "brokerEntryBlocked": gate.status == "RED",
+        })
     return JSONResponse({
         "readOnly": True, "tradingEnabled": False, "asOf": now.isoformat(),
         "account": {"equity": str(account.equity), "cash": str(account.cash)},
@@ -104,6 +111,8 @@ def scan(x_preview_token: str = Header(default="")):
         "positionLimitScope": "whole broker account",
         "managedPositions": [],
         "managedPositionsConfigured": False,
+        "researchMode": "hypothetical signals only; no virtual fills or profit claims",
+        "availableCash": str(account.cash),
         "signals": signals,
     }, headers={"Cache-Control": "no-store"})
 
@@ -125,8 +134,8 @@ button{background:#2563eb;color:white;border:0;cursor:pointer}
 </style><main><h1>TradeBot 2.0</h1><p>Live broker data · Research signals only · Trading disabled</p>
 <input type="password" id="token" placeholder="Private preview token" autocomplete="off">
 <button id="refresh">Scan stocks</button><p id="status">Enter token to load.</p>
-<div id="account" class="grid"></div><h2>Tech stock scanner</h2><div id="signals" class="grid"></div>
-<p><small>Green = research candidate, NOT permission to buy. Red = blocked. Amber = wait. Two-position limit currently covers the whole Alpaca account. Existing holdings are never automatically assigned to this bot. No orders are enabled.</small></p>
+<div id="account" class="grid"></div><h2>Market research signals</h2><p>Independent of your existing holdings. These are hypothetical setups, not executable orders.</p><div id="research" class="grid"></div><h2>Real-account safety checks</h2><div id="signals" class="grid"></div>
+<p><small>Green = research candidate, NOT permission to buy. Red = blocked. Amber = wait. Two-position limit currently covers the whole Alpaca account. Research signals ignore holdings to show market setups, but account safeguards still block real entries. Bot-managed tracking requires a verified persistent ledger. No orders are enabled.</small></p>
 <script>
 const el=id=>document.getElementById(id);
 el('refresh').onclick=async()=>{
@@ -137,8 +146,12 @@ el('refresh').onclick=async()=>{
  if(!response.ok){el('status').textContent='Unable to scan (HTTP '+response.status+'). No trading possible.';return}
  const data=await response.json();el('status').textContent='Updated '+new Date(data.asOf).toLocaleString()+' · Read-only';
  const money=n=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(Number(n));
- el('account').replaceChildren();for(const [name,val] of [['Account equity',money(data.account.equity)],['Cash',money(data.account.cash)],['Broker positions',String(data.positions.length)],['Bot-managed positions','Not configured']]){
+ el('account').replaceChildren();for(const [name,val] of [['Account equity',money(data.account.equity)],['Cash',money(data.account.cash)],['Broker positions',String(data.positions.length)],['Bot-managed positions','Not configured'],['Available cash',money(data.availableCash)]]){
  const card=document.createElement('div');card.className='card';card.textContent=name+': '+val;el('account').append(card)}
+ el('research').replaceChildren();for(const signal of data.signals){
+ const card=document.createElement('div');card.className='card';
+ const title=document.createElement('h3');title.textContent=signal.symbol+' · '+signal.researchStatus;title.className=signal.researchStatus.toLowerCase();
+ const desc=document.createElement('p');desc.textContent=signal.researchReason;card.append(title,desc);el('research').append(card)}
  el('signals').replaceChildren();for(const signal of data.signals){
  const card=document.createElement('div');card.className='card';
  const title=document.createElement('h3');title.textContent=signal.symbol+' · '+signal.status;title.className=signal.status.toLowerCase();
