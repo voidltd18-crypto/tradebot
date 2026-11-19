@@ -34,6 +34,7 @@ small{color:#a9b7c9}
 <button id="check">Check UNI/USD and ARB/USD</button>
 <p><small>Your token is used only for these requests. It is not saved in your browser or displayed in the results.</small></p>
 <div id="results" aria-live="polite"></div>\n<section><h2>Full Alpaca Account</h2><button id="accountCheck">Refresh account balance</button><div id="accountResults" aria-live="polite"><small>Enter your private preview token, then refresh to see live holdings.</small></div></section>
+<section><h2>Holdings performance</h2><p><small>Historical market prices · Current share quantities · Not historical account equity</small></p><div id="chartRanges"></div><div id="chartStatus" class="metrics">Enter your token and choose a range.</div><div id="chartLegend" class="metrics"></div><svg id="holdingsChart" viewBox="0 0 720 300" role="img" aria-label="Combined holdings performance chart" style="width:100%;height:auto;display:none"></svg></section>
 <script>
 const btn=document.getElementById('check');
 const output=document.getElementById('results');
@@ -110,6 +111,37 @@ accountBtn.addEventListener('click',async()=>{
   };filter.addEventListener('change',render);render();
  }catch(e){accountOutput.textContent='Connection error retrieving account.'}finally{accountBtn.disabled=false}
 });
+
+const ranges=['1D','5D','1M','3M','1Y','ALL'];
+const chartRanges=document.getElementById('chartRanges'),chartStatus=document.getElementById('chartStatus');
+const chart=document.getElementById('holdingsChart'),chartLegend=document.getElementById('chartLegend');
+let chartRange='5D';
+function svgNode(tag,attrs){const n=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const [k,v] of Object.entries(attrs))n.setAttribute(k,String(v));return n}
+async function loadChart(){
+ const token=document.getElementById('token').value;
+ if(!token){chartStatus.textContent='Enter your private preview token first.';return}
+ chartStatus.textContent='Loading historical stock prices…';chart.style.display='none';
+ try{
+  const r=await fetch('/holdings-history?range='+encodeURIComponent(chartRange),{headers:{'X-Preview-Token':token},cache:'no-store'});
+  if(!r.ok){chartStatus.textContent=r.status===403?'Invalid preview token':'Historical prices unavailable (HTTP '+r.status+')';return}
+  const data=await r.json(),series=data.series||[];
+  if(!series.length||!series.some(s=>s.points.length>1)){chartStatus.textContent='Not enough market history for this range.';return}
+  const values=series.flatMap(s=>s.points.map(p=>p[1]));
+  let lo=Math.min(...values),hi=Math.max(...values);if(hi===lo){lo-=1;hi+=1}
+  const pad=(hi-lo)*.12;lo-=pad;hi+=pad;
+  const times=series.flatMap(s=>s.points.map(p=>p[0])),minT=Math.min(...times),maxT=Math.max(...times);
+  const X=t=>55+(t-minT)/Math.max(1,maxT-minT)*645,Y=v=>260-(v-lo)/(hi-lo)*220;
+  chart.replaceChildren();const gridColor='#526176';
+  for(let i=0;i<=4;i++){const v=lo+(hi-lo)*i,y=Y(v);chart.append(svgNode('line',{x1:55,y1:y,x2:700,y2:y,stroke:gridColor,'stroke-opacity':'.35'}));const label=svgNode('text',{x:47,y:y+4,fill:'#cbd5e1','font-size':12,'text-anchor':'end'});label.textContent=v.toFixed(1)+'%';chart.append(label)}
+  const colors={'MSFT':'#60a5fa','NVDA':'#f59e0b','Combined':'#34d399'};
+  chartLegend.replaceChildren();
+  for(const s of series){if(s.points.length<2)continue;const points=s.points.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' ');
+   chart.append(svgNode('polyline',{points,fill:'none',stroke:colors[s.symbol]||'#d8b4fe','stroke-width':s.symbol==='Combined'?3.5:2.5,'stroke-linejoin':'round'}));
+   const last=s.points[s.points.length-1][1];const label=document.createElement('span');label.style.cssText='display:inline-block;margin:8px 16px 0 0;color:'+(colors[s.symbol]||'#d8b4fe');label.textContent='● '+s.symbol+' '+(last>=0?'+':'')+last.toFixed(2)+'%';chartLegend.append(label)}
+  chart.style.display='block';chartStatus.textContent='Change since the start of the selected range · Prices may be delayed. Combined uses current holdings quantities, not historical account equity.';
+ }catch(e){chartStatus.textContent='Unable to load historical price chart.'}
+}
+for(const range of ranges){const b=document.createElement('button');b.textContent=range;b.style.marginRight='6px';b.addEventListener('click',()=>{chartRange=range;loadChart()});chartRanges.append(b)}
 </script></main></body></html>"""
     return HTMLResponse(html, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"})
 
@@ -171,3 +203,69 @@ def account_overview(x_preview_token: str = Header(default="")):
         "todayChangePct": fmt(change / prior * 100 if prior else Decimal("0")),
         "positions": result, "readOnly": True
     }, headers={"Cache-Control": "no-store"})
+
+@app.get("/holdings-history")
+def holdings_history(range: str = "5D", x_preview_token: str = Header(default="")):
+    """Read-only price histories for material US equity holdings, weighted by current quantities."""
+    token = os.getenv("SMART_REBUY_PREVIEW_TOKEN", "")
+    if not token or not secrets.compare_digest(x_preview_token, token):
+        raise HTTPException(status_code=403, detail="Preview access denied")
+    key, secret = os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY")
+    if not key or not secret:
+        raise HTTPException(status_code=503, detail="Broker credentials not configured")
+    from datetime import datetime, timedelta, timezone
+    from alpaca.trading.client import TradingClient
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.enums import DataFeed
+    from fastapi.responses import JSONResponse
+    options = {"1D": (2, True), "5D": (9, True), "1M": (35, False),
+               "3M": (100, False), "1Y": (375, False), "ALL": (1825, False)}
+    if range not in options:
+        raise HTTPException(status_code=400, detail="Invalid chart range")
+    days, intraday = options[range]
+    try:
+        broker = TradingClient(key, secret, paper=os.getenv("APCA_API_PAPER", "false").lower() == "true")
+        positions = [p for p in broker.get_all_positions()
+                     if str(getattr(p.asset_class, "value", p.asset_class)).lower() == "us_equity"
+                     and abs(float(p.market_value)) >= 0.01 and float(p.qty) > 0]
+        positions = sorted(positions, key=lambda p: abs(float(p.market_value)), reverse=True)[:10]
+        if not positions:
+            return JSONResponse({"series": []}, headers={"Cache-Control": "no-store"})
+        now = datetime.now(timezone.utc)
+        request = StockBarsRequest(symbol_or_symbols=[p.symbol for p in positions],
+                                   timeframe=TimeFrame.Minute if intraday else TimeFrame.Day,
+                                   start=now-timedelta(days=days), end=now,
+                                   feed=DataFeed.IEX, limit=10000)
+        bars = StockHistoricalDataClient(key, secret).get_stock_bars(request)
+        raw = {}
+        for p in positions:
+            values = [(int(b.timestamp.timestamp()*1000), float(b.close)) for b in bars.data.get(p.symbol, [])]
+            values.sort()
+            if range == "1D" and values:
+                latest_day = datetime.fromtimestamp(values[-1][0]/1000, timezone.utc).date()
+                values = [v for v in values if datetime.fromtimestamp(v[0]/1000, timezone.utc).date() == latest_day]
+            raw[p.symbol] = values
+        series = []
+        for symbol, values in raw.items():
+            if len(values) < 2 or not values[0][1]:
+                continue
+            base = values[0][1]
+            series.append({"symbol": symbol, "points": [[t, round((price/base-1)*100, 4)] for t, price in values]})
+        # Use aligned timestamps only; a historical reconstruction of current positions, not past account equity.
+        available = {p.symbol: {t: price for t, price in raw[p.symbol]} for p in positions}
+        symbols = [p.symbol for p in positions if len(raw[p.symbol]) > 1]
+        if symbols:
+            common = sorted(set.intersection(*(set(available[s]) for s in symbols)))
+            if len(common) > 1:
+                quantities = {p.symbol: float(p.qty) for p in positions}
+                baseline = sum(available[s][common[0]]*quantities[s] for s in symbols)
+                if baseline:
+                    series.append({"symbol": "Combined", "points": [
+                        [t, round((sum(available[s][t]*quantities[s] for s in symbols)/baseline-1)*100, 4)]
+                        for t in common]})
+        return JSONResponse({"range": range, "series": series, "readOnly": True},
+                            headers={"Cache-Control": "no-store"})
+    except Exception:
+        raise HTTPException(status_code=502, detail="Historical market data unavailable")
