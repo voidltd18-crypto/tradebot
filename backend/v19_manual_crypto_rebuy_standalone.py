@@ -127,14 +127,9 @@ async function loadChart(){
   const data=await r.json(),series=data.series||[];
   if(!series.length||!series.some(s=>s.points.length>1)){chartStatus.textContent='Not enough market history for this range.';return}
   const m=data.money;
-  if(m&&Number(m.costBasis)>0){
-    const combined=series.find(s=>s.symbol==='Combined');
-    if(combined&&combined.points.length){
-      const last=combined.points[combined.points.length-1];
-      combined.points.push([Math.max(Date.now(),last[0]+1),100*(Number(m.currentValue)/Number(m.costBasis)-1)]);
-    }
-  }
-  const values=series.flatMap(s=>s.points.map(p=>p[1])).concat([0]);
+  // Live account values are not historical bars: never join them with a fabricated segment.
+  const liveReturn=m&&Number(m.costBasis)>0?100*(Number(m.currentValue)/Number(m.costBasis)-1):null;
+  const values=series.flatMap(s=>s.points.map(p=>p[1])).concat([0],Number.isFinite(liveReturn)?[liveReturn]:[]);
   let lo=Math.min(...values),hi=Math.max(...values);if(hi===lo){lo-=1;hi+=1}
   const pad=(hi-lo)*.12;lo-=pad;hi+=pad;
   const times=series.flatMap(s=>s.points.map(p=>p[0])),minT=Math.min(...times),maxT=Math.max(...times);
@@ -146,9 +141,13 @@ async function loadChart(){
   chartLegend.replaceChildren();const baseline=document.createElement('span');baseline.style.cssText='display:inline-block;margin:8px 16px 0 0;color:#ef4444';baseline.textContent='┄ Starting investment (0%)';chartLegend.append(baseline);
   for(const s of series){if(s.points.length<2)continue;const points=s.points.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' ');
    chart.append(svgNode('polyline',{points,fill:'none',stroke:colors[s.symbol]||'#d8b4fe','stroke-width':s.symbol==='Combined'?3.5:2.5,'stroke-linejoin':'round'}));
-   const last=s.points[s.points.length-1][1];const label=document.createElement('span');label.style.cssText='display:inline-block;margin:8px 16px 0 0;color:'+(colors[s.symbol]||'#d8b4fe');label.textContent='● '+s.symbol+' '+(last>=0?'+':'')+last.toFixed(2)+'%';chartLegend.append(label)}
+   const last=s.points[s.points.length-1][1];const label=document.createElement('span');label.style.cssText='display:inline-block;margin:8px 16px 0 0;color:'+(colors[s.symbol]||'#d8b4fe');label.textContent='● '+s.symbol+' (last historical) '+(last>=0?'+':'')+last.toFixed(2)+'%';chartLegend.append(label)}
+  if(Number.isFinite(liveReturn)){
+    const dot=svgNode('circle',{cx:695,cy:Y(liveReturn),r:5,fill:'#34d399',stroke:'#ffffff','stroke-width':1.5});chart.append(dot);
+    const liveLabel=svgNode('text',{x:688,y:Y(liveReturn)-11,fill:'#34d399','font-size':12,'text-anchor':'end'});liveLabel.textContent='LIVE '+(liveReturn>=0?'+':'')+liveReturn.toFixed(2)+'%';chart.append(liveLabel);
+  }
   const summary=document.getElementById('moneySummary');summary.textContent=m?'Starting investment '+usd(m.costBasis)+'  ·  Holdings now '+usd(m.currentValue)+'  ·  P/L '+signed(Number(m.currentValue)-Number(m.costBasis))+'  ·  Full account equity '+usd(data.accountEquity):'Holdings figures unavailable';
-  chart.style.display='block';chartStatus.textContent='Split-adjusted prices; the latest combined point uses live holdings. '+(chartRange==='ALL'&&!data.holdingStartVerified?'Purchase date unavailable: showing up to 30 days. ':'')+'Not historical account equity.';
+  chart.style.display='block';chartStatus.textContent='Split-adjusted historical trails; the separate green LIVE dot shows current broker holdings return (not connected to delayed history). '+(chartRange==='ALL'&&!data.holdingStartVerified?'Purchase date unavailable: showing up to 30 days. ':'')+'Not historical account equity.';
  }catch(e){chartStatus.textContent='Unable to load historical price chart.'}
 }
 
