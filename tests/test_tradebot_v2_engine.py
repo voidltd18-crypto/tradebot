@@ -82,3 +82,24 @@ def test_future_dated_order_fails_closed():
 def test_non_finite_prices_cannot_produce_green_signal():
     for bad in (float("nan"), float("inf"), float("-inf")):
         assert evaluate_pullback("AAPL", [100.0] * 29 + [bad]).status != "GREEN"
+
+
+def test_invalid_broker_quantities_fail_closed():
+    for bad in (float("nan"), float("inf"), float("-inf"), -1):
+        result = entry_gate("AAPL", [Position("MSFT", bad)], [], NOW)
+        assert result.status == "RED"
+
+
+def test_invalid_unrelated_order_timestamp_fails_closed():
+    future = OrderRecord("NVDA", "buy", NOW + timedelta(hours=1), "filled")
+    assert entry_gate("AAPL", [], [future], NOW).status == "RED"
+
+
+def test_duplicate_position_rows_count_as_one_symbol():
+    result = entry_gate("AAPL", [Position("MSFT", 1), Position("MSFT", 2)], [], NOW)
+    assert result.status == "AMBER"
+
+
+def test_unreadable_broker_state_fails_closed():
+    assert entry_gate("AAPL", [Position("MSFT", "unknown")], [], NOW).status == "RED"
+    assert entry_gate("AAPL", [], [OrderRecord("NVDA", "buy", None, "filled")], NOW).status == "RED"
