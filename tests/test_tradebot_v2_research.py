@@ -26,3 +26,10 @@ def test_invalid_forward_horizon():
     import pytest
     with pytest.raises(ValueError):
         evaluate_history("AAPL", [100.0] * 40, 0)
+
+
+def test_non_finite_prices_rejected():
+    import pytest
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            evaluate_history("AAPL", [100.0] * 35 + [bad])
