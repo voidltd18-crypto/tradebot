@@ -70,3 +70,10 @@ def test_research_is_independent_of_broker_positions():
 def test_research_never_overrides_existing_position_guard():
     gate = entry_gate("MSFT", [Position("MSFT", 3)], [], NOW)
     assert gate.reason == "Already holding this stock"
+
+
+def test_future_dated_order_fails_closed():
+    future = OrderRecord("AAPL", "sell", NOW + timedelta(hours=2), "filled")
+    gate = entry_gate("AAPL", [], [future], NOW)
+    assert gate.status == "RED"
+    assert "timestamp" in gate.reason.lower()
