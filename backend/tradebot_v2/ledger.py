@@ -5,6 +5,7 @@ does not create, import, or infer ownership from Alpaca positions. Unverified
 records fail closed. No order submission functions exist.
 """
 from dataclasses import dataclass
+from math import isfinite
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -44,7 +45,7 @@ def reconcile(events: Iterable[OwnershipEvent] | None, broker_positions: dict[st
         seen.add(e.event_id)
         if e.recorded_at.tzinfo is None or e.recorded_at > datetime.now(timezone.utc):
             return OwnershipSnapshot(False, {}, "Invalid event timestamp")
-        if e.kind not in {"BUY_FILLED", "SELL_FILLED"} or e.quantity <= 0:
+        if e.kind not in {"BUY_FILLED", "SELL_FILLED"} or not isinstance(e.quantity, (int, float)) or not isfinite(e.quantity) or e.quantity <= 0:
             return OwnershipSnapshot(False, {}, "Invalid fill event")
         symbol = e.symbol.strip().upper()
         if not symbol:
@@ -56,6 +57,6 @@ def reconcile(events: Iterable[OwnershipEvent] | None, broker_positions: dict[st
     active = {symbol: round(qty, 8) for symbol, qty in totals.items() if qty > 1e-8}
     for symbol, qty in active.items():
         broker_qty = broker_positions.get(symbol)
-        if broker_qty is None or broker_qty + 1e-8 < qty:
+        if broker_qty is None or not isinstance(broker_qty, (int, float)) or not isfinite(broker_qty) or broker_qty < 0 or broker_qty + 1e-8 < qty:
             return OwnershipSnapshot(False, {}, "Broker holdings cannot reconcile with bot ledger")
     return OwnershipSnapshot(True, active, "Verified ledger quantities reconcile with broker holdings")
