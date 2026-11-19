@@ -21,9 +21,26 @@ def authorize(token: str):
         raise HTTPException(403, "Access denied")
 
 
+def ledger_health():
+    """Check database connectivity without exposing credentials or account data."""
+    url = os.getenv("TRADEBOT_V2_DATABASE_URL")
+    if not url:
+        return {"configured": False, "reachable": False, "schemaReady": False}
+    try:
+        import psycopg
+        with psycopg.connect(url, connect_timeout=4) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION READ ONLY")
+                cur.execute("SELECT to_regclass('public.tradebot_v2_fill_events') IS NOT NULL")
+                schema_ready = bool(cur.fetchone()[0])
+        return {"configured": True, "reachable": True, "schemaReady": schema_ready}
+    except Exception:
+        return {"configured": True, "reachable": False, "schemaReady": False}
+
+
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "2.0", "readOnly": True, "tradingEnabled": False, "brokerConfigured": bool(os.getenv("APCA_API_KEY_ID") and os.getenv("APCA_API_SECRET_KEY")), "previewTokenConfigured": bool(os.getenv("SMART_REBUY_PREVIEW_TOKEN"))}
+    return {"ok": True, "version": "2.0", "readOnly": True, "tradingEnabled": False, "brokerConfigured": bool(os.getenv("APCA_API_KEY_ID") and os.getenv("APCA_API_SECRET_KEY")), "previewTokenConfigured": bool(os.getenv("SMART_REBUY_PREVIEW_TOKEN")), "ledger": ledger_health()}
 
 
 @app.get("/api/scan")
