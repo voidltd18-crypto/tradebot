@@ -126,6 +126,14 @@ async function loadChart(){
   if(!r.ok){chartStatus.textContent=r.status===403?'Invalid preview token':'Historical prices unavailable (HTTP '+r.status+')';return}
   const data=await r.json(),series=data.series||[];
   if(!series.length||!series.some(s=>s.points.length>1)){chartStatus.textContent='Not enough market history for this range.';return}
+  const m=data.money;
+  if(m&&Number(m.costBasis)>0){
+    const combined=series.find(s=>s.symbol==='Combined');
+    if(combined&&combined.points.length){
+      const last=combined.points[combined.points.length-1];
+      combined.points.push([Math.max(Date.now(),last[0]+1),100*(Number(m.currentValue)/Number(m.costBasis)-1)]);
+    }
+  }
   const values=series.flatMap(s=>s.points.map(p=>p[1])).concat([0]);
   let lo=Math.min(...values),hi=Math.max(...values);if(hi===lo){lo-=1;hi+=1}
   const pad=(hi-lo)*.12;lo-=pad;hi+=pad;
@@ -140,7 +148,7 @@ async function loadChart(){
    chart.append(svgNode('polyline',{points,fill:'none',stroke:colors[s.symbol]||'#d8b4fe','stroke-width':s.symbol==='Combined'?3.5:2.5,'stroke-linejoin':'round'}));
    const last=s.points[s.points.length-1][1];const label=document.createElement('span');label.style.cssText='display:inline-block;margin:8px 16px 0 0;color:'+(colors[s.symbol]||'#d8b4fe');label.textContent='● '+s.symbol+' '+(last>=0?'+':'')+last.toFixed(2)+'%';chartLegend.append(label)}
   const summary=document.getElementById('moneySummary');const m=data.money;summary.textContent=m?'Starting investment '+usd(m.costBasis)+'  ·  Holdings now '+usd(m.currentValue)+'  ·  P/L '+signed(Number(m.currentValue)-Number(m.costBasis))+'  ·  Full account equity '+usd(data.accountEquity):'Holdings figures unavailable';
-  chart.style.display='block';chartStatus.textContent='All lines use gain/loss versus current positions’ purchase cost (0%). Historical trails reconstruct current holdings from market prices; they are not historical account equity. Prices may be delayed.';
+  chart.style.display='block';chartStatus.textContent='Split-adjusted prices; the latest combined point uses live holdings. '+(chartRange==='ALL'&&!data.holdingStartVerified?'Purchase date unavailable: showing up to 30 days. ':'')+'Not historical account equity.';
  }catch(e){chartStatus.textContent='Unable to load historical price chart.'}
 }
 
@@ -221,7 +229,7 @@ def holdings_history(range: str = "5D", x_preview_token: str = Header(default=""
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
-    from alpaca.data.enums import DataFeed
+    from alpaca.data.enums import DataFeed, Adjustment
     from fastapi.responses import JSONResponse
     options = {"1D": (2, True), "5D": (9, True), "1M": (35, False),
                "3M": (100, False), "1Y": (375, False), "ALL": (1825, False)}
@@ -238,10 +246,24 @@ def holdings_history(range: str = "5D", x_preview_token: str = Header(default=""
         if not positions:
             return JSONResponse({"series": []}, headers={"Cache-Control": "no-store"})
         now = datetime.now(timezone.utc)
+        holding_start = None
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            orders = broker.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=500))
+            symbols_held = {p.symbol for p in positions}
+            buys = [o.filled_at for o in orders if o.symbol in symbols_held and
+                    str(getattr(o.side, "value", o.side)).lower() == "buy" and getattr(o, "filled_at", None)]
+            if buys:
+                holding_start = min(buys)
+        except Exception:
+            pass
+        if range == "ALL":
+            days = 30 if holding_start is None else max(2, min(1825, (now-holding_start).days+2))
         request = StockBarsRequest(symbol_or_symbols=[p.symbol for p in positions],
                                    timeframe=TimeFrame.Minute if intraday else TimeFrame.Day,
                                    start=now-timedelta(days=days), end=now,
-                                   feed=DataFeed.IEX, limit=10000)
+                                   feed=DataFeed.IEX, adjustment=Adjustment.ALL, limit=10000)
         bars = StockHistoricalDataClient(key, secret).get_stock_bars(request)
         raw = {}
         for p in positions:
@@ -250,6 +272,9 @@ def holdings_history(range: str = "5D", x_preview_token: str = Header(default=""
             if range == "1D" and values:
                 latest_day = datetime.fromtimestamp(values[-1][0]/1000, timezone.utc).date()
                 values = [v for v in values if datetime.fromtimestamp(v[0]/1000, timezone.utc).date() == latest_day]
+            if range == "ALL" and holding_start is not None:
+                cutoff = int(holding_start.timestamp()*1000)
+                values = [v for v in values if v[0] >= cutoff]
             raw[p.symbol] = values
         series = []
         money = None
@@ -276,7 +301,7 @@ def holdings_history(range: str = "5D", x_preview_token: str = Header(default=""
                     series.append({"symbol": "Combined", "points": [
                         [t, round((sum(available[s][t]*quantities[s] for s in symbols)/baseline-1)*100, 4)]
                         for t in common]})
-        return JSONResponse({"range": range, "series": series, "money": money, "accountEquity": account_equity, "readOnly": True},
+        return JSONResponse({"range": range, "series": series, "money": money, "accountEquity": account_equity, "holdingStartVerified": holding_start is not None, "readOnly": True},
                             headers={"Cache-Control": "no-store"})
     except Exception:
         raise HTTPException(status_code=502, detail="Historical market data unavailable")
