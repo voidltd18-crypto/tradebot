@@ -59,10 +59,11 @@ def entry_gate(
         if any(not isinstance(o.symbol, str) or not o.symbol.strip()
                or not isinstance(o.side, str) or o.side.lower() not in {"buy", "sell"}
                or not isinstance(o.status, str) or not o.status.strip()
-               or not isinstance(o.created_at, datetime)
-               or o.created_at.tzinfo is None or o.created_at > now
                for o in orders):
             return Signal(symbol, "RED", "Broker order history cannot be verified")
+        if any(not isinstance(o.created_at, datetime) or o.created_at.tzinfo is None
+               or o.created_at > now for o in orders):
+            return Signal(symbol, "RED", "Order timestamp cannot be verified")
     except (TypeError, ValueError, AttributeError):
         return Signal(symbol, "RED", "Broker state cannot be verified")
     if any(p.symbol.upper() == symbol and p.quantity != 0 for p in positions):
