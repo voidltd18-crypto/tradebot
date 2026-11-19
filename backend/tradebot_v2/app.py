@@ -156,7 +156,7 @@ el('refresh').onclick=async()=>{
  const money=n=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(Number(n));
  el('account').replaceChildren();for(const [name,val] of [['Account equity',money(data.account.equity)],['Cash',money(data.account.cash)],['Broker positions',String(data.positions.length)],['Bot-managed positions',data.managedPositionsConfigured?String(data.managedPositions.length):'Unverified'],['Available cash',money(data.availableCash)]]){
  const card=document.createElement('div');card.className='card';card.textContent=name+': '+val;el('account').append(card)}
- const note=document.createElement('p');note.textContent='Ownership: '+data.ownershipStatus;el('account').after(note);
+ let note=el('ownershipNote');if(!note){note=document.createElement('p');note.id='ownershipNote';el('account').after(note)}note.textContent='Ownership: '+data.ownershipStatus;
  el('research').replaceChildren();for(const signal of data.signals){
  const card=document.createElement('div');card.className='card';
  const title=document.createElement('h3');title.textContent=signal.symbol+' · '+signal.researchStatus;title.className=signal.researchStatus.toLowerCase();
