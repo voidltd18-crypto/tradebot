@@ -4,6 +4,7 @@ No broker order submission capability is imported or exposed.
 All order placement must remain disabled until a separately reviewed execution layer exists.
 """
 from dataclasses import dataclass
+from math import isfinite
 from datetime import datetime, timezone
 from typing import Iterable
 
@@ -79,7 +80,7 @@ def evaluate_pullback(symbol: str, closes: list[float]) -> Signal:
     symbol = symbol.upper().strip()
     if symbol not in TECH_UNIVERSE:
         return Signal(symbol, "RED", "Outside approved tech universe")
-    if len(closes) < 30 or any(p <= 0 for p in closes):
+    if len(closes) < 30 or any(not isinstance(p, (int, float)) or not isfinite(p) or p <= 0 for p in closes):
         return Signal(symbol, "AMBER", "Insufficient valid price history")
     recent = closes[-1]
     avg20 = sum(closes[-20:]) / 20
