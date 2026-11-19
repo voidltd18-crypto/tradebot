@@ -34,7 +34,7 @@ small{color:#a9b7c9}
 <button id="check">Check UNI/USD and ARB/USD</button>
 <p><small>Your token is used only for these requests. It is not saved in your browser or displayed in the results.</small></p>
 <div id="results" aria-live="polite"></div>\n<section><h2>Full Alpaca Account</h2><button id="accountCheck">Refresh account balance</button><div id="accountResults" aria-live="polite"><small>Enter your private preview token, then refresh to see live holdings.</small></div></section>
-<section><h2>Holdings performance</h2><p><small>Historical market prices · Current share quantities · Not historical account equity</small></p><div id="chartRanges"></div><div id="chartStatus" class="metrics">Enter your token and choose a range.</div><div id="chartLegend" class="metrics"></div><div id="moneySummary" class="metrics" style="margin:14px 0"></div><svg id="holdingsChart" viewBox="0 0 720 300" role="img" aria-label="Combined holdings performance chart" style="width:100%;height:auto;display:none"></svg></section>
+<section><h2>Holdings performance</h2><p><small>Historical market prices · Current share quantities · Not historical account equity</small></p><div id="chartRanges"></div><div id="chartStatus" class="metrics">Enter your token and choose a range.</div><div id="chartLegend" class="metrics"></div><div id="moneySummary" style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:18px 0"><div style="padding:14px;background:#142235;border-radius:10px"><div style="color:#b9c7da;font-size:13px">Total invested</div><strong id="investedValue" style="font-size:clamp(16px,2.5vw,25px)">$—</strong></div><div style="padding:14px;background:#142235;border-radius:10px"><div style="color:#b9c7da;font-size:13px">Holdings now</div><strong id="holdingsValue" style="font-size:clamp(16px,2.5vw,25px)">$—</strong></div><div style="padding:14px;background:#142235;border-radius:10px"><div style="color:#b9c7da;font-size:13px">Profit / loss</div><strong id="profitValue" style="font-size:clamp(16px,2.5vw,25px)">—</strong></div></div><div id="equityValue" class="metrics"></div><svg id="holdingsChart" viewBox="0 0 720 300" role="img" aria-label="Combined holdings performance chart" style="width:100%;height:auto;display:none"></svg></section>
 <script>
 const btn=document.getElementById('check');
 const output=document.getElementById('results');
@@ -146,7 +146,11 @@ async function loadChart(){
     const dot=svgNode('circle',{cx:695,cy:Y(liveReturn),r:5,fill:'#34d399',stroke:'#ffffff','stroke-width':1.5});chart.append(dot);
     const liveLabel=svgNode('text',{x:688,y:Y(liveReturn)-11,fill:'#34d399','font-size':12,'text-anchor':'end'});liveLabel.textContent='LIVE '+(liveReturn>=0?'+':'')+liveReturn.toFixed(2)+'%';chart.append(liveLabel);
   }
-  const summary=document.getElementById('moneySummary');summary.textContent=m?'Starting investment '+usd(m.costBasis)+'  ·  Holdings now '+usd(m.currentValue)+'  ·  P/L '+signed(Number(m.currentValue)-Number(m.costBasis))+'  ·  Full account equity '+usd(data.accountEquity):'Holdings figures unavailable';
+  document.getElementById('investedValue').textContent=m?usd(m.costBasis):'—';
+  document.getElementById('holdingsValue').textContent=m?usd(m.currentValue):'—';
+  const profit=m?Number(m.currentValue)-Number(m.costBasis):NaN;
+  const profitEl=document.getElementById('profitValue');profitEl.textContent=Number.isFinite(profit)?signed(profit):'—';profitEl.style.color=profit>=0?'#34d399':'#f87171';
+  document.getElementById('equityValue').textContent='Full account equity: '+usd(data.accountEquity)+' · Values update when the chart is refreshed.';
   chart.style.display='block';chartStatus.textContent='Split-adjusted historical trails; the separate green LIVE dot shows current broker holdings return (not connected to delayed history). '+(chartRange==='ALL'&&!data.holdingStartVerified?'Purchase date unavailable: showing up to 30 days. ':'')+'Not historical account equity.';
  }catch(e){chartStatus.textContent='Unable to load historical price chart.'}
 }
