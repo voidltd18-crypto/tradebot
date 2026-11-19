@@ -33,7 +33,7 @@ small{color:#a9b7c9}
 <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Enter your Render preview token">
 <button id="check">Check UNI/USD and ARB/USD</button>
 <p><small>Your token is used only for these requests. It is not saved in your browser or displayed in the results.</small></p>
-<div id="results" aria-live="polite"></div>
+<div id="results" aria-live="polite"></div>\n<section><h2>Full Alpaca Account</h2><button id="accountCheck">Refresh account balance</button><div id="accountResults" aria-live="polite"><small>Enter your private preview token, then refresh to see live holdings.</small></div></section>
 <script>
 const btn=document.getElementById('check');
 const output=document.getElementById('results');
@@ -83,6 +83,33 @@ btn.addEventListener('click',async()=>{
   }
   btn.disabled=false;
 });
+
+const accountBtn=document.getElementById('accountCheck');
+const accountOutput=document.getElementById('accountResults');
+const usd=v=>{const n=Number(v);return Number.isFinite(n)?new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(n):'—'};
+const signed=v=>{const n=Number(v);return (n>0?'+':'')+usd(n)};
+const accountLine=(label,value)=>{const p=document.createElement('p');p.className='metrics';p.textContent=label+': '+value;return p};
+accountBtn.addEventListener('click',async()=>{
+ const token=document.getElementById('token').value;
+ if(!token){accountOutput.textContent='Enter your private preview token first.';return}
+ accountBtn.disabled=true;accountOutput.textContent='Loading live account…';
+ try{
+  const r=await fetch('/account',{headers:{'X-Preview-Token':token},cache:'no-store'});
+  if(!r.ok){accountOutput.textContent=r.status===403?'Invalid preview token':'Account unavailable (HTTP '+r.status+')';return}
+  const a=await r.json();accountOutput.replaceChildren();
+  const heading=document.createElement('h3');heading.textContent=a.mode+' account overview';accountOutput.append(heading);
+  for(const [label,value] of [['Total equity',usd(a.equity)],['Previous equity',usd(a.previousEquity)],['Cash',usd(a.cash)],['Buying power',usd(a.buyingPower)],['Account today',signed(a.todayChange)+' ('+Number(a.todayChangePct).toFixed(2)+'%)']])accountOutput.append(accountLine(label,value));
+  const filter=document.createElement('select');filter.setAttribute('aria-label','Filter holdings');
+  for(const [v,label] of [['all','All holdings'],['us_equity','Stocks'],['crypto','Crypto']]){const opt=document.createElement('option');opt.value=v;opt.textContent=label;filter.append(opt)}
+  filter.style.cssText='width:100%;padding:10px;background:#202d40;color:white;border-radius:8px;margin-top:12px';
+  const list=document.createElement('div');accountOutput.append(filter,list);
+  const render=()=>{list.replaceChildren();const items=a.positions.filter(p=>filter.value==='all'||p.assetClass===filter.value);
+   const summary=document.createElement('p');summary.className='metrics';summary.textContent=items.length+' positions · Market value '+usd(items.reduce((t,p)=>t+Number(p.marketValue),0))+' · Unrealized P/L '+signed(items.reduce((t,p)=>t+Number(p.unrealizedPL),0));list.append(summary);
+   for(const p of items){const box=document.createElement('section');const title=document.createElement('strong');title.textContent=p.symbol+' · '+p.assetClass;box.append(title);
+    for(const [k,v] of [['Quantity',p.quantity],['Average buy',usd(p.averageBuy)],['Current price',usd(p.currentPrice)],['Cost basis',usd(p.costBasis)],['Market value',usd(p.marketValue)],['Overall P/L',signed(p.unrealizedPL)+' ('+Number(p.unrealizedPLPct).toFixed(2)+'%)'],["Today's P/L",signed(p.todayPL)+' ('+Number(p.todayPLPct).toFixed(2)+'%)']])box.append(accountLine(k,v));list.append(box)}
+  };filter.addEventListener('change',render);render();
+ }catch(e){accountOutput.textContent='Connection error retrieving account.'}finally{accountBtn.disabled=false}
+});
 </script></main></body></html>"""
     return HTMLResponse(html, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"})
 
@@ -98,3 +125,49 @@ def signal(symbol: str, x_preview_token: str = Header(default="")):
     from alpaca.data.historical import CryptoHistoricalDataClient
     return preview(TradingClient(key, secret, paper=os.getenv("APCA_API_PAPER", "false").lower() == "true"),
                    CryptoHistoricalDataClient(key, secret), symbol)
+
+@app.get("/account")
+def account_overview(x_preview_token: str = Header(default="")):
+    """Authenticated, read-only Alpaca equity, positions and intraday P/L."""
+    token = os.getenv("SMART_REBUY_PREVIEW_TOKEN", "")
+    if not token or not secrets.compare_digest(x_preview_token, token):
+        raise HTTPException(status_code=403, detail="Preview access denied")
+    key, secret = os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY")
+    if not key or not secret:
+        raise HTTPException(status_code=503, detail="Broker credentials not configured")
+    from decimal import Decimal
+    from alpaca.trading.client import TradingClient
+    from fastapi.responses import JSONResponse
+    client = TradingClient(key, secret, paper=os.getenv("APCA_API_PAPER", "false").lower() == "true")
+    try:
+        account = client.get_account()
+        positions = client.get_all_positions()
+    except Exception:
+        raise HTTPException(status_code=502, detail="Unable to retrieve broker account data")
+    def dec(value):
+        return Decimal(str(value)) if value is not None and str(value) != "" else Decimal("0")
+    def fmt(value):
+        return str(value)
+    equity, prior = dec(account.equity), dec(account.last_equity)
+    change = equity - prior
+    result = []
+    for p in positions:
+        asset_class = str(getattr(p.asset_class, "value", p.asset_class)).lower()
+        result.append({
+            "symbol": p.symbol, "assetClass": asset_class,
+            "quantity": fmt(dec(p.qty)), "averageBuy": fmt(dec(p.avg_entry_price)),
+            "currentPrice": fmt(dec(p.current_price)), "costBasis": fmt(dec(p.cost_basis)),
+            "marketValue": fmt(dec(p.market_value)),
+            "unrealizedPL": fmt(dec(p.unrealized_pl)),
+            "unrealizedPLPct": fmt(dec(p.unrealized_plpc) * 100),
+            "todayPL": fmt(dec(p.unrealized_intraday_pl)),
+            "todayPLPct": fmt(dec(p.unrealized_intraday_plpc) * 100)
+        })
+    return JSONResponse({
+        "mode": "PAPER" if os.getenv("APCA_API_PAPER", "false").lower() == "true" else "LIVE",
+        "equity": fmt(equity), "previousEquity": fmt(prior),
+        "cash": fmt(dec(account.cash)), "buyingPower": fmt(dec(account.buying_power)),
+        "todayChange": fmt(change),
+        "todayChangePct": fmt(change / prior * 100 if prior else Decimal("0")),
+        "positions": result, "readOnly": True
+    }, headers={"Cache-Control": "no-store"})
