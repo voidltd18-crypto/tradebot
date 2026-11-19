@@ -21,7 +21,7 @@ def authorize(token: str):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "2.0", "readOnly": True, "tradingEnabled": False}
+    return {"ok": True, "version": "2.0", "readOnly": True, "tradingEnabled": False, "brokerConfigured": bool(os.getenv("APCA_API_KEY_ID") and os.getenv("APCA_API_SECRET_KEY")), "previewTokenConfigured": bool(os.getenv("SMART_REBUY_PREVIEW_TOKEN"))}
 
 
 @app.get("/api/scan")
