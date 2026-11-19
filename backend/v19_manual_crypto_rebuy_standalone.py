@@ -147,7 +147,7 @@ async function loadChart(){
   for(const s of series){if(s.points.length<2)continue;const points=s.points.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' ');
    chart.append(svgNode('polyline',{points,fill:'none',stroke:colors[s.symbol]||'#d8b4fe','stroke-width':s.symbol==='Combined'?3.5:2.5,'stroke-linejoin':'round'}));
    const last=s.points[s.points.length-1][1];const label=document.createElement('span');label.style.cssText='display:inline-block;margin:8px 16px 0 0;color:'+(colors[s.symbol]||'#d8b4fe');label.textContent='● '+s.symbol+' '+(last>=0?'+':'')+last.toFixed(2)+'%';chartLegend.append(label)}
-  const summary=document.getElementById('moneySummary');const m=data.money;summary.textContent=m?'Starting investment '+usd(m.costBasis)+'  ·  Holdings now '+usd(m.currentValue)+'  ·  P/L '+signed(Number(m.currentValue)-Number(m.costBasis))+'  ·  Full account equity '+usd(data.accountEquity):'Holdings figures unavailable';
+  const summary=document.getElementById('moneySummary');summary.textContent=m?'Starting investment '+usd(m.costBasis)+'  ·  Holdings now '+usd(m.currentValue)+'  ·  P/L '+signed(Number(m.currentValue)-Number(m.costBasis))+'  ·  Full account equity '+usd(data.accountEquity):'Holdings figures unavailable';
   chart.style.display='block';chartStatus.textContent='Split-adjusted prices; the latest combined point uses live holdings. '+(chartRange==='ALL'&&!data.holdingStartVerified?'Purchase date unavailable: showing up to 30 days. ':'')+'Not historical account equity.';
  }catch(e){chartStatus.textContent='Unable to load historical price chart.'}
 }
