@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from backend.tradebot_v2.store import read_verified_ownership
 from backend.tradebot_v2.research import evaluate_history
 from backend.tradebot_v2.engine import (
     TECH_UNIVERSE, OrderRecord, Position, entry_gate, evaluate_pullback,
@@ -53,6 +54,7 @@ def scan(x_preview_token: str = Header(default="")):
         raise HTTPException(502, "Broker account or order history unavailable; all entries blocked")
 
     positions = [Position(p.symbol, float(p.qty)) for p in broker_positions if float(p.qty) != 0]
+    ownership = read_verified_ownership(os.getenv("TRADEBOT_V2_DATABASE_URL"), {p.symbol: float(p.qty) for p in broker_positions})
     history = []
     for o in orders:
         created = getattr(o, "filled_at", None) or getattr(o, "created_at", None)
@@ -113,8 +115,9 @@ def scan(x_preview_token: str = Header(default="")):
         "positions": [{"symbol": p.symbol, "quantity": p.quantity} for p in positions],
         "positionLimit": 2,
         "positionLimitScope": "whole broker account",
-        "managedPositions": [],
-        "managedPositionsConfigured": False,
+        "managedPositions": [{"symbol": k, "quantity": v} for k, v in ownership.managed.items()] if ownership.verified else [],
+        "managedPositionsConfigured": ownership.verified,
+        "ownershipStatus": ownership.reason,
         "researchMode": "hypothetical signals only; no virtual fills or profit claims",
         "availableCash": str(account.cash),
         "signals": signals,
@@ -151,8 +154,9 @@ el('refresh').onclick=async()=>{
  if(!response.ok){el('status').textContent='Unable to scan (HTTP '+response.status+'). No trading possible.';return}
  const data=await response.json();el('status').textContent='Updated '+new Date(data.asOf).toLocaleString()+' · Read-only';
  const money=n=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD'}).format(Number(n));
- el('account').replaceChildren();for(const [name,val] of [['Account equity',money(data.account.equity)],['Cash',money(data.account.cash)],['Broker positions',String(data.positions.length)],['Bot-managed positions','Not configured'],['Available cash',money(data.availableCash)]]){
+ el('account').replaceChildren();for(const [name,val] of [['Account equity',money(data.account.equity)],['Cash',money(data.account.cash)],['Broker positions',String(data.positions.length)],['Bot-managed positions',data.managedPositionsConfigured?String(data.managedPositions.length):'Unverified'],['Available cash',money(data.availableCash)]]){
  const card=document.createElement('div');card.className='card';card.textContent=name+': '+val;el('account').append(card)}
+ const note=document.createElement('p');note.textContent='Ownership: '+data.ownershipStatus;el('account').after(note);
  el('research').replaceChildren();for(const signal of data.signals){
  const card=document.createElement('div');card.className='card';
  const title=document.createElement('h3');title.textContent=signal.symbol+' · '+signal.researchStatus;title.className=signal.researchStatus.toLowerCase();
