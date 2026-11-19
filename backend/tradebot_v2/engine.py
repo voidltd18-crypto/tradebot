@@ -54,6 +54,10 @@ def entry_gate(
         return Signal(symbol, "RED", "Already holding this stock")
     if len([p for p in positions if p.quantity != 0]) >= MAX_POSITIONS:
         return Signal(symbol, "RED", "Maximum two positions already held")
+    pending_buy_symbols = {o.symbol.upper() for o in orders if o.side.lower() == "buy" and o.status.lower() in {"new", "accepted", "pending_new", "partially_filled", "held", "pending_replace"}}
+    held_symbols = {p.symbol.upper() for p in positions if p.quantity != 0}
+    if len(held_symbols | pending_buy_symbols) >= MAX_POSITIONS and symbol not in held_symbols:
+        return Signal(symbol, "RED", "Position slots reserved by holdings or pending buys")
     for order in orders:
         if order.symbol.upper() != symbol:
             continue
