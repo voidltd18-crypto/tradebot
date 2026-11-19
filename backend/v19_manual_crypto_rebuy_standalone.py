@@ -97,7 +97,7 @@ accountBtn.addEventListener('click',async()=>{
  try{
   const r=await fetch('/account',{headers:{'X-Preview-Token':token},cache:'no-store'});
   if(!r.ok){accountOutput.textContent=r.status===403?'Invalid preview token':'Account unavailable (HTTP '+r.status+')';return}
-  const a=await r.json();accountOutput.replaceChildren();
+  const a=await r.json();updateHoldingFigures(a.positions,a.equity);accountOutput.replaceChildren();
   const heading=document.createElement('h3');heading.textContent=a.mode+' account overview';accountOutput.append(heading);
   for(const [label,value] of [['Total equity',usd(a.equity)],['Previous equity',usd(a.previousEquity)],['Cash',usd(a.cash)],['Buying power',usd(a.buyingPower)],['Account today',signed(a.todayChange)+' ('+Number(a.todayChangePct).toFixed(2)+'%)']])accountOutput.append(accountLine(label,value));
   const filter=document.createElement('select');filter.setAttribute('aria-label','Filter holdings');
@@ -112,6 +112,16 @@ accountBtn.addEventListener('click',async()=>{
  }catch(e){accountOutput.textContent='Connection error retrieving account.'}finally{accountBtn.disabled=false}
 });
 
+function updateHoldingFigures(positions,equity){
+ const stocks=(positions||[]).filter(p=>p.assetClass==='us_equity'&&Number(p.marketValue)>=0.01);
+ const invested=stocks.reduce((sum,p)=>sum+Number(p.costBasis||0),0);
+ const now=stocks.reduce((sum,p)=>sum+Number(p.marketValue||0),0);
+ const profit=now-invested;
+ document.getElementById('investedValue').textContent=usd(invested);
+ document.getElementById('holdingsValue').textContent=usd(now);
+ const el=document.getElementById('profitValue');el.textContent=signed(profit);el.style.color=profit>=0?'#34d399':'#f87171';
+ document.getElementById('equityValue').textContent='Full account equity: '+usd(equity);
+}
 const ranges=['1D','5D','1M','3M','1Y','ALL'];
 const chartRanges=document.getElementById('chartRanges'),chartStatus=document.getElementById('chartStatus');
 const chart=document.getElementById('holdingsChart'),chartLegend=document.getElementById('chartLegend');
@@ -155,6 +165,7 @@ async function loadChart(){
  }catch(e){chartStatus.textContent='Unable to load historical price chart.'}
 }
 
+document.getElementById('token').addEventListener('change',()=>{if(document.getElementById('token').value){accountBtn.click();loadChart();}});
 for(const range of ranges){const b=document.createElement('button');b.textContent=range;b.style.marginRight='6px';b.addEventListener('click',()=>{chartRange=range;loadChart()});chartRanges.append(b)}
 </script></main></body></html>"""
     return HTMLResponse(html, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"})
