@@ -5,6 +5,7 @@ Results measure signal frequency and forward price changes, NOT trading returns.
 """
 from dataclasses import dataclass
 from statistics import mean
+from math import isfinite
 
 from backend.tradebot_v2.engine import evaluate_pullback
 
@@ -22,7 +23,7 @@ class ResearchStats:
 def evaluate_history(symbol: str, closes: list[float], forward_bars: int = 5) -> ResearchStats:
     if forward_bars < 1:
         raise ValueError("forward_bars must be positive")
-    if any(not isinstance(v, (int, float)) or v <= 0 for v in closes):
+    if any(not isinstance(v, (int, float)) or not isfinite(v) or v <= 0 for v in closes):
         raise ValueError("Prices must be positive numbers")
     green = 0
     forward = []
