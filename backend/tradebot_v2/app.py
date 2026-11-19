@@ -1,6 +1,7 @@
 """Isolated read-only TradeBot 2.0 dashboard. No trading API calls."""
 import os
 import secrets
+import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, Header, HTTPException
@@ -36,6 +37,16 @@ def ledger_health():
         return {"configured": True, "reachable": True, "schemaReady": schema_ready}
     except Exception:
         return {"configured": True, "reachable": False, "schemaReady": False}
+
+
+@app.on_event("startup")
+def startup_database_diagnostic():
+    # Only booleans; never print credentials, connection strings or broker data.
+    status = ledger_health()
+    logging.getLogger("tradebot_v2").info(
+        "v2 ledger diagnostic: configured=%s reachable=%s schemaReady=%s",
+        status["configured"], status["reachable"], status["schemaReady"],
+    )
 
 
 @app.get("/health")
