@@ -34,7 +34,7 @@ small{color:#a9b7c9}
 <button id="check">Check UNI/USD and ARB/USD</button>
 <p><small>Your token is used only for these requests. It is not saved in your browser or displayed in the results.</small></p>
 <div id="results" aria-live="polite"></div>\n<section><h2>Full Alpaca Account</h2><button id="accountCheck">Refresh account balance</button><div id="accountResults" aria-live="polite"><small>Enter your private preview token, then refresh to see live holdings.</small></div></section>
-<section><h2>Holdings performance</h2><p><small>Historical market prices · Current share quantities · Not historical account equity</small></p><div id="chartRanges"></div><div id="chartStatus" class="metrics">Enter your token and choose a range.</div><div id="chartLegend" class="metrics"></div><svg id="holdingsChart" viewBox="0 0 720 300" role="img" aria-label="Combined holdings performance chart" style="width:100%;height:auto;display:none"></svg></section>
+<section><h2>Holdings performance</h2><p><small>Historical market prices · Current share quantities · Not historical account equity</small></p><div id="chartRanges"></div><div id="chartStatus" class="metrics">Enter your token and choose a range.</div><div id="chartLegend" class="metrics"></div><div id="moneySummary" class="metrics" style="margin-top:16px"></div><svg id="moneyChart" viewBox="0 0 720 300" role="img" aria-label="Portfolio market value and purchase cost" style="width:100%;height:auto;display:none"></svg><svg id="holdingsChart" viewBox="0 0 720 300" role="img" aria-label="Combined holdings performance chart" style="width:100%;height:auto;display:none"></svg></section>
 <script>
 const btn=document.getElementById('check');
 const output=document.getElementById('results');
@@ -138,8 +138,30 @@ async function loadChart(){
   for(const s of series){if(s.points.length<2)continue;const points=s.points.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' ');
    chart.append(svgNode('polyline',{points,fill:'none',stroke:colors[s.symbol]||'#d8b4fe','stroke-width':s.symbol==='Combined'?3.5:2.5,'stroke-linejoin':'round'}));
    const last=s.points[s.points.length-1][1];const label=document.createElement('span');label.style.cssText='display:inline-block;margin:8px 16px 0 0;color:'+(colors[s.symbol]||'#d8b4fe');label.textContent='● '+s.symbol+' '+(last>=0?'+':'')+last.toFixed(2)+'%';chartLegend.append(label)}
+  drawMoney(data);
   chart.style.display='block';chartStatus.textContent='Change since the start of the selected range · Prices may be delayed. Combined uses current holdings quantities, not historical account equity.';
  }catch(e){chartStatus.textContent='Unable to load historical price chart.'}
+}
+
+function drawMoney(data){
+ const el=document.getElementById('moneyChart'),summary=document.getElementById('moneySummary');
+ el.replaceChildren();el.style.display='none';summary.textContent='';
+ const money=data.money;
+ if(!money||!money.points||money.points.length<2)return;
+ const pts=money.points,cost=Number(money.costBasis),current=Number(money.currentValue);
+ if(!Number.isFinite(cost)||!Number.isFinite(current))return;
+ const vals=pts.map(p=>p[1]).concat([cost,current]);
+ let lo=Math.min(...vals),hi=Math.max(...vals);if(hi===lo){lo-=1;hi+=1}
+ const pad=(hi-lo)*.15;lo-=pad;hi+=pad;
+ const t0=pts[0][0],t1=pts[pts.length-1][0],X=t=>58+(t-t0)/Math.max(1,t1-t0)*635,Y=v=>255-(v-lo)/(hi-lo)*215;
+ for(let i=0;i<=4;i++){const v=lo+(hi-lo)*i,y=Y(v);
+  el.append(svgNode('line',{x1:58,y1:y,x2:695,y2:y,stroke:'#526176','stroke-opacity':'.35'}));
+  const label=svgNode('text',{x:52,y:y+4,fill:'#cbd5e1','font-size':12,'text-anchor':'end'});label.textContent=usd(v);el.append(label)}
+ el.append(svgNode('line',{x1:58,y1:Y(cost),x2:695,y2:Y(cost),stroke:'#f87171','stroke-width':2,'stroke-dasharray':'8 5'}));
+ el.append(svgNode('polyline',{points:pts.map(p=>X(p[0]).toFixed(1)+','+Y(p[1]).toFixed(1)).join(' '),fill:'none',stroke:'#34d399','stroke-width':3,'stroke-linejoin':'round'}));
+ const last=pts[pts.length-1],dot=svgNode('circle',{cx:X(last[0]),cy:Y(last[1]),r:5,fill:'#34d399'});el.append(dot);
+ summary.textContent='Purchase cost: '+usd(cost)+'  |  Current Alpaca holdings: '+usd(current)+'  |  Unrealized P/L: '+signed(current-cost)+'  |  Green: historical reconstructed value · Dashed red: purchase cost';
+ el.style.display='block';
 }
 for(const range of ranges){const b=document.createElement('button');b.textContent=range;b.style.marginRight='6px';b.addEventListener('click',()=>{chartRange=range;loadChart()});chartRanges.append(b)}
 </script></main></body></html>"""
@@ -248,6 +270,7 @@ def holdings_history(range: str = "5D", x_preview_token: str = Header(default=""
                 values = [v for v in values if datetime.fromtimestamp(v[0]/1000, timezone.utc).date() == latest_day]
             raw[p.symbol] = values
         series = []
+        money = None
         for symbol, values in raw.items():
             if len(values) < 2 or not values[0][1]:
                 continue
@@ -262,10 +285,13 @@ def holdings_history(range: str = "5D", x_preview_token: str = Header(default=""
                 quantities = {p.symbol: float(p.qty) for p in positions}
                 baseline = sum(available[s][common[0]]*quantities[s] for s in symbols)
                 if baseline:
+                    money = {"costBasis": round(sum(float(p.cost_basis) for p in positions if p.symbol in symbols), 4),
+                             "currentValue": round(sum(float(p.market_value) for p in positions if p.symbol in symbols), 4),
+                             "points": [[t, round(sum(available[s][t]*quantities[s] for s in symbols), 4)] for t in common]}
                     series.append({"symbol": "Combined", "points": [
                         [t, round((sum(available[s][t]*quantities[s] for s in symbols)/baseline-1)*100, 4)]
                         for t in common]})
-        return JSONResponse({"range": range, "series": series, "readOnly": True},
+        return JSONResponse({"range": range, "series": series, "money": money, "readOnly": True},
                             headers={"Cache-Control": "no-store"})
     except Exception:
         raise HTTPException(status_code=502, detail="Historical market data unavailable")
