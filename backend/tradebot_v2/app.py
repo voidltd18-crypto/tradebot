@@ -43,7 +43,7 @@ def ledger_health():
 def startup_database_diagnostic():
     # Only booleans; never print credentials, connection strings or broker data.
     status = ledger_health()
-    logging.getLogger("tradebot_v2").info(
+    logging.getLogger("uvicorn.error").warning(
         "v2 ledger diagnostic: configured=%s reachable=%s schemaReady=%s",
         status["configured"], status["reachable"], status["schemaReady"],
     )
