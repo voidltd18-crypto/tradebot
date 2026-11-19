@@ -61,7 +61,7 @@ def entry_gate(
     for order in orders:
         if order.symbol.upper() != symbol:
             continue
-        if order.created_at.tzinfo is None:
+        if order.created_at.tzinfo is None or order.created_at > now:
             return Signal(symbol, "RED", "Order timestamp cannot be verified")
         if order.status.lower() in {"new", "accepted", "pending_new", "partially_filled", "held", "pending_replace"}:
             return Signal(symbol, "RED", "Existing pending order")
