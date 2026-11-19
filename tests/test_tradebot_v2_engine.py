@@ -32,3 +32,22 @@ def test_universe_restriction():
 
 def test_short_price_history_not_green():
     assert evaluate_pullback("AAPL", [100.0] * 10).status != "GREEN"
+
+def test_rebuy_next_day_still_blocked_if_holding():
+    assert entry_gate("AAPL", [Position("AAPL", 2)], [order("AAPL", "buy", "filled", 26)], NOW).status == "RED"
+
+def test_recent_sell_blocks_even_after_new_day():
+    assert entry_gate("AAPL", [], [order("AAPL", "sell", "filled", 13)], NOW).status == "AMBER"
+
+def test_old_sale_does_not_authorize_buy():
+    assert entry_gate("AAPL", [], [order("AAPL", "sell", "filled", 48)], NOW).status == "AMBER"
+
+def test_signal_never_places_orders():
+    import ast
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "backend" / "tradebot_v2"
+    for file in root.glob("*.py"):
+        tree = ast.parse(file.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                assert node.attr not in {"submit_order", "cancel_order", "close_position", "close_all_positions"}
