@@ -77,3 +77,8 @@ def test_future_dated_order_fails_closed():
     gate = entry_gate("AAPL", [], [future], NOW)
     assert gate.status == "RED"
     assert "timestamp" in gate.reason.lower()
+
+
+def test_non_finite_prices_cannot_produce_green_signal():
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        assert evaluate_pullback("AAPL", [100.0] * 29 + [bad]).status != "GREEN"
