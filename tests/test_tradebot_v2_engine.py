@@ -59,3 +59,14 @@ def test_two_pending_buys_reserve_both_slots():
 def test_one_holding_and_one_pending_buy_reserve_slots():
     pending = [order("NVDA", "buy", "accepted")]
     assert entry_gate("AAPL", [Position("MSFT", 1)], pending, NOW).status == "RED"
+
+def test_research_is_independent_of_broker_positions():
+    prices = [100.0] * 10 + [102.0] * 10 + [104.0] * 9 + [102.0]
+    research = evaluate_pullback("NVDA", prices)
+    gate = entry_gate("NVDA", [Position("NVDA", 1)], [], NOW)
+    assert gate.status == "RED"
+    assert research.status in {"GREEN", "AMBER", "RED"}
+
+def test_research_never_overrides_existing_position_guard():
+    gate = entry_gate("MSFT", [Position("MSFT", 3)], [], NOW)
+    assert gate.reason == "Already holding this stock"
