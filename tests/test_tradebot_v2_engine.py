@@ -51,3 +51,11 @@ def test_signal_never_places_orders():
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute):
                 assert node.attr not in {"submit_order", "cancel_order", "close_position", "close_all_positions"}
+
+def test_two_pending_buys_reserve_both_slots():
+    pending = [order("MSFT", "buy", "accepted"), order("NVDA", "buy", "new")]
+    assert entry_gate("AAPL", [], pending, NOW).status == "RED"
+
+def test_one_holding_and_one_pending_buy_reserve_slots():
+    pending = [order("NVDA", "buy", "accepted")]
+    assert entry_gate("AAPL", [Position("MSFT", 1)], pending, NOW).status == "RED"
