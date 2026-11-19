@@ -260,6 +260,8 @@ def holdings_history(range: str = "5D", x_preview_token: str = Header(default=""
             pass
         if range == "ALL":
             days = 30 if holding_start is None else max(2, min(1825, (now-holding_start).days+2))
+        if range == "ALL" and days <= 9:
+            intraday = True
         request = StockBarsRequest(symbol_or_symbols=[p.symbol for p in positions],
                                    timeframe=TimeFrame.Minute if intraday else TimeFrame.Day,
                                    start=now-timedelta(days=days), end=now,
