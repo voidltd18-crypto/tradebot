@@ -4,6 +4,7 @@ Runs tests and prints a machine-readable result. This is NOT an autonomous
 coding agent. No broker imports, order submission, deployments or commits.
 """
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -21,6 +22,16 @@ def main():
     tests = sorted(str(p.relative_to(ROOT)) for p in (ROOT / "tests").glob("test_tradebot_v2_*.py"))
     if not tests:
         raise SystemExit("Refusing audit: no TradeBot v2 tests found")
+    if os.getenv("TRADEBOT_V2_DISPOSABLE_TEST_BRANCH") == "true":
+        # Test-only dependency: the isolated cron's build command installs pytest.
+        # Fail closed if psycopg cannot be installed; never skip integration silently.
+        install = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+             "psycopg[binary]==3.2.12"],
+            cwd=ROOT, capture_output=True, text=True, timeout=90, check=False,
+        )
+        if install.returncode:
+            raise SystemExit("Disposable Neon integration dependency installation failed")
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", *tests],
