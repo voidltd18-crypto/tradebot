@@ -103,3 +103,8 @@ def test_duplicate_position_rows_count_as_one_symbol():
 def test_unreadable_broker_state_fails_closed():
     assert entry_gate("AAPL", [Position("MSFT", "unknown")], [], NOW).status == "RED"
     assert entry_gate("AAPL", [], [OrderRecord("NVDA", "buy", None, "filled")], NOW).status == "RED"
+
+def test_invalid_symbol_type_fails_closed():
+    for bad in (None, 42, [], {}):
+        assert entry_gate(bad, [], [], NOW).status == "RED"
+        assert evaluate_pullback(bad, [100.0] * 30).status == "RED"
