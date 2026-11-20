@@ -1,0 +1,7 @@
+{
+  "git": {
+    "deploymentEnabled": {
+      "feature/tradebot-v2-clean-rebuild": false
+    }
+  }
+}
