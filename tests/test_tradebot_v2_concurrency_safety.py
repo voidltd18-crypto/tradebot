@@ -49,8 +49,11 @@ def test_same_side_duplicate_active_order_blocked(side):
 def test_uncertain_or_active_order_blocks_duplicate(state):
     simulator = OfflineOrders()
     simulator.reserve("META", "BUY", 2, "first")
-    if state != "reserved":
-        simulator.update("first", state, 1 if state == "partially_filled" else 0)
+    if state == "partially_filled":
+        simulator.update("first", "accepted", 0)
+        simulator.update("first", state, 1)
+    elif state != "reserved":
+        simulator.update("first", state, 0)
     with pytest.raises(RuntimeError):
         simulator.reserve("META", "BUY", 2, "second")
 
