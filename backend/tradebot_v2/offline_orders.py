@@ -57,8 +57,8 @@ class OfflineOrders:
                 raise ValueError("Invalid quantity") from None
             if not qty.is_finite() or qty <= 0 or side not in {"BUY", "SELL"} or not symbol:
                 raise ValueError("Invalid order")
-            if (symbol, side) in self._active:
-                raise RuntimeError("Duplicate active order")
+            if any(active_symbol == symbol for active_symbol, _ in self._active):
+                raise RuntimeError("Duplicate active order for symbol")
             order = SimulatedOrder("sim-" + uuid4().hex, symbol, side, qty, Decimal(0), "reserved")
             self._orders[request_id] = order
             self._active.add((symbol, side))
