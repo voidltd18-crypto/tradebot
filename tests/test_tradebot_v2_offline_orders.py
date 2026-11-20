@@ -51,3 +51,19 @@ def test_shutdown_blocks_new_orders():
     s.shutdown = True
     with pytest.raises(RuntimeError):
         s.reserve("AAPL", "BUY", 1, "r1")
+
+def test_idempotency_key_cannot_change_order():
+    s = OfflineOrders()
+    s.reserve("AAPL", "BUY", 1, "key")
+    with pytest.raises(ValueError):
+        s.reserve("AAPL", "SELL", 1, "key")
+    with pytest.raises(ValueError):
+        s.reserve("AAPL", "BUY", 2, "key")
+    with pytest.raises(ValueError):
+        s.reserve("NVDA", "BUY", 1, "key")
+
+
+def test_blank_symbol_is_rejected():
+    s = OfflineOrders()
+    with pytest.raises(ValueError):
+        s.reserve("", "BUY", 1, "key")
