@@ -1,0 +1,13 @@
+{
+  "project": "TradeBot 2.0 isolated engineering",
+  "branch": "feature/tradebot-v2-clean-rebuild",
+  "execution_enabled": false,
+  "tasks": [
+    {"id":"tests-full-suite","priority":1,"status":"pending","acceptance":"Full TradeBot v2 suite executed with recorded pass/fail counts and GitHub Actions confirmed"},
+    {"id":"neon-durable-reservations","priority":2,"status":"pending","acceptance":"Atomic durable reservations with unique keys, concurrency and restart recovery tests"},
+    {"id":"simulated-buy-sell","priority":3,"status":"pending","acceptance":"End-to-end simulated buy/sell, manual inventory protected, account-wide two-position cap"},
+    {"id":"backtesting-real-data","priority":4,"status":"pending","acceptance":"Historical data provenance, out-of-sample net results, drawdown and benchmark comparison"},
+    {"id":"failure-integration","priority":5,"status":"pending","acceptance":"Outages, unknown submission, partial fills, duplicate orders and shutdown fail closed"},
+    {"id":"deployment-verification","priority":6,"status":"pending","acceptance":"Isolated service healthy, Neon verified, PR unmerged, live and paper orders disabled"}
+  ]
+}
