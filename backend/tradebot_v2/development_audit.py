@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKLOG = Path(__file__).with_name("development_backlog.json")
-from backend.tradebot_v2.development_coordinator import next_task
+from development_coordinator import next_task
 
 
 def main():
