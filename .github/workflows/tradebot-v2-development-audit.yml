@@ -1,0 +1,47 @@
+name: TradeBot v2 five-minute development audit
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tradebot-v2-development-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    if: github.repository == 'voidltd18-crypto/tradebot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out isolated development branch
+        uses: actions/checkout@v4
+        with:
+          ref: feature/tradebot-v2-clean-rebuild
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install test dependencies
+        run: python -m pip install pytest
+      - name: Run isolated TradeBot v2 tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q tests/test_tradebot_v2_*.py | tee tradebot-v2-audit.txt
+      - name: Preserve results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tradebot-v2-audit-${{ github.run_id }}
+          path: tradebot-v2-audit.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+# Safety: audit only. No broker credentials, no deployment credentials, no
+# code-writing agent and no automatic merge or deployment. A separate
+# explicitly configured development agent is required for autonomous builds.
