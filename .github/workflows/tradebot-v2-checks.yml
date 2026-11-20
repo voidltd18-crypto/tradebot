@@ -18,5 +18,15 @@ jobs:
         run: python -m pip install pytest
       - name: Compile modules
         run: python -m py_compile backend/tradebot_v2/engine.py backend/tradebot_v2/research.py backend/tradebot_v2/ledger.py backend/tradebot_v2/store.py backend/tradebot_v2/execution_plan.py backend/tradebot_v2/app.py backend/tradebot_v2/offline_orders.py
-      - name: Test safeguards
-        run: python -m pytest -q tests/test_tradebot_v2_engine.py tests/test_tradebot_v2_research.py tests/test_tradebot_v2_ledger.py tests/test_tradebot_v2_execution_plan.py tests/test_tradebot_v2_offline_orders.py
+      - name: Run the complete TradeBot v2 audit
+        shell: bash
+        run: |
+          set -o pipefail
+          python backend/tradebot_v2/development_audit.py | tee tradebot-v2-audit.json
+      - name: Preserve audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tradebot-v2-audit
+          path: tradebot-v2-audit.json
+          if-no-files-found: error
