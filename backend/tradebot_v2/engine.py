@@ -90,7 +90,7 @@ def entry_gate(
 
 def evaluate_pullback(symbol: str, closes: list[float]) -> Signal:
     """Research-only signal; requires backtesting before any use in trading."""
-    symbol = symbol.upper().strip()
+    symbol = symbol.upper().strip() if isinstance(symbol, str) else ""
     if symbol not in TECH_UNIVERSE:
         return Signal(symbol, "RED", "Outside approved tech universe")
     if len(closes) < 30 or any(not isinstance(p, (int, float)) or not isfinite(p) or p <= 0 for p in closes):
