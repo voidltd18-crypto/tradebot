@@ -39,14 +39,23 @@ class OfflineOrders:
             if not isinstance(request_id, str) or not request_id.strip():
                 raise ValueError("Missing idempotency key")
             if request_id in self._orders:
-                return self._orders[request_id]
+                existing = self._orders[request_id]
+                try:
+                    requested = Decimal(str(quantity))
+                except (InvalidOperation, TypeError, ValueError):
+                    raise ValueError("Idempotency key reused with invalid request") from None
+                if (not isinstance(symbol, str) or not isinstance(side, str)
+                        or existing.symbol != symbol.strip().upper()
+                        or existing.side != side.upper() or existing.quantity != requested):
+                    raise ValueError("Idempotency key reused for different order")
+                return existing
             symbol = symbol.strip().upper() if isinstance(symbol, str) else ""
             side = side.upper() if isinstance(side, str) else ""
             try:
                 qty = Decimal(str(quantity))
             except (InvalidOperation, TypeError, ValueError):
                 raise ValueError("Invalid quantity") from None
-            if not qty.is_finite() or qty <= 0 or side not in {"BUY", "SELL"}:
+            if not qty.is_finite() or qty <= 0 or side not in {"BUY", "SELL"} or not symbol:
                 raise ValueError("Invalid order")
             if (symbol, side) in self._active:
                 raise RuntimeError("Duplicate active order")
