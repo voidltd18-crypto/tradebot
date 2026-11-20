@@ -8,7 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 import pytest
 
-URL = os.getenv("TRADEBOT_V2_TEST_DATABASE_URL")
+URL = (os.getenv("TRADEBOT_V2_TEST_DATABASE_URL")
+       if os.getenv("TRADEBOT_V2_DISPOSABLE_TEST_BRANCH") == "true" else None)
 
 
 @pytest.mark.skipif(not URL, reason="Isolated Neon integration test URL not configured")
