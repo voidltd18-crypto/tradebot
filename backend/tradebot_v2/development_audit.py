@@ -11,6 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 BACKLOG = Path(__file__).with_name("development_backlog.json")
+from backend.tradebot_v2.development_coordinator import next_task
 
 
 def main():
@@ -28,12 +29,15 @@ def main():
         code, output = result.returncode, (result.stdout + result.stderr)[-12000:]
     except subprocess.TimeoutExpired:
         code, output = 124, "Tests exceeded 240-second timeout"
+    task = next_task(BACKLOG)
     report = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "branch": backlog["branch"],
         "execution_enabled": False,
         "tests_exit_code": code,
         "test_files": len(tests),
+        "next_task": task.task_id if task else None,
+        "coding_agent_connected": False,
         "outstanding_tasks": [task["id"] for task in backlog["tasks"] if task["status"] != "verified"],
         "test_output": output,
     }
