@@ -62,3 +62,25 @@ def reserve_offline(database_url: str, request_id: str, symbol: str, side: str, 
             except errors.UniqueViolation:
                 raise RuntimeError("Active order already reserved for this stock") from None
     return Reservation(str(row[0]), str(row[1]), row[2], row[3], Decimal(row[4]), row[5])
+
+
+def recover_active_offline(database_url: str) -> list[Reservation]:
+    """Read all outstanding reservations after restart; fail closed on database errors.
+
+    Caller must reconcile unknown outcomes before creating further reservations.
+    This function does not change order status or submit orders.
+    """
+    if not database_url:
+        raise ValueError("Isolated database URL required")
+    import psycopg
+    with psycopg.connect(database_url, connect_timeout=5) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT request_id, client_order_id, symbol, side, quantity, status
+                FROM tradebot_v2_order_reservations
+                WHERE status IN ('reserved', 'submitted_unknown', 'accepted', 'partially_filled')
+                ORDER BY created_at, request_id
+            """)
+            rows = cur.fetchall()
+    return [Reservation(str(row[0]), str(row[1]), row[2], row[3],
+                        Decimal(row[4]), row[5]) for row in rows]
