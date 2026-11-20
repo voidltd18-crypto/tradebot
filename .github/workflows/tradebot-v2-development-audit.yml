@@ -1,8 +1,8 @@
 name: TradeBot v2 five-minute development audit
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
+  # Scheduled runs require this workflow on the repository default branch.
+  # Keep the original bot isolated: do not merge merely to enable scheduling.
   workflow_dispatch:
 
 permissions:
