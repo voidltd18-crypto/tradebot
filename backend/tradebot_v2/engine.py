@@ -44,7 +44,7 @@ def entry_gate(
     now = now or datetime.now(timezone.utc)
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware")
-    symbol = symbol.upper().strip()
+    symbol = symbol.upper().strip() if isinstance(symbol, str) else ""
     if symbol not in TECH_UNIVERSE:
         return Signal(symbol, "RED", "Outside approved tech universe")
     if positions is None or orders is None:
