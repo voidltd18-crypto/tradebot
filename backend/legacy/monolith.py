@@ -20,7 +20,7 @@ import requests
 from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 
-from alpaca.trading.client import TradingClient
+from backend.read_only_broker import ReadOnlyTradingClient
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
@@ -539,7 +539,7 @@ LOCKED_UNIVERSE_FALLBACK_POOL = [
 # =========================
 # CLIENTS
 # =========================
-trading_client = TradingClient(API_KEY, API_SECRET, paper=PAPER)
+trading_client = ReadOnlyTradingClient(API_KEY, API_SECRET, paper=PAPER)
 data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
 
 
@@ -577,7 +577,7 @@ pdt_warning_events: List[Dict[str, Any]] = []
 partial_profit_taken: Dict[str, str] = {}
 equity_curve: List[Dict[str, Any]] = []
 
-bot_enabled = True
+bot_enabled = False
 manual_override = False
 emergency_stop = False
 bot_thread_started = False
@@ -10592,11 +10592,7 @@ def pause_bot(request: Request):
 @app.post("/resume")
 def resume_bot(request: Request):
     verify_api_key(request)
-    global bot_enabled, emergency_stop
-    bot_enabled = True
-    emergency_stop = False
-    update_status(BOT_NAME, latest_scans)
-    return {"ok": True, "message": "Bot resumed"}
+    raise HTTPException(403, "TradeBot is read-only. Orders are disabled.")
 
 
 @app.post("/manual-override/on")
@@ -10620,53 +10616,31 @@ def manual_override_off(request: Request):
 @app.post("/manual-buy")
 def manual_buy(request: Request):
     verify_api_key(request)
-    with bot_lock:
-        if not get_effective_market_status_payload().get("isOpen", False):
-            return {"ok": False, "message": "Market closed"}
-        result = money_mode_buy(latest_scans, manual=True)
-        update_status(BOT_NAME, latest_scans)
-        return {"ok": True, "message": result}
+    raise HTTPException(403, "TradeBot is read-only. Orders are disabled.")
 
 
 @app.post("/custom-buy/{symbol}")
 def custom_buy(symbol: str, request: Request):
     verify_api_key(request)
-    with bot_lock:
-        result = buy_custom_symbol(symbol)
-        update_status(BOT_NAME, latest_scans)
-        return result
+    raise HTTPException(403, "TradeBot is read-only. Orders are disabled.")
 
 
 @app.post("/manual-sell")
 def manual_sell(request: Request):
     verify_api_key(request)
-    with bot_lock:
-        result = close_worst_or_largest_position(reason="MANUAL SELL")
-        update_status(BOT_NAME, latest_scans)
-        return result
+    raise HTTPException(403, "TradeBot is read-only. Orders are disabled.")
 
 
 @app.post("/sell/{symbol}")
 def sell_symbol(symbol: str, request: Request):
     verify_api_key(request)
-    with bot_lock:
-        result = close_position_by_symbol(symbol.upper(), reason="MANUAL SYMBOL SELL")
-        update_status(BOT_NAME, latest_scans)
-        return result
+    raise HTTPException(403, "TradeBot is read-only. Orders are disabled.")
 
 
 @app.post("/emergency-sell")
 def emergency_sell(request: Request):
     verify_api_key(request)
-    global emergency_stop, bot_enabled
-    with bot_lock:
-        emergency_stop = True
-        bot_enabled = False
-        result = close_all_positions(reason="EMERGENCY SELL")
-        update_status(BOT_NAME, latest_scans)
-        return {**result, "emergencyStop": True, "botEnabled": False}
-
-
+    raise HTTPException(403, "TradeBot is read-only. Orders are disabled.")
 
 
 @app.post("/rebuild-closed-trades")
