@@ -108,3 +108,19 @@ def test_invalid_symbol_type_fails_closed():
     for bad in (None, 42, [], {}):
         assert entry_gate(bad, [], [], NOW).status == "RED"
         assert evaluate_pullback(bad, [100.0] * 30).status == "RED"
+
+
+def test_unknown_status_and_pending_cancel_do_not_free_account_slots():
+    existing = [Position("MSFT", 2)]
+    for status in ("unrecognized_status", "pending_cancel"):
+        pending = [OrderRecord("META", "buy", NOW, status)]
+        assert entry_gate("AAPL", existing, pending, NOW).status == "RED"
+
+
+def test_cancelled_partial_fills_still_count_for_entry_safeguards():
+    placed = NOW - timedelta(days=2)
+    fill_time = NOW - timedelta(minutes=1)
+    buy = OrderRecord("AAPL", "buy", placed, "canceled", 0.25, fill_time)
+    sell = OrderRecord("AAPL", "sell", placed, "canceled", 0.25, fill_time)
+    assert entry_gate("AAPL", [], [buy], NOW).reason == "Already bought today"
+    assert entry_gate("AAPL", [], [sell], NOW).reason == "Post-sale cooldown active"

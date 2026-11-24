@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
-TECH = frozenset({"AAPL", "MSFT", "NVDA", "AMZN", "GOOG", "GOOGL", "META"})
+from backend.tradebot_v2.engine import COOLDOWN_HOURS, MARKET_TIMEZONE, TECH_UNIVERSE
+from backend.tradebot_v2.offline_orders import TRANSITIONS
+
 ACTIVE = frozenset({"reserved", "submitted_unknown", "accepted", "partially_filled"})
 
 
@@ -18,9 +20,10 @@ class Reservation:
     side: str
     quantity: Decimal
     status: str
+    cumulative_filled: Decimal = Decimal(0)
 
 
-def reserve_offline(database_url: str, request_id: str, symbol: str, side: str, quantity) -> Reservation:
+def reserve_offline(database_url: str, request_id: str, symbol: str, side: str, quantity, *, require_idle=False) -> Reservation:
     """Atomically reserve in isolated Neon. Never retries an uncertain database write."""
     if not database_url or not isinstance(request_id, str) or not request_id.strip():
         raise ValueError("Isolated database URL and idempotency key required")
@@ -31,7 +34,7 @@ def reserve_offline(database_url: str, request_id: str, symbol: str, side: str, 
         qty = Decimal(str(quantity))
     except (InvalidOperation, TypeError, ValueError):
         raise ValueError("Invalid quantity") from None
-    if symbol not in TECH or side not in {"BUY", "SELL"} or not qty.is_finite() or qty <= 0:
+    if symbol not in TECH_UNIVERSE or side not in {"BUY", "SELL"} or not qty.is_finite() or qty <= 0:
         raise ValueError("Invalid offline reservation")
     # The unique request key and unique active-symbol index are enforced by Postgres.
     # A failed/uncertain connection raises; callers must not treat that as permission.
@@ -40,18 +43,45 @@ def reserve_offline(database_url: str, request_id: str, symbol: str, side: str, 
     client_order_id = "offline-" + uuid4().hex
     with psycopg.connect(database_url, connect_timeout=5) as conn:
         with conn.cursor() as cur:
+            cur.execute("SET LOCAL lock_timeout = '5s'")
+            if require_idle:
+                # Serialize against every insert/update, including existing callers.
+                cur.execute("LOCK TABLE tradebot_v2_order_reservations IN SHARE ROW EXCLUSIVE MODE")
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM tradebot_v2_order_reservations
+                        WHERE status = ANY(%s) AND request_id <> %s
+                    )
+                """, (list(ACTIVE), request_id))
+                if cur.fetchone()[0]:
+                    raise RuntimeError("Outstanding durable reservation")
+                if side == "BUY":
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT 1 FROM tradebot_v2_order_reservations
+                            WHERE symbol = %s AND request_id <> %s AND cumulative_filled > 0
+                            AND (
+                                (side = 'BUY' AND timezone(%s, updated_at)::date
+                                    = timezone(%s, now())::date)
+                                OR (side = 'SELL' AND updated_at > now() - make_interval(hours => %s))
+                            )
+                        )
+                    """, (symbol, request_id, MARKET_TIMEZONE.key,
+                          MARKET_TIMEZONE.key, COOLDOWN_HOURS))
+                    if cur.fetchone()[0]:
+                        raise RuntimeError("Daily purchase limit or post-sale cooldown active")
             try:
                 cur.execute("""
                     INSERT INTO tradebot_v2_order_reservations
                         (request_id, client_order_id, symbol, side, quantity, status)
                     VALUES (%s, %s, %s, %s, %s, 'reserved')
                     ON CONFLICT (request_id) DO NOTHING
-                    RETURNING request_id, client_order_id, symbol, side, quantity, status
+                    RETURNING request_id, client_order_id, symbol, side, quantity, status, cumulative_filled
                 """, (request_id, client_order_id, symbol, side, qty))
                 row = cur.fetchone()
                 if row is None:
                     cur.execute("""
-                        SELECT request_id, client_order_id, symbol, side, quantity, status
+                        SELECT request_id, client_order_id, symbol, side, quantity, status, cumulative_filled
                         FROM tradebot_v2_order_reservations WHERE request_id = %s
                     """, (request_id,))
                     row = cur.fetchone()
@@ -61,7 +91,7 @@ def reserve_offline(database_url: str, request_id: str, symbol: str, side: str, 
                         raise ValueError("Idempotency key reused with different payload")
             except errors.UniqueViolation:
                 raise RuntimeError("Active order already reserved for this stock") from None
-    return Reservation(str(row[0]), str(row[1]), row[2], row[3], Decimal(row[4]), row[5])
+    return Reservation(*row)
 
 
 def recover_active_offline(database_url: str) -> list[Reservation]:
@@ -76,11 +106,57 @@ def recover_active_offline(database_url: str) -> list[Reservation]:
     with psycopg.connect(database_url, connect_timeout=5) as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT request_id, client_order_id, symbol, side, quantity, status
+                SELECT request_id, client_order_id, symbol, side, quantity, status, cumulative_filled
                 FROM tradebot_v2_order_reservations
                 WHERE status IN ('reserved', 'submitted_unknown', 'accepted', 'partially_filled')
                 ORDER BY created_at, request_id
             """)
             rows = cur.fetchall()
-    return [Reservation(str(row[0]), str(row[1]), row[2], row[3],
-                        Decimal(row[4]), row[5]) for row in rows]
+    return [Reservation(*row) for row in rows]
+
+
+def update_offline(database_url: str, request_id: str, status: str, cumulative_filled) -> Reservation:
+    """Persist an offline transition under a row lock without creating ownership."""
+    if not database_url or not isinstance(request_id, str) or not request_id.strip():
+        raise ValueError("Isolated database URL and idempotency key required")
+    try:
+        filled = Decimal(str(cumulative_filled))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("Invalid cumulative fill") from None
+    if not filled.is_finite() or filled < 0:
+        raise ValueError("Invalid cumulative fill")
+
+    import psycopg
+
+    with psycopg.connect(database_url, connect_timeout=5) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL lock_timeout = '5s'")
+            cur.execute("""
+                SELECT request_id, client_order_id, symbol, side, quantity, status, cumulative_filled
+                FROM tradebot_v2_order_reservations WHERE request_id = %s FOR UPDATE
+            """, (request_id,))
+            row = cur.fetchone()
+            if row is None or not row[1].startswith("offline-"):
+                raise ValueError("Unknown offline reservation")
+            order = Reservation(*row)
+            if order.status == status and order.cumulative_filled == filled:
+                return order
+            if status not in TRANSITIONS.get(order.status, frozenset()):
+                raise ValueError("Invalid lifecycle transition")
+            if not order.cumulative_filled <= filled <= order.quantity:
+                raise ValueError("Invalid cumulative fill")
+            if status == "filled" and filled != order.quantity:
+                raise ValueError("Full fill quantity mismatch")
+            if status == "partially_filled" and not 0 < filled < order.quantity:
+                raise ValueError("Partial fill quantity mismatch")
+            if status in {"submitted_unknown", "accepted", "rejected"} and filled != 0:
+                raise ValueError("Unexpected fills for order status")
+            if status == "cancelled" and filled == order.quantity:
+                raise ValueError("Cancelled order cannot be fully filled")
+            cur.execute("""
+                UPDATE tradebot_v2_order_reservations
+                SET status = %s, cumulative_filled = %s, updated_at = now()
+                WHERE request_id = %s
+                RETURNING request_id, client_order_id, symbol, side, quantity, status, cumulative_filled
+            """, (status, filled, request_id))
+            return Reservation(*cur.fetchone())

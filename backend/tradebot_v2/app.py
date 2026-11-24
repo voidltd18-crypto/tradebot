@@ -32,7 +32,11 @@ def ledger_health():
         with psycopg.connect(url, connect_timeout=4) as conn:
             with conn.cursor() as cur:
                 cur.execute("SET TRANSACTION READ ONLY")
-                cur.execute("SELECT to_regclass('public.tradebot_v2_fill_events') IS NOT NULL")
+                cur.execute("""
+                    SELECT to_regclass('public.tradebot_v2_fill_events') IS NOT NULL
+                    AND to_regclass('public.tradebot_v2_order_reservations') IS NOT NULL
+                    AND to_regclass('public.tradebot_v2_one_active_order_per_symbol') IS NOT NULL
+                """)
                 schema_ready = bool(cur.fetchone()[0])
         return {"configured": True, "reachable": True, "schemaReady": schema_ready}
     except Exception:
@@ -68,35 +72,50 @@ def scan(x_preview_token: str = Header(default="")):
     from alpaca.data.timeframe import TimeFrame
     from alpaca.data.enums import DataFeed, Adjustment
 
-    now = datetime.now(timezone.utc)
     try:
         broker = TradingClient(key, secret, paper=os.getenv("APCA_API_PAPER", "false").lower() == "true")
         account = broker.get_account()
         broker_positions = broker.get_all_positions()
         # Broker history is required: if it cannot be checked, fail closed.
-        orders = broker.get_orders(filter=GetOrdersRequest(
-            status=QueryOrderStatus.ALL, after=now-timedelta(days=3), limit=500,
+        recent_orders = broker.get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.ALL, after=datetime.now(timezone.utc)-timedelta(days=3), limit=500,
             nested=False, direction="desc",
         ))
+        open_orders = broker.get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.OPEN, limit=500, nested=False,
+        ))
+        if max(len(recent_orders), len(open_orders)) >= 500:
+            raise ValueError("Order history may be truncated")
+        # Open orders are read last and supersede recent history for the same ID.
+        orders = {o.id: o for o in [*recent_orders, *open_orders]}
     except Exception:
         raise HTTPException(502, "Broker account or order history unavailable; all entries blocked")
 
+    now = datetime.now(timezone.utc)
     positions = [Position(p.symbol, float(p.qty)) for p in broker_positions if float(p.qty) != 0]
     ownership = read_verified_ownership(os.getenv("TRADEBOT_V2_DATABASE_URL"), {p.symbol: float(p.qty) for p in broker_positions})
     history = []
-    for o in orders:
-        created = getattr(o, "filled_at", None) or getattr(o, "created_at", None)
-        if created is None:
-            raise HTTPException(502, "Order history contains missing timestamps; entries blocked")
-        history.append(OrderRecord(
-            symbol=o.symbol,
-            side=str(getattr(o.side, "value", o.side)),
-            created_at=created,
-            status=str(getattr(o.status, "value", o.status)),
-        ))
-    # Never infer a clean history from a potentially truncated page.
-    if len(orders) >= 500:
-        raise HTTPException(502, "Order history may be truncated; entries blocked")
+    try:
+        for o in orders.values():
+            filled_qty = float(o.filled_qty or 0)
+            status = str(getattr(o.status, "value", o.status))
+            fill_time = o.filled_at
+            if status == "filled" and (filled_qty <= 0 or not fill_time):
+                raise ValueError("Filled order has incomplete evidence")
+            if not fill_time and filled_qty > 0:
+                # For a terminal partial fill, updated_at is a conservative
+                # upper bound on the most recent fill time.
+                fill_time = o.updated_at
+            history.append(OrderRecord(
+                symbol=o.symbol,
+                side=str(getattr(o.side, "value", o.side)),
+                created_at=o.created_at,
+                status=status,
+                filled_quantity=filled_qty,
+                last_fill_at=fill_time,
+            ))
+    except (TypeError, ValueError, AttributeError):
+        raise HTTPException(502, "Order history cannot be verified; entries blocked")
 
     try:
         data = StockHistoricalDataClient(key, secret)
@@ -135,7 +154,7 @@ def scan(x_preview_token: str = Header(default="")):
         signals.append({
             "symbol": symbol, "status": final.status, "reason": final.reason,
             "researchStatus": research.status, "researchReason": research.reason,
-            "brokerEntryBlocked": gate.status == "RED",
+            "brokerEntryBlocked": gate.status == "RED" or "cooldown" in gate.reason.lower(),
         })
     return JSONResponse({
         "readOnly": True, "tradingEnabled": False, "asOf": now.isoformat(),
