@@ -98,7 +98,7 @@ export default function App() {
         </section>
 
         {tab === "overview" && <OverviewPage {...bot} positionGlowStyle={positionGlowStyle} onExportFullBot={() => setExportRequested(true)} exportBusy={exportRequested} />}
-        {tab === "positions" && <PositionsPage positions={bot.positions} rate={bot.rate} action={bot.action} positionGlowStyle={positionGlowStyle} authToken={bot.authToken} />}
+        {tab === "positions" && <PositionsPage positions={bot.positions} rate={bot.rate} positionGlowStyle={positionGlowStyle} authToken={bot.authToken} />}
         <Suspense fallback={<PageLoading />}>
           {tab === "portfolio" && <PortfolioPage authToken={bot.authToken} />}
           {tab === "reports" && <ReportsPage reports={bot.reports} data={bot.data} rate={bot.rate} closedTrades={bot.closedTrades} chartCurrency={bot.chartCurrency} setChartCurrency={bot.setChartCurrency} reportsLoading={bot.reportsLoading} reportsError={bot.reportsError} reportsUpdatedAt={bot.reportsUpdatedAt} loadReports={bot.loadReports} authToken={bot.authToken} />}

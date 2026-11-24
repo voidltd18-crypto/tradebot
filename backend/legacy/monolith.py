@@ -22,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.read_only_broker import ReadOnlyTradingClient
 from backend.stock_buy_risk import cap_stock_buy_notional
+from backend.stock_sell_preview import stock_sell_preview
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
@@ -1411,6 +1412,11 @@ def get_all_positions():
                 "trailingActive": trailing_active,
                 "stopPrice": stop_price,
                 "emergencyStopPrice": emergency_stop_price,
+                "sellPreview": stock_sell_preview(
+                    quantity=qty, entry=entry, mark=display_price, stop=stop_price,
+                    emergency_stop=emergency_stop_price, trail_active=trailing_active,
+                    trail_floor=trail_floor,
+                ) if str(getattr(pos, "asset_class", "")).lower() in {"us_equity", "assetclass.us_equity"} else None,
                 "trailStartPct": trail_start_pct,
                 "trailGivebackPct": trail_giveback_pct,
                 "runnerTrailEnabled": bool(ADAPTIVE_RUNNER_TRAIL_ENABLED),
