@@ -1,0 +1,21 @@
+name: Stock buy risk cap
+on:
+  pull_request:
+    paths:
+      - 'backend/stock_buy_risk.py'
+      - 'backend/legacy/monolith.py'
+      - 'tests/test_stock_buy_risk.py'
+      - '.github/workflows/stock-buy-risk-cap.yml'
+permissions:
+  contents: read
+jobs:
+  stock-risk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install pytest
+      - run: python -m py_compile backend/legacy/monolith.py backend/stock_buy_risk.py
+      - run: python -m pytest -q tests/test_stock_buy_risk.py
