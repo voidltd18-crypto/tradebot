@@ -9,16 +9,48 @@ on:
 jobs:
   safety:
     runs-on: ubuntu-latest
+    env:
+      TRADEBOT_V2_DISPOSABLE_TEST_BRANCH: "true"
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: tradebot_recovery
+          POSTGRES_PASSWORD: disposable
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tradebot_recovery"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       - name: Install test dependencies
-        run: python -m pip install pytest
+        run: python -m pip install pytest "psycopg[binary]==3.2.12" alpaca-py==0.45.0
       - name: Compile modules
         run: python -m py_compile backend/tradebot_v2/engine.py backend/tradebot_v2/research.py backend/tradebot_v2/ledger.py backend/tradebot_v2/store.py backend/tradebot_v2/execution_plan.py backend/tradebot_v2/app.py backend/tradebot_v2/offline_orders.py
+      - name: Initialize disposable PostgreSQL
+        env:
+          TRADEBOT_V2_TEST_DATABASE_URL: postgresql://postgres:disposable@127.0.0.1:${{ job.services.postgres.ports[5432] }}/tradebot_recovery
+        run: |
+          python - <<'PYTHON'
+          import os
+          from pathlib import Path
+
+          import psycopg
+
+          with psycopg.connect(os.environ["TRADEBOT_V2_TEST_DATABASE_URL"]) as connection:
+              for migration in sorted(Path("backend/tradebot_v2/migrations").glob("*.sql")):
+                  connection.execute(migration.read_text())
+          PYTHON
       - name: Run the complete TradeBot v2 audit
+        env:
+          TRADEBOT_V2_TEST_DATABASE_URL: postgresql://postgres:disposable@127.0.0.1:${{ job.services.postgres.ports[5432] }}/tradebot_recovery
+          TRADEBOT_V2_RECOVERY_TEST_DATABASE_URL: postgresql://postgres:disposable@127.0.0.1:${{ job.services.postgres.ports[5432] }}/tradebot_recovery
         shell: bash
         run: |
           set -o pipefail

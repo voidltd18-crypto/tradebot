@@ -93,7 +93,11 @@ def scan(x_preview_token: str = Header(default="")):
 
     now = datetime.now(timezone.utc)
     positions = [Position(p.symbol, float(p.qty)) for p in broker_positions if float(p.qty) != 0]
-    ownership = read_verified_ownership(os.getenv("TRADEBOT_V2_DATABASE_URL"), {p.symbol: float(p.qty) for p in broker_positions})
+    ownership = read_verified_ownership(
+        os.getenv("TRADEBOT_V2_DATABASE_URL"),
+        {p.symbol: float(p.qty) for p in broker_positions},
+        account_id=account.id,
+    )
     history = []
     try:
         for o in orders.values():

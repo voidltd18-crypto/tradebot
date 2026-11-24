@@ -25,8 +25,7 @@ class Reservation:
     cumulative_filled: Decimal = Decimal(0)
 
 
-def reserve_offline(database_url: str, request_id: str, symbol: str, side: str, quantity, *, require_idle=False) -> Reservation:
-    """Atomically reserve in isolated Neon. Never retries an uncertain database write."""
+def validate_reservation(database_url, request_id, symbol, side, quantity):
     if not database_url or not isinstance(request_id, str) or not request_id.strip():
         raise ValueError("Isolated database URL and idempotency key required")
     if not isinstance(symbol, str) or not isinstance(side, str):
@@ -38,7 +37,18 @@ def reserve_offline(database_url: str, request_id: str, symbol: str, side: str, 
         raise ValueError("Invalid quantity") from None
     if (symbol not in TECH_UNIVERSE or side not in {"BUY", "SELL"} or not qty.is_finite()
             or not 0 < qty < MAX_QUANTITY or qty.quantize(QUANTITY_INCREMENT) != qty):
-        raise ValueError("Invalid offline reservation")
+        raise ValueError("Invalid reservation")
+    return symbol, side, qty
+
+
+def lock_reservations(cur):
+    cur.execute("SET LOCAL lock_timeout = '5s'")
+    cur.execute("LOCK TABLE tradebot_v2_order_reservations IN SHARE ROW EXCLUSIVE MODE")
+
+
+def reserve_offline(database_url: str, request_id: str, symbol: str, side: str, quantity, *, require_idle=False) -> Reservation:
+    """Atomically reserve in isolated Neon. Never retries an uncertain database write."""
+    symbol, side, qty = validate_reservation(database_url, request_id, symbol, side, quantity)
     # The unique request key and unique active-symbol index are enforced by Postgres.
     # A failed/uncertain connection raises; callers must not treat that as permission.
     import psycopg
@@ -46,33 +56,32 @@ def reserve_offline(database_url: str, request_id: str, symbol: str, side: str, 
     client_order_id = "offline-" + uuid4().hex
     with psycopg.connect(database_url, connect_timeout=5) as conn:
         with conn.cursor() as cur:
-            cur.execute("SET LOCAL lock_timeout = '5s'")
-            if require_idle:
-                # Serialize against every insert/update, including existing callers.
-                cur.execute("LOCK TABLE tradebot_v2_order_reservations IN SHARE ROW EXCLUSIVE MODE")
+            lock_reservations(cur)
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT 1 FROM tradebot_v2_order_reservations
+                    WHERE status = ANY(%s)
+                    AND (client_order_id NOT LIKE 'offline-%%'
+                         OR (%s AND request_id <> %s))
+                )
+            """, (list(ACTIVE), require_idle, request_id))
+            if cur.fetchone()[0]:
+                raise RuntimeError("Outstanding durable reservation")
+            if require_idle and side == "BUY":
                 cur.execute("""
                     SELECT EXISTS (
                         SELECT 1 FROM tradebot_v2_order_reservations
-                        WHERE status = ANY(%s) AND request_id <> %s
-                    )
-                """, (list(ACTIVE), request_id))
-                if cur.fetchone()[0]:
-                    raise RuntimeError("Outstanding durable reservation")
-                if side == "BUY":
-                    cur.execute("""
-                        SELECT EXISTS (
-                            SELECT 1 FROM tradebot_v2_order_reservations
-                            WHERE symbol = %s AND request_id <> %s AND cumulative_filled > 0
-                            AND (
-                                (side = 'BUY' AND timezone(%s, updated_at)::date
-                                    = timezone(%s, now())::date)
-                                OR (side = 'SELL' AND updated_at > now() - make_interval(hours => %s))
-                            )
+                        WHERE symbol = %s AND request_id <> %s AND cumulative_filled > 0
+                        AND (
+                            (side = 'BUY' AND timezone(%s, updated_at)::date
+                                = timezone(%s, now())::date)
+                            OR (side = 'SELL' AND updated_at > now() - make_interval(hours => %s))
                         )
-                    """, (symbol, request_id, MARKET_TIMEZONE.key,
-                          MARKET_TIMEZONE.key, COOLDOWN_HOURS))
-                    if cur.fetchone()[0]:
-                        raise RuntimeError("Daily purchase limit or post-sale cooldown active")
+                    )
+                """, (symbol, request_id, MARKET_TIMEZONE.key,
+                      MARKET_TIMEZONE.key, COOLDOWN_HOURS))
+                if cur.fetchone()[0]:
+                    raise RuntimeError("Daily purchase limit or post-sale cooldown active")
             try:
                 cur.execute("""
                     INSERT INTO tradebot_v2_order_reservations
@@ -90,7 +99,8 @@ def reserve_offline(database_url: str, request_id: str, symbol: str, side: str, 
                     row = cur.fetchone()
                     if row is None:
                         raise RuntimeError("Reservation state uncertain")
-                    if row[2] != symbol or row[3] != side or Decimal(row[4]) != qty:
+                    if (not row[1].startswith("offline-") or row[2] != symbol
+                            or row[3] != side or Decimal(row[4]) != qty):
                         raise ValueError("Idempotency key reused with different payload")
             except errors.UniqueViolation:
                 raise RuntimeError("Active order already reserved for this stock") from None

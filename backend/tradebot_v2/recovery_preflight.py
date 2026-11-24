@@ -1,10 +1,10 @@
-"""Read-only durable restart preflight for isolated TradeBot 2.0.
+"""Durable restart gate for isolated TradeBot 2.0.
 
-Never submits broker orders or changes database rows. A database outage,
-unknown submission, or any active reservation blocks simulated new buys.
-The check alone does NOT make an in-memory simulator durable or live-ready.
+By default the gate only reads local reservations. With an explicit broker
+reader it first attempts to persist corroborated recovery evidence.
 """
 from dataclasses import dataclass
+from backend.tradebot_v2.durable_broker_recovery import AlpacaRecoveryReader, recover_broker_intents
 from backend.tradebot_v2.durable_reservations import recover_active_offline
 
 
@@ -15,10 +15,13 @@ class RecoveryPreflight:
     active_count: int
 
 
-def check_restart_preflight(database_url: str, *, reader=recover_active_offline) -> RecoveryPreflight:
+def check_restart_preflight(database_url: str, *, reader=recover_active_offline,
+                            broker_reader: AlpacaRecoveryReader | None = None) -> RecoveryPreflight:
     if not isinstance(database_url, str) or not database_url.strip():
         return RecoveryPreflight(False, "Isolated durable store unavailable", 0)
     try:
+        if broker_reader is not None:
+            recover_broker_intents(database_url, broker_reader)
         outstanding = reader(database_url)
         if not isinstance(outstanding, list):
             return RecoveryPreflight(False, "Invalid durable recovery response", 0)

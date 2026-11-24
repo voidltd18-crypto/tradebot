@@ -48,7 +48,7 @@ def plan_buy(symbol, quantity, positions, orders, now=None, *,
 
 def plan_sell(symbol, quantity, owned_quantity, broker_quantity, *,
               verified_bot_origin=False, ledger_reconciled=False,
-              market_data_verified=False):
+              market_data_verified=False, position_provenance_verified=False):
     """Manual shares can never be treated as bot inventory by this planner."""
     symbol = symbol.strip().upper() if isinstance(symbol, str) else ""
     q, owned, broker = _qty(quantity), _qty(owned_quantity), _qty(broker_quantity)
@@ -58,4 +58,6 @@ def plan_sell(symbol, quantity, owned_quantity, broker_quantity, *,
         return Plan(False, symbol, "SELL", q, "Bot ownership or market data unverified")
     if q > owned or q > broker:
         return Plan(False, symbol, "SELL", q, "Quantity exceeds verified inventory")
+    if not position_provenance_verified:
+        return Plan(False, symbol, "SELL", q, "Order execution disabled; current shares have ambiguous ownership")
     return Plan(False, symbol, "SELL", q, "Research plan only; live order submission disabled")

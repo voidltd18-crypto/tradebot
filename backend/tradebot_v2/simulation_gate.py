@@ -60,7 +60,8 @@ def simulate_buy(*, symbol: str, closes: list[float],
 def simulate_sell(*, symbol: str, quantity: float, broker_positions: dict,
                   verified_fill_events, request_id: str, simulator: OfflineOrders,
                   emergency_shutdown: bool = False,
-                  require_exclusive_ownership: bool = False) -> SimulationDecision:
+                  require_exclusive_ownership: bool = False,
+                  position_provenance_verified: bool = False) -> SimulationDecision:
     """Only simulate a sale of reconciled bot-owned shares.
 
     Ledger event provenance must be independently verified before production use.
@@ -77,7 +78,8 @@ def simulate_sell(*, symbol: str, quantity: float, broker_positions: dict,
         return SimulationDecision("RED", "Ownership unavailable")
     if not ownership.verified or ownership.managed.get(symbol, 0) < quantity:
         return SimulationDecision("RED", "Sale exceeds verified bot-owned quantity")
-    if require_exclusive_ownership and ownership.managed[symbol] != broker_positions[symbol]:
+    if require_exclusive_ownership and (not position_provenance_verified
+                                        or ownership.managed[symbol] != broker_positions[symbol]):
         return SimulationDecision("RED", "Mixed or unreconciled ownership blocks sale")
     try:
         reserved = simulator.reserve(symbol, "SELL", quantity, request_id)

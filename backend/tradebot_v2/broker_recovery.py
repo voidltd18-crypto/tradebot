@@ -1,6 +1,7 @@
 """Read-only Alpaca verification for a previously recorded submission intent."""
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Protocol
 from uuid import UUID
@@ -31,6 +32,8 @@ class BrokerObservation:
     broker_order_id: UUID
     status: str
     cumulative_filled: Decimal
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 # Only states with an unambiguous meaning in the local lifecycle are mapped.
@@ -69,6 +72,8 @@ def read_broker_observation(
         order_id = UUID(str(order.id))
         side = getattr(order.side, "value", order.side)
         status = STATES.get(getattr(order.status, "value", order.status))
+        created_at = getattr(order, "created_at", None)
+        updated_at = getattr(order, "updated_at", None)
         quantity = Decimal(str(order.qty))
         filled = Decimal(str(order.filled_qty))
         if (order.client_order_id != intent.client_order_id or order.symbol != intent.symbol
@@ -86,4 +91,4 @@ def read_broker_observation(
     except Exception:
         # A missing order, timeout or malformed response leaves it unresolved.
         return None
-    return BrokerObservation(order_id, status, filled)
+    return BrokerObservation(order_id, status, filled, created_at, updated_at)
