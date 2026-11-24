@@ -9,6 +9,8 @@ from uuid import uuid4
 from backend.tradebot_v2.engine import COOLDOWN_HOURS, MARKET_TIMEZONE, TECH_UNIVERSE
 from backend.tradebot_v2.offline_orders import TRANSITIONS
 
+QUANTITY_INCREMENT = Decimal("0.00000001")
+MAX_QUANTITY = Decimal("10000000000000000")
 ACTIVE = frozenset({"reserved", "submitted_unknown", "accepted", "partially_filled"})
 
 
@@ -34,7 +36,8 @@ def reserve_offline(database_url: str, request_id: str, symbol: str, side: str, 
         qty = Decimal(str(quantity))
     except (InvalidOperation, TypeError, ValueError):
         raise ValueError("Invalid quantity") from None
-    if symbol not in TECH_UNIVERSE or side not in {"BUY", "SELL"} or not qty.is_finite() or qty <= 0:
+    if (symbol not in TECH_UNIVERSE or side not in {"BUY", "SELL"} or not qty.is_finite()
+            or not 0 < qty < MAX_QUANTITY or qty.quantize(QUANTITY_INCREMENT) != qty):
         raise ValueError("Invalid offline reservation")
     # The unique request key and unique active-symbol index are enforced by Postgres.
     # A failed/uncertain connection raises; callers must not treat that as permission.
@@ -123,7 +126,8 @@ def update_offline(database_url: str, request_id: str, status: str, cumulative_f
         filled = Decimal(str(cumulative_filled))
     except (InvalidOperation, TypeError, ValueError):
         raise ValueError("Invalid cumulative fill") from None
-    if not filled.is_finite() or filled < 0:
+    if (not isinstance(status, str) or not filled.is_finite()
+            or not 0 <= filled < MAX_QUANTITY or filled.quantize(QUANTITY_INCREMENT) != filled):
         raise ValueError("Invalid cumulative fill")
 
     import psycopg

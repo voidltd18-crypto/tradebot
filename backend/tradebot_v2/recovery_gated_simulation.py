@@ -43,4 +43,6 @@ def simulate_buy_after_recovery(*, database_url: str, recovery_reader=None,
 
 def simulate_sell_after_recovery(*, database_url: str, **sell_kwargs):
     """Reserve an offline sell only after the existing ownership checks."""
-    return simulate_sell(simulator=_DurableSimulator(database_url), **sell_kwargs)
+    return simulate_sell(
+        simulator=_DurableSimulator(database_url), require_exclusive_ownership=True, **sell_kwargs
+    )
