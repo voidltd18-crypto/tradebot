@@ -3,12 +3,13 @@
 Requires a dedicated TradeBot v2 DATABASE_URL and externally verified fill events.
 This module never writes, adopts broker positions, or creates fills.
 """
+from decimal import Decimal
 from uuid import UUID
 
 from backend.tradebot_v2.ledger import OwnershipEvent, reconcile
 
 
-def read_verified_ownership(database_url: str | None, broker_positions: dict[str, float],
+def read_verified_ownership(database_url: str | None, broker_positions: dict[str, Decimal | float],
                             *, account_id: UUID | None = None):
     if not database_url or not isinstance(account_id, UUID):
         return reconcile(None, broker_positions)
@@ -29,7 +30,7 @@ def read_verified_ownership(database_url: str | None, broker_positions: dict[str
                 """, (account_id,))
                 rows = cur.fetchall()
         events = [
-            OwnershipEvent(str(row[0]), row[1], str(row[2]), row[3], float(row[4]), row[5])
+            OwnershipEvent(str(row[0]), row[1], str(row[2]), row[3], row[4], row[5])
             for row in rows
         ]
         return reconcile(events, broker_positions)

@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -75,7 +76,7 @@ def broker_payload(status="partially_filled", cumulative="0.5", *, revision=5):
     }
 
 
-def fixture_reader(payload, *, lookup_error=None, synchronize=None):
+def fixture_reader(payload, *, lookup_error=None, synchronize=None, pages=None):
     from alpaca.trading.client import TradingClient
 
     class FixtureClient(TradingClient):
@@ -92,7 +93,7 @@ def fixture_reader(payload, *, lookup_error=None, synchronize=None):
                 return payload["order"]
             assert path == "/account/activities/FILL"
             assert data["direction"] == "asc"
-            return payload["fills"]
+            return payload["fills"] if pages is None else pages[data.get("page_token")]
 
     return FixtureClient("fixture-key", "fixture-secret")
 
@@ -249,3 +250,62 @@ def test_database_failure_rolls_back_fills_and_lifecycle(database):
         conn.execute("ALTER TABLE tradebot_v2_order_reservations DROP CONSTRAINT injected_failure")
     assert recover_broker_intents(database, reader) == ["request"]
     assert state(database) == (("partially_filled", Decimal("0.5")), [Decimal("0.25")] * 2)
+
+
+@pytest.mark.parametrize("tail", ["complete", "missing", "repeated", "wrong_account", "naive_time"])
+def test_paginated_nine_decimal_activity(database, tail):
+    intent = replace(INTENT, quantity=Decimal("0.123456789"))
+    record_submission_intent(database, "request", intent)
+    payload = broker_payload("filled", "0.123456789")
+    payload["order"]["qty"] = "0.123456789"
+    first, second = payload["fills"]
+    first.update(qty="0.123456788", cum_qty="0.123456788")
+    second.update(qty="0.000000001", cum_qty="0.123456789", type="fill")
+    unrelated_id = str(uuid4())
+    initial_page = [first, *[
+        dict(first, order_id=unrelated_id, symbol="MSFT", id=f"unrelated-{index}")
+        for index in range(99)
+    ]]
+    next_token = initial_page[-1]["id"]
+    final_page = [second]
+    if tail == "missing":
+        final_page = []
+    elif tail == "repeated":
+        final_page = initial_page
+    elif tail == "wrong_account":
+        second["account_id"] = str(uuid4())
+    elif tail == "naive_time":
+        second["transaction_time"] = second["transaction_time"].removesuffix("+00:00")
+    reader = fixture_reader(payload, pages={None: initial_page, next_token: final_page})
+    if tail != "complete":
+        assert recover_broker_intents(database, reader) == []
+        assert state(database) == (("submitted_unknown", 0), [])
+        assert not check_restart_preflight(database).allowed
+        return
+    assert recover_broker_intents(database, reader) == ["request"]
+    assert state(database) == (
+        ("filled", Decimal("0.123456789")),
+        [Decimal("0.123456788"), Decimal("0.000000001")],
+    )
+    positions = {"AAPL": Decimal("0.123456789"), "MSFT": 1, "NVDA": 2}
+    assert read_verified_ownership(database, positions, account_id=ACCOUNT).managed == {
+        "AAPL": 0.123456789
+    }
+    positions["AAPL"] -= Decimal("0.000000001")
+    assert not read_verified_ownership(database, positions, account_id=ACCOUNT).verified
+
+
+def test_older_schema_cannot_silently_round_a_broker_fill(database):
+    import psycopg
+
+    record_submission_intent(database, "request", INTENT)
+    with psycopg.connect(database) as conn:
+        conn.execute("""
+            ALTER TABLE tradebot_v2_order_reservations
+            ALTER COLUMN cumulative_filled TYPE NUMERIC(24,8)
+        """)
+    payload = broker_payload(cumulative="0.250000001")
+    payload["fills"][1].update(qty="0.000000001", cum_qty="0.250000001")
+    with pytest.raises(RuntimeError, match="cannot store broker fill exactly"):
+        recover_broker_intents(database, fixture_reader(payload))
+    assert state(database) == (("submitted_unknown", 0), [])

@@ -3,6 +3,7 @@ import os
 import secrets
 import logging
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -95,7 +96,7 @@ def scan(x_preview_token: str = Header(default="")):
     positions = [Position(p.symbol, float(p.qty)) for p in broker_positions if float(p.qty) != 0]
     ownership = read_verified_ownership(
         os.getenv("TRADEBOT_V2_DATABASE_URL"),
-        {p.symbol: float(p.qty) for p in broker_positions},
+        {p.symbol: Decimal(p.qty) for p in broker_positions},
         account_id=account.id,
     )
     history = []

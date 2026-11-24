@@ -12,11 +12,12 @@ from backend.tradebot_v2.broker_recovery import (
 )
 from backend.tradebot_v2.durable_reservations import (
     ACTIVE,
-    QUANTITY_INCREMENT,
     lock_reservations,
     validate_reservation,
 )
 from backend.tradebot_v2.offline_orders import TRANSITIONS
+
+BROKER_SHARE_INCREMENT = Decimal("0.000000001")
 
 COLUMNS = """
     request_id, account_id, client_order_id, symbol, side, quantity,
@@ -31,7 +32,8 @@ class AlpacaRecoveryReader(AlpacaOrderReader, Protocol):
 def record_submission_intent(database_url: str, request_id: str, intent: SubmissionIntent):
     """Commit the submission identity before any external action can occur."""
     symbol, side, quantity = validate_reservation(
-        database_url, request_id, intent.symbol, intent.side, intent.quantity
+        database_url, request_id, intent.symbol, intent.side, intent.quantity,
+        increment=BROKER_SHARE_INCREMENT,
     )
     client_id = intent.client_order_id
     if (not isinstance(intent.account_id, UUID) or not isinstance(client_id, str)
@@ -61,7 +63,10 @@ def record_submission_intent(database_url: str, request_id: str, intent: Submiss
             INSERT INTO tradebot_v2_order_reservations
                 (request_id, account_id, client_order_id, symbol, side, quantity, status)
             VALUES (%s, %s, %s, %s, %s, %s, 'submitted_unknown')
+            RETURNING quantity
         """, identity)
+        if cur.fetchone()[0] != quantity:
+            raise RuntimeError("Reservation schema cannot store broker quantity exactly")
 
 
 def _timestamp(value):
@@ -104,7 +109,7 @@ def _verified_fills(reader, intent, observation, created_at, updated_at):
                     or activity["symbol"] != intent.symbol or activity["side"] != intent.side
                     or not qty.is_finite() or not cumulative.is_finite()
                     or not 0 < qty <= cumulative <= observation.cumulative_filled
-                    or qty.quantize(QUANTITY_INCREMENT) != qty
+                    or qty.quantize(BROKER_SHARE_INCREMENT) != qty
                     or not created_at <= when <= updated_at):
                 raise ValueError("Inconsistent fill activity")
             fill = (qty, cumulative, when)
@@ -194,9 +199,11 @@ def _persist_evidence(database_url, row, evidence):
             UPDATE tradebot_v2_order_reservations
             SET status = %s, cumulative_filled = %s, broker_order_id = %s,
                 broker_updated_at = %s, updated_at = now()
-            WHERE request_id = %s
+            WHERE request_id = %s RETURNING cumulative_filled
         """, (observation.status, observation.cumulative_filled,
               observation.broker_order_id, updated_at, request_id))
+        if cur.fetchone()[0] != observation.cumulative_filled:
+            raise RuntimeError("Reservation schema cannot store broker fill exactly")
     return True
 
 

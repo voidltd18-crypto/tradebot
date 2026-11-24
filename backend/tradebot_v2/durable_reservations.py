@@ -25,7 +25,7 @@ class Reservation:
     cumulative_filled: Decimal = Decimal(0)
 
 
-def validate_reservation(database_url, request_id, symbol, side, quantity):
+def validate_reservation(database_url, request_id, symbol, side, quantity, *, increment=QUANTITY_INCREMENT):
     if not database_url or not isinstance(request_id, str) or not request_id.strip():
         raise ValueError("Isolated database URL and idempotency key required")
     if not isinstance(symbol, str) or not isinstance(side, str):
@@ -36,7 +36,7 @@ def validate_reservation(database_url, request_id, symbol, side, quantity):
     except (InvalidOperation, TypeError, ValueError):
         raise ValueError("Invalid quantity") from None
     if (symbol not in TECH_UNIVERSE or side not in {"BUY", "SELL"} or not qty.is_finite()
-            or not 0 < qty < MAX_QUANTITY or qty.quantize(QUANTITY_INCREMENT) != qty):
+            or not 0 < qty < MAX_QUANTITY or qty.quantize(increment) != qty):
         raise ValueError("Invalid reservation")
     return symbol, side, qty
 

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 from backend.tradebot_v2.ledger import OwnershipEvent, reconcile
 
 T = datetime(2026, 11, 19, 12, tzinfo=timezone.utc)
@@ -40,3 +41,13 @@ def test_non_finite_fill_quantity_fails_closed():
 def test_non_finite_broker_quantity_fails_closed():
     for bad in (float("nan"), float("inf"), float("-inf")):
         assert not reconcile([event(1, "AAPL", "BUY_FILLED", 1)], {"AAPL": bad}).verified
+
+
+
+def test_one_billionth_of_a_share_is_reconciled_without_tolerance():
+    quantity = Decimal("0.000000001")
+    events = [event(1, "AAPL", "BUY_FILLED", quantity)]
+    assert reconcile(events, {"AAPL": quantity}).managed == {"AAPL": 1e-9}
+    assert not reconcile(events, {"AAPL": 0}).verified
+    events.append(event(2, "AAPL", "SELL_FILLED", 2 * quantity))
+    assert not reconcile(events, {"AAPL": 0}).verified
