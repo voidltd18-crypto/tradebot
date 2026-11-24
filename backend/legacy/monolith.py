@@ -21,6 +21,7 @@ from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.read_only_broker import ReadOnlyTradingClient
+from backend.stock_buy_risk import cap_stock_buy_notional
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
@@ -2153,6 +2154,21 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
                 "BUY BLOCKED | two-stock broker asset verification: " +
                 ",".join(broker_asset["reasons"])
             )
+    account = get_account()
+    stop_distance_pct = max(
+        (1.0 - STOP_LOSS) * 100.0,
+        abs(HARD_STOP_LOSS_PCT),
+        AI_RISK_EMERGENCY_STOP_PCT,
+        float(_ai_risk_effective_profile(symbol).get("emergencyStopPct") or 0),
+    )
+    notional_amount = cap_stock_buy_notional(
+        requested=notional_amount,
+        equity=account.equity,
+        cash=account.cash,
+        buying_power=account.buying_power,
+        stop_distance_pct=stop_distance_pct,
+        minimum_order=MIN_ORDER_NOTIONAL,
+    )
     order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
     trading_client.submit_order(order)
     if AI_RISK_ENGINE_ENABLED and scan:
@@ -2186,6 +2202,7 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
             f"remaining={remaining} daily_lock={'READY_AFTER_EXIT' if remaining > 0 else 'LIMIT_REACHED'}"
         )
     notify(f"🟢 {reason}: ${round(notional_amount, 2)} {symbol}")
+    return notional_amount
 
 
 def register_pending_sell_order(order_id: str, symbol: str, qty: float, reason: str, status: str = "") -> bool:
@@ -4666,7 +4683,7 @@ def maybe_rotate_weakest_into_best(scans):
         notional = ai_risk_notional(best)
         if notional < MIN_ORDER_NOTIONAL:
             return "ROTATION BUY SKIP | no buying power"
-        market_buy_notional(best["symbol"], notional, reason=f"PROFIT MODE ROTATE INTO FROM {weakest['symbol']}", scan=best)
+        notional = market_buy_notional(best["symbol"], notional, reason=f"PROFIT MODE ROTATE INTO FROM {weakest['symbol']}", scan=best)
         last_rotation_ts = time.time()
         return f"ROTATION DONE | sold {weakest['symbol']} -> bought {best['symbol']} ${notional:.2f}"
     except Exception as e:
@@ -6002,7 +6019,7 @@ def money_mode_buy(scans, manual=False):
         confidence, label = calculate_confidence(c)
         reason = f"{'MANUAL' if manual else 'AUTO'} V16 PORTFOLIO #{allocation.get('rank', bought + 1)} {label} BUY"
         try:
-            market_buy_notional(symbol, notional, reason=reason, scan=c)
+            notional = market_buy_notional(symbol, notional, reason=reason, scan=c)
             v174_final_gate_last_event.clear()
             v174_final_gate_last_event.update({
                 "type": "BUY_SENT",
@@ -6040,7 +6057,7 @@ def buy_custom_symbol(symbol: str):
     add_symbol_to_universe(symbol, custom=True)
     fake_scan = {"symbol": symbol, "quality_score": 0.03, "spread": quote["spread"], "short_momentum": 0, "pullback": 0.01}
     notional = ai_risk_notional(fake_scan)
-    market_buy_notional(symbol, notional, reason="CUSTOM SNIPER BUY", scan=fake_scan)
+    notional = market_buy_notional(symbol, notional, reason="CUSTOM SNIPER BUY", scan=fake_scan)
     return {"ok": True, "message": f"CUSTOM BUY ${notional:.2f} of {symbol}. Added to managed universe."}
 
 
