@@ -125,12 +125,22 @@ def poll_profit_sells(client, data_client, db_path, *, now=None, enabled=False,
             if not outcome["eligible"]:
                 result["blocked"].append((symbol, outcome["reason"]))
                 continue
+            from backend.v20_master_pause import is_paused
+            if is_paused():
+                result["blocked"].append((symbol, "master pause active"))
+                continue
             identity = f"{symbol}:{entry}:{qty}"
             oid = _reserve(db_path, identity)
             if not oid:
                 result["blocked"].append((symbol, "previous sell attempt exists"))
                 continue
             try:
+                # Re-evaluate persisted master pause immediately before any broker order.
+                # Missing state always blocks the sell, including after a restart.
+                from backend.v20_master_pause import is_paused
+                if is_paused():
+                    result["blocked"].append((symbol, "master pause active"))
+                    continue
                 client.submit_order(LimitOrderRequest(
                     symbol=pair, qty=float(qty), side=OrderSide.SELL,
                     time_in_force=TimeInForce.GTC,
