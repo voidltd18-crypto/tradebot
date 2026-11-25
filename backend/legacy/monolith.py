@@ -21,6 +21,7 @@ import requests
 from fastapi import FastAPI, Request, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.config import CRYPTO_ENABLED
 from backend.read_only_broker import ReadOnlyTradingClient
 from backend.stock_buy_risk import cap_stock_buy_notional
 from backend.stock_sell_preview import stock_sell_preview
@@ -1397,12 +1398,14 @@ def get_all_positions():
             emergency_stop_price = entry * (1.0 - emergency_stop_pct / 100.0) if entry > 0 else 0.0
             trailing_active = bool((state[symbol].get("highest_since_entry") or 0.0) >= trail_start_price) if trail_start_price > 0 else False
 
-            equity_position = str(getattr(pos, "asset_class", "")).lower() in {"us_equity", "assetclass.us_equity"}
+            asset_class = getattr(pos, "asset_class", None)
+            equity_position = str(asset_class).lower() in {"us_equity", "assetclass.us_equity"}
             owned_quantity = verified_stock_quantity(db_connect, trading_client, symbol) if equity_position else None
             if owned_quantity is not None and owned_quantity != Decimal(str(pos.qty)):
                 owned_quantity = None
             positions.append({
                 "symbol": symbol,
+                "assetClass": getattr(asset_class, "value", asset_class),
                 "qty": qty,
                 "entry": entry,
                 "price": display_price,
@@ -10596,6 +10599,9 @@ def get_status():
     payload.pop("closedTrades", None)
     payload.pop("stockMemory", None)
     payload["statusPayloadMode"] = "compact-live-cache"
+    payload["cryptoMonitoringEnabled"] = CRYPTO_ENABLED
+    payload["orderExecutionEnabled"] = False
+    payload["approvedStockSymbols"] = sorted(TECH_GIANT_STOCK_ALLOWED)
     payload["fullHistoryAvailableFrom"] = "/reports"
     payload["statusCacheReady"] = isinstance(payload.get("account"), dict)
 
