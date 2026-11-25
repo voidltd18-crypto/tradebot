@@ -147,3 +147,33 @@ def test_partial_profit_requires_confirmed_accounted_fill_and_survives_restart(t
     assert load_function("has_taken_partial_profit", dict(scope))("aapl")
     scope["today_str"] = lambda: "2026-11-26"
     assert not has_taken("AAPL")
+
+
+def test_replay_match_checks_entry_and_exit_time_and_rejects_ambiguity():
+    import math
+    import sqlite3
+
+    lookup = load_function("_replay_session_for_exit", {"math": math, "TRADE_REPLAY_SAMPLE_SECONDS": 10})
+    with sqlite3.connect(":memory:") as conn:
+        conn.executescript("""
+            CREATE TABLE trade_replay_sessions (
+                id INTEGER, symbol TEXT, entry_price REAL, started_at TEXT, closed_trade_id INTEGER
+            );
+            CREATE TABLE trade_replay_points (
+                session_id INTEGER, symbol TEXT, price REAL, qty REAL, observed_at TEXT
+            );
+            INSERT INTO trade_replay_sessions VALUES
+                (1, 'AAPL', 100, '2026-11-25T14:30:00Z', 99),
+                (2, 'AAPL', 100, '2026-11-24T14:30:00Z', 100),
+                (3, 'AAPL', 110, '2026-11-25T14:30:00Z', 101);
+            INSERT INTO trade_replay_points VALUES
+                (1, 'AAPL', 99, 1, '2026-11-25T14:31:00Z'),
+                (2, 'AAPL', 99, 1, '2026-11-24T14:31:30Z'),
+                (3, 'AAPL', 109, 1, '2026-11-25T14:31:30Z');
+        """)
+        exit_ts = "2026-11-25T14:31:30Z"
+        assert lookup(conn, "AAPL", 100, exit_ts)[0] == 1
+        assert lookup(conn, "AAPL", 120, exit_ts) is None
+        assert lookup(conn, "AAPL", 100, "2026-11-25T14:30:45Z") is None
+        conn.execute("INSERT INTO trade_replay_points VALUES (2,'AAPL',99,1,'2026-11-25T14:31:15Z')")
+        assert lookup(conn, "AAPL", 100, exit_ts) is None

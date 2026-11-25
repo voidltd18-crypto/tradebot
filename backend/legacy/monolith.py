@@ -11397,39 +11397,74 @@ def trade_replay_recorder_worker() -> None:
         time.sleep(max(1.0, min(2.0, TRADE_REPLAY_SAMPLE_SECONDS / 4.0)))
 
 
+def _replay_session_for_exit(conn, symbol, entry, exit_ts):
+    """Match by observations near the actual exit, independent of rebuilt row IDs."""
+    if not symbol or not math.isfinite(entry) or entry <= 0 or not exit_ts:
+        return None
+    candidates = conn.execute(
+        """SELECT session.* FROM trade_replay_sessions AS session
+           WHERE session.symbol=?
+             AND julianday(session.started_at)<=julianday(?)
+             AND ABS(session.entry_price-?)<=?
+             AND EXISTS (
+                SELECT 1 FROM trade_replay_points AS point
+                WHERE point.session_id=session.id AND point.symbol=session.symbol
+                  AND point.price>0 AND point.qty>0
+                  AND julianday(point.observed_at) BETWEEN julianday(?) - ? / 86400.0 AND julianday(?)
+             )
+           LIMIT 2""",
+        (symbol, exit_ts, entry, max(0.01, abs(entry) * 0.0005),
+         exit_ts, max(120, TRADE_REPLAY_SAMPLE_SECONDS * 3), exit_ts),
+    ).fetchall()
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def _trade_replay_close_for_trade(trade: Dict[str, Any], closed_trade_id: Optional[int] = None) -> None:
     if not SQLITE_ENABLED or not TRADE_REPLAY_ENABLED:
         return
+    conn = None
     try:
         _trade_replay_ensure_tables()
         symbol = str(trade.get("symbol") or "").upper()
-        if not symbol:
+        ended_at = str(trade.get("timestamp") or "")
+        entry = float(trade.get("entryPrice") or 0)
+        exit_price = float(trade.get("exitPrice") or 0)
+        quantity = float(trade.get("qty") or 0)
+        if not all(math.isfinite(value) and value > 0 for value in (exit_price, quantity)):
             return
-        ended_at = str(trade.get("timestamp") or datetime.now(UTC).isoformat())
-        exit_price = float(trade.get("exitPrice") or trade.get("price") or 0.0)
         conn = db_connect()
-        row = conn.execute(
-            "SELECT id FROM trade_replay_sessions WHERE symbol=? AND status='OPEN' ORDER BY id DESC LIMIT 1",
-            (symbol,),
+        row = _replay_session_for_exit(conn, symbol, entry, ended_at)
+        if not row or row["status"] != "OPEN":
+            return
+        last = conn.execute(
+            "SELECT qty FROM trade_replay_points WHERE session_id=? "
+            "AND julianday(observed_at)<=julianday(?) ORDER BY julianday(observed_at) DESC LIMIT 1",
+            (int(row["id"]), ended_at),
         ).fetchone()
-        if row:
-            conn.execute(
-                """UPDATE trade_replay_sessions
-                   SET status='CLOSED',ended_at=?,exit_price=?,closed_trade_id=COALESCE(?,closed_trade_id),updated_at=?
-                   WHERE id=?""",
-                (ended_at, exit_price, closed_trade_id, datetime.now(UTC).isoformat(), int(row["id"])),
-            )
-            conn.commit()
-        conn.close()
+        if not last or not math.isclose(quantity, float(last["qty"]), rel_tol=1e-8):
+            return
+        conn.execute(
+            """UPDATE trade_replay_sessions
+               SET status='CLOSED', ended_at=?, exit_price=?, closed_trade_id=?, updated_at=?
+               WHERE id=? AND status='OPEN'
+                 AND julianday(updated_at)<=julianday(?)""",
+            (ended_at, exit_price, closed_trade_id, datetime.now(UTC).isoformat(),
+             int(row["id"]), ended_at),
+        )
+        conn.commit()
     except Exception as exc:
         print(f"V17.1 TRADE REPLAY CLOSE ERROR: {exc}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 
-def _trade_replay_points_for_session(session_id: int, limit: int = TRADE_REPLAY_MAX_POINTS) -> List[Dict[str, Any]]:
+def _trade_replay_points_for_session(session_id: int, limit: int = TRADE_REPLAY_MAX_POINTS, *, through: Optional[str] = None) -> List[Dict[str, Any]]:
     _trade_replay_ensure_tables(); conn = db_connect()
     rows = conn.execute(
-        "SELECT * FROM trade_replay_points WHERE session_id=? ORDER BY observed_at ASC LIMIT ?",
-        (int(session_id), max(1, min(int(limit), TRADE_REPLAY_MAX_POINTS))),
+        "SELECT * FROM trade_replay_points WHERE session_id=? "
+        "AND (? IS NULL OR julianday(observed_at)<=julianday(?)) ORDER BY observed_at ASC LIMIT ?",
+        (int(session_id), through, through, max(1, min(int(limit), TRADE_REPLAY_MAX_POINTS))),
     ).fetchall(); conn.close()
     return [
         {"id": int(r["id"]), "sessionId": int(r["session_id"]), "symbol": r["symbol"], "time": r["observed_at"],
@@ -11447,7 +11482,9 @@ def _trade_replay_points_for_session(session_id: int, limit: int = TRADE_REPLAY_
 def _trade_replay_payload(session_row, limit: int = TRADE_REPLAY_MAX_POINTS, closed_trade: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not session_row:
         return {"ok": True, "recorded": False, "points": [], "message": "No recorded replay is available for this trade yet."}
-    session = dict(session_row); points = _trade_replay_points_for_session(int(session["id"]), limit)
+    session = dict(session_row)
+    through = closed_trade.get("timestamp") if closed_trade else None
+    points = _trade_replay_points_for_session(int(session["id"]), limit, through=through)
     prices = [float(p.get("price") or 0.0) for p in points if float(p.get("price") or 0.0) > 0]
     entry = float(session.get("entry_price") or (points[0].get("entry") if points else 0.0) or 0.0)
     last_price = float((closed_trade or {}).get("exitPrice") or session.get("exit_price") or (points[-1].get("price") if points else 0.0) or 0.0)
@@ -11479,27 +11516,17 @@ def trade_replay_closed_payload(trade_id: int, limit: int = TRADE_REPLAY_MAX_POI
     if not trade_row:
         conn.close(); return {"ok": False, "message": "Closed trade not found", "points": []}
     tr = dict(trade_row); symbol = str(tr.get("symbol") or "").upper(); exit_ts = str(tr.get("timestamp") or "")
-    row = conn.execute(
-        "SELECT * FROM trade_replay_sessions WHERE closed_trade_id=? ORDER BY id DESC LIMIT 1", (int(trade_id),)
-    ).fetchone()
-    if not row:
-        # Historical matcher rows may have been written before the replay session
-        # was linked. Prefer the most recent session for this symbol that began
-        # before the trade closed.
-        row = conn.execute(
-            """SELECT * FROM trade_replay_sessions
-               WHERE symbol=? AND started_at<=?
-               ORDER BY CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END, ABS(strftime('%s', COALESCE(ended_at,updated_at))-strftime('%s',?)) ASC
-               LIMIT 1""",
-            (symbol, exit_ts, exit_ts),
-        ).fetchone()
+    row = _replay_session_for_exit(conn, symbol, float(tr.get("entry_price") or 0), exit_ts)
     conn.close()
     trade = {"id": int(tr["id"]), "timestamp": tr.get("timestamp"), "symbol": symbol,
              "qty": float(tr.get("qty") or 0.0), "entryPrice": float(tr.get("entry_price") or 0.0),
              "exitPrice": float(tr.get("exit_price") or 0.0), "pnl": float(tr.get("pnl") or 0.0),
              "pnlGbp": float(tr.get("pnl_gbp") or 0.0), "pnlPct": float(tr.get("pnl_pct") or 0.0),
              "reason": tr.get("reason") or ""}
-    return _trade_replay_payload(row, limit, trade)
+    payload = _trade_replay_payload(row, limit, trade)
+    if row is None:
+        payload["message"] = "No unique price history matches this trade near its exit."
+    return payload
 
 
 def run_bot_loop():
