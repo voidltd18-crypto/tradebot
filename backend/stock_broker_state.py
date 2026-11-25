@@ -52,6 +52,16 @@ def open_stock_orders(broker, symbol):
     return _read("open orders", fetch)
 
 
+def verify_entry_slot(broker):
+    # A pending buy on another symbol can consume the single stock slot or its cash.
+    def fetch():
+        orders = broker.get("/orders", data={"status": "open", "side": "buy", "limit": 1})
+        if not isinstance(orders, list):
+            raise ValueError("invalid open orders")
+        return not orders
+    return _read("account open buy orders", fetch)
+
+
 def stock_position(broker, symbol):
     def fetch():
         positions = broker.get_all_positions()
@@ -74,12 +84,12 @@ def stock_account(broker):
         account = broker.get_account()
         status = getattr(account.status, "value", account.status)
         if not status or not account.id or not all(
-            isinstance(flag, bool) for flag in (account.trading_blocked, account.account_blocked)
+            isinstance(flag, bool) for flag in (account.trading_blocked, account.account_blocked, account.trade_suspended_by_user)
         ):
             raise ValueError("invalid account response")
         for value in (account.equity, account.cash, account.buying_power):
             _number(value)
-        if status != "ACTIVE" or account.trading_blocked or account.account_blocked:
+        if status != "ACTIVE" or account.trading_blocked or account.account_blocked or account.trade_suspended_by_user:
             raise BrokerStateUnverified("Trade blocked: Alpaca account restricted")
         return account
     return _read("account", fetch)
