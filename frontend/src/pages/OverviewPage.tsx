@@ -1,135 +1,75 @@
 import { SmartRebuyPanel } from "../components/SmartRebuyPanel";
 import { Card } from "../components/Card";
-import { useEffect, useState } from "react";
-import { API_URL } from "../lib/api";
+import { useState } from "react";
 
-function EntryGateDiagnostics({ authToken, symbols, marketOpen }: {
-  authToken: string; symbols: string[]; marketOpen: boolean;
+type ScanDecision = {
+  symbol: string;
+  decision?: string;
+  stage?: string;
+  reason?: string;
+  confidence?: number;
+  quality?: number;
+};
+
+type StockScan = {
+  startedAt: string;
+  completedAt: string;
+  attemptedCount: number;
+  scannedCount: number;
+  evaluationComplete: boolean;
+  rows: ScanDecision[];
+};
+
+function EntryGateDiagnostics({ symbols, scan, marketOpen }: {
+  symbols: string[]; scan?: StockScan | null; marketOpen: boolean;
 }) {
   const [showAll, setShowAll] = useState(false);
-  const [rows, setRows] = useState<any[]>([]);
-  const [error, setError] = useState("");
-  const [updated, setUpdated] = useState("");
-  useEffect(() => {
-    if (!authToken) return;
-    let active = true;
-    const refresh = async () => {
-      try {
-        const response = await fetch(`${API_URL}/v2/recent-decisions?limit=300`, {
-          cache: "no-store", headers: { "X-Auth-Token": authToken, "x-api-key": authToken }
-        });
-        if (!response.ok) throw new Error(`Decision history unavailable (HTTP ${response.status})`);
-        const result = await response.json();
-        if (!active) return;
-        const latest = new Map<string, any>();
-        for (const item of (Array.isArray(result?.decisions) ? result.decisions : [])) {
-          const symbol = String(item?.symbol || "").toUpperCase();
-          if (symbol && !latest.has(symbol)) latest.set(symbol, item);
-        }
-        setRows(Array.from(latest.values()));
-        setUpdated(new Date().toISOString());
-        setError("");
-      } catch (e: any) { if (active) setError(e?.message || "Decision history unavailable"); }
-    };
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), 30000);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [authToken]);
-  // A pre-expectancy rejection records zero-valued placeholders for historical
-  // metrics. Do not present those as evidence of zero wins or zero samples.
-  const hasExpectancyEvidence = (row: any) =>
-    ["expectancy_gate", "v17_cold_start_gate", "final_gate"].includes(String(row.stage || "")) ||
-    Number(row.historical_samples || 0) > 0;
-  // Session-aware freshness: the previous close is expected outside regular
-  // US equity hours. This schedule is indicative; exchange holidays and halts
-  // are not inferred from the clock.
-  const nyParts = new Intl.DateTimeFormat("en-US", {
-    timeZone: "America/New_York", weekday: "short", hour: "2-digit",
-    minute: "2-digit", hourCycle: "h23"
-  }).formatToParts(new Date());
-  const nyValue = (type: string) => nyParts.find(part => part.type === type)?.value || "";
-  const nyMinute = Number(nyValue("hour")) * 60 + Number(nyValue("minute"));
-  const regularHours = !["Sat", "Sun"].includes(nyValue("weekday")) && nyMinute >= 570 && nyMinute < 960;
-  const sessionStartedLongEnough = nyMinute >= 600;
-  const decisionStatus = (row: any) => {
-    if (!row.timestamp) return "NO RECORD";
-    const age = Date.now() - new Date(row.timestamp).getTime();
-    if (!regularHours) return "LAST SESSION";
-    if (age <= 30 * 60 * 1000) return "RECENT";
-    return sessionStartedLongEnough ? "SCAN OVERDUE" : "AWAITING OPEN SCAN";
-  };
-  const memoryAudit = (row: any) => {
-    try { const payload = JSON.parse(String(row.payload_json || "{}")); return payload?.confidenceMemoryAudit || null; }
-    catch { return null; }
-  };
-  const numeric = (value: unknown, digits: number) => value == null || value === "" ? "—" : Number(value).toFixed(digits);
-  const friendlyReason = (row: any) => {
-    const reason = String(row.reason || "");
-    if (!row.decision) return "No recorded decision";
-    if (row.stage === "sniper_gate" && reason.includes("confidence too low")) return "Confidence below sniper minimum";
-    if (row.stage === "account_gate" && reason.includes("locked until tomorrow")) return "Daily trading lock";
-    if (row.stage === "symbol_reputation_gate" && reason.includes("cooldown")) return "Historical reputation cooldown";
-    if (row.stage === "expectancy_gate") return "Historical expectancy check";
-    if (row.stage === "account_gate") return "Account or order restriction";
-    return reason || String(row.stage || "Not approved").replace(/_/g, " ");
-  };
-  const recordedAt = (row: any) => row.timestamp
-    ? new Date(row.timestamp).toLocaleString("en-GB", {
-        timeZone: "Europe/London", day: "2-digit", month: "short",
-        hour: "2-digit", minute: "2-digit"
-      }) : "—";
-  const opportunity = (row: any) => {
-    const age = Date.now() - Date.parse(String(row.timestamp || ""));
-    if (error || !marketOpen || !(age >= 0 && age <= 30 * 60 * 1000)) return "RED";
+  const age = scan ? Date.now() - Date.parse(scan.startedAt) : Infinity;
+  const current = marketOpen && scan?.evaluationComplete === true && age >= 0 && age <= 5 * 60 * 1000;
+  const opportunity = (row: ScanDecision) => {
+    if (!current) return "RED";
     if (row.decision === "APPROVED" && row.stage === "final_gate") return "GREEN";
     if (row.decision === "REJECTED" && row.stage === "trigger_gate") return "AMBER";
     return "RED";
   };
   const priority = { GREEN: 0, AMBER: 1, RED: 2 };
-  const watchlist = symbols.map(symbol => rows.find(row => row.symbol === symbol) || { symbol });
+  const colors = { GREEN: "#22c55e", AMBER: "#f59e0b", RED: "#f87171" };
+  const watchlist = symbols.map<ScanDecision>(symbol => scan?.rows.find(row => row.symbol === symbol) || { symbol });
   watchlist.sort((a, b) => priority[opportunity(a)] - priority[opportunity(b)] ||
-    Number(b.confidence || 0) - Number(a.confidence || 0) ||
-    Number(b.quality || 0) - Number(a.quality || 0));
+    (b.confidence ?? 0) - (a.confidence ?? 0) || (b.quality ?? 0) - (a.quality ?? 0));
   const visible = showAll ? watchlist : watchlist.filter(row => opportunity(row) !== "RED");
   return <Card title="Stock Opportunities" wide className="decision-card">
-    <p className="muted">Green passed the recorded entry gates. Amber is waiting for an entry trigger. Orders are disabled.</p>
+    <p className="muted">Green passed the latest scan’s entry gates. Amber is waiting for an entry trigger. Orders are disabled.</p>
+    {!marketOpen && <p className="muted">Waiting for an open market confirmed by Alpaca.</p>}
+    {marketOpen && !scan && <p className="muted">Waiting for the first scan of this session.</p>}
+    {scan && <p className="muted">
+      Last scan {new Date(scan.completedAt).toLocaleTimeString("en-GB", { timeZone: "Europe/London" })}
+      {" (UK) · "}{scan.scannedCount}/{scan.attemptedCount} stocks scanned
+      {!scan.evaluationComplete ? " · Entry evaluation incomplete" : !current ? " · Inactive" : ""}
+    </p>}
     <button className="ghost" onClick={() => setShowAll(value => !value)}>{showAll ? "Hide red" : "Show all"}</button>
-    {!visible.length && <p className="muted">{symbols.length ? "No current green or amber candidates." : "Approved watchlist unavailable."}</p>}
-    {error && <p className="muted">{error}</p>}
-    {updated && <p className="muted">Checked {new Date(updated).toLocaleTimeString("en-GB")} · US session labels are clock-based (holidays and halts not detected)</p>}
-    <div style={{ overflowX: "auto" }}>
-      <table style={{ width: "100%", borderCollapse: "collapse", textAlign: "left", fontSize: "0.85rem" }}>
-        <thead><tr>{["Stock", "Result", "Session", "Final conf.", "Raw conf.", "Memory ×", "Why?", "Recorded"].map(label =>
-          <th key={label} style={{ padding: "9px 7px", borderBottom: "1px solid #64748b", whiteSpace: "nowrap" }}>{label}</th>
-        )}</tr></thead>
-        <tbody>{visible.map(row => <tr key={row.symbol}>
-          <td style={{ padding: "9px 7px" }}><b>{row.symbol}</b></td>
-          <td style={{ padding: "9px 7px" }}><b style={{ color: { GREEN: "#22c55e", AMBER: "#f59e0b", RED: "#f87171" }[opportunity(row)] }}>{opportunity(row)}</b></td>
-          <td style={{ padding: "9px 7px", whiteSpace: "nowrap" }}>{decisionStatus(row)}</td>
-          <td style={{ padding: "9px 7px" }}><b>{numeric(row.confidence, 2)}</b></td>
-          <td style={{ padding: "9px 7px" }}>{numeric(memoryAudit(row)?.rawConfidence, 2)}</td>
-          <td style={{ padding: "9px 7px" }}>{memoryAudit(row)?.multiplier == null ? "—" : `${Number(memoryAudit(row).multiplier).toFixed(2)}×`}</td>
-          <td style={{ padding: "9px 7px", minWidth: "190px" }}>
-            <details>
-              <summary style={{ cursor: "pointer" }}>{friendlyReason(row)}</summary>
-              <div className="muted" style={{ paddingTop: "6px", fontSize: "0.8rem" }}>
-                <div>Gate: {row.stage || "—"}</div>
-                <div>Exact reason: {row.reason || "—"}</div>
-                <div>Quality: {numeric(row.quality, 4)}</div>
-                <div>Historical samples: {hasExpectancyEvidence(row) ? row.historical_samples ?? "—" : "Not evaluated"}</div>
-                <div>Win rate: {hasExpectancyEvidence(row) && row.historical_win_rate != null ? `${(Number(row.historical_win_rate) * 100).toFixed(0)}%` : "Not evaluated"}</div>
-                <div>Profit factor: {hasExpectancyEvidence(row) ? numeric(row.historical_profit_factor, 2) : "Not evaluated"}</div>
-              </div>
-            </details>
-          </td>
-          <td style={{ padding: "9px 7px", whiteSpace: "nowrap" }}>{recordedAt(row)}</td>
-        </tr>)}</tbody>
+    {current && !visible.length && <p className="muted">No current green or amber candidates.</p>}
+    {visible.length > 0 && <div className="table-wrap">
+      <table className="compact-table">
+        <thead><tr><th>Stock</th><th>Result</th><th>Confidence</th><th>Quality</th><th>Reason</th></tr></thead>
+        <tbody>{visible.map(row => {
+          const result = opportunity(row);
+          const reason = current ? row.reason || "No evaluation available"
+            : !marketOpen ? "Market closed or unconfirmed"
+            : scan?.evaluationComplete === false ? "Entry evaluation incomplete"
+            : scan ? "Scan expired" : "Waiting for scan";
+          return <tr key={row.symbol}>
+            <td><b>{row.symbol}</b></td>
+            <td><b style={{ color: colors[result] }}>{result}</b></td>
+            <td>{row.confidence?.toFixed(2) ?? "—"}</td>
+            <td>{row.quality?.toFixed(4) ?? "—"}</td>
+            <td>{reason}</td>
+          </tr>;
+        })}</tbody>
       </table>
-    </div>
-    <p className="muted" style={{ fontSize: "0.78rem" }}>LAST SESSION = previous regular session; RECENT = within 30 minutes; SCAN OVERDUE = no recent decision after 10:00 New York time. Dashes mean older decisions lack the new memory audit. Click a reason for the full evidence.</p>
+    </div>}
   </Card>;
 }
-
 
 import { Meter } from "../components/Meter";
 import { gbp, pct, tone, usd, positionQuantity, isSmallCryptoResidual } from "../lib/format";
@@ -224,7 +164,7 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
       </Card>
     </section>
 
-    <EntryGateDiagnostics authToken={authToken} symbols={data?.approvedStockSymbols || []} marketOpen={market?.isOpen === true && !market?.fallbackActive} />
+    <EntryGateDiagnostics symbols={data?.approvedStockSymbols || []} scan={data?.stockScan} marketOpen={market?.isOpen === true && !market?.fallbackActive} />
     <section className="grid two dashboard-detail-grid">
       <Card title="AI Brain" className="decision-card"><div className="ai-grid"><div><div className="ai-status-line"><span>Market view</span><b>{marketRegime}</b></div><div className="ai-status-line"><span>Risk</span><b>{riskLabel}</b></div><div className="ai-status-line"><span>Current action</span><b>{currentAction}</b></div><div className="ai-status-line"><span>Open positions</span><b>{stockPositions.length}/{maxPositions}</b></div></div><div><Meter value={aiConfidence} label="AI confidence"/><Meter value={botHealth} label="System health"/></div></div></Card>
       <Card title="Best Current Opportunity" className="decision-card">{bestCandidate?.symbol ? <><p className="eyebrow">Top-ranked candidate</p><h3 className="decision-symbol">{bestCandidate.symbol}</h3><div className="summary"><div><span>Confidence</span><b>{aiConfidence.toFixed(0)}%</b></div><div><span>Price</span><b>{bestCandidate?.price ? usd(bestCandidate.price) : "—"}</b></div><div><span>Movement</span><b className={tone(bestCandidate?.changePct || bestCandidate?.gap_pct)}>{pct(bestCandidate?.changePct ?? bestCandidate?.gap_pct ?? 0)}</b></div></div><ul className="reason-list">{aiReasons.length ? aiReasons.map((reason) => <li key={reason}>{reason}</li>) : <li>Waiting for the live scanner to provide detailed evidence.</li>}</ul></> : <p className="muted">No ranked opportunity is available yet. The card will populate when the scanner produces candidates.</p>}</Card>

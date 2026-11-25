@@ -570,6 +570,7 @@ adaptive_universe_runtime_cache: Dict[str, Any] = {"updatedAt": "", "symbols": [
 
 latest_status: Dict[str, Any] = {}
 _STATUS_LOCK = threading.RLock()
+_stock_scan_snapshot = None
 latest_scans: List[Dict[str, Any]] = []
 v174_final_gate_last_event: Dict[str, Any] = {}
 
@@ -4547,6 +4548,7 @@ def pick_money_mode_stocks(
     approval_reason: str = "all V2 gates passed",
     persist_decisions: bool = True,
     log_rejections: bool = True,
+    scan_decisions=None,
 ):
     """Evaluate scans through the exact live entry gates.
 
@@ -4564,6 +4566,15 @@ def pick_money_mode_stocks(
         # This is diagnostic-only and does not change eligibility.
         key = stage if decision == "REJECTED" else "passed"
         gate_counts[key] = gate_counts.get(key, 0) + 1
+        if scan_decisions is not None:
+            scan_decisions[scan["symbol"]] = {
+                "symbol": scan["symbol"],
+                "decision": decision,
+                "stage": stage,
+                "reason": reason,
+                "confidence": scan.get("confidence"),
+                "quality": scan.get("quality_score"),
+            }
         if persist_decisions:
             record_v2_setup_decision(scan, decision, stage, reason, profile)
 
@@ -4646,6 +4657,7 @@ def v17_live_entry_gate_pipeline(
     approval_reason: str = "all V2 gates passed",
     persist_decisions: bool = True,
     log_rejections: bool = True,
+    scan_decisions=None,
     log_summary: bool = False,
 ):
     """V17.0.15 single source of truth for pre-portfolio entry eligibility.
@@ -4663,6 +4675,7 @@ def v17_live_entry_gate_pipeline(
         approval_reason=approval_reason,
         persist_decisions=persist_decisions,
         log_rejections=log_rejections,
+        scan_decisions=scan_decisions,
     )
     if log_summary:
         survivor_symbols = ",".join(str(row.get("symbol") or "") for row in survivors) or "-"
@@ -10593,6 +10606,7 @@ def get_status():
     # synchronous status rebuild.
     with _STATUS_LOCK:
         payload = dict(latest_status)
+        payload["stockScan"] = _stock_scan_snapshot
 
     payload["botVersion"] = "v1.1-strict-profit-mode"
     payload.pop("tradeTimeline", None)
@@ -11461,6 +11475,7 @@ def trade_replay_closed_payload(trade_id: int, limit: int = TRADE_REPLAY_MAX_POI
 
 
 def run_bot_loop():
+    global _stock_scan_snapshot
     print("Rebuilt Sniper Profit Bot started...")
     init_db()
     seeded_outcomes = v2_seed_missing_outcomes()
@@ -11514,6 +11529,8 @@ def run_bot_loop():
                     print(f"V17.1 TRADE REPLAY LOOP ERROR: {e}")
 
                 if not market_state.get("isOpen"):
+                    with _STATUS_LOCK:
+                        _stock_scan_snapshot = None
                     print("Market closed. Waiting...")
                     update_status(BOT_NAME, latest_scans)
                     _cycle_monitor_finish("bot", _cycle_started, True)
@@ -11535,6 +11552,8 @@ def run_bot_loop():
                         print(f"V2 OUTCOME LOOP ERROR: {e}")
 
                 scans = []
+                scan_started_at = datetime.now(UTC)
+                scan_decisions = {}
                 preferred_scan_symbol = _first_dibs_symbol()
                 # Always evaluate the complete approved tech pool; legacy September
                 # and two-stock modes must not silently narrow the live scan to one.
@@ -11549,22 +11568,41 @@ def run_bot_loop():
                         print(f"{symbol} | price={scan['price']:.2f} | quality={scan['quality_score']:.4f} | confidence={scan['confidence']:.2f} | sniper={scan['sniper_pass']}")
                     except Exception as e:
                         print(f"SCAN ERROR {symbol}: {e}")
+                        scan_decisions[symbol] = {
+                            "symbol": symbol,
+                            "decision": "REJECTED",
+                            "stage": "scan",
+                            "reason": "Market data scan failed.",
+                        }
 
                 latest_scans.clear()
                 latest_scans.extend(scans)
 
-                # Always publish the current AI Portfolio plan after a completed
-                # live scan. Previously this only happened inside money_mode_buy,
-                # so a paused bot, manual override or no order attempt left the
-                # dashboard stuck on WAITING_FOR_PLAN.
-                if AI_PORTFOLIO_MANAGER_ENABLED:
+                # Reuse the entry gates without creating learning records.
+                gate_eligible = None
+                try:
+                    gate_eligible = v17_live_entry_gate_pipeline(
+                        scans,
+                        persist_decisions=False,
+                        log_rejections=False,
+                        log_summary=AI_PORTFOLIO_MANAGER_ENABLED,
+                        scan_decisions=scan_decisions,
+                    )
+                except Exception as gate_error:
+                    print(f"STOCK MONITOR ENTRY GATE ERROR: {gate_error}")
+                    scan_decisions = {}
+                with _STATUS_LOCK:
+                    _stock_scan_snapshot = {
+                        "startedAt": scan_started_at.isoformat(),
+                        "completedAt": datetime.now(UTC).isoformat(),
+                        "attemptedCount": len(scan_order),
+                        "scannedCount": len(scans),
+                        "evaluationComplete": gate_eligible is not None,
+                        "rows": list(scan_decisions.values()),
+                    }
+
+                if AI_PORTFOLIO_MANAGER_ENABLED and gate_eligible is not None:
                     try:
-                        gate_eligible = v17_live_entry_gate_pipeline(
-                            scans,
-                            persist_decisions=False,
-                            log_rejections=False,
-                            log_summary=True,
-                        )
                         build_v16_portfolio_plan(gate_eligible, manual=False)
                     except Exception as portfolio_error:
                         print(f"V17.0.15 PORTFOLIO AUTO-PUBLISH ERROR: {portfolio_error}")
