@@ -9,6 +9,7 @@ type ScanDecision = {
   reason?: string;
   confidence?: number;
   quality?: number;
+  quoteTimestamp?: string;
 };
 
 type StockScan = {
@@ -37,7 +38,7 @@ function EntryGateDiagnostics({ symbols, scan, marketOpen }: {
   const watchlist = symbols.map<ScanDecision>(symbol => scan?.rows.find(row => row.symbol === symbol) || { symbol });
   watchlist.sort((a, b) => priority[opportunity(a)] - priority[opportunity(b)] ||
     (b.confidence ?? 0) - (a.confidence ?? 0) || (b.quality ?? 0) - (a.quality ?? 0));
-  const visible = showAll ? watchlist : watchlist.filter(row => opportunity(row) !== "RED");
+  const visible = showAll ? watchlist : watchlist.filter(row => opportunity(row) !== "RED" || row.stage === "scan" || row.stage === "evaluation_error");
   return <Card title="Stock Opportunities" wide className="decision-card">
     <p className="muted">Green passed the latest scan’s entry gates. Amber is waiting for an entry trigger. Orders are disabled.</p>
     {!marketOpen && <p className="muted">Waiting for an open market confirmed by Alpaca.</p>}
@@ -51,10 +52,10 @@ function EntryGateDiagnostics({ symbols, scan, marketOpen }: {
     {current && !visible.length && <p className="muted">No current green or amber candidates.</p>}
     {visible.length > 0 && <div className="table-wrap">
       <table className="compact-table">
-        <thead><tr><th>Stock</th><th>Result</th><th>Confidence</th><th>Quality</th><th>Reason</th></tr></thead>
+        <thead><tr><th>Stock</th><th>Result</th><th>Confidence</th><th>Quality</th><th>Quote (UK)</th><th>Reason</th></tr></thead>
         <tbody>{visible.map(row => {
           const result = opportunity(row);
-          const reason = current ? row.reason || "No evaluation available"
+          const reason = current || row.stage === "scan" || row.stage === "evaluation_error" ? row.reason || "No evaluation available"
             : !marketOpen ? "Market closed or unconfirmed"
             : scan?.evaluationComplete === false ? "Entry evaluation incomplete"
             : scan ? "Scan expired" : "Waiting for scan";
@@ -63,6 +64,7 @@ function EntryGateDiagnostics({ symbols, scan, marketOpen }: {
             <td><b style={{ color: colors[result] }}>{result}</b></td>
             <td>{row.confidence?.toFixed(2) ?? "—"}</td>
             <td>{row.quality?.toFixed(4) ?? "—"}</td>
+            <td>{row.quoteTimestamp ? new Date(row.quoteTimestamp).toLocaleTimeString("en-GB", {timeZone: "Europe/London"}) : "—"}</td>
             <td>{reason}</td>
           </tr>;
         })}</tbody>

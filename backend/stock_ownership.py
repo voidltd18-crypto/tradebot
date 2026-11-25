@@ -10,6 +10,8 @@ from backend.stock_broker_state import open_stock_orders
 
 
 def init_stock_ownership(conn):
+    from backend.stock_exit_reservation import init_exit_schema
+    init_exit_schema(conn)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS stock_ownership_intents (
             symbol TEXT PRIMARY KEY,
@@ -127,10 +129,24 @@ def _resolved_buy(broker, symbol, intent):
                        "fills": list(fills.items())}, default=str)
 
 
-def reserve_stock_purchase(connect, broker, symbol, notional, account_id):
+def reserve_stock_purchase(connect, broker, symbol, notional, account_id, *, check_capacity=None):
     """Commit a unique client ID before submission and archive resolved intents."""
     with closing(connect()) as conn:
         intent = _intent(conn, symbol)
+        others = conn.execute("SELECT symbol, account_id, client_order_id, notional, created_at "
+                              "FROM stock_ownership_intents WHERE symbol != ? ORDER BY symbol", (symbol,)).fetchall()
+    resolved = []
+    if check_capacity is not None:
+        # Production has one autonomous stock slot. Reclaim it only from a proven flat lifecycle.
+        if not check_capacity():
+            raise ValueError("BUY BLOCKED | no verified stock capacity")
+        for other_symbol, *prior in others:
+            if prior[0] != str(account_id) or not _flat_and_clear(broker, other_symbol, account_id):
+                raise ValueError("BUY BLOCKED | another stock intent occupies the slot")
+            proof = _resolved_buy(broker, other_symbol, prior)
+            if not proof or not _flat_and_clear(broker, other_symbol, account_id):
+                raise ValueError("BUY BLOCKED | another stock intent is unresolved")
+            resolved.append((other_symbol, prior, proof))
     if not _flat_and_clear(broker, symbol, account_id):
         raise ValueError("BUY BLOCKED | stock ownership requires a flat position and no open orders")
     evidence = None
@@ -147,6 +163,17 @@ def reserve_stock_purchase(connect, broker, symbol, notional, account_id):
     created = datetime.now(timezone.utc).isoformat()
     with closing(connect()) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
+        if check_capacity is not None:
+            current = conn.execute("SELECT symbol, account_id, client_order_id, notional, created_at "
+                                   "FROM stock_ownership_intents WHERE symbol != ? ORDER BY symbol", (symbol,)).fetchall()
+            if current != others or conn.execute("SELECT 1 FROM stock_emergency_latch").fetchone():
+                raise ValueError("BUY BLOCKED | portfolio reservation changed or emergency stop active")
+            if conn.execute("SELECT 1 FROM stock_exit_intents WHERE terminal_status IS NULL").fetchone():
+                raise ValueError("BUY BLOCKED | exit unresolved")
+            for other_symbol, (acct, old_id, amount, stamp), proof in resolved:
+                conn.execute("INSERT INTO stock_ownership_resolutions VALUES (?,?,?,?,?,?,?)",
+                             (old_id, other_symbol, acct, amount, stamp, created, proof))
+                conn.execute("DELETE FROM stock_ownership_intents WHERE client_order_id=?", (old_id,))
         if _intent(conn, symbol) != intent:
             raise ValueError("BUY BLOCKED | stock intent changed during reconciliation")
         if intent is not None:
@@ -176,33 +203,39 @@ def verified_stock_holding(connect, broker, symbol):
         position_qty = _position_quantity(broker, symbol)
         order = broker.get_order_by_client_id(client_id)
         if (order.client_order_id != client_id or order.symbol != symbol
-                or _value(order.status) != "filled" or _value(order.side) != "buy"
+                or _value(order.status) not in {"filled", "canceled", "expired"} or _value(order.side) != "buy"
                 or order.created_at < datetime.fromisoformat(created)
                 or Decimal(order.notional) != Decimal(notional)
-                or position_qty != Decimal(order.filled_qty) or not position_qty > 0):
+                or not position_qty > 0):
             return None
 
-        activities = _fill_activities(broker, created)
+        with closing(connect()) as conn:
+            exits = dict(conn.execute("SELECT broker_id,filled FROM stock_exit_intents "
+                "WHERE buy_id=? AND terminal_status IS NOT NULL AND broker_id IS NOT NULL", (client_id,)))
+        expected = {str(order.id): Decimal(order.filled_qty)}
+        expected.update({oid: Decimal(qty) for oid, qty in exits.items()})
         fills = {}
-        for activity in activities:
+        for activity in _fill_activities(broker, created):
             if activity.get("symbol") not in (None, "", symbol):
                 continue
+            oid = activity.get("order_id")
             if (activity.get("symbol") != symbol or activity.get("activity_type") != "FILL"
-                    or activity.get("order_id") != str(order.id) or activity.get("side") != "buy"
+                    or oid not in expected or activity.get("side") != ("buy" if oid == str(order.id) else "sell")
                     or activity.get("account_id") not in (None, account_id)):
                 return None
             qty, cumulative = Decimal(activity["qty"]), Decimal(activity["cum_qty"])
             if not (qty.is_finite() and cumulative.is_finite() and 0 < qty <= cumulative):
                 return None
-            fill = (cumulative, qty)
+            fill = (oid, cumulative, qty)
             if not activity["id"] or fills.setdefault(activity["id"], fill) != fill:
                 return None
-        total = Decimal(0)
-        for cumulative, qty in sorted(fills.values()):
-            total += qty
-            if total != cumulative:
+        totals = dict.fromkeys(expected, Decimal(0))
+        for oid, cumulative, qty in sorted(fills.values()):
+            totals[oid] += qty
+            if totals[oid] != cumulative:
                 return None
-        if (total == position_qty == _position_quantity(broker, symbol)
+        total = expected[str(order.id)] - sum(Decimal(qty) for qty in exits.values())
+        if (totals == expected and total == position_qty == _position_quantity(broker, symbol)
                 and str(broker.get_account().id) == account_id
                 and not open_stock_orders(broker, symbol)):
             return total, client_id

@@ -4,6 +4,8 @@ No order execution, exit management, or broker balance checks are changed.
 """
 from __future__ import annotations
 
+import math
+
 
 def stock_crypto_capacity(base_payload, trading_client, min_notional=1.0):
     """Fail closed when Alpaca positions or cash cannot be verified."""
@@ -20,6 +22,8 @@ def stock_crypto_capacity(base_payload, trading_client, min_notional=1.0):
     })
     try:
         raw = trading_client.get_all_positions()
+        if not isinstance(raw, list):
+            raise ValueError("invalid positions response")
         account = trading_client.get_account()
         cash = max(0.0, float(account.buying_power))
         stocks = 0
@@ -27,6 +31,8 @@ def stock_crypto_capacity(base_payload, trading_client, min_notional=1.0):
         for position in raw:
             qty = float(position.qty)
             value = abs(float(position.market_value))
+            if not math.isfinite(qty) or not math.isfinite(value):
+                raise ValueError("invalid stock quantity or market value")
             if qty <= 0 or value < 0.01:
                 continue
             asset_class = str(getattr(position, "asset_class", "")).lower()

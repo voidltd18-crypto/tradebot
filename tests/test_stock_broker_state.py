@@ -46,7 +46,7 @@ def test_sellable_shares_and_account_restrictions():
         sellable_stock_quantity(broker, "AAPL")
 
     broker.get_account.return_value = SimpleNamespace(
-        id="account", status="ACTIVE", account_blocked=False, trading_blocked=False,
+        id="account", status="ACTIVE", account_blocked=False, trading_blocked=False, trade_suspended_by_user=False,
         equity="100", cash="80", buying_power="80",
     )
     assert stock_account(broker).cash == "80"

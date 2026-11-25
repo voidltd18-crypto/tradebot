@@ -131,7 +131,12 @@ def _stock_broker_audit():
 
     broker = _legacy.trading_client
     try:
-        account = stock_account(broker)
+        account = broker.get_account()
+        try:
+            stock_account(broker)
+            account_check = "active"
+        except BrokerStateUnverified as exc:
+            account_check = str(exc)
         positions = broker.get_all_positions()
         orders = broker.get("/orders", data={"status": "open", "limit": 500})
         if not isinstance(positions, list) or not isinstance(orders, list):
@@ -140,13 +145,25 @@ def _stock_broker_audit():
             position for position in positions
             if getattr(position.asset_class, "value", position.asset_class) == "us_equity"
         ]
+        for position in equity_positions:
+            qty = float(position.qty)
+            value = abs(float(position.market_value))
+            classification = ("nonpositive quantity" if qty <= 0 else "sub-cent residue"
+                              if value < _legacy.POSITION_DUST_VALUE_USD else "active")
+            print(f"STOCK POSITION AUDIT | symbol={position.symbol} qty={position.qty} "
+                  f"available={position.qty_available} category={classification}", flush=True)
         sellable_reported = sum(getattr(position, "qty_available", None) is not None for position in equity_positions)
         report = reconcile_stock_intents(_legacy.db_connect, broker, account)
         print(
-            f"STOCK BROKER AUDIT | account=active stock_positions={len(equity_positions)} "
+            f"STOCK BROKER AUDIT | account={account_check} stock_positions={len(equity_positions)} "
             f"sellable_reported={sellable_reported} open_orders={len(orders)} "
             f"open_orders_complete={len(orders) < 500} ledger={report}", flush=True,
         )
+        recent = broker.get("/account/activities", data={"activity_types": "FILL", "page_size": 1})
+        visible = isinstance(recent, list) and bool(recent) and all(
+            isinstance(row, dict) and row.get("activity_type") == "FILL" and row.get("order_id") and row.get("id")
+            for row in recent)
+        print(f"STOCK FILL VISIBILITY | observed={bool(visible)}", flush=True)
     except BrokerStateUnverified as exc:
         print(f"STOCK BROKER AUDIT | {exc}", flush=True)
     except Exception as exc:

@@ -25,12 +25,13 @@ from backend.config import CRYPTO_ENABLED
 from backend.read_only_broker import ReadOnlyTradingClient
 from backend.stock_buy_risk import cap_stock_buy_notional
 from backend.stock_sell_preview import stock_sell_preview
+from backend.stock_exit_reservation import emergency_latched, latch_emergency, recover_exits, reserve_exit
 from backend.stock_ownership import (
     init_stock_ownership, reserve_stock_purchase, verified_stock_holding, verified_stock_quantity,
 )
 from backend.stock_broker_state import (
     BrokerStateUnverified, fresh_stock_quote, open_stock_orders,
-    sellable_stock_quantity, stock_account, stock_position,
+    sellable_stock_quantity, stock_account, stock_position, verify_entry_slot,
 )
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
@@ -1275,15 +1276,13 @@ def get_quote(symbol: str, *, require_fresh: bool = False):
         raise ValueError(f"Bad quote for {symbol}")
     mid = (bid + ask) / 2.0
     spread = (ask - bid) / mid
-    return {"bid": float(bid), "ask": float(ask), "mid": float(mid), "spread": float(spread)}
+    return {"bid": float(bid), "ask": float(ask), "mid": float(mid), "spread": float(spread),
+            "timestamp": quote.timestamp.isoformat() if quote.timestamp else None}
 
 
 def get_position(symbol: str):
-    try:
-        pos = trading_client.get_open_position(symbol)
-        return float(pos.qty), float(pos.avg_entry_price)
-    except Exception:
-        return 0.0, 0.0
+    pos = stock_position(trading_client, symbol)
+    return (float(pos.qty), float(pos.avg_entry_price)) if pos else (0.0, 0.0)
 
 
 def has_open_order(symbol: str):
@@ -1691,6 +1690,7 @@ def compute_scan(symbol: str):
         "spread": spread,
         "bid": quote["bid"],
         "ask": quote["ask"],
+        "quoteTimestamp": quote["timestamp"],
         "qty": qty,
         "entry": entry,
         "ref": ref,
@@ -2089,11 +2089,17 @@ def can_buy_symbol(symbol: str):
             return False, "Insufficient cash or buying power"
         if has_open_order(sym):
             return False, f"{sym} existing open order"
+        if not verify_entry_slot(trading_client):
+            return False, "Existing open buy order occupies the stock slot"
         position = stock_position(trading_client, sym)
     except BrokerStateUnverified as exc:
         return False, str(exc)
     if position is not None and Decimal(str(position.qty)) != 0:
         return False, f"{sym} already holding"
+    from backend.v19_stock_crypto_capacity import stock_crypto_capacity
+    capacity = stock_crypto_capacity({}, trading_client, MIN_ORDER_NOTIONAL)
+    if not capacity["availableSlots"]:
+        return False, "No stock entry capacity" if "openStockPositions" in capacity else capacity["reason"]
     return True, ""
 
 
@@ -2184,11 +2190,17 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
     if not bot_enabled or emergency_stop:
         raise RuntimeError("BUY BLOCKED | trading paused or emergency stop active")
     get_quote(symbol, require_fresh=True)
-    client_order_id = reserve_stock_purchase(db_connect, trading_client, symbol, notional_amount, account.id)
+    client_order_id = reserve_stock_purchase(
+        db_connect, trading_client, symbol, notional_amount, account.id,
+        check_capacity=lambda: verify_entry_slot(trading_client) and ai_position_capacity_payload().get("availableSlots", 0) > 0,
+    )
     order = MarketOrderRequest(
         symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY, client_order_id=client_order_id,
     )
+    get_quote(symbol, require_fresh=True)
+    if not bot_enabled or emergency_stop or emergency_latched(db_connect):
+        raise RuntimeError("BUY BLOCKED | trading paused or emergency stop active")
     trading_client.submit_order(order)
     if AI_RISK_ENGINE_ENABLED and scan:
         try:
@@ -2288,12 +2300,18 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     crypto_full_close = manual_full_close and _manual_sell_is_crypto(symbol)
     rounded_qty = qty if crypto_full_close else floor_qty(qty, 6)
     if rounded_qty <= 0:
-        return
+        return {"ok": False, "message": "Rounded sell quantity is zero"}
 
+    automated = not str(reason).upper().startswith("MANUAL")
+    client_id = reserve_exit(db_connect, trading_client, symbol, rounded_qty, reason) if automated else None
     submitted_order = None
 
     def submit(q):
-        order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=(TimeInForce.GTC if _manual_sell_is_crypto(symbol) else TimeInForce.DAY))
+        order = MarketOrderRequest(symbol=symbol, qty=q, side=OrderSide.SELL, time_in_force=(TimeInForce.GTC if _manual_sell_is_crypto(symbol) else TimeInForce.DAY), **({"client_order_id": client_id} if client_id else {}))
+        if automated:
+            get_quote(symbol, require_fresh=True)
+        if automated and (not bot_enabled or emergency_stop or emergency_latched(db_connect)):
+            raise RuntimeError("SELL BLOCKED | trading paused or emergency stop active")
         return trading_client.submit_order(order)
 
     try:
@@ -2366,6 +2384,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
     # Do not update stock memory or the profit vault from a quote estimate.
     lock_symbol_until_tomorrow(symbol)
     notify(f"🔴 SELL SUBMITTED: {symbol} | qty={rounded_qty} | broker status={order_status} | fill/PnL pending")
+    return {"ok": True, "orderId": order_id, "status": order_status}
 
 
 def close_position(position, reason="MANUAL SELL"):
@@ -2385,8 +2404,6 @@ def close_position(position, reason="MANUAL SELL"):
     outcome = market_sell_qty(symbol, qty, entry=entry, price=price, reason=reason)
     if isinstance(outcome, dict) and not outcome.get("ok"):
         return outcome
-    if symbol in state:
-        state[symbol]["highest_since_entry"] = None
     return {"ok": True, "message": f"{reason} submitted for {symbol}. {symbol} locked until tomorrow.", "symbol": symbol}
 
 
@@ -4713,6 +4730,40 @@ def v17_live_entry_gate_pipeline(
     return survivors
 
 
+def evaluate_stock_scan(scans, scan_order, scan_decisions, scan_started_at):
+    gate_eligible = []
+    for scan in scans:
+        try:
+            gate_eligible.extend(v17_live_entry_gate_pipeline(
+                [scan], persist_decisions=False, log_rejections=False,
+                scan_decisions=scan_decisions,
+            ))
+        except Exception as exc:
+            scan_decisions[scan["symbol"]] = {
+                "symbol": scan["symbol"], "decision": "REJECTED", "stage": "evaluation_error",
+                "reason": str(exc) if isinstance(exc, BrokerStateUnverified) else "Entry evaluation failed.",
+            }
+            print(f"STOCK MONITOR ENTRY GATE ERROR {scan['symbol']}: {exc}")
+        decision = scan_decisions.setdefault(scan["symbol"], {
+            "symbol": scan["symbol"], "decision": "REJECTED", "stage": "evaluation_error",
+            "reason": "Entry gate returned no decision.",
+        })
+        decision["quoteTimestamp"] = scan["quoteTimestamp"]
+    gate_eligible.sort(key=lambda row: (-row["confidence"], -row["quality_score"], row["spread"]))
+
+    snapshot = {
+        "startedAt": scan_started_at.isoformat(),
+        "completedAt": datetime.now(UTC).isoformat(),
+        "attemptedCount": len(scan_order),
+        "scannedCount": len(scans),
+        "evaluationComplete": set(scan_decisions) == set(scan_order) and all(
+            row["stage"] not in {"scan", "evaluation_error"} and
+            "broker state unverified" not in row["reason"].lower() for row in scan_decisions.values()),
+        "rows": list(scan_decisions.values()),
+    }
+    return gate_eligible, snapshot
+
+
 def get_best_profit_candidate(scans):
     picks = pick_money_mode_stocks(scans)
     return picks[0] if picks else None
@@ -5037,9 +5088,9 @@ def manage_money_mode_positions():
                 if pdt_aware_should_avoid_sell(symbol, "FAST EXIT STOP LOSS", p["pnlPct"], allow_hard_stop=True):
                     continue
 
-                market_sell_qty(symbol, qty, entry=entry, price=price, reason="FAST EXIT STOP LOSS")
-                state[symbol]["highest_since_entry"] = None
-                _v17_reset_peak_exhaustion(symbol)
+                result = market_sell_qty(symbol, qty, entry=entry, price=price, reason="FAST EXIT STOP LOSS")
+                if not result or not result.get("ok"):
+                    continue
                 print(f"FAST EXIT STOP LOSS SELL {qty:.6f} {symbol}")
             except Exception as e:
                 print(f"SELL ERROR {symbol}: {e}")
@@ -5052,9 +5103,9 @@ def manage_money_mode_positions():
         emergency_stop_price = entry * (1.0 - emergency_stop_pct / 100.0)
         if price <= emergency_stop_price:
             try:
-                market_sell_qty(symbol, qty, entry=entry, price=price, reason="AI RISK EMERGENCY STOP")
-                state[symbol]["highest_since_entry"] = None
-                _v17_reset_peak_exhaustion(symbol)
+                result = market_sell_qty(symbol, qty, entry=entry, price=price, reason="AI RISK EMERGENCY STOP")
+                if not result or not result.get("ok"):
+                    continue
                 print(f"AI RISK EMERGENCY STOP {symbol} | pnl={p['pnlPct']:.2f}% limit=-{emergency_stop_pct:.2f}%")
             except Exception as e:
                 print(f"EMERGENCY SELL ERROR {symbol}: {e}")
@@ -5064,9 +5115,9 @@ def manage_money_mode_positions():
                 if pdt_aware_should_avoid_sell(symbol, "MONEY MODE STOP LOSS", p["pnlPct"], allow_hard_stop=True):
                     continue
 
-                market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
-                state[symbol]["highest_since_entry"] = None
-                _v17_reset_peak_exhaustion(symbol)
+                result = market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE STOP LOSS")
+                if not result or not result.get("ok"):
+                    continue
             except Exception as e:
                 print(f"SELL ERROR {symbol}: {e}")
             continue
@@ -5076,10 +5127,9 @@ def manage_money_mode_positions():
             try:
                 if pdt_aware_should_avoid_sell(symbol, "PEAK EXHAUSTION PROFIT", p["pnlPct"], allow_hard_stop=False):
                     continue
-                market_sell_qty(symbol, qty, entry=entry, price=price, reason="PEAK EXHAUSTION PROFIT")
-                state[symbol]["highest_since_entry"] = None
-                _v17_reset_peak_exhaustion(symbol)
-                _v17_reset_runner_trail(symbol)
+                result = market_sell_qty(symbol, qty, entry=entry, price=price, reason="PEAK EXHAUSTION PROFIT")
+                if not result or not result.get("ok"):
+                    continue
                 print(
                     f"PEAK EXHAUSTION PROFIT SELL {qty:.6f} {symbol} | "
                     f"attempts={peak_exit.get('touches', 0)} peak={float(peak_exit.get('peak') or 0):.2f} "
@@ -5096,10 +5146,9 @@ def manage_money_mode_positions():
                 # intentionally allowed after the timer, even when the legacy
                 # PDT-aware soft-profit hold would normally defer it. Broker-side
                 # PDT/account restrictions still remain authoritative.
-                market_sell_qty(symbol, qty, entry=entry, price=price, reason="ONE HOUR PROFIT EXIT")
-                state[symbol]["highest_since_entry"] = None
-                _v17_reset_peak_exhaustion(symbol)
-                _v17_reset_runner_trail(symbol)
+                result = market_sell_qty(symbol, qty, entry=entry, price=price, reason="ONE HOUR PROFIT EXIT")
+                if not result or not result.get("ok"):
+                    continue
                 print(
                     f"V18.2.28 ONE HOUR PROFIT EXIT | {symbol} qty={qty:.6f} "
                     f"held={int(p.get('minutesSinceBuy') or 0)}m pnl={float(p.get('pnlPct') or 0.0):.2f}% "
@@ -5137,9 +5186,9 @@ def manage_money_mode_positions():
                 if pdt_aware_should_avoid_sell(symbol, "STALL EXIT", p["pnlPct"], allow_hard_stop=False):
                     continue
 
-                market_sell_qty(symbol, qty, entry=entry, price=price, reason="STALL EXIT")
-                state[symbol]["highest_since_entry"] = None
-                _v17_reset_peak_exhaustion(symbol)
+                result = market_sell_qty(symbol, qty, entry=entry, price=price, reason="STALL EXIT")
+                if not result or not result.get("ok"):
+                    continue
                 print(f"STALL EXIT SELL {qty:.6f} {symbol} | {stall_reason}")
             except Exception as e:
                 print(f"STALL SELL ERROR {symbol}: {e}")
@@ -5186,10 +5235,9 @@ def manage_money_mode_positions():
                     if pdt_aware_should_avoid_sell(symbol, "MONEY MODE TRAILING PROFIT", p["pnlPct"]):
                         continue
 
-                    market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
-                    state[symbol]["highest_since_entry"] = None
-                    _v17_reset_runner_trail(symbol)
-                    _v17_reset_peak_exhaustion(symbol)
+                    result = market_sell_qty(symbol, qty, entry=entry, price=price, reason="MONEY MODE TRAILING PROFIT")
+                    if not result or not result.get("ok"):
+                        continue
                 except Exception as e:
                     print(f"SELL ERROR {symbol}: {e}")
                 continue
@@ -10677,6 +10725,17 @@ def pause_bot(request: Request):
     return {"ok": True, "message": "Bot paused"}
 
 
+@app.post("/emergency-stop")
+def stop_execution(request: Request):
+    verify_api_key(request)
+    global emergency_stop, bot_enabled
+    bot_enabled = False
+    emergency_stop = True
+    latch_emergency(db_connect)
+    update_status(BOT_NAME, latest_scans)
+    return {"ok": True, "message": "Emergency stop latched. Outstanding orders require broker review."}
+
+
 @app.post("/resume")
 def resume_bot(request: Request):
     verify_api_key(request)
@@ -10698,7 +10757,7 @@ def manual_override_off(request: Request):
     global manual_override
     manual_override = False
     update_status(BOT_NAME, latest_scans)
-    return {"ok": True, "message": "Manual override OFF. Auto-buy active."}
+    return {"ok": True, "message": "Manual override off. Broker orders remain disabled."}
 
 
 @app.post("/manual-buy")
@@ -11574,6 +11633,7 @@ def run_bot_loop():
                 except Exception as e:
                     print(f"V17.5 ADAPTIVE UNIVERSE LOOP ERROR: {e}")
                 try:
+                    recover_exits(db_connect, trading_client, register_pending_sell_order)
                     sync_recent_filled_orders_to_reports()
                 except Exception as e:
                     print(f"AUTO REPORT LOOP SYNC ERROR: {e}")
@@ -11634,27 +11694,9 @@ def run_bot_loop():
                 latest_scans.extend(scans)
 
                 # Reuse the entry gates without creating learning records.
-                gate_eligible = None
-                try:
-                    gate_eligible = v17_live_entry_gate_pipeline(
-                        scans,
-                        persist_decisions=False,
-                        log_rejections=False,
-                        log_summary=AI_PORTFOLIO_MANAGER_ENABLED,
-                        scan_decisions=scan_decisions,
-                    )
-                except Exception as gate_error:
-                    print(f"STOCK MONITOR ENTRY GATE ERROR: {gate_error}")
-                    scan_decisions = {}
+                gate_eligible, snapshot = evaluate_stock_scan(scans, scan_order, scan_decisions, scan_started_at)
                 with _STATUS_LOCK:
-                    _stock_scan_snapshot = {
-                        "startedAt": scan_started_at.isoformat(),
-                        "completedAt": datetime.now(UTC).isoformat(),
-                        "attemptedCount": len(scan_order),
-                        "scannedCount": len(scans),
-                        "evaluationComplete": gate_eligible is not None,
-                        "rows": list(scan_decisions.values()),
-                    }
+                    _stock_scan_snapshot = snapshot
 
                 if AI_PORTFOLIO_MANAGER_ENABLED and gate_eligible is not None:
                     try:
@@ -11694,6 +11736,8 @@ def startup_event():
     # Initialise the shared SQLite schema synchronously before any worker threads start.
     # This removes the startup race where multiple workers all tried to create tables.
     init_db()
+    global emergency_stop
+    emergency_stop = emergency_latched(db_connect)
     # V17.0.11: restore persisted daily SELL locks synchronously before the live
     # bot thread starts. This closes the restart/redeploy eligibility window.
     try:
