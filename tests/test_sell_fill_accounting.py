@@ -111,3 +111,39 @@ def test_reconciliation_requires_terminal_order_and_fifo_match():
     assert "abs(matched_qty - filled_qty) > tolerance" in text
     assert "accounting_status='PROCESSED'" in text
     assert "actual_fill_price <= 0" in text
+
+
+def test_partial_profit_requires_confirmed_accounted_fill_and_survives_restart(tmp_path):
+    import sqlite3
+
+    database = tmp_path / "trades.db"
+
+    def connect():
+        return sqlite3.connect(database)
+
+    with connect() as conn:
+        conn.executescript("""
+            CREATE TABLE pending_sell_orders (
+                alpaca_order_id TEXT, symbol TEXT, reason TEXT,
+                accounting_status TEXT, accounted_qty REAL
+            );
+            CREATE TABLE closed_trades (
+                source_sell_order_id TEXT, symbol TEXT, day TEXT, qty REAL
+            );
+            INSERT INTO pending_sell_orders VALUES
+                ('profit-order', 'AAPL', 'PARTIAL PROFIT TAKE', 'PENDING', 0),
+                ('manual-order', 'AAPL', 'MANUAL SELL', 'PROCESSED', 1);
+            INSERT INTO closed_trades VALUES ('manual-order', 'AAPL', '2026-11-25', 1);
+        """)
+    scope = {"SQLITE_ENABLED": True, "db_connect": connect, "today_str": lambda: "2026-11-25"}
+    has_taken = load_function("has_taken_partial_profit", scope)
+    assert not has_taken("AAPL")
+    with connect() as conn:
+        conn.execute("INSERT INTO closed_trades VALUES ('profit-order', 'AAPL', '2026-11-25', 0.5)")
+    assert not has_taken("AAPL")
+    with connect() as conn:
+        conn.execute("UPDATE pending_sell_orders SET accounting_status='PROCESSED', accounted_qty=0.5 "
+                     "WHERE alpaca_order_id='profit-order'")
+    assert load_function("has_taken_partial_profit", dict(scope))("aapl")
+    scope["today_str"] = lambda: "2026-11-26"
+    assert not has_taken("AAPL")
