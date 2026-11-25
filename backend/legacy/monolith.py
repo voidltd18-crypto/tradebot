@@ -9343,8 +9343,9 @@ def root():
 def v2_status():
     return {
         "ok": True, "enabled": TRADEBOT_V2_ENABLED, "paper": PAPER,
-        "liveBuyingEnabled": TRADEBOT_V2_LIVE_ENABLED,
-        "mode": "paper" if PAPER else ("live" if TRADEBOT_V2_LIVE_ENABLED else "validation-only"),
+        "liveBuyingEnabled": False,
+        "orderExecutionEnabled": False,
+        "mode": "read-only",
         "features": {
             "decisionExplanation": True, "shadowVsOriginal": True,
             "adaptiveThresholdAdvisory": True, "autoApplyThresholds": V2_AUTO_APPLY_THRESHOLDS,
