@@ -5561,7 +5561,16 @@ def _v174_final_gate_monitor_payload() -> Dict[str, Any]:
         }
 
 
-def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) -> Dict[str, Any]:
+def _stock_gate_audit(rows):
+    rejected = [dict(row) for row in (rows or []) if row.get("decision") == "REJECTED"]
+    counts = {}
+    for row in rejected:
+        stage = str(row.get("stage") or "unknown")
+        counts[stage] = counts.get(stage, 0) + 1
+    return {"rejectedCount": len(rejected), "reasonCounts": counts, "decisions": rejected}
+
+
+def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False, scan_decisions=None) -> Dict[str, Any]:
     account = get_account()
     equity = float(account.equity)
     buying_power = max(0.0, float(account.buying_power))
@@ -5927,6 +5936,10 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False) 
             )
         ),
     }
+    if scan_decisions is not None:
+        plan["entryGateAudit"] = _stock_gate_audit(scan_decisions)
+        audit = plan["entryGateAudit"]
+        print("V19 STOCK ENTRY GATE AUDIT | " + json.dumps(audit, default=str), flush=True)
     _v16_save_portfolio_plan(plan)
     # Read-only diagnostics: inspect already-computed decisions; no trade gate changes.
     rejected_examples = [
@@ -5978,13 +5991,15 @@ def api_v16_portfolio_status(request: Request):
             # through the exact same entry gates used by money_mode_buy(), but
             # read-only so a status refresh cannot create duplicate evidence.
             raw_scans = list(latest_scans)
+            refresh_decisions = {}
             gate_eligible = v17_live_entry_gate_pipeline(
                 raw_scans,
                 persist_decisions=False,
                 log_rejections=False,
                 log_summary=False,
+                scan_decisions=refresh_decisions,
             )
-            payload = build_v16_portfolio_plan(gate_eligible, manual=False).get("plan") or payload
+            payload = build_v16_portfolio_plan(gate_eligible, manual=False, scan_decisions=list(refresh_decisions.values())).get("plan") or payload
             payload["source"] = "latest_live_scans_after_live_gates"
             payload["rawScanCount"] = len(raw_scans)
             payload["gateEligibleCount"] = len(gate_eligible)
@@ -11700,7 +11715,7 @@ def run_bot_loop():
 
                 if AI_PORTFOLIO_MANAGER_ENABLED and gate_eligible is not None:
                     try:
-                        build_v16_portfolio_plan(gate_eligible, manual=False)
+                        build_v16_portfolio_plan(gate_eligible, manual=False, scan_decisions=snapshot["rows"])
                     except Exception as portfolio_error:
                         print(f"V17.0.15 PORTFOLIO AUTO-PUBLISH ERROR: {portfolio_error}")
 
