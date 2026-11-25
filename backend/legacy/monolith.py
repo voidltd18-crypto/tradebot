@@ -586,7 +586,6 @@ stock_memory: Dict[str, Dict[str, Any]] = {}
 temp_blacklist: Dict[str, Any] = {}
 alpaca_rejection_events: List[Dict[str, Any]] = []
 pdt_warning_events: List[Dict[str, Any]] = []
-partial_profit_taken: Dict[str, str] = {}
 equity_curve: List[Dict[str, Any]] = []
 
 bot_enabled = False
@@ -870,10 +869,6 @@ def reset_daily_flags_if_needed():
     for symbol, day in list(locked_today.items()):
         if day != today:
             del locked_today[symbol]
-
-    for symbol, day in list(partial_profit_taken.items()):
-        if day != today:
-            del partial_profit_taken[symbol]
 
     if starting_equity_day != today:
         try:
@@ -2521,11 +2516,28 @@ def hold_ai_blocks_soft_exit(position: Dict[str, Any], exit_reason: str):
 # FASTER EXIT HELPERS
 # =========================
 def has_taken_partial_profit(symbol: str):
-    return partial_profit_taken.get(symbol.upper()) == today_str()
-
-
-def mark_partial_profit_taken(symbol: str):
-    partial_profit_taken[symbol.upper()] = today_str()
+    """Read the current day's confirmed and accounted partial sell fills."""
+    if not SQLITE_ENABLED:
+        return False
+    conn = None
+    try:
+        conn = db_connect()
+        row = conn.execute(
+            "SELECT 1 FROM closed_trades AS trade "
+            "JOIN pending_sell_orders AS sell ON sell.alpaca_order_id=trade.source_sell_order_id "
+            "WHERE trade.symbol=? AND trade.day=? AND trade.qty>0 "
+            "AND sell.symbol=trade.symbol AND sell.reason='PARTIAL PROFIT TAKE' "
+            "AND sell.accounting_status='PROCESSED' AND sell.accounted_qty>0 "
+            "LIMIT 1",
+            (symbol.upper(), today_str()),
+        ).fetchone()
+        return row is not None
+    except Exception as exc:
+        print(f"PARTIAL PROFIT FILL LOOKUP ERROR | symbol={symbol} error={exc}")
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def sell_notional_ok(qty: float, price: float):
@@ -5108,9 +5120,9 @@ def manage_money_mode_positions():
                     continue
 
                 sell_qty = partial_profit_qty(p)
-                market_sell_qty(symbol, sell_qty, entry=entry, price=price, reason="PARTIAL PROFIT TAKE")
-                mark_partial_profit_taken(symbol)
-                print(f"PARTIAL PROFIT SELL {sell_qty:.6f} {symbol}")
+                result = market_sell_qty(symbol, sell_qty, entry=entry, price=price, reason="PARTIAL PROFIT TAKE")
+                if isinstance(result, dict) and not result.get("ok"):
+                    print(f"PARTIAL SELL BLOCKED | symbol={symbol} reason={result.get('message')}")
             except Exception as e:
                 print(f"PARTIAL SELL ERROR {symbol}: {e}")
             continue
