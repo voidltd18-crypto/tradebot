@@ -13,6 +13,7 @@ import re
 import threading
 import random
 from datetime import datetime, UTC, timedelta, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -23,6 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.read_only_broker import ReadOnlyTradingClient
 from backend.stock_buy_risk import cap_stock_buy_notional
 from backend.stock_sell_preview import stock_sell_preview
+from backend.stock_ownership import init_stock_ownership, reserve_stock_purchase, verified_stock_quantity
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
@@ -1395,6 +1397,10 @@ def get_all_positions():
             emergency_stop_price = entry * (1.0 - emergency_stop_pct / 100.0) if entry > 0 else 0.0
             trailing_active = bool((state[symbol].get("highest_since_entry") or 0.0) >= trail_start_price) if trail_start_price > 0 else False
 
+            equity_position = str(getattr(pos, "asset_class", "")).lower() in {"us_equity", "assetclass.us_equity"}
+            owned_quantity = verified_stock_quantity(db_connect, trading_client, symbol) if equity_position else None
+            if owned_quantity is not None and owned_quantity != Decimal(str(pos.qty)):
+                owned_quantity = None
             positions.append({
                 "symbol": symbol,
                 "qty": qty,
@@ -1415,8 +1421,8 @@ def get_all_positions():
                 "sellPreview": stock_sell_preview(
                     quantity=qty, entry=entry, mark=display_price, stop=stop_price,
                     emergency_stop=emergency_stop_price, trail_active=trailing_active,
-                    trail_floor=trail_floor,
-                ) if str(getattr(pos, "asset_class", "")).lower() in {"us_equity", "assetclass.us_equity"} else None,
+                    trail_floor=trail_floor, owned_quantity=owned_quantity,
+                ) if equity_position else None,
                 "trailStartPct": trail_start_pct,
                 "trailGivebackPct": trail_giveback_pct,
                 "runnerTrailEnabled": bool(ADAPTIVE_RUNNER_TRAIL_ENABLED),
@@ -2175,7 +2181,13 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
         stop_distance_pct=stop_distance_pct,
         minimum_order=MIN_ORDER_NOTIONAL,
     )
-    order = MarketOrderRequest(symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY, time_in_force=TimeInForce.DAY)
+    if isinstance(trading_client, ReadOnlyTradingClient):
+        raise RuntimeError("TradeBot is read-only. Broker orders are disabled.")
+    client_order_id = reserve_stock_purchase(db_connect, trading_client, symbol, notional_amount, account.id)
+    order = MarketOrderRequest(
+        symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY, client_order_id=client_order_id,
+    )
     trading_client.submit_order(order)
     if AI_RISK_ENGINE_ENABLED and scan:
         try:
@@ -2245,6 +2257,10 @@ def _manual_sell_is_crypto(symbol: str) -> bool:
 
 
 def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 0.0, reason="AUTO SELL"):
+    if not str(reason).upper().startswith("MANUAL"):
+        owned_quantity = verified_stock_quantity(db_connect, trading_client, symbol)
+        if owned_quantity is None or not 0 < Decimal(str(qty)) <= owned_quantity:
+            return {"ok": False, "message": "Automated sell blocked: bot ownership unverified"}
     # Defense in depth: no legacy automated crypto sells, even from a path
     # outside manage_money_mode_positions. Explicit manual sells remain usable.
     # A broker asset-class lookup failure must never permit an auto sell.
@@ -6580,6 +6596,7 @@ def _init_db_impl():
         return
 
     conn = db_connect()
+    init_stock_ownership(conn)
     cur = conn.cursor()
 
     cur.execute("""

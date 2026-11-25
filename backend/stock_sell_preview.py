@@ -6,10 +6,12 @@ from backend.stock_buy_risk import ROUND_TRIP_COST_ALLOWANCE
 
 
 def stock_sell_preview(*, quantity, entry, mark, stop, emergency_stop,
-                       trail_active, trail_floor):
+                       trail_active, trail_floor, owned_quantity=None):
     result = {
         "action": "HOLD",
-        "reason": "Bot ownership unverified. Selling is blocked.",
+        "reason": ("Bot shares verified. Execution is disabled." if owned_quantity is not None
+                   else "Bot ownership unverified. Selling is blocked."),
+        "verifiedBotQuantity": str(owned_quantity) if owned_quantity is not None else None,
         "thresholdSignal": None,
         "estimatedNetPnl": None,
         "costAllowancePct": float(ROUND_TRIP_COST_ALLOWANCE * 100),
