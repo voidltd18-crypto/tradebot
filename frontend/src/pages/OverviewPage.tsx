@@ -3,9 +3,10 @@ import { Card } from "../components/Card";
 import { useEffect, useState } from "react";
 import { API_URL } from "../lib/api";
 
-const APPROVED_TECH = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "AVGO", "ORCL", "AMD", "TSLA"];
-
-function EntryGateDiagnostics({ authToken }: { authToken: string }) {
+function EntryGateDiagnostics({ authToken, symbols, marketOpen }: {
+  authToken: string; symbols: string[]; marketOpen: boolean;
+}) {
+  const [showAll, setShowAll] = useState(false);
   const [rows, setRows] = useState<any[]>([]);
   const [error, setError] = useState("");
   const [updated, setUpdated] = useState("");
@@ -23,9 +24,9 @@ function EntryGateDiagnostics({ authToken }: { authToken: string }) {
         const latest = new Map<string, any>();
         for (const item of (Array.isArray(result?.decisions) ? result.decisions : [])) {
           const symbol = String(item?.symbol || "").toUpperCase();
-          if (APPROVED_TECH.includes(symbol) && !latest.has(symbol)) latest.set(symbol, item);
+          if (symbol && !latest.has(symbol)) latest.set(symbol, item);
         }
-        setRows(APPROVED_TECH.map(symbol => latest.get(symbol) || { symbol }));
+        setRows(Array.from(latest.values()));
         setUpdated(new Date().toISOString());
         setError("");
       } catch (e: any) { if (active) setError(e?.message || "Decision history unavailable"); }
@@ -77,8 +78,23 @@ function EntryGateDiagnostics({ authToken }: { authToken: string }) {
         timeZone: "Europe/London", day: "2-digit", month: "short",
         hour: "2-digit", minute: "2-digit"
       }) : "—";
-  return <Card title="Why No Buy? · Entry Gate Diagnostics" wide className="decision-card">
-    <p className="muted">Latest recorded decision for each approved stock. Confidence shows the score used for trading; raw confidence and memory show how historical performance affected it. Read-only.</p>
+  const opportunity = (row: any) => {
+    const age = Date.now() - Date.parse(String(row.timestamp || ""));
+    if (error || !marketOpen || !(age >= 0 && age <= 30 * 60 * 1000)) return "RED";
+    if (row.decision === "APPROVED" && row.stage === "final_gate") return "GREEN";
+    if (row.decision === "REJECTED" && row.stage === "trigger_gate") return "AMBER";
+    return "RED";
+  };
+  const priority = { GREEN: 0, AMBER: 1, RED: 2 };
+  const watchlist = symbols.map(symbol => rows.find(row => row.symbol === symbol) || { symbol });
+  watchlist.sort((a, b) => priority[opportunity(a)] - priority[opportunity(b)] ||
+    Number(b.confidence || 0) - Number(a.confidence || 0) ||
+    Number(b.quality || 0) - Number(a.quality || 0));
+  const visible = showAll ? watchlist : watchlist.filter(row => opportunity(row) !== "RED");
+  return <Card title="Stock Opportunities" wide className="decision-card">
+    <p className="muted">Green passed the recorded entry gates. Amber is waiting for an entry trigger. Orders are disabled.</p>
+    <button className="ghost" onClick={() => setShowAll(value => !value)}>{showAll ? "Hide red" : "Show all"}</button>
+    {!visible.length && <p className="muted">{symbols.length ? "No current green or amber candidates." : "Approved watchlist unavailable."}</p>}
     {error && <p className="muted">{error}</p>}
     {updated && <p className="muted">Checked {new Date(updated).toLocaleTimeString("en-GB")} · US session labels are clock-based (holidays and halts not detected)</p>}
     <div style={{ overflowX: "auto" }}>
@@ -86,9 +102,9 @@ function EntryGateDiagnostics({ authToken }: { authToken: string }) {
         <thead><tr>{["Stock", "Result", "Session", "Final conf.", "Raw conf.", "Memory ×", "Why?", "Recorded"].map(label =>
           <th key={label} style={{ padding: "9px 7px", borderBottom: "1px solid #64748b", whiteSpace: "nowrap" }}>{label}</th>
         )}</tr></thead>
-        <tbody>{rows.map(row => <tr key={row.symbol}>
+        <tbody>{visible.map(row => <tr key={row.symbol}>
           <td style={{ padding: "9px 7px" }}><b>{row.symbol}</b></td>
-          <td style={{ padding: "9px 7px" }}>{row.decision || "No record"}</td>
+          <td style={{ padding: "9px 7px" }}><b style={{ color: { GREEN: "#22c55e", AMBER: "#f59e0b", RED: "#f87171" }[opportunity(row)] }}>{opportunity(row)}</b></td>
           <td style={{ padding: "9px 7px", whiteSpace: "nowrap" }}>{decisionStatus(row)}</td>
           <td style={{ padding: "9px 7px" }}><b>{numeric(row.confidence, 2)}</b></td>
           <td style={{ padding: "9px 7px" }}>{numeric(memoryAudit(row)?.rawConfidence, 2)}</td>
@@ -119,7 +135,8 @@ import { Meter } from "../components/Meter";
 import { gbp, pct, tone, usd, positionQuantity, isSmallCryptoResidual } from "../lib/format";
 import type { ActionFn, AnyObj, PositionStyleFn } from "../lib/types";
 
-export function OverviewPage({ data, banking, message, positions, trades, rate, bestCandidate, aiConfidence, marketRegime, riskLabel, currentAction, botHealth, aiReasons, positionSettings, fetchData, action, positionGlowStyle, onExportFullBot, exportBusy, authToken }: { data: AnyObj; banking: AnyObj; message: string; positions: AnyObj[]; trades: AnyObj[]; rate: number; bestCandidate?: AnyObj; aiConfidence: number; marketRegime: string; riskLabel: string; currentAction: string; botHealth: number; aiReasons: string[]; positionSettings: AnyObj; fetchData: (force?: boolean) => Promise<void>; action: ActionFn; positionGlowStyle: PositionStyleFn; onExportFullBot: () => void; exportBusy: boolean; authToken: string }) {
+export function OverviewPage({ data, banking, message, positions, trades, rate, bestCandidate, aiConfidence, marketRegime, riskLabel, currentAction, botHealth, aiReasons, positionSettings, fetchData, positionGlowStyle, onExportFullBot, exportBusy, authToken }: { data: AnyObj; banking: AnyObj; message: string; positions: AnyObj[]; trades: AnyObj[]; rate: number; bestCandidate?: AnyObj; aiConfidence: number; marketRegime: string; riskLabel: string; currentAction: string; botHealth: number; aiReasons: string[]; positionSettings: AnyObj; fetchData: (force?: boolean) => Promise<void>; action: ActionFn; positionGlowStyle: PositionStyleFn; onExportFullBot: () => void; exportBusy: boolean; authToken: string }) {
+  const stockPositions = positions.filter(position => position.assetClass === "us_equity");
   const maxPositions = Number(data?.maxPositions || positionSettings?.maxPositions || 0);
   const vault = banking?.profitVault || data?.banking?.profitVault || {};
   const market = data?.market || {};
@@ -148,7 +165,11 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
   };
 
   return <main className="home-command-center">
-    <SmartRebuyPanel authToken={authToken} />
+    <section className="system-banner" aria-label="Trading mode">
+      <b>Stock monitoring · Read-only</b>
+      <span>Automatic buying and selling are disabled. Cryptocurrency trading is temporarily unavailable through Alpaca.</span>
+    </section>
+    {data?.cryptoMonitoringEnabled === true && <SmartRebuyPanel authToken={authToken} />}
     <section className="home-hero-row">
       <div className="system-banner"><span className={`status-dot ${botHealth >= 75 ? "healthy" : "warning"}`} /><b>{botHealth >= 75 ? "SYSTEM OPERATIONAL" : "SYSTEM CHECK"}</b><span>{message || currentAction}</span></div>
       <button className="full-report-button" onClick={onExportFullBot} disabled={exportBusy}>
@@ -159,11 +180,7 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
 
     <Card title="Quick Actions" wide className="quick-actions-card">
       <div className="command-actions">
-        <button className="ghost" onClick={() => action(data?.botEnabled ? "/pause" : "/resume")}>{data?.botEnabled ? "⏸  Pause Trading" : "▶  Resume Trading"}</button>
-        <button className="ghost" onClick={() => action("/manual-buy")}>🛒  Manual Buy</button>
-        <button className="ghost" onClick={() => action("/manual-sell")}>⇩  Manual Sell (Worst)</button>
         <button className="ghost" onClick={() => fetchData(true)}>↻  Refresh Dashboard</button>
-        <button className="danger" onClick={() => confirm("Emergency sell all open positions?") && action("/emergency-sell")}>⚡  Emergency Sell</button>
       </div>
     </Card>
 
@@ -178,9 +195,9 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
         </div>
       </Card>
 
-      <Card title="Open Positions" className="command-panel positions-panel">
-        <div className="panel-count">{positions.length}</div>
-        {positions.length ? <div className="position-list compact-positions">{positions.slice(0, 3).map((p) => <article className="position" key={p.symbol} style={positionGlowStyle(p)}><div><h3>{p.symbol}</h3><p>Price {gbp(Number(p.price || 0) * rate)} · Qty {positionQuantity(p)}{isSmallCryptoResidual(p) ? " · Small residual holding" : ""}</p><p>Position value <b>{gbp(p.marketValueGbp ?? Number(p.marketValue || 0) * rate)}</b></p></div><div className="position-side"><b className={tone(p.pnl)}>PnL {gbp(p.pnlGbp ?? Number(p.pnl || 0) * rate)}<br />{pct(p.pnlPct)}</b></div></article>)}</div> : <div className="empty-position"><span>▣</span><b>No Open Positions</b><small>The bot is ready to find opportunities</small></div>}
+      <Card title="Open Stock Positions" className="command-panel positions-panel">
+        <div className="panel-count">{stockPositions.length}</div>
+        {stockPositions.length ? <div className="position-list compact-positions">{stockPositions.slice(0, 3).map((p) => <article className="position" key={p.symbol} style={positionGlowStyle(p)}><div><h3>{p.symbol}</h3><p>Price {gbp(Number(p.price || 0) * rate)} · Qty {positionQuantity(p)}{isSmallCryptoResidual(p) ? " · Small residual holding" : ""}</p><p>Position value <b>{gbp(p.marketValueGbp ?? Number(p.marketValue || 0) * rate)}</b></p></div><div className="position-side"><b className={tone(p.pnl)}>PnL {gbp(p.pnlGbp ?? Number(p.pnl || 0) * rate)}<br />{pct(p.pnlPct)}</b></div></article>)}</div> : <div className="empty-position"><span>▣</span><b>No open stock positions</b></div>}
       </Card>
 
       <Card title="AI System Overview" className="command-panel systems-panel">
@@ -207,9 +224,9 @@ export function OverviewPage({ data, banking, message, positions, trades, rate, 
       </Card>
     </section>
 
-    <EntryGateDiagnostics authToken={authToken} />
+    <EntryGateDiagnostics authToken={authToken} symbols={data?.approvedStockSymbols || []} marketOpen={market?.isOpen === true && !market?.fallbackActive} />
     <section className="grid two dashboard-detail-grid">
-      <Card title="AI Brain" className="decision-card"><div className="ai-grid"><div><div className="ai-status-line"><span>Market view</span><b>{marketRegime}</b></div><div className="ai-status-line"><span>Risk</span><b>{riskLabel}</b></div><div className="ai-status-line"><span>Current action</span><b>{currentAction}</b></div><div className="ai-status-line"><span>Open positions</span><b>{positions.length}/{maxPositions}</b></div></div><div><Meter value={aiConfidence} label="AI confidence"/><Meter value={botHealth} label="System health"/></div></div></Card>
+      <Card title="AI Brain" className="decision-card"><div className="ai-grid"><div><div className="ai-status-line"><span>Market view</span><b>{marketRegime}</b></div><div className="ai-status-line"><span>Risk</span><b>{riskLabel}</b></div><div className="ai-status-line"><span>Current action</span><b>{currentAction}</b></div><div className="ai-status-line"><span>Open positions</span><b>{stockPositions.length}/{maxPositions}</b></div></div><div><Meter value={aiConfidence} label="AI confidence"/><Meter value={botHealth} label="System health"/></div></div></Card>
       <Card title="Best Current Opportunity" className="decision-card">{bestCandidate?.symbol ? <><p className="eyebrow">Top-ranked candidate</p><h3 className="decision-symbol">{bestCandidate.symbol}</h3><div className="summary"><div><span>Confidence</span><b>{aiConfidence.toFixed(0)}%</b></div><div><span>Price</span><b>{bestCandidate?.price ? usd(bestCandidate.price) : "—"}</b></div><div><span>Movement</span><b className={tone(bestCandidate?.changePct || bestCandidate?.gap_pct)}>{pct(bestCandidate?.changePct ?? bestCandidate?.gap_pct ?? 0)}</b></div></div><ul className="reason-list">{aiReasons.length ? aiReasons.map((reason) => <li key={reason}>{reason}</li>) : <li>Waiting for the live scanner to provide detailed evidence.</li>}</ul></> : <p className="muted">No ranked opportunity is available yet. The card will populate when the scanner produces candidates.</p>}</Card>
       <Card title="Final Gate Monitor" className="decision-card final-gate-card"><div className="final-gate-head"><span className={`gate-pill ${finalGate?.state === "FINAL_GATE_READY" ? "ready" : finalGate?.state === "FINAL_GATE_WAITING" ? "waiting" : "idle"}`}>{finalGate?.state === "FINAL_GATE_READY" ? "FINAL GATE READY" : finalGate?.state === "FINAL_GATE_WAITING" ? "FINAL GATE · WAITING" : "SCANNING"}</span></div>{finalGate?.topCandidate?.symbol ? <><h3 className="decision-symbol">{finalGate.topCandidate.symbol}</h3><div className="summary"><div><span>Portfolio score</span><b>{Number(finalGate.topCandidate.portfolioScore || 0).toFixed(3)}</b></div><div><span>Minimum</span><b>{Number(finalGate.topCandidate.minimumScore || finalGate.minimumPortfolioScore || 0).toFixed(3)}</b></div></div><p className="muted">{finalGate.detail}</p></> : <p className="muted">No stock has reached the final portfolio gate yet.</p>}</Card>
       <Card title="Profit Vault" className="decision-card"><div className="final-gate-head"><span className={`gate-pill ${vault?.enabled ? "ready" : "idle"}`}>{vault?.enabled ? "PROFIT VAULT ACTIVE" : "VAULT OFF"}</span><span className="muted">100% realised-profit banking</span></div><div className="summary"><div><span>Trading capital</span><b>{gbp(Math.max(0, Number(vault?.accountEquityGbp || 0) - Number(vault?.bankedProfitGbp || 0)))}</b></div><div><span>Free cash</span><b>{gbp(Number(vault?.workingCapitalGbp || 0))}</b></div><div><span>Banked profit</span><b className={Number(vault?.bankedProfitGbp || 0) > 0 ? "positive" : ""}>{gbp(Number(vault?.bankedProfitGbp || 0))}</b></div><div><span>Protected baseline</span><b>{gbp(Number(vault?.baselineGbp || 0))}</b></div><div><span>Lifetime banked</span><b>{gbp(Number(vault?.lifetimeBankedGbp || 0))}</b></div></div><p className="muted" style={{marginTop:10}}>Trading capital includes money currently invested in the open position plus free cash. Banked profit is protected and excluded from new buys.</p></Card>

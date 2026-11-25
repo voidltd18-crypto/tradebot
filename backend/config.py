@@ -13,8 +13,10 @@ ALPACA_API_SECRET = os.getenv('APCA_API_SECRET_KEY', '')
 ALPACA_PAPER = os.getenv('PAPER', 'true').lower() == 'true'
 STOCK_NO_SAME_DAY_SELLS = os.getenv('STOCK_NO_SAME_DAY_SELLS', 'true').lower() == 'true'
 
+# Crypto monitoring requires explicit opt-in. Broker execution is separately blocked.
+CRYPTO_ENABLED = os.getenv('CRYPTO_ENABLED', 'false').strip().lower() == 'true'
+
 # Crypto / Binance via CCXT
-CRYPTO_ENABLED = os.getenv('CRYPTO_ENABLED', 'true').lower() == 'true'
 BINANCE_API_KEY = os.getenv('BINANCE_API_KEY', '')
 BINANCE_SECRET_KEY = os.getenv('BINANCE_SECRET_KEY', '')
 BINANCE_TESTNET = os.getenv('BINANCE_TESTNET', 'true').lower() == 'true'

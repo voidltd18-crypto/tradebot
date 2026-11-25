@@ -12,14 +12,16 @@ from backend.legacy.monolith import app
 __all__ = ["app"]
 
 # Read-only Telegram crypto alerts run only with explicit environment opt-in.
+from backend.config import CRYPTO_ENABLED
 from backend.legacy import monolith as _legacy
 from backend.v19_stock_crypto_capacity import install_stock_crypto_capacity
 install_stock_crypto_capacity(_legacy)
 from backend.v19_crypto_telegram_monitor import install_crypto_telegram_worker
-install_crypto_telegram_worker(app, _legacy.trading_client, _legacy.state, _legacy.SQLITE_DB_FILE)
+if CRYPTO_ENABLED:
+    install_crypto_telegram_worker(app, _legacy.trading_client, _legacy.state, _legacy.SQLITE_DB_FILE)
 
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from backend.v19_crypto_telegram_monitor import crypto_monitor_status
 
 @app.get("/v19/telegram-crypto-monitor-status")
@@ -47,6 +49,8 @@ def reports_crypto_buy_again(request: Request):
 @app.get("/v19/xrp-repeat-cycle-preview")
 def xrp_repeat_cycle_preview(request: Request):
     _legacy.verify_api_key(request)
+    if not CRYPTO_ENABLED:
+        raise HTTPException(403, "Crypto monitoring is disabled.")
     import os
     from alpaca.data.historical import CryptoHistoricalDataClient
     from backend.v19_xrp_repeat_cycle_snapshot import xrp_cycle_preview
@@ -96,6 +100,8 @@ from backend.v19_manual_crypto_rebuy_preview import preview as manual_crypto_reb
 @app.get("/v19/manual-crypto-rebuy-preview/{symbol}")
 def manual_crypto_rebuy_preview_endpoint(symbol: str, request: Request):
     _legacy.verify_api_key(request)
+    if not CRYPTO_ENABLED:
+        raise HTTPException(403, "Crypto monitoring is disabled.")
     from alpaca.data.historical import CryptoHistoricalDataClient
     data_client = CryptoHistoricalDataClient(_legacy.API_KEY, _legacy.API_SECRET)
     return manual_crypto_rebuy_preview(_legacy.trading_client, data_client, symbol)
@@ -104,6 +110,8 @@ def manual_crypto_rebuy_preview_endpoint(symbol: str, request: Request):
 @app.get("/v19/manual-crypto-rebuy-scan")
 def manual_crypto_rebuy_scan_endpoint(request: Request):
     _legacy.verify_api_key(request)
+    if not CRYPTO_ENABLED:
+        raise HTTPException(403, "Crypto monitoring is disabled.")
     from alpaca.data.historical import CryptoHistoricalDataClient
     from backend.v19_manual_crypto_rebuy_bulk import scan_all
     data_client = CryptoHistoricalDataClient(_legacy.API_KEY, _legacy.API_SECRET)

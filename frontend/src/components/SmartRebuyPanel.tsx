@@ -100,68 +100,6 @@ export function SmartRebuyPanel({authToken}:{authToken:string}) {
       setSignal({status:"WAIT",reason:"Could not verify broker data; do not buy"});
     } finally { setSignalLoading(false); }
   }
-  const [rebuySymbol, setRebuySymbol] = useState("");
-  const [rebuyRequestId, setRebuyRequestId] = useState("");
-  const [rebuyAmount, setRebuyAmount] = useState("25");
-  const [rebuyPotChoice, setRebuyPotChoice] = useState<"FULL" | "HALF" | null>(null);
-  const [rebuySignalWarning, setRebuySignalWarning] = useState("");
-  const [rebuyAvailable, setRebuyAvailable] = useState<number | null>(null);
-  const [rebuyCashLoading, setRebuyCashLoading] = useState(false);
-  const [rebuyCashError, setRebuyCashError] = useState("");
-  async function fetchRebuyCash() {
-    setRebuyCashLoading(true);
-    setRebuyAvailable(null);
-    setRebuyCashError("");
-    try {
-      const response = await fetch(`${API_URL}/v19/reports/crypto-buy-again/available`, {
-        cache: "no-store",
-        headers: {"X-Auth-Token":authToken, "x-api-key":authToken},
-      });
-      const payload = await readJson(response);
-      const amount = Number(payload?.availableUsd);
-      if (!response.ok || !payload?.ok || payload?.availableUsd == null || !Number.isFinite(amount) || amount < 0) {
-        throw new Error(String(payload?.message || "Available cash could not be verified"));
-      }
-      setRebuyAvailable(amount);
-      setRebuyAmount(rebuyPotChoice === "HALF" ? (Math.floor(amount * 50) / 100).toFixed(2) : (Math.floor(amount * 100) / 100).toFixed(2));
-    } catch (error: any) {
-      setRebuyCashError(String(error?.message || "Available cash could not be verified"));
-    } finally { setRebuyCashLoading(false); }
-  }
-  function openSmartRebuyBuy(row: AnyObj) {
-    const symbol = String(row?.symbol || "").toUpperCase();
-    if (!cryptoPair(symbol) || rebuyPending) return;
-    setRebuySymbol(symbol);
-    setRebuyRequestId(crypto.randomUUID());
-    setRebuyPotChoice(null);
-    setRebuyAvailable(null);
-    setRebuyAmount("");
-    setRebuyMessage("");
-    setRebuySignalWarning(row.status === "BUY_CANDIDATE"
-      ? "Green signal is informational, not a guarantee. Broker conditions may have changed."
-      : "AMBER WATCH: Recovery is NOT verified. Buying now is outside the green rebuy signal.");
-    void fetchRebuyCash();
-  }
-  const [rebuyPending, setRebuyPending] = useState(false);
-  const [rebuyMessage, setRebuyMessage] = useState("");
-  const cryptoPair = (symbol: string) => /^[A-Z0-9]{2,20}\/USD$/.test(symbol.toUpperCase());
-  async function submitRebuy() {
-    if (!rebuySymbol || !rebuyRequestId || rebuyPending || rebuyCashLoading || rebuyAvailable === null || Number(rebuyAmount) < 1 || Number(rebuyAmount) > rebuyAvailable || !rebuyPotChoice) return;
-    setRebuyPending(true);
-    setRebuyMessage("");
-    try {
-      const response = await fetch(`${API_URL}/v19/reports/crypto-buy-again`, {
-        method: "POST",
-        headers: {"Content-Type":"application/json", "X-Auth-Token": authToken, "x-api-key":authToken},
-        body: JSON.stringify({symbol:rebuySymbol, amountUsd:rebuyAmount, confirmation:`BUY ${rebuySymbol}`, requestId:rebuyRequestId}),
-      });
-      const result = await readJson(response);
-      setRebuyMessage(String(result?.message || (response.ok ? "Broker request submitted; verify your orders." : "Order not placed.")));
-      if (result?.orderSubmitted) { setRebuySymbol(""); }
-    } catch {
-      setRebuyMessage("Request status unknown. Check Alpaca orders before trying again.");
-    } finally {setRebuyPending(false);}
-  }
   const highlightedRebuyCoins = useMemo(() => bulkSignals.filter(row =>
     row?.status === "BUY_CANDIDATE" && row?.readOnly === true && row?.orderSubmitted === false ||
     row?.status === "WATCH" && row?.readOnly === true && row?.orderSubmitted === false
@@ -198,7 +136,6 @@ return <>
               <button type="button" onClick={()=>{setSignalSymbol(normaliseCryptoPair(row.symbol));setSignal(row);}} style={{padding:"6px 2px",border:0,background:"transparent",color:"#f8fafc",cursor:"pointer"}}>
                 <span style={{color:row.status==="BUY_CANDIDATE"?"#22c55e":"#f59e0b"}}>●</span> {row.symbol} · {row.status==="BUY_CANDIDATE"?"BUY candidate":"WATCH"}{row.dipPct!=null?` · ${row.dipPct}% dip`:""}{row.status==="BUY_CANDIDATE" && typeof row.recoveryStrengthPct==="number" ? ` · #${highlightedRebuyCoins.slice(0,index+1).filter(r=>r.status==="BUY_CANDIDATE" && typeof r.recoveryStrengthPct==="number").length} recovery +${row.recoveryStrengthPct.toFixed(2)}%` : ""}{row.status==="BUY_CANDIDATE" && row.recoveryConfidence?.label ? ` · ${row.recoveryConfidence.label} confidence (${row.recoveryConfidence.score}/100)` : ""}
               </button>
-              <button type="button" className="table-action" onClick={()=>openSmartRebuyBuy(row)}>Buy</button>
             </div>)}
           </div>
         </div>
@@ -232,29 +169,5 @@ return <>
       </div>
     </Card>
 
-    {rebuySymbol && <div role="dialog" aria-modal="true" aria-label="Buy crypto again" className="report-rebuy-dialog" style={{position:"fixed",inset:0,zIndex:9000,background:"rgba(0,0,0,.75)",display:"flex",alignItems:"center",justifyContent:"center",padding:"max(8px, env(safe-area-inset-top)) 8px max(8px, env(safe-area-inset-bottom))",overflowY:"auto",boxSizing:"border-box"}}>
-      <div style={{width:"100%",maxWidth:450,maxHeight:"calc(100dvh - 24px)",minWidth:0,overflowY:"auto",overscrollBehavior:"contain",boxSizing:"border-box",background:"#161b27",border:"1px solid #475569",borderRadius:12,padding:"clamp(12px, 4vw, 20px)",color:"#f8fafc",fontSize:"clamp(14px, 3.8vw, 16px)",lineHeight:1.45}}>
-        <h3>Buy Crypto — {rebuySymbol}</h3>
-        {rebuySignalWarning && <p role="alert" style={{color:"#fbbf24"}}>{rebuySignalWarning}</p>}
-        <p>This requests a <strong>new Alpaca market buy</strong> at the current market price, not the historical sale price. It may use real money if the broker account is live and the feature is enabled.</p>
-        <div style={{display:"flex",gap:8,marginBottom:12,flexWrap:"wrap"}}>
-          <button type="button" disabled={rebuyAvailable===null || rebuyPending} onClick={()=>{setRebuyPotChoice("FULL");setRebuyAmount((Math.floor((rebuyAvailable||0)*100)/100).toFixed(2));}}>Full pot (100%)</button>
-          <button type="button" disabled={rebuyAvailable===null || rebuyPending} onClick={()=>{setRebuyPotChoice("HALF");setRebuyAmount((Math.floor((rebuyAvailable||0)*50)/100).toFixed(2));}}>Half pot (50%)</button>
-        </div>
-        <p style={{color:"#cbd5e1"}}>Pot = verified available Alpaca cash, not total portfolio value. Choose a pot size, then confirm the live market order.</p>
-        <label style={{display:"block",marginBottom:12}}>Amount to spend (USD) — choose Full or Half pot
-          <input type="number" min="1" max={rebuyAvailable ?? undefined} step="0.01" value={rebuyAmount} disabled={rebuyCashLoading || rebuyAvailable === null} onChange={e=>{setRebuyPotChoice(null);setRebuyAmount(e.target.value);}} style={{display:"block",width:"100%",maxWidth:"100%",boxSizing:"border-box",marginTop:5,fontSize:16}}/>
-        </label>
-        <p role="status" style={{marginTop:-4}}>{rebuyCashLoading ? "Checking Alpaca cash…" : rebuyAvailable !== null ? `Available to buy: ${rebuyAvailable.toFixed(2)} USD` : (rebuyCashError || "No verified buying power available")}</p>
-        <button className="ghost" disabled={rebuyCashLoading || rebuyPending} onClick={()=>{void fetchRebuyCash();}}>Refresh buying power</button>
-        <p style={{color:"#fbbf24"}}>Review your coin and amount before pressing Confirm Buy. This button places a real-money market order when live trading is enabled.</p>
-        <p>The available amount comes from Alpaca cash and non-marginable buying power, not your invested positions or vault. Alpaca rechecks cash when you confirm.</p>
-        {rebuyMessage && <p role="status">{rebuyMessage}</p>}
-        <div style={{display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap",position:"sticky",bottom:0,background:"#161b27",padding:"10px 0"}}>
-          <button className="ghost" disabled={rebuyPending} onClick={()=>{setRebuySymbol("");setRebuyRequestId("");setRebuyMessage("");}}>Close</button>
-          <button disabled={rebuyPending || rebuyCashLoading || rebuyAvailable === null || !rebuyPotChoice || !(Number(rebuyAmount)>=1 && Number(rebuyAmount)<=rebuyAvailable)} onClick={submitRebuy}>{rebuyPending?"Submitting…":"Confirm Buy"}</button>
-        </div>
-      </div>
-    </div>}
 </>;
 }
