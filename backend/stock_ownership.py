@@ -6,6 +6,8 @@ from decimal import Decimal
 import json
 from uuid import uuid4
 
+from backend.stock_broker_state import open_stock_orders
+
 
 def init_stock_ownership(conn):
     conn.execute("""
@@ -45,18 +47,30 @@ def _intent(conn, symbol):
     ).fetchone()
 
 
-def _has_open_orders(broker, symbol):
-    orders = broker.get("/orders", data={"status": "open", "symbols": symbol, "limit": 1})
-    if not isinstance(orders, list):
-        raise ValueError("Open broker orders could not be verified")
-    return bool(orders)
+def _fill_activities(broker, created):
+    activities = []
+    params = {"activity_types": "FILL", "after": created, "direction": "asc", "page_size": 100}
+    seen_tokens = set()
+    for _ in range(10):
+        page = broker.get("/account/activities", data=dict(params))
+        if not isinstance(page, list) or len(page) > 100 or not all(isinstance(row, dict) for row in page):
+            raise ValueError("Malformed fill activity page")
+        activities.extend(page)
+        if len(page) < 100:
+            return activities
+        token = page[-1].get("id")
+        if not token or token in seen_tokens:
+            raise ValueError("Fill activity pagination stalled")
+        seen_tokens.add(token)
+        params["page_token"] = token
+    raise ValueError("Fill activity pagination limit reached")
 
 
 def _flat_and_clear(broker, symbol, account_id):
     return (
         str(broker.get_account().id) == str(account_id)
         and _position_quantity(broker, symbol) == 0
-        and not _has_open_orders(broker, symbol)
+        and not open_stock_orders(broker, symbol)
     )
 
 
@@ -74,12 +88,7 @@ def _resolved_buy(broker, symbol, intent):
     if not filled.is_finite() or filled < 0 or (status == "filled" and filled == 0):
         return None
 
-    # Refuse truncated history, missing IDs, and buy fills from other orders.
-    activities = broker.get("/account/activities", data={
-        "activity_types": "FILL", "after": created, "direction": "asc", "page_size": 100,
-    })
-    if not isinstance(activities, list) or len(activities) >= 100:
-        return None
+    activities = _fill_activities(broker, created)
     fills = {}
     for activity in activities:
         if activity.get("symbol") not in (None, "", symbol):
@@ -154,7 +163,7 @@ def _value(field):
     return getattr(field, "value", field)
 
 
-def verified_stock_quantity(connect, broker, symbol):
+def verified_stock_holding(connect, broker, symbol):
     """Require exclusive, exact inventory from a fully corroborated bot order."""
     try:
         with closing(connect()) as conn:
@@ -173,12 +182,7 @@ def verified_stock_quantity(connect, broker, symbol):
                 or position_qty != Decimal(order.filled_qty) or not position_qty > 0):
             return None
 
-        # Read the full bounded window. Missing or ambiguous activity fails closed.
-        activities = broker.get("/account/activities", data={
-            "after": created, "direction": "asc", "page_size": 100,
-        })
-        if not isinstance(activities, list) or len(activities) >= 100:
-            return None
+        activities = _fill_activities(broker, created)
         fills = {}
         for activity in activities:
             if activity.get("symbol") not in (None, "", symbol):
@@ -200,9 +204,39 @@ def verified_stock_quantity(connect, broker, symbol):
                 return None
         if (total == position_qty == _position_quantity(broker, symbol)
                 and str(broker.get_account().id) == account_id
-                and not _has_open_orders(broker, symbol)):
-            return total
+                and not open_stock_orders(broker, symbol)):
+            return total, client_id
     except Exception:
         # Broker errors and database failures must never grant ownership.
         return None
     return None
+
+def verified_stock_quantity(connect, broker, symbol):
+    holding = verified_stock_holding(connect, broker, symbol)
+    return holding[0] if holding else None
+
+
+def reconcile_stock_intents(connect, broker, account):
+    """Audit current intents without releasing them or changing the ledger."""
+    with closing(connect()) as conn:
+        rows = conn.execute("SELECT symbol FROM stock_ownership_intents LIMIT 101").fetchall()
+    results = {"checked": 0, "verifiedHeld": 0, "resolvedFlat": 0, "unverified": 0,
+               "intentLimitReached": len(rows) > 100}
+    for (symbol,) in rows[:100]:
+        results["checked"] += 1
+        if verified_stock_holding(connect, broker, symbol):
+            results["verifiedHeld"] += 1
+            continue
+        try:
+            with closing(connect()) as conn:
+                intent = _intent(conn, symbol)
+            if (intent and intent[0] == str(account.id)
+                    and _flat_and_clear(broker, symbol, account.id)
+                    and _resolved_buy(broker, symbol, intent)
+                    and _flat_and_clear(broker, symbol, account.id)):
+                results["resolvedFlat"] += 1
+                continue
+        except Exception:
+            pass
+        results["unverified"] += 1
+    return results

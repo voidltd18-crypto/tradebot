@@ -113,7 +113,7 @@ class StockOwnershipTests(unittest.TestCase):
             reserve_stock_purchase(self.connect, self.broker, "MSFT", 100, self.account)
         self.activities.append(dict(bought, id="exit", order_id="exit-order", side="sell",
                                     transaction_time=(stamp + timedelta(seconds=1)).isoformat()))
-        self.open_orders = [{"id": "still-open"}]
+        self.open_orders = [{"id": "still-open", "symbol": "MSFT"}]
         with self.assertRaises(ValueError):
             reserve_stock_purchase(self.connect, self.broker, "MSFT", 100, self.account)
         self.open_orders = []
@@ -124,7 +124,7 @@ class StockOwnershipTests(unittest.TestCase):
 
     def test_open_orders_block_sell_ownership(self):
         self.own_one_share()
-        self.open_orders = [{"id": "sell-already-open"}]
+        self.open_orders = [{"id": "sell-already-open", "symbol": "MSFT"}]
         self.assertIsNone(self.verify())
 
     def test_two_workers_cannot_replace_one_resolved_intent(self):

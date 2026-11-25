@@ -25,7 +25,13 @@ from backend.config import CRYPTO_ENABLED
 from backend.read_only_broker import ReadOnlyTradingClient
 from backend.stock_buy_risk import cap_stock_buy_notional
 from backend.stock_sell_preview import stock_sell_preview
-from backend.stock_ownership import init_stock_ownership, reserve_stock_purchase, verified_stock_quantity
+from backend.stock_ownership import (
+    init_stock_ownership, reserve_stock_purchase, verified_stock_holding, verified_stock_quantity,
+)
+from backend.stock_broker_state import (
+    BrokerStateUnverified, fresh_stock_quote, open_stock_orders,
+    sellable_stock_quantity, stock_account, stock_position,
+)
 from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
@@ -1264,9 +1270,10 @@ def get_market_status_payload():
     return get_effective_market_status_payload()
 
 
-def get_quote(symbol: str):
+def get_quote(symbol: str, *, require_fresh: bool = False):
     req = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
-    quote = data_client.get_stock_latest_quote(req)[symbol]
+    quote = (fresh_stock_quote(data_client, req, symbol) if require_fresh
+             else data_client.get_stock_latest_quote(req)[symbol])
     bid = quote.bid_price
     ask = quote.ask_price
     if bid is None or ask is None or bid <= 0 or ask <= 0:
@@ -1284,58 +1291,35 @@ def get_position(symbol: str):
         return 0.0, 0.0
 
 
-def get_open_orders(symbol=None):
-    try:
-        request = GetOrdersRequest(status=QueryOrderStatus.OPEN)
-        orders = trading_client.get_orders(filter=request)
-        if symbol is None:
-            return orders
-        return [order for order in orders if str(order.symbol).upper() == symbol.upper()]
-    except Exception:
-        return []
-
-
 def has_open_order(symbol: str):
-    return len(get_open_orders(symbol)) > 0
+    # A broker failure propagates and stops the attempted exit.
+    return bool(open_stock_orders(trading_client, symbol.upper()))
 
 
-def _persistent_position_peak(symbol: str, entry: float, observed: float) -> float:
-    """Persist the observed post-entry peak across service restarts.
-
-    Never invent a peak from historical candles. If the database is
-    unavailable, fall back to the caller's observed/in-memory peak.
-    """
-    if not SQLITE_ENABLED or entry <= 0 or observed <= 0:
+def _persistent_position_peak(symbol: str, client_id: str, observed: float) -> float:
+    """Keep the peak for this verified buy, including across restarts."""
+    if not SQLITE_ENABLED or not client_id or observed <= 0:
         return observed
-    conn = None
+    conn = db_connect()
     try:
-        conn = db_connect()
-        conn.execute("""CREATE TABLE IF NOT EXISTS position_peak_state (
-            symbol TEXT PRIMARY KEY,
-            entry_price REAL NOT NULL,
-            highest_price REAL NOT NULL
-        )""")
-        row = conn.execute(
-            "SELECT entry_price, highest_price FROM position_peak_state WHERE symbol=?",
-            (symbol,),
-        ).fetchone()
-        peak = observed
-        if row and abs(float(row["entry_price"]) - entry) <= max(0.0001, entry * 0.00001):
-            peak = max(observed, float(row["highest_price"]))
-        if not row or peak != float(row["highest_price"]) or abs(float(row["entry_price"]) - entry) > max(0.0001, entry * 0.00001):
+        with conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS stock_position_peaks (
+                client_order_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                highest_price REAL NOT NULL
+            )""")
             conn.execute(
-                "INSERT INTO position_peak_state(symbol,entry_price,highest_price) VALUES(?,?,?) "
-                "ON CONFLICT(symbol) DO UPDATE SET entry_price=excluded.entry_price,highest_price=excluded.highest_price",
-                (symbol, entry, peak),
+                "INSERT INTO stock_position_peaks VALUES (?, ?, ?) "
+                "ON CONFLICT(client_order_id) DO UPDATE SET "
+                "highest_price=MAX(stock_position_peaks.highest_price, excluded.highest_price)",
+                (client_id, symbol, observed),
             )
-            conn.commit()
-        return peak
-    except Exception as exc:
-        print(f"POSITION PEAK PERSISTENCE ERROR | {symbol} {exc}")
-        return observed
+            return float(conn.execute(
+                "SELECT highest_price FROM stock_position_peaks WHERE client_order_id=?",
+                (client_id,),
+            ).fetchone()[0])
     finally:
-        if conn is not None:
-            conn.close()
+        conn.close()
 
 
 def get_all_positions():
@@ -1376,12 +1360,22 @@ def get_all_positions():
             from backend.v19_position_display import broker_display_values
             display_price, pnl, pnl_pct = broker_display_values(pos, quote_price)
 
-            highest = state[symbol].get("highest_since_entry")
-            observed_peak = max(float(highest or 0.0), quote_price)
-            if observed_peak > 0:
-                # Recover from the durable SQLite file on restart and persist new highs.
-                state[symbol]["highest_since_entry"] = _persistent_position_peak(
-                    symbol, entry, observed_peak
+            asset_class = getattr(pos, "asset_class", None)
+            equity_position = str(asset_class).lower() in {"us_equity", "assetclass.us_equity"}
+            holding = verified_stock_holding(db_connect, trading_client, symbol) if equity_position else None
+            owned_quantity = None
+            if holding and holding[0] == Decimal(str(pos.qty)):
+                owned_quantity, client_id = holding
+                try:
+                    state[symbol]["highest_since_entry"] = _persistent_position_peak(symbol, client_id, quote_price)
+                except Exception:
+                    state[symbol]["highest_since_entry"] = None
+                    owned_quantity = None
+            elif equity_position:
+                state[symbol]["highest_since_entry"] = None
+            else:
+                state[symbol]["highest_since_entry"] = max(
+                    float(state[symbol].get("highest_since_entry") or 0), quote_price
                 )
 
             # V17.1: expose the same adaptive AI risk levels that the live exit
@@ -1399,11 +1393,6 @@ def get_all_positions():
             emergency_stop_price = entry * (1.0 - emergency_stop_pct / 100.0) if entry > 0 else 0.0
             trailing_active = bool((state[symbol].get("highest_since_entry") or 0.0) >= trail_start_price) if trail_start_price > 0 else False
 
-            asset_class = getattr(pos, "asset_class", None)
-            equity_position = str(asset_class).lower() in {"us_equity", "assetclass.us_equity"}
-            owned_quantity = verified_stock_quantity(db_connect, trading_client, symbol) if equity_position else None
-            if owned_quantity is not None and owned_quantity != Decimal(str(pos.qty)):
-                owned_quantity = None
             positions.append({
                 "symbol": symbol,
                 "assetClass": getattr(asset_class, "value", asset_class),
@@ -1642,8 +1631,9 @@ def compute_short_momentum(symbol: str, current_price: float):
 
 def compute_scan(symbol: str):
     ensure_symbol_state(symbol, custom=symbol in custom_symbols)
-    quote = get_quote(symbol)
-    qty, entry = get_position(symbol)
+    quote = get_quote(symbol, require_fresh=True)
+    position = stock_position(trading_client, symbol)
+    qty, entry = (float(position.qty), float(position.avg_entry_price)) if position else (0.0, 0.0)
 
     price = quote["mid"]
     spread = quote["spread"]
@@ -2098,10 +2088,16 @@ def can_buy_symbol(symbol: str):
         return False, f"{sym} locked until tomorrow (MARA daily entries {MARA_DAILY_ENTRY_LIMIT}/{MARA_DAILY_ENTRY_LIMIT})"
     if STRICT_ONE_CYCLE_PER_STOCK_PER_DAY and is_locked_today(sym):
         return False, f"{sym} locked until tomorrow"
-    if has_open_order(sym):
-        return False, f"{sym} existing open order"
-    qty, _ = get_position(sym)
-    if qty > DUST_THRESHOLD:
+    try:
+        account = stock_account(trading_client)
+        if min(Decimal(str(account.cash)), Decimal(str(account.buying_power))) < Decimal(str(MIN_ORDER_NOTIONAL)):
+            return False, "Insufficient cash or buying power"
+        if has_open_order(sym):
+            return False, f"{sym} existing open order"
+        position = stock_position(trading_client, sym)
+    except BrokerStateUnverified as exc:
+        return False, str(exc)
+    if position is not None and Decimal(str(position.qty)) != 0:
         return False, f"{sym} already holding"
     return True, ""
 
@@ -2170,7 +2166,10 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
                 "BUY BLOCKED | two-stock broker asset verification: " +
                 ",".join(broker_asset["reasons"])
             )
-    account = get_account()
+    eligible, gate_reason = can_buy_symbol(symbol)
+    if not eligible:
+        raise ValueError(f"BUY BLOCKED | {gate_reason}")
+    account = stock_account(trading_client)
     stop_distance_pct = max(
         (1.0 - STOP_LOSS) * 100.0,
         abs(HARD_STOP_LOSS_PCT),
@@ -2187,6 +2186,9 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
     )
     if isinstance(trading_client, ReadOnlyTradingClient):
         raise RuntimeError("TradeBot is read-only. Broker orders are disabled.")
+    if not bot_enabled or emergency_stop:
+        raise RuntimeError("BUY BLOCKED | trading paused or emergency stop active")
+    get_quote(symbol, require_fresh=True)
     client_order_id = reserve_stock_purchase(db_connect, trading_client, symbol, notional_amount, account.id)
     order = MarketOrderRequest(
         symbol=symbol, notional=round(notional_amount, 2), side=OrderSide.BUY,
@@ -2262,9 +2264,20 @@ def _manual_sell_is_crypto(symbol: str) -> bool:
 
 def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 0.0, reason="AUTO SELL"):
     if not str(reason).upper().startswith("MANUAL"):
+        if isinstance(trading_client, ReadOnlyTradingClient):
+            raise RuntimeError("TradeBot is read-only. Broker orders are disabled.")
+        if not bot_enabled or emergency_stop:
+            return {"ok": False, "message": "Automated sell blocked: paused or emergency stop active"}
         owned_quantity = verified_stock_quantity(db_connect, trading_client, symbol)
         if owned_quantity is None or not 0 < Decimal(str(qty)) <= owned_quantity:
             return {"ok": False, "message": "Automated sell blocked: bot ownership unverified"}
+        try:
+            stock_account(trading_client)
+            if has_open_order(symbol) or Decimal(str(qty)) > sellable_stock_quantity(trading_client, symbol):
+                return {"ok": False, "message": "Automated sell blocked: open order or insufficient sellable quantity"}
+            get_quote(symbol, require_fresh=True)
+        except BrokerStateUnverified as exc:
+            return {"ok": False, "message": str(exc)}
     # Defense in depth: no legacy automated crypto sells, even from a path
     # outside manage_money_mode_positions. Explicit manual sells remain usable.
     # A broker asset-class lookup failure must never permit an auto sell.
@@ -2304,7 +2317,7 @@ def market_sell_qty(symbol: str, qty: float, entry: float = 0.0, price: float = 
             # Fail visibly. Never turn a failed Sell All into a partial order.
             add_alpaca_rejection_event(symbol, reason, err)
             raise
-        if is_insufficient_qty_error(err):
+        if str(reason).upper().startswith("MANUAL") and is_insufficient_qty_error(err):
             available = parse_available_qty(err)
             retry_qty = floor_qty(available, 6) if available else 0
             if retry_qty > 0 and retry_qty < rounded_qty:
@@ -2374,7 +2387,9 @@ def close_position(position, reason="MANUAL SELL"):
     if has_open_order(symbol):
         return {"ok": False, "message": f"{symbol} already has open order"}
 
-    market_sell_qty(symbol, qty, entry=entry, price=price, reason=reason)
+    outcome = market_sell_qty(symbol, qty, entry=entry, price=price, reason=reason)
+    if isinstance(outcome, dict) and not outcome.get("ok"):
+        return outcome
     if symbol in state:
         state[symbol]["highest_since_entry"] = None
     return {"ok": True, "message": f"{reason} submitted for {symbol}. {symbol} locked until tomorrow.", "symbol": symbol}
@@ -11573,7 +11588,7 @@ def run_bot_loop():
                             "symbol": symbol,
                             "decision": "REJECTED",
                             "stage": "scan",
-                            "reason": "Market data scan failed.",
+                            "reason": str(e) if isinstance(e, BrokerStateUnverified) else "Market data scan failed.",
                         }
 
                 latest_scans.clear()

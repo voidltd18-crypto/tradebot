@@ -116,3 +116,38 @@ def manual_crypto_rebuy_scan_endpoint(request: Request):
     from backend.v19_manual_crypto_rebuy_bulk import scan_all
     data_client = CryptoHistoricalDataClient(_legacy.API_KEY, _legacy.API_SECRET)
     return scan_all(_legacy.trading_client, data_client)
+
+
+@app.on_event("startup")
+def start_stock_broker_audit():
+    """Run a read-only check once per service start and log aggregate results."""
+    from threading import Thread
+    Thread(target=_stock_broker_audit, daemon=True, name="stock-broker-audit").start()
+
+
+def _stock_broker_audit():
+    from backend.stock_broker_state import BrokerStateUnverified, broker_failure_category, stock_account
+    from backend.stock_ownership import reconcile_stock_intents
+
+    broker = _legacy.trading_client
+    try:
+        account = stock_account(broker)
+        positions = broker.get_all_positions()
+        orders = broker.get("/orders", data={"status": "open", "limit": 500})
+        if not isinstance(positions, list) or not isinstance(orders, list):
+            raise ValueError("malformed broker response")
+        equity_positions = [
+            position for position in positions
+            if getattr(position.asset_class, "value", position.asset_class) == "us_equity"
+        ]
+        sellable_reported = sum(getattr(position, "qty_available", None) is not None for position in equity_positions)
+        report = reconcile_stock_intents(_legacy.db_connect, broker, account)
+        print(
+            f"STOCK BROKER AUDIT | account=active stock_positions={len(equity_positions)} "
+            f"sellable_reported={sellable_reported} open_orders={len(orders)} "
+            f"open_orders_complete={len(orders) < 500} ledger={report}", flush=True,
+        )
+    except BrokerStateUnverified as exc:
+        print(f"STOCK BROKER AUDIT | {exc}", flush=True)
+    except Exception as exc:
+        print(f"STOCK BROKER AUDIT | unverified ({broker_failure_category(exc)})", flush=True)
