@@ -36,7 +36,14 @@ export function PortfolioPage({ authToken }: { authToken: string }) {
     </Card>
     <Card title="Planned Allocations" wide>
       <div className="table-wrap"><table><thead><tr><th>Rank</th><th>Symbol</th><th>Portfolio score</th><th>Confidence</th><th>Quality</th><th>Allocation</th><th>Share deployed</th><th>Why</th></tr></thead>
-      <tbody>{rows.map((row:AnyObj) => <tr key={`${row.rank}-${row.symbol}`}><td>#{row.rank}</td><td><b>{row.symbol}</b></td><td>{Number(row.portfolioScore || 0).toFixed(3)}</td><td>{pct(Number(row.confidence || 0) * 100)}</td><td>{Number(row.quality || 0).toFixed(4)}</td><td>{gbp(row.notionalGbp)} / {usd(row.notionalUsd)}</td><td>{pct(row.shareOfDeployedPct)}</td><td>{row.reason}</td></tr>)}{!rows.length && <tr><td colSpan={8}>No active portfolio plan yet.</td></tr>}</tbody></table></div>
+      <tbody>{rows.map((row:AnyObj) => <tr key={`${row.rank}-${row.symbol}`}><td>#{row.rank}</td><td><b>{row.symbol}</b></td><td>{Number(row.portfolioScore || 0).toFixed(3)}</td><td>{pct(Number(row.confidence || 0) * 100)}</td><td>{Number(row.quality || 0).toFixed(4)}</td><td>{gbp(row.notionalGbp)} / {usd(row.notionalUsd)}</td><td>{pct(row.shareOfDeployedPct)}</td><td>{row.reason}
+        {row.plannedLossUsd != null && <div className="muted">
+          Risk-capped preview · spread {pct(Number(row.spread) * 100)} · cash {usd(row.availableCashUsd)} ·
+          estimated costs {usd(row.estimatedCostUsd)} ·
+          planned loss incl. costs {usd(row.plannedLossUsd)}
+          {row.quoteTimestamp && <> · Quote {new Date(row.quoteTimestamp).toLocaleTimeString("en-GB", { timeZone: "Europe/London" })} UK</>}
+        </div>}
+      </td></tr>)}{!rows.length && <tr><td colSpan={8}>No active portfolio plan yet.</td></tr>}</tbody></table></div>
     </Card>
   </main>;
 }

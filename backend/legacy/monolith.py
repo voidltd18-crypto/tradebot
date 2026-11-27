@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.config import CRYPTO_ENABLED
 from backend.read_only_broker import ReadOnlyTradingClient
-from backend.stock_buy_risk import cap_stock_buy_notional
+from backend.stock_buy_risk import ROUND_TRIP_COST_ALLOWANCE, cap_stock_buy_notional
 from backend.stock_sell_preview import stock_sell_preview
 from backend.stock_exit_reservation import emergency_latched, latch_emergency, recover_exits, reserve_exit
 from backend.stock_ownership import (
@@ -2152,6 +2152,15 @@ def pdt_aware_should_avoid_sell(symbol: str, reason: str, pnl_pct: float, allow_
     return False
 
 
+def stock_buy_stop_distance_pct(symbol):
+    return max(
+        (1.0 - STOP_LOSS) * 100.0,
+        abs(HARD_STOP_LOSS_PCT),
+        AI_RISK_EMERGENCY_STOP_PCT,
+        float(_ai_risk_effective_profile(symbol).get("emergencyStopPct") or 0),
+    )
+
+
 def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", scan: Optional[Dict[str, Any]] = None):
     if TRADEBOT_STOCK_BUYS_PAUSED:
         raise ValueError("BUY BLOCKED | stock buys paused pending two-stock validation")
@@ -2171,12 +2180,7 @@ def market_buy_notional(symbol: str, notional_amount: float, reason="AUTO BUY", 
     if not eligible:
         raise ValueError(f"BUY BLOCKED | {gate_reason}")
     account = stock_account(trading_client)
-    stop_distance_pct = max(
-        (1.0 - STOP_LOSS) * 100.0,
-        abs(HARD_STOP_LOSS_PCT),
-        AI_RISK_EMERGENCY_STOP_PCT,
-        float(_ai_risk_effective_profile(symbol).get("emergencyStopPct") or 0),
-    )
+    stop_distance_pct = stock_buy_stop_distance_pct(symbol)
     notional_amount = cap_stock_buy_notional(
         requested=notional_amount,
         equity=account.equity,
@@ -5847,6 +5851,19 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False, 
                 amount = round(max(0.0, min(requested, constitutional_cap, remaining)), 2)
                 if index == len(actionable_ranked) - 1:
                     amount = round(max(0.0, min(remaining, constitutional_cap)), 2)
+            try:
+                stop_pct = stock_buy_stop_distance_pct(item["symbol"])
+                amount = cap_stock_buy_notional(
+                    requested=amount, equity=account.equity, cash=account.cash,
+                    buying_power=account.buying_power, stop_distance_pct=stop_pct,
+                    minimum_order=MIN_ORDER_NOTIONAL,
+                )
+            except ValueError as exc:
+                for decision in decisions:
+                    if decision.get("symbol") == item["symbol"]:
+                        decision.update(decision="QUALIFIED_WAITING", deployableNow=False,
+                                        reasonCode="ORDER_RISK_CAP", reason=str(exc))
+                continue
             remaining = round(max(0.0, remaining - amount), 2)
             if amount < MIN_ORDER_NOTIONAL:
                 continue
@@ -5860,6 +5877,10 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False, 
                 "spread": item["spread"],
                 "weightPct": round((amount / (vault_working_capital if single_full_buy else managed_capital)) * 100.0, 2) if (vault_working_capital if single_full_buy else managed_capital) else 0.0,
                 "shareOfDeployedPct": round((amount / deployable) * 100.0, 2) if deployable else 0.0,
+                "quoteTimestamp": item["scan"].get("quoteTimestamp"),
+                "availableCashUsd": round(float(account.cash), 2),
+                "estimatedCostUsd": round(amount * float(ROUND_TRIP_COST_ALLOWANCE), 4),
+                "plannedLossUsd": round(amount * (stop_pct / 100 + float(ROUND_TRIP_COST_ALLOWANCE)), 4),
                 "notionalUsd": amount,
                 "notionalGbp": round(money_gbp(amount), 2),
                 "riskMultiplier": round(float(item["riskProfile"].get("positionMultiplier") or 1.0), 3),
@@ -5912,7 +5933,7 @@ def build_v16_portfolio_plan(picks: List[Dict[str, Any]], manual: bool = False, 
                 "confidenceLabel": item["confidenceLabel"],
                 "quality": item["quality"],
                 "spread": item["spread"],
-                "deployableNow": index < len(actionable_ranked),
+                "deployableNow": any(row["symbol"] == item["symbol"] for row in allocations),
             }
             for index, item in enumerate(qualified_ranked[:25])
         ],

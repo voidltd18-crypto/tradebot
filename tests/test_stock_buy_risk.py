@@ -43,3 +43,27 @@ def test_original_stock_order_boundary_applies_cap_before_submission():
     submit_line = next(node.lineno for node in calls
                        if isinstance(node.func, ast.Attribute) and node.func.attr == "submit_order")
     assert cap_line < submit_line
+
+
+def test_portfolio_preview_caps_full_buy_with_the_execution_sizing_rule():
+    path = Path(__file__).resolve().parents[1] / "backend/legacy/monolith.py"
+    source = path.read_text(encoding="utf-8")
+    start = source.index("            try:\n                stop_pct = stock_buy_stop_distance_pct")
+    end = source.index("            remaining = round", start)
+    from textwrap import dedent
+    from types import SimpleNamespace
+
+    body = dedent(source[start:end])
+    for cash, expected in [(740.28, 35.93), (0.01, None)]:
+        decisions = [{"symbol": "AAPL", "decision": "QUALIFIED"}]
+        scope = dict(
+            item={"symbol": "AAPL"}, account=SimpleNamespace(equity=740.28, cash=cash, buying_power=cash),
+            MIN_ORDER_NOTIONAL=1, stock_buy_stop_distance_pct=lambda symbol: 10,
+            cap_stock_buy_notional=cap_stock_buy_notional, amount=738.28, decisions=decisions,
+        )
+        exec("for candidate in (1,):\n" + "".join("    " + line for line in body.splitlines(keepends=True))
+             + "    preview = amount\n", scope)
+        assert scope.get("preview") == expected
+        if expected is None:
+            assert decisions[0]["reasonCode"] == "ORDER_RISK_CAP"
+            assert not decisions[0]["deployableNow"]
